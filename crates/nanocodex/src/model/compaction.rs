@@ -8,6 +8,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use nanocodex_core::{
     ContentItem, FunctionOutputBody, FunctionOutputContent, ImageDetail, ResponseItem,
+    responses::ResponseHistory,
 };
 #[cfg(not(target_family = "wasm"))]
 use sha1::{Digest as _, Sha1};
@@ -72,35 +73,75 @@ pub(super) const fn trigger() -> ResponseItem {
 }
 
 pub(super) fn trim_tool_outputs_to_fit_context_window(
-    history: &mut [ResponseItem],
+    history: &mut ResponseHistory,
     active_context_tokens: u64,
 ) -> usize {
     let mut estimated_tokens = active_context_tokens;
-    let mut rewritten_outputs = 0;
-    for item in history.iter_mut().rev() {
+    let mut rewritten_outputs = Vec::new();
+    for item in history.iter_rev() {
         if estimated_tokens <= SOL_CONTEXT_WINDOW {
             break;
         }
         let tokens_before = estimate_item_tokens(item);
-        if !rewrite_tool_output(item) {
+        let Some(rewritten) = rewritten_tool_output(item) else {
             break;
-        }
-        let tokens_after = estimate_item_tokens(item);
+        };
+        let tokens_after = estimate_item_tokens(&rewritten);
         estimated_tokens =
             estimated_tokens.saturating_sub(tokens_before.saturating_sub(tokens_after));
-        rewritten_outputs += 1;
+        rewritten_outputs.push(rewritten);
     }
-    rewritten_outputs
+    let rewritten_count = rewritten_outputs.len();
+    if rewritten_count > 0 {
+        rewritten_outputs.reverse();
+        history.replace_suffix(history.len() - rewritten_count, rewritten_outputs);
+    }
+    rewritten_count
 }
 
-fn rewrite_tool_output(item: &mut ResponseItem) -> bool {
-    let (ResponseItem::FunctionCallOutput { output, .. }
-    | ResponseItem::CustomToolCallOutput { output, .. }) = item
-    else {
-        return false;
-    };
-    *output = FunctionOutputBody::Text(CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE.into());
-    true
+fn rewritten_tool_output(item: &ResponseItem) -> Option<ResponseItem> {
+    let output = FunctionOutputBody::Text(CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE.into());
+    match item {
+        ResponseItem::FunctionCallOutput {
+            id,
+            call_id,
+            caller,
+            status,
+            created_by,
+            internal_chat_message_metadata_passthrough,
+            ..
+        } => Some(ResponseItem::FunctionCallOutput {
+            id: id.clone(),
+            call_id: call_id.clone(),
+            output,
+            caller: caller.clone(),
+            status: *status,
+            created_by: created_by.clone(),
+            internal_chat_message_metadata_passthrough: internal_chat_message_metadata_passthrough
+                .clone(),
+        }),
+        ResponseItem::CustomToolCallOutput {
+            id,
+            call_id,
+            name,
+            caller,
+            status,
+            created_by,
+            internal_chat_message_metadata_passthrough,
+            ..
+        } => Some(ResponseItem::CustomToolCallOutput {
+            id: id.clone(),
+            call_id: call_id.clone(),
+            name: name.clone(),
+            output,
+            caller: caller.clone(),
+            status: *status,
+            created_by: created_by.clone(),
+            internal_chat_message_metadata_passthrough: internal_chat_message_metadata_passthrough
+                .clone(),
+        }),
+        _ => None,
+    }
 }
 
 pub(super) fn install_history(
@@ -456,22 +497,38 @@ mod tests {
 
     #[test]
     fn over_window_history_rewrites_trailing_tool_outputs() {
-        let mut history = vec![ResponseItem::custom_tool_output(
+        let mut history = ResponseHistory::new(vec![ResponseItem::custom_tool_output(
             "call".to_owned(),
             None,
             FunctionOutputBody::Text("x".repeat(200_000).into_boxed_str()),
-        )];
+        )]);
         assert_eq!(
             trim_tool_outputs_to_fit_context_window(&mut history, SOL_CONTEXT_WINDOW + 50_000),
             1
         );
         assert!(matches!(
-            &history[0],
+            history.iter().next().unwrap(),
             ResponseItem::CustomToolCallOutput {
                 output: FunctionOutputBody::Text(text),
                 ..
             } if text.as_ref() == CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE
         ));
+    }
+
+    #[test]
+    fn under_window_history_keeps_its_shared_storage() {
+        let mut history = ResponseHistory::new(vec![ResponseItem::custom_tool_output(
+            "call".to_owned(),
+            None,
+            FunctionOutputBody::Text("output".into()),
+        )]);
+        let shared_tail = history.shared_tail();
+
+        assert_eq!(
+            trim_tool_outputs_to_fit_context_window(&mut history, SOL_CONTEXT_WINDOW),
+            0
+        );
+        assert!(std::sync::Arc::ptr_eq(&history.shared_tail(), &shared_tail));
     }
 
     fn message(text: &str) -> ResponseItem {

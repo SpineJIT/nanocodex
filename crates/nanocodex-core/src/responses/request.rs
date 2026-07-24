@@ -123,6 +123,36 @@ impl ResponseHistory {
         self.tail = Arc::new(items);
     }
 
+    /// Replaces every item from `start` onward while sharing complete prefix
+    /// segments.
+    ///
+    /// This is an internal COW primitive used when a transport operation needs
+    /// to rewrite a trailing portion of retained history.
+    #[doc(hidden)]
+    pub fn replace_suffix(&mut self, start: usize, replacement: Vec<ResponseItem>) {
+        let start = start.min(self.len());
+        let committed_len = self.head.as_ref().map_or(0, |segment| segment.len);
+        if start >= committed_len {
+            let tail_prefix_len = start - committed_len;
+            let mut tail = Vec::with_capacity(tail_prefix_len + replacement.len());
+            tail.extend(self.tail[..tail_prefix_len].iter().cloned());
+            tail.extend(replacement);
+            self.tail = Arc::new(tail);
+            return;
+        }
+        let mut current = self.head.clone();
+        while let Some(segment) = current.take() {
+            let previous_len = segment.previous.as_ref().map_or(0, |previous| previous.len);
+            if start >= previous_len {
+                self.head.clone_from(&segment.previous);
+                self.tail = Arc::new(segment.items[..start - previous_len].to_vec());
+                break;
+            }
+            current.clone_from(&segment.previous);
+        }
+        Arc::make_mut(&mut self.tail).extend(replacement);
+    }
+
     #[must_use]
     pub fn iter(&self) -> ResponseHistoryIter<'_> {
         ResponseHistoryIter::new(self, 0)
@@ -131,6 +161,16 @@ impl ResponseHistory {
     #[must_use]
     pub fn iter_from(&self, start: usize) -> ResponseHistoryIter<'_> {
         ResponseHistoryIter::new(self, start)
+    }
+
+    #[must_use]
+    pub fn iter_rev(&self) -> ResponseHistoryRevIter<'_> {
+        ResponseHistoryRevIter {
+            tail: self.tail.iter().rev(),
+            segment: self.head.as_deref(),
+            segment_items: None,
+            remaining: self.len(),
+        }
     }
 
     #[cfg(test)]
@@ -219,6 +259,39 @@ impl<'a> Iterator for ResponseHistoryIter<'a> {
 }
 
 impl ExactSizeIterator for ResponseHistoryIter<'_> {}
+
+pub struct ResponseHistoryRevIter<'a> {
+    tail: std::iter::Rev<std::slice::Iter<'a, ResponseItem>>,
+    segment: Option<&'a HistorySegment>,
+    segment_items: Option<std::iter::Rev<std::slice::Iter<'a, ResponseItem>>>,
+    remaining: usize,
+}
+
+impl<'a> Iterator for ResponseHistoryRevIter<'a> {
+    type Item = &'a ResponseItem;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(item) = self.tail.next() {
+            self.remaining -= 1;
+            return Some(item);
+        }
+        loop {
+            if let Some(item) = self.segment_items.as_mut().and_then(Iterator::next) {
+                self.remaining -= 1;
+                return Some(item);
+            }
+            let segment = self.segment.take()?;
+            self.segment = segment.previous.as_deref();
+            self.segment_items = Some(segment.items.iter().rev());
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for ResponseHistoryRevIter<'_> {}
 
 #[derive(Clone, Copy)]
 pub struct ResponsesInput<'a> {
@@ -711,5 +784,54 @@ mod tests {
             serde_json::to_value(vec![item("one"), item("two"), item("three")]).unwrap(),
         );
         assert_eq!(history.iter_from(99).count(), 0);
+    }
+
+    #[test]
+    fn reverse_iteration_crosses_tail_and_segments_newest_first() {
+        let item = |text: &'static str| {
+            ResponseItem::message(
+                MessageRole::User,
+                [ContentItem::InputText { text: text.into() }],
+            )
+        };
+        let mut history = ResponseHistory::new(vec![item("zero"), item("one")]);
+        history.commit_tail();
+        history.push(item("two"));
+        history.commit_tail();
+        history.push(item("three"));
+
+        let reversed: Vec<_> = history.iter_rev().cloned().collect();
+        assert_eq!(
+            serde_json::to_value(reversed).unwrap(),
+            serde_json::to_value(vec![item("three"), item("two"), item("one"), item("zero")])
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn replacing_a_suffix_shares_complete_prefix_segments() {
+        let item = |text: &'static str| {
+            ResponseItem::message(
+                MessageRole::User,
+                [ContentItem::InputText { text: text.into() }],
+            )
+        };
+        let mut history = ResponseHistory::new(vec![item("zero"), item("one")]);
+        history.commit_tail();
+        let shared_prefix = Arc::clone(history.committed_head().unwrap());
+        history.push(item("two"));
+        history.commit_tail();
+        history.push(item("three"));
+
+        history.replace_suffix(2, vec![item("replacement")]);
+
+        assert!(Arc::ptr_eq(
+            history.committed_head().unwrap(),
+            &shared_prefix
+        ));
+        assert_eq!(
+            serde_json::to_value(history.iter().cloned().collect::<Vec<_>>()).unwrap(),
+            serde_json::to_value(vec![item("zero"), item("one"), item("replacement")]).unwrap(),
+        );
     }
 }

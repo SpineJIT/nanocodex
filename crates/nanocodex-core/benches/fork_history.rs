@@ -1,7 +1,9 @@
 use std::{hint::black_box, sync::Arc};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use nanocodex_core::{ContentItem, MessageRole, ResponseItem, responses::ResponseHistory};
+use nanocodex_core::{
+    ContentItem, FunctionOutputBody, MessageRole, ResponseItem, responses::ResponseHistory,
+};
 
 fn history_item(index: usize) -> ResponseItem {
     ResponseItem::message(
@@ -147,11 +149,79 @@ fn benchmark_code_mode_history_snapshot(criterion: &mut Criterion) {
     group.finish();
 }
 
+fn benchmark_compaction_snapshot(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("compaction_snapshot");
+    for item_count in [100_usize, 1_000, 10_000] {
+        group.throughput(Throughput::Elements(
+            u64::try_from(item_count).expect("benchmark sizes fit in u64"),
+        ));
+        let mut history =
+            ResponseHistory::new((0..item_count).map(history_item).collect::<Vec<_>>());
+        history.commit_tail();
+        history.push(ResponseItem::custom_tool_output(
+            "call".to_owned(),
+            None,
+            FunctionOutputBody::Text("x".repeat(200_000).into_boxed_str()),
+        ));
+
+        group.bench_with_input(
+            BenchmarkId::new("eager_flatten_no_rewrite", item_count),
+            &history,
+            |bencher, history| {
+                bencher.iter(|| black_box(history.iter().cloned().collect::<Vec<_>>()));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("shared_no_rewrite", item_count),
+            &history,
+            |bencher, history| {
+                bencher.iter(|| black_box(history.clone()));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("eager_flatten_rewrite", item_count),
+            &history,
+            |bencher, history| {
+                bencher.iter(|| {
+                    let mut flattened = history.iter().cloned().collect::<Vec<_>>();
+                    flattened.pop();
+                    flattened.push(ResponseItem::custom_tool_output(
+                        "call".to_owned(),
+                        None,
+                        FunctionOutputBody::Text("truncated".into()),
+                    ));
+                    black_box(flattened);
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("shared_prefix_rewrite", item_count),
+            &history,
+            |bencher, history| {
+                bencher.iter(|| {
+                    let mut snapshot = history.clone();
+                    snapshot.replace_suffix(
+                        snapshot.len() - 1,
+                        vec![ResponseItem::custom_tool_output(
+                            "call".to_owned(),
+                            None,
+                            FunctionOutputBody::Text("truncated".into()),
+                        )],
+                    );
+                    black_box(snapshot);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     benchmark_fork_append,
     benchmark_active_boundary_snapshot,
     benchmark_incremental_suffix,
-    benchmark_code_mode_history_snapshot
+    benchmark_code_mode_history_snapshot,
+    benchmark_compaction_snapshot
 );
 criterion_main!(benches);
