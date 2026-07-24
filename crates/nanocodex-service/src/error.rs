@@ -179,7 +179,7 @@ fn retryable_api_error(event: &str) -> Option<(&'static str, Option<Duration>)> 
         .error
         .as_ref()
         .or_else(|| event.response.as_ref()?.error.as_ref())?;
-    let class = match error.code.as_deref() {
+    let class = match error.code.as_deref().or(error.kind.as_deref()) {
         Some(
             "server_is_overloaded"
             | "slow_down"
@@ -239,6 +239,8 @@ struct ApiErrorResponse {
 
 #[derive(Deserialize)]
 struct ApiErrorDetail {
+    #[serde(default, rename = "type")]
+    kind: Option<Box<str>>,
     #[serde(default)]
     code: Option<Box<str>>,
     #[serde(default)]
@@ -258,5 +260,40 @@ impl RetryAfterValue {
             Self::Number(seconds) => Some(*seconds),
             Self::String(seconds) => seconds.parse().ok(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retryable_api_error;
+
+    #[test]
+    fn retries_server_error_reported_as_error_type() {
+        let event = r#"{
+            "type":"error",
+            "error":{
+                "type":"server_error",
+                "code":null,
+                "message":"An error occurred while processing the request."
+            }
+        }"#;
+
+        assert_eq!(
+            retryable_api_error(event).map(|(class, _)| class),
+            Some("api_server")
+        );
+    }
+
+    #[test]
+    fn error_code_takes_precedence_over_error_type() {
+        let event = r#"{
+            "type":"error",
+            "error":{
+                "type":"server_error",
+                "code":"invalid_prompt"
+            }
+        }"#;
+
+        assert!(retryable_api_error(event).is_none());
     }
 }
