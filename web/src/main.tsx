@@ -1,4 +1,3 @@
-import "./reactScan";
 import { createRoot } from "react-dom/client";
 import { Xedoc } from "./Xedoc";
 

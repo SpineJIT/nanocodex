@@ -1,13 +1,15 @@
-import { Actions, Agent, type ReasoningMode, type Thinking, type Turn } from "nanocodex/browser";
-import type { TuiCommand, TuiTarget } from "nanocodex-tui";
+import { Actions, Agent, type ReasoningMode, type Thinking, type ToolMap, type Turn } from "nanocodex/browser";
+import type { TuiTarget } from "nanocodex-tui";
 import { createBrowserTools } from "./browserTools";
+import type { PaymentStatus, WebTuiCommand } from "./nanocodex";
 
 type Target = TuiTarget;
 type BrowserPromptItem =
   | { type: "image"; image_url: string; detail?: "auto" | "low" | "high" | "original" }
   | { type: "text"; text: string };
 
-type IncomingMessage = TuiCommand;
+type IncomingMessage = WebTuiCommand;
+type PaymentSession = Awaited<ReturnType<(typeof import("./tempo"))["createTempoMppSession"]>>;
 
 type WorkerScope = {
   location: Location;
@@ -46,6 +48,7 @@ const branches = new Map<number, Branch>();
 const sessionImages = new Map<string, string[]>();
 let btw: BtwBranch | undefined;
 let eventWatch: Actions.events.watch.Watcher | undefined;
+let paymentSession: PaymentSession | undefined;
 worker.onmessage = ({ data }: MessageEvent<IncomingMessage>) => {
   void handleMessage(data).catch((error) => {
     worker.postMessage({
@@ -58,7 +61,7 @@ worker.onmessage = ({ data }: MessageEvent<IncomingMessage>) => {
 async function handleMessage(message: IncomingMessage): Promise<void> {
   switch (message.type) {
     case "start":
-      await start(message.thinking, message.reasoningMode);
+      await start(message.thinking, message.reasoningMode, message.transport);
       return;
     case "prompt": {
       const branch = resolveTarget(message.target);
@@ -188,7 +191,11 @@ async function handleMessage(message: IncomingMessage): Promise<void> {
   }
 }
 
-async function start(thinking: Thinking, reasoningMode: ReasoningMode): Promise<void> {
+async function start(
+  thinking: Thinking,
+  reasoningMode: ReasoningMode,
+  transport: "openai" | "mpp",
+): Promise<void> {
   eventWatch?.off();
   eventWatch = undefined;
   for (const branch of branches.values()) branch.agent.dispose();
@@ -197,14 +204,8 @@ async function start(thinking: Thinking, reasoningMode: ReasoningMode): Promise<
   sessionImages.clear();
   btw?.agent.dispose();
   btw = undefined;
-  const agent = await Agent.create({
-    apiKey: "worker-managed",
-    websocketUrl: workerEndpoint(),
-    createWebSocket: (endpoint: string, sessionId: string) => {
-      const url = new URL(endpoint);
-      url.searchParams.set("session_id", sessionId);
-      return new WebSocket(url);
-    },
+  paymentSession = undefined;
+  const common = {
     tools: {
       ...createBrowserTools({
         recentImages(sessionId, count) {
@@ -224,9 +225,26 @@ async function start(thinking: Thinking, reasoningMode: ReasoningMode): Promise<
     },
     thinking,
     reasoningMode,
-  });
+  };
+  const agent = transport === "mpp"
+    ? await createMppAgent(common)
+    : await Agent.create({
+        ...common,
+        apiKey: "worker-managed",
+        websocketUrl: workerEndpoint(),
+        createWebSocket: (endpoint: string, sessionId: string) => {
+          const url = new URL(endpoint);
+          url.searchParams.set("session_id", sessionId);
+          return new WebSocket(url);
+        },
+      });
   eventWatch = agent.events.watch({ includeAllSessions: true });
   eventWatch.onEvent((event) => {
+    if (paymentSession) {
+      const line = JSON.stringify(event);
+      console.info(line);
+      worker.postMessage({ type: "mppJsonl", line });
+    }
     const target = event.request_id ? routes.get(event.request_id) : undefined;
     if (target) worker.postMessage({ type: "event", target, event });
   });
@@ -234,6 +252,17 @@ async function start(thinking: Thinking, reasoningMode: ReasoningMode): Promise<
   branches.set(0, main);
   routes.set(agent.sessionId, { pane: "main", branchId: 0 });
   worker.postMessage({ type: "ready", sessionId: agent.sessionId });
+  postPaymentStatus();
+}
+
+async function createMppAgent(common: {
+  tools: ToolMap;
+  thinking: Thinking;
+  reasoningMode: ReasoningMode;
+}) {
+  const { createTempoMppSession } = await import("./tempo");
+  paymentSession = await createTempoMppSession();
+  return Agent.create({ ...common, fastMode: true, mpp: paymentSession.mpp });
 }
 
 function startTurn(branch: Branch, target: Target, id: number, prompt: string, images: string[] = []): void {
@@ -256,12 +285,24 @@ function startTurn(branch: Branch, target: Target, id: number, prompt: string, i
       record.settled = true;
       record.completed = true;
       post("turnFinished", target, { id, message });
+      postPaymentStatus();
     },
     (error) => {
       record.settled = true;
       post("turnFinished", target, { id, error: errorMessage(error) });
     },
   );
+}
+
+function postPaymentStatus(): void {
+  if (!paymentSession) return;
+  const payment: PaymentStatus = {
+    rootAddress: paymentSession.rootAddress,
+    accessKeyAddress: paymentSession.accessKeyAddress,
+    channelId: paymentSession.mpp.channelId,
+    cumulative: paymentSession.mpp.cumulative.toString(),
+  };
+  worker.postMessage({ type: "mppPayment", payment });
 }
 
 function rememberSessionImage(sessionId: string, imageUrl: string): void {

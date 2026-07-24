@@ -1,11 +1,23 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   NanocodexProvider,
+  useNanocodex,
+  useNanocodexMessage,
 } from "nanocodex-react";
 import { NanocodexTui } from "nanocodex-tui-react";
 import "nanocodex-tui-react/structure.css";
 
-import { nanocodexConfig } from "./nanocodex";
+import {
+  nanocodexConfig,
+  type AgentTransport,
+  type PaymentStatus,
+  type WebTuiCommand,
+  type WebTuiMessage,
+} from "./nanocodex";
+
+const MppControls = lazy(async () => ({
+  default: (await import("./MppControls")).MppControls,
+}));
 
 /** Website policy around the reusable TUI: credential UX and the site theme. */
 export function AgentTerminal() {
@@ -17,7 +29,17 @@ export function AgentTerminal() {
 }
 
 function AgentTerminalDemo() {
+  const agent = useNanocodex<WebTuiCommand>();
+  const [transport, setTransport] = useState<AgentTransport>("openai");
   const [credentialSource, setCredentialSource] = useState<CredentialSource | undefined>();
+  const [payment, setPayment] = useState<PaymentStatus>();
+  const [jsonl, setJsonl] = useState<string[]>([]);
+  useNanocodexMessage<WebTuiMessage>((message) => {
+    if (message.type === "mppPayment") setPayment(message.payment);
+    if (message.type === "mppJsonl") {
+      setJsonl((current) => [...current.slice(-99), message.line]);
+    }
+  });
   useEffect(() => {
     let active = true;
     void fetch("/api/health")
@@ -39,17 +61,81 @@ function AgentTerminalDemo() {
       });
     return () => { active = false; };
   }, []);
+
+  useEffect(() => {
+    setPayment(undefined);
+    setJsonl([]);
+    if (transport !== "openai") return;
+    if (credentialSource === "user" || credentialSource === "deployment") {
+      nanocodexConfig.restart(startCommand("openai"));
+    } else {
+      nanocodexConfig.disconnect();
+    }
+  }, [credentialSource, transport]);
+
+  const startMpp = useCallback(() => {
+    nanocodexConfig.restart(startCommand("mpp"));
+  }, []);
+  const disconnectMpp = useCallback(() => nanocodexConfig.disconnect(), []);
+  const selectTransport = (next: AgentTransport) => {
+    if (next === transport) return;
+    nanocodexConfig.disconnect();
+    setTransport(next);
+  };
+
+  const enabled = transport === "openai"
+    ? credentialSource === "user" || credentialSource === "deployment"
+    : agent.status === "ready";
+  const unavailableMessage = transport === "openai"
+    ? credentialSource === undefined
+      ? "Checking OpenAI credentials..."
+      : "OpenAI API key is not configured"
+    : agent.status === "starting"
+      ? "Starting paid MPP session..."
+      : agent.status === "error"
+        ? agent.error ?? "MPP session failed"
+        : "Connect Tempo to authorize an MPP session";
+
   return (
     <div className="nanocodex-demo">
-      <CredentialBar source={credentialSource} />
+      <div className="agent-transport" role="group" aria-label="Agent connection">
+        <button
+          type="button"
+          aria-pressed={transport === "openai"}
+          onClick={() => selectTransport("openai")}
+        >OpenAI API</button>
+        <button
+          type="button"
+          aria-pressed={transport === "mpp"}
+          onClick={() => selectTransport("mpp")}
+        >Tempo MPP</button>
+      </div>
+      {transport === "openai" ? <CredentialBar source={credentialSource} /> : (
+        <Suspense fallback={<aside className="agent-byok">Loading Tempo Accounts…</aside>}>
+          <MppControls
+            jsonl={jsonl}
+            payment={payment}
+            onDisconnect={disconnectMpp}
+            onReady={startMpp}
+          />
+        </Suspense>
+      )}
       <NanocodexTui
-        enabled={credentialSource === "user" || credentialSource === "deployment"}
-        unavailableMessage={credentialSource === undefined
-          ? "Checking OpenAI credentials..."
-          : "OpenAI API key is not configured"}
+        key={transport}
+        enabled={enabled}
+        unavailableMessage={unavailableMessage}
       />
     </div>
   );
+}
+
+function startCommand(transport: AgentTransport): WebTuiCommand {
+  return {
+    type: "start",
+    transport,
+    thinking: transport === "mpp" ? "none" : "high",
+    reasoningMode: "standard",
+  };
 }
 
 type CredentialSource = "user" | "deployment" | null;

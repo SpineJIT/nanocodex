@@ -4,10 +4,16 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "start": "node --env-file-if-exists=../../.env index.mjs"
+    "start": "node --env-file-if-exists=../../.env index.mjs",
+    "smoke:mpp": "node mpp.mjs",
+    "test": "node --test mpp-support.test.mjs"
   },
   "dependencies": {
-    "nanocodex": "file:../../js/bindings"
+    "accounts": "^0.15.5",
+    "mppx": "^0.8.14",
+    "nanocodex": "file:../../js/bindings",
+    "viem": "^2.55.8",
+    "ws": "^8.18.3"
   },
   "engines": {
     "node": ">=22.13.0"

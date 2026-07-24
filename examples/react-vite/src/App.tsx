@@ -1,4 +1,9 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { formatUnits } from "viem";
+import { useConnect, useConnection, useConnectors } from "wagmi";
+import { tempo } from "wagmi/chains";
+import { Hooks } from "wagmi/tempo";
+import { PATH_USD } from "./tempo-policy";
 
 type Thinking = "low" | "medium" | "high" | "xhigh";
 type Status = "waiting" | "starting" | "ready" | "running" | "completed" | "failed";
@@ -24,18 +29,22 @@ type ToolTrace = {
   duration_ns?: number;
 };
 type WorkerMessage =
-  | { type: "ready" }
+  | { type: "ready"; transport: "openai" | "mpp"; rootAddress?: string; accessKeyAddress?: string; channelId?: string }
   | { type: "event"; event: AgentEvent }
-  | { type: "result"; id: number; message: string }
+  | { type: "result"; id: number; message: string; payment?: { channelId?: string; cumulative: string } }
   | { type: "error"; id?: number; message: string };
 
 const DEFAULT_PROMPT = `Inspect the browser runtime with tools.browserInfo(), then explain what is running in Rust/WASM versus JavaScript. End with one concrete idea for a useful browser-native tool.`;
 
 export function App() {
+  const connection = useConnection();
+  const connectors = useConnectors();
+  const connect = useConnect();
   const workerRef = useRef<Worker | null>(null);
   const nextId = useRef(1);
   const startedAt = useRef(0);
-  const [thinking, setThinking] = useState<Thinking>("medium");
+  const [thinking, setThinking] = useState<Thinking>("high");
+  const [transport, setTransport] = useState<"openai" | "mpp">("openai");
   const [status, setStatus] = useState<Status>("waiting");
   const [ready, setReady] = useState(false);
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
@@ -45,12 +54,26 @@ export function App() {
   const [liveAnswer, setLiveAnswer] = useState("");
   const [reasoning, setReasoning] = useState("");
   const [elapsedMs, setElapsedMs] = useState(0);
+  const [payment, setPayment] = useState<{ rootAddress?: string; accessKeyAddress?: string; channelId?: string; cumulative?: string }>({});
+  const mppBalance = Hooks.token.useGetBalance({
+    account: connection.address,
+    token: PATH_USD,
+    query: {
+      enabled: transport === "mpp" && connection.status === "connected",
+      refetchInterval: 5_000,
+    },
+  });
 
   useEffect(() => {
     const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
     workerRef.current = worker;
     worker.onmessage = ({ data }: MessageEvent<WorkerMessage>) => {
       if (data.type === "ready") {
+        setPayment(data.transport === "mpp" ? {
+          rootAddress: data.rootAddress,
+          accessKeyAddress: data.accessKeyAddress,
+          channelId: data.channelId,
+        } : {});
         setReady(true);
         setStatus("ready");
         return;
@@ -79,6 +102,7 @@ export function App() {
         return;
       }
       if (data.type === "result") {
+        if (data.payment) setPayment((current) => ({ ...current, ...data.payment }));
         setPending((current) => without(current, data.id));
         setLiveAnswer(data.message);
         setTranscript((current) => [
@@ -111,7 +135,7 @@ export function App() {
   const stats = asObject(terminal?.payload.stats);
   const usage = asObject(stats?.usage);
 
-  function start(event: FormEvent) {
+  async function start(event: FormEvent) {
     event.preventDefault();
     setReady(false);
     setStatus("starting");
@@ -121,7 +145,25 @@ export function App() {
     setLiveAnswer("");
     setReasoning("");
     setElapsedMs(0);
-    workerRef.current?.postMessage({ type: "start", thinking });
+    try {
+      if (transport === "mpp") {
+        const connector = connectors[0];
+        if (!connector) throw new Error("Tempo Wallet connector is unavailable");
+        const connected = connection.status === "connected"
+          ? connection
+          : await connect.mutateAsync({ connector, chainId: tempo.id });
+        const rootAddress = "address" in connected
+          ? connected.address
+          : connected.accounts[0];
+        setPayment({ rootAddress });
+      } else {
+        setPayment({});
+      }
+      workerRef.current?.postMessage({ type: "start", thinking, transport });
+    } catch (error) {
+      setStatus("failed");
+      setTranscript([{ id: nextId.current++, role: "error", text: error instanceof Error ? error.message : String(error) }]);
+    }
   }
 
   function submit(event: FormEvent) {
@@ -148,27 +190,45 @@ export function App() {
           <h1>The agent loop,<br /><em>inside your browser.</em></h1>
           <p className="lede">
             React drives a dedicated Worker. Rust/WASM owns the persistent Responses session,
-            typed history, and tool loop. A Cloudflare Worker holds the API secret at the edge.
+            typed history, and tool loop. Choose the normal OpenAI path or opt into Tempo MPP.
           </p>
         </div>
         <div className="architecture" aria-label="Runtime architecture">
           <RuntimeStep number="01" title="React" note="controls + live trace" />
           <RuntimeStep number="02" title="Web Worker" note="isolated host boundary" />
           <RuntimeStep number="03" title="Rust / WASM" note="session + model loop" active />
-          <RuntimeStep number="04" title="CF Worker API" note="secret-bound upgrade" />
-          <RuntimeStep number="05" title="OpenAI Responses" note="default WebSocket API" />
+          {transport === "mpp" ? (
+            <>
+              <RuntimeStep number="04" title="Tempo MPP" note="reused paid channel" />
+              <RuntimeStep number="05" title="OpenAI Responses" note="keyless paid WebSocket" />
+            </>
+          ) : (
+            <>
+              <RuntimeStep number="04" title="CF Worker API" note="secret-bound upgrade" />
+              <RuntimeStep number="05" title="OpenAI Responses" note="API-key WebSocket" />
+            </>
+          )}
         </div>
       </header>
 
       <section className="control-panel">
         <form className="connection-controls" onSubmit={start}>
           <label className="endpoint-field">
-            <span>OpenAI Responses WebSocket</span>
+            <span>{transport === "mpp" ? "MPP Responses WebSocket" : "OpenAI Responses WebSocket"}</span>
             <input
-              value="wss://api.openai.com/v1/responses"
+              value={transport === "mpp"
+                ? "wss://openai.mpp.tempo.xyz/v1/responses"
+                : "wss://api.openai.com/v1/responses"}
               readOnly
               aria-label="Default OpenAI Responses WebSocket endpoint"
             />
+          </label>
+          <label>
+            <span>Payment</span>
+            <select value={transport} onChange={(event) => setTransport(event.target.value as "openai" | "mpp") }>
+              <option value="openai">OpenAI API key</option>
+              <option value="mpp">Tempo MPP</option>
+            </select>
           </label>
           <label>
             <span>Reasoning</span>
@@ -198,7 +258,17 @@ export function App() {
             placeholder="Start the agent, then send a prompt."
           />
           <div className="run-row">
-            <p><code>OPENAI_API_KEY</code> is a Worker secret binding; no credential enters this page.</p>
+            {transport === "mpp" ? (
+              <div>
+                <p>
+                  Tempo root <code>{shortAddress(payment.rootAddress ?? connection.address)}</code> delegates to access key{" "}
+                  <code>{shortAddress(payment.accessKeyAddress)}</code>.
+                </p>
+                {payment.channelId && <p>Reusable MPP channel <code>{shortAddress(payment.channelId)}</code>.</p>}
+              </div>
+            ) : (
+              <p><code>OPENAI_API_KEY</code> stays in the Worker secret binding and never enters the page.</p>
+            )}
             <div className="run-controls">
               <span className={`status status-${status}`}>{status}</span>
               <button className="run" type="submit" disabled={!ready || !prompt.trim()}>
@@ -215,6 +285,12 @@ export function App() {
         <Metric label="Tool calls" value={formatNumber(stats?.tool_calls ?? tools.length)} />
         <Metric label="Total tokens" value={formatNumber(usage?.total_tokens)} />
         <Metric label="WS connects" value={formatNumber(stats?.connection_attempts ?? count(events, "model.connection.completed"))} />
+        {transport === "mpp" && (
+          <Metric label="MPP paid" value={payment.cumulative ? `${Number(payment.cumulative) / 1_000_000}` : "—"} />
+        )}
+        {transport === "mpp" && (
+          <Metric label="PathUSD available" value={mppBalance.data === undefined ? "—" : formatUnits(mppBalance.data.amount, 6)} />
+        )}
       </section>
 
       <section className="workspace-grid">
@@ -359,6 +435,10 @@ function formatNs(nanoseconds: number): string {
 
 function formatNumber(value: unknown): string {
   return typeof value === "number" ? value.toLocaleString() : "—";
+}
+
+function shortAddress(value: string | undefined): string {
+  return value ? `${value.slice(0, 6)}…${value.slice(-4)}` : "not connected";
 }
 
 function formatJson(value: unknown): string {

@@ -16,7 +16,8 @@ let initialized;
 
 export function create(options = {}) {
   const {
-    apiKey = "host-managed",
+    apiKey,
+    mpp,
     websocketUrl,
     apiBaseUrl,
     module,
@@ -28,8 +29,11 @@ export function create(options = {}) {
     resume,
     ...hostOptions
   } = options;
+  if (mpp !== undefined && apiKey !== undefined) {
+    throw new TypeError("apiKey and mpp are mutually exclusive");
+  }
   const events = createEventChannel();
-  const host = createBrowserHost({ ...hostOptions, onEvent: events.emit });
+  const host = createBrowserHost({ ...hostOptions, mpp, onEvent: events.emit });
   activateHost(host);
   const runtime = defineRuntime({
     key: "browser-wasm",
@@ -41,8 +45,10 @@ export function create(options = {}) {
       await initialized;
       activateHost(host);
       return new Nanocodex(JSON.stringify(toWasmConfig({
-        apiKey,
-        websocketUrl,
+        apiKey: apiKey ?? (mpp === undefined ? "host-managed" : "mpp-managed"),
+        websocketUrl: websocketUrl ?? (mpp === undefined
+          ? undefined
+          : "wss://openai.mpp.tempo.xyz/v1/responses"),
         apiBaseUrl,
         ...config,
       })));

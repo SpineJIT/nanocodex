@@ -14,7 +14,15 @@ export function createConfig(options) {
     for (const listener of stateListeners) listener();
   }
 
-  function connect() {
+  function defaultStartCommand() {
+    return {
+      type: "start",
+      thinking: options.thinking ?? "high",
+      reasoningMode: options.reasoningMode ?? "standard",
+    };
+  }
+
+  function connect(command = defaultStartCommand()) {
     if (worker || snapshot.status === "stopped") return;
     setSnapshot("starting");
     try {
@@ -27,11 +35,7 @@ export function createConfig(options) {
         }
         for (const listener of messageListeners) listener(data);
       };
-      current.postMessage({
-        type: "start",
-        thinking: options.thinking ?? "medium",
-        reasoningMode: options.reasoningMode ?? "standard",
-      });
+      current.postMessage(command);
     } catch (error) {
       worker = undefined;
       setSnapshot("error", errorMessage(error));
@@ -56,7 +60,7 @@ export function createConfig(options) {
     },
     mount() {
       mounts += 1;
-      connect();
+      if (options.autoStart !== false) connect();
       let mounted = true;
       return () => {
         if (!mounted) return;
@@ -69,6 +73,15 @@ export function createConfig(options) {
       if (!worker) throw new Error("the Nanocodex worker is not running");
       worker.postMessage(command);
     },
+    start(command) {
+      connect(command);
+    },
+    restart(command) {
+      if (snapshot.status === "stopped") return;
+      disconnect();
+      connect(command);
+    },
+    disconnect,
     stop() {
       if (snapshot.status === "stopped") return;
       setSnapshot("stopped");

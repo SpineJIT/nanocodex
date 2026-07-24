@@ -30,6 +30,9 @@ export function useNanocodex() {
   return useMemo(() => ({
     ...snapshot,
     dispatch: config.dispatch,
+    start: config.start,
+    restart: config.restart,
+    disconnect: config.disconnect,
     stop: config.stop,
   }), [config, snapshot]);
 }

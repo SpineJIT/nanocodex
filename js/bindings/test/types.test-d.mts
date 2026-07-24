@@ -30,6 +30,18 @@ async function check() {
   extended.inspect.session();
 
   await BrowserAgent.create({ websocketUrl: "wss://example.com" });
+  await BrowserAgent.create({ apiKey });
+  await BrowserAgent.create({ mpp: { async ws() { return {} as WebSocket; } } });
+  // @ts-expect-error API-key and MPP authentication are mutually exclusive.
+  await BrowserAgent.create({ apiKey, mpp: { async ws() { return {} as WebSocket; } } });
+  await Agent.create({
+    mpp: {
+      async ws() {
+        return {} as WebSocket;
+      },
+      async close() {},
+    },
+  });
 
   // @ts-expect-error actions are domain-grouped on the decorated Agent.
   agent.prompt("hello");

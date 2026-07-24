@@ -2,14 +2,16 @@ import { cloudflare } from "@cloudflare/vite-plugin";
 import react from "@vitejs/plugin-react";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
+import mkcert from "vite-plugin-mkcert";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
-const productionReactScan = fileURLToPath(new URL("./src/reactScan.production.ts", import.meta.url));
 
-export default defineConfig(({ command }) => ({
-  plugins: [react(), cloudflare()],
+export default defineConfig({
+  // Tempo Wallet embeds in an iframe only on HTTPS. A trusted local
+  // certificate keeps the development flow identical to production and lets
+  // the hosted wallet perform cross-origin passkey ceremonies in the embed.
+  plugins: [mkcert(), react(), cloudflare()],
   resolve: {
-    alias: command === "build" ? { "react-scan": productionReactScan } : undefined,
     preserveSymlinks: true,
     dedupe: [
       "react",
@@ -33,4 +35,4 @@ export default defineConfig(({ command }) => ({
       allow: [repositoryRoot],
     },
   },
-}));
+});

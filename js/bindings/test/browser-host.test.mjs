@@ -41,6 +41,27 @@ test("browser host carries ordered frames and application tools", async () => {
   assert.deepEqual(events, ["event"]);
 });
 
+test("browser host opens application sockets through MPP", async () => {
+  const socket = new FakeWebSocket("wss://paid.test");
+  socket.readyState = FakeWebSocket.OPEN;
+  const endpoints = [];
+  const host = createBrowserHost({
+    mpp: {
+      async ws(endpoint) {
+        endpoints.push(endpoint);
+        return socket;
+      },
+    },
+  });
+
+  assert.equal(JSON.parse(await host.connect("wss://paid.test", "mpp-managed", "session")).status, 101);
+  assert.deepEqual(endpoints, ["wss://paid.test"]);
+  socket.message('{"type":"paid"}');
+  assert.equal(JSON.parse(await host.next(1, 10)).text, '{"type":"paid"}');
+  assert.equal(JSON.parse(await host.send(1, "request")).ok, true);
+  assert.deepEqual(socket.sent.map(JSON.parse), [{ mpp: "message", data: "request" }]);
+});
+
 test("browser host bounds queued receives and buffered sends", async () => {
   const host = createBrowserHost({
     WebSocketImpl: FakeWebSocket,
@@ -128,6 +149,7 @@ class FakeWebSocket {
     this.readyState = 0;
     this.bufferedAmount = 0;
     this.listeners = new Map();
+    this.sent = [];
     FakeWebSocket.instances.push(this);
   }
 
@@ -146,7 +168,7 @@ class FakeWebSocket {
     this.emit("message", { data });
   }
 
-  send() {}
+  send(message) { this.sent.push(message); }
   close(code) {
     this.readyState = 3;
     this.closedCode = code;

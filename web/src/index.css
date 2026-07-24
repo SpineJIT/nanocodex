@@ -715,6 +715,35 @@ html[data-theme="dark"] .button--medium:focus-visible {
   border-radius: var(--radius-small);
 }
 
+.agent-transport {
+  display: inline-flex;
+  gap: 2px;
+  margin-top: 30px;
+  padding: 2px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-small);
+}
+
+.agent-transport button {
+  min-height: 26px;
+  padding: 0 9px;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 11px;
+  background: transparent;
+  border: 0;
+  border-radius: calc(var(--radius-small) - 2px);
+  cursor: pointer;
+}
+
+.agent-transport button[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--surface);
+}
+
+.agent-transport + .agent-byok { margin-top: 8px; }
+
 .agent-byok-summary,
 .agent-byok-summary > span,
 .agent-byok-summary > div,
@@ -763,6 +792,36 @@ html[data-theme="dark"] .button--medium:focus-visible {
 .agent-byok-form p { width: 100%; margin: 0; font-size: 10px; }
 .agent-byok-error { margin: 0; color: var(--negative); }
 .agent-byok + .agent-tui { margin-top: 10px; }
+
+.agent-mpp-details {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 10px;
+  margin: 0;
+}
+
+.agent-mpp-details dt { color: var(--text); }
+.agent-mpp-details dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-family: var(--nc-font-family, monospace);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-mpp-jsonl summary { cursor: pointer; color: var(--text); }
+.agent-mpp-jsonl pre {
+  max-height: 180px;
+  margin: 8px 0 0;
+  padding: 8px;
+  overflow: auto;
+  font-size: 9px;
+  line-height: 1.45;
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+}
 
 .agent-tui {
   --nc-color-background: var(--surface-raised);

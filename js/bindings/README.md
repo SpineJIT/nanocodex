@@ -27,6 +27,72 @@ const followOn = Actions.turn.prompt(agent, { input: "Now explain it." });
 console.log(await Actions.turn.getResult(followOn));
 ```
 
+Node and browser applications can instead pay through MPP without an OpenAI
+API key. Pass an MPP session with a `ws(endpoint)` method; an `mppx` Tempo
+session manager has this shape. Nanocodex defaults the socket to
+`wss://openai.mpp.tempo.xyz/v1/responses` when `mpp` is present.
+
+```js
+import { Agent } from "nanocodex/node";
+import { Expiry } from "accounts";
+import { Provider } from "accounts/cli";
+import { tempo } from "mppx/client";
+import { parseUnits } from "viem";
+import { connect } from "viem/experimental/erc7846";
+import WebSocket from "ws";
+
+const pathUsd = "0x20c0000000000000000000000000000000000000";
+const provider = Provider.create({ mpp: false });
+if (!provider.store.persist.hasHydrated()) {
+  await new Promise((resolve) => provider.store.persist.onFinishHydration(resolve));
+}
+const status = await provider.getAccessKeyStatus();
+if (status === "missing" || status === "expired") {
+  await connect(provider.getClient(), {
+    capabilities: { authorizeAccessKey: {
+      expiry: Expiry.days(1),
+      limits: [{ token: pathUsd, limit: parseUnits("25", 6) }],
+    } },
+  });
+}
+const root = provider.getAccount();
+const account = await provider.store.accessKeys.select({
+  account: root.address,
+  chainId: provider.getClient().chain.id,
+});
+if (!account) throw new Error("Tempo account has no usable access key");
+console.error(`Tempo access-key signer: ${account.accessKeyAddress}`);
+const mpp = tempo.session.manager({
+  account,
+  autoSwap: { tokenIn: [pathUsd], slippage: 1 },
+  bootstrap: true,
+  client: provider.getClient(),
+  webSocket: WebSocket,
+  maxDeposit: "0.05",
+  topUpAmount: "0.05",
+});
+
+const agent = await Agent.create({ mpp, thinking: "none", fastMode: true, tools });
+const events = agent.events.watch();
+const unwatch = events.onEvent((event) => {
+  process.stdout.write(`${JSON.stringify(event)}\n`);
+});
+try {
+  console.error(await agent.turn.prompt({ input: "Build the thing." }).result());
+} finally {
+  await mpp.close();
+  unwatch();
+  events.off();
+  agent.dispose();
+}
+```
+
+The application still owns its wallet, deposit policy, persisted payment
+channel store, and final settlement. Keep the manager alive to reuse its channel
+across agents, and supply mppx `channelStore` for reuse after a process or page
+restart. Nanocodex never closes a caller-owned MPP session. `apiKey` and `mpp`
+are mutually exclusive.
+
 Completed turns can be persisted and resumed by a fresh Node or browser agent:
 
 ```js

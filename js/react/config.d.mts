@@ -27,6 +27,9 @@ export type Config<
   subscribeMessages(listener: (message: Message) => void): () => void;
   mount(): () => void;
   dispatch(command: Command): void;
+  start(command?: Command): void;
+  restart(command?: Command): void;
+  disconnect(): void;
   stop(): void;
 }>;
 
@@ -35,6 +38,8 @@ export type CreateConfigParameters<
   Message extends WorkerMessage = WorkerMessage,
 > = {
   worker(): WorkerLike<Command, Message>;
+  /** Start the Worker on mount. Defaults to true. */
+  autoStart?: boolean;
   thinking?: Thinking;
   reasoningMode?: ReasoningMode;
 };

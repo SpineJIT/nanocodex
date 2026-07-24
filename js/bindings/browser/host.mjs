@@ -18,6 +18,7 @@ export function createBrowserHost(options = {}) {
   let nextHandle = 1;
 
   function connect(endpoint, _apiKey, sessionId) {
+    if (options.mpp) return connectMpp(endpoint);
     return new Promise((resolve, reject) => {
       let settled = false;
       const handle = nextHandle++;
@@ -59,6 +60,41 @@ export function createBrowserHost(options = {}) {
     });
   }
 
+  async function connectMpp(endpoint) {
+    if (typeof options.mpp.ws !== "function") {
+      throw new TypeError("mpp must provide ws(endpoint)");
+    }
+    const socket = await options.mpp.ws(endpoint);
+    if (!socket || typeof socket.addEventListener !== "function") {
+      throw new TypeError("mpp.ws(endpoint) must return a WebSocket");
+    }
+    const handle = nextHandle++;
+    const connection = {
+      socket,
+      queue: [],
+      queuedBytes: 0,
+      waiter: undefined,
+      intentionallyClosed: false,
+      overflowed: false,
+      managed: true,
+    };
+    connections.set(handle, connection);
+    socket.addEventListener("message", (event) => {
+      enqueue(connection, typeof event.data === "string"
+        ? { kind: "text", text: event.data }
+        : { kind: "binary" });
+    });
+    socket.addEventListener("close", (event) => {
+      if (!connection.intentionallyClosed && !connection.overflowed) {
+        enqueue(connection, { kind: "closed", detail: `with code ${event.code ?? 1000}` });
+      }
+    });
+    socket.addEventListener("error", () => {
+      enqueue(connection, { kind: "error", detail: "MPP WebSocket connection failed" });
+    });
+    return JSON.stringify({ handle, status: 101, reasoning_included: false });
+  }
+
   function send(handle, message) {
     const connection = connections.get(handle);
     if (!connection || connection.socket.readyState !== WebSocketImpl.OPEN) {
@@ -69,6 +105,10 @@ export function createBrowserHost(options = {}) {
       }));
     }
     try {
+      if (connection.managed) {
+        connection.socket.send(JSON.stringify({ mpp: "message", data: message }));
+        return Promise.resolve(JSON.stringify({ ok: true }));
+      }
       const frameBytes = encoder.encode(message).byteLength;
       if (frameBytes > maxBufferedSendBytes
         || connection.socket.bufferedAmount + frameBytes > maxBufferedSendBytes) {

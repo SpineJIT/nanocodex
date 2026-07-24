@@ -25,9 +25,6 @@ npm install
 npm run dev
 ```
 
-Development runs include the React Scan toolbar for render profiling.
-Production builds replace the profiler with a no-op module.
-
 The homepage consumes the publishable `nanocodex` and `nanocodex-react`
 packages under `../js`; it does not reach into generated WASM artifacts. Its
 React integration follows an external-store pattern: create a
@@ -35,7 +32,7 @@ React integration follows an external-store pattern: create a
 `useNanocodex`, `useNanocodexMessage`, or `useConfig`. React owns no agent
 history, credential policy, or model-loop state.
 
-The local Worker and Vite client run together at `http://localhost:5173`, using
+The local Worker and Vite client run together at `https://localhost:5173`, using
 the same Cloudflare Vite-plugin layout as Tempo's React MPP examples.
 
 `npm run dev` and `npm run build` first regenerate
@@ -81,6 +78,23 @@ is never placed in a URL, local storage, React state, or WASM configuration.
 A user key takes precedence over the optional deployment-owned
 `OPENAI_API_KEY`; forgetting or expiring it falls back to that deployment key
 when present.
+
+OpenAI remains the default agent connection. A user can explicitly select
+Tempo MPP instead; only then does React lazy-load Wagmi and Tempo Accounts,
+open the standard embedded Tempo Wallet dialog for its account and passkey flow, and
+authorize a bounded one-day access key in that same Accounts connection
+ceremony. The
+module Worker hydrates that delegated signer from Accounts' IndexedDB storage
+and gives it to an mppx session manager with a durable channel store. The same
+MPP channel is reused across turns and reloads and is not closed by Nanocodex.
+Wallet, payer, delegated signer, channel, cumulative authorization, and the
+agent event JSONL are shown only while the MPP route is selected. The normal
+OpenAI route does not initialize or expose any payment state.
+
+Development uses `vite-plugin-mkcert` because the Accounts SDK intentionally
+falls back to a popup on plain HTTP. Cross-origin passkeys inside the hosted
+Tempo Wallet iframe require a secure context; trusted local HTTPS exercises the
+same embedded flow as production.
 
 Local development reads the optional ignored root `.env` through the repository
 workflow. For a shared demo fallback, configure the deployed Worker with

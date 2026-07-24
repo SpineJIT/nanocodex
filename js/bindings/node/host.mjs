@@ -24,6 +24,7 @@ export function createNodeHost(options = {}) {
   let nextHandle = 1;
 
   function connect(endpoint, apiKey, sessionId) {
+    if (options.mpp) return connectMpp(endpoint);
     return new Promise((resolve, reject) => {
       let settled = false;
       let upgradeResponse;
@@ -80,6 +81,35 @@ export function createNodeHost(options = {}) {
     });
   }
 
+  async function connectMpp(endpoint) {
+    if (typeof options.mpp.ws !== "function") {
+      throw new TypeError("mpp must provide ws(endpoint)");
+    }
+    const socket = await options.mpp.ws(endpoint);
+    if (!socket || typeof socket.addEventListener !== "function") {
+      throw new TypeError("mpp.ws(endpoint) must return a WebSocket");
+    }
+    const handle = nextHandle++;
+    const connection = queueState(socket);
+    connection.managed = true;
+    connections.set(handle, connection);
+    socket.addEventListener("message", (event) => {
+      enqueue(connection, typeof event.data === "string"
+        ? { kind: "text", text: event.data }
+        : { kind: "binary" });
+    });
+    socket.addEventListener("close", (event) => {
+      if (!connection.intentionallyClosed && !connection.overflowed) {
+        const suffix = event.reason ? `: ${event.reason}` : "";
+        enqueue(connection, { kind: "closed", detail: `with code ${event.code ?? 1000}${suffix}` });
+      }
+    });
+    socket.addEventListener("error", () => {
+      enqueue(connection, { kind: "error", detail: "MPP WebSocket connection failed" });
+    });
+    return JSON.stringify({ handle, status: 101, reasoning_included: false });
+  }
+
   function send(handle, message) {
     const connection = connections.get(handle);
     if (!connection || connection.socket.readyState !== WebSocket.OPEN) {
@@ -88,6 +118,18 @@ export function createNodeHost(options = {}) {
         reconnectable: true,
         error: "WebSocket is no longer open",
       }));
+    }
+    if (connection.managed) {
+      try {
+        connection.socket.send(JSON.stringify({ mpp: "message", data: message }));
+        return Promise.resolve(JSON.stringify({ ok: true }));
+      } catch (error) {
+        return Promise.resolve(JSON.stringify({
+          ok: false,
+          reconnectable: connection.socket.readyState !== WebSocket.OPEN,
+          error: errorMessage(error),
+        }));
+      }
     }
     return new Promise((resolve) => {
       let completed = false;
@@ -159,7 +201,8 @@ export function createNodeHost(options = {}) {
         detail: `receive queue exceeded ${maxQueuedMessages} messages or ${maxQueuedBytes} bytes`,
       };
       connection.queue.push({ message: error, bytes: messageBytes(error) });
-      connection.socket.terminate();
+      if (typeof connection.socket.terminate === "function") connection.socket.terminate();
+      else connection.socket.close(1009, "receive queue exceeded configured bounds");
       return;
     }
     connection.queue.push({ message, bytes });
@@ -187,6 +230,7 @@ function queueState(socket) {
     waiter: undefined,
     intentionallyClosed: false,
     overflowed: false,
+    managed: false,
   };
 }
 

@@ -26,8 +26,11 @@
     "@pierre/trees": "^1.0.0-beta.5",
     "@radix-ui/react-dropdown-menu": "2.1.16",
     "@radix-ui/react-switch": "1.2.6",
+    "@tanstack/react-query": "^5.101.4",
     "@tanstack/react-virtual": "^3.14.6",
+    "accounts": "~0.14.12",
     "lucide-react": "^1.24.0",
+    "mppx": "^0.8.14",
     "nanocodex": "file:../js/bindings",
     "nanocodex-react": "file:../js/react",
     "nanocodex-tui": "file:../js/tui",
@@ -35,7 +38,9 @@
     "react": "19.2.6",
     "react-dom": "19.2.6",
     "shiki": "^4.3.1",
-    "streamdown": "^2.5.0"
+    "streamdown": "^2.5.0",
+    "viem": "^2.55.8",
+    "wagmi": "^3.7.4"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "1.37.1",
@@ -43,9 +48,12 @@
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",
-    "react-scan": "^0.5.7",
     "typescript": "5.9.3",
     "vite": "8.0.13",
+    "vite-plugin-mkcert": "^1.17.12",
     "wrangler": "4.92.0"
+  },
+  "overrides": {
+    "ws": "^8.21.1"
   }
 }

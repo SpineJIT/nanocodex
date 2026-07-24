@@ -15,6 +15,9 @@ export {
 
 export type Nanocodex<Command extends WorkerCommand = WorkerCommand> = Snapshot & {
   dispatch(command: Command): void;
+  start(command?: Command): void;
+  restart(command?: Command): void;
+  disconnect(): void;
   stop(): void;
 };
 

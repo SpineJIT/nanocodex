@@ -2,6 +2,7 @@ import { Agent, type ReasoningMode, type Thinking } from "nanocodex/browser";
 
 type StartMessage = {
   type: "start";
+  transport: "openai" | "mpp";
   thinking: Thinking;
   reasoningMode?: ReasoningMode;
 };
@@ -13,11 +14,15 @@ type PromptMessage = {
 };
 
 type IncomingMessage = StartMessage | PromptMessage;
+type PaymentSession = Awaited<
+  ReturnType<(typeof import("./tempo"))["createTempoMppSession"]>
+>;
 
 const worker = self as DedicatedWorkerGlobalScope;
 
 let agent: Agent.Agent | undefined;
 let eventWatch: ReturnType<Agent.Agent["events"]["watch"]> | undefined;
+let paymentSession: PaymentSession | undefined;
 
 worker.onmessage = ({ data }: MessageEvent<IncomingMessage>) => {
   void handleMessage(data);
@@ -28,16 +33,8 @@ async function handleMessage(data: IncomingMessage): Promise<void> {
     eventWatch?.off();
     eventWatch = undefined;
     agent?.dispose();
-    agent = await Agent.create({
-      apiKey: "worker-managed",
-      websocketUrl: workerEndpoint(),
-      // Browser WebSockets cannot attach an Authorization header. The URL must
-      // be authorized by the embedding application.
-      createWebSocket: (endpoint: string, sessionId: string) => {
-        const url = new URL(endpoint);
-        url.searchParams.set("session_id", sessionId);
-        return new WebSocket(url);
-      },
+    paymentSession = undefined;
+    const common = {
       tools: {
         browserInfo: {
           description: "Return basic information about the browser Worker runtime.",
@@ -51,10 +48,37 @@ async function handleMessage(data: IncomingMessage): Promise<void> {
       },
       thinking: data.thinking,
       reasoningMode: data.reasoningMode,
-    });
+    };
+    if (data.transport === "mpp") {
+      const { createTempoMppSession } = await import("./tempo");
+      const created = await createTempoMppSession();
+      paymentSession = created;
+      agent = await Agent.create({ ...common, mpp: created.mpp });
+    } else {
+      agent = await Agent.create({
+        ...common,
+        apiKey: "worker-managed",
+        websocketUrl: workerEndpoint(),
+        createWebSocket: (endpoint: string, sessionId: string) => {
+          const url = new URL(endpoint);
+          url.searchParams.set("session_id", sessionId);
+          return new WebSocket(url);
+        },
+      });
+    }
     eventWatch = agent.events.watch();
     eventWatch.onEvent((event) => worker.postMessage({ type: "event", event }));
-    worker.postMessage({ type: "ready" });
+    worker.postMessage({
+      type: "ready",
+      transport: data.transport,
+      ...(paymentSession
+        ? {
+            rootAddress: paymentSession.rootAddress,
+            accessKeyAddress: paymentSession.accessKeyAddress,
+            channelId: paymentSession.mpp.channelId,
+          }
+        : {}),
+    });
     return;
   }
 
@@ -68,7 +92,17 @@ async function handleMessage(data: IncomingMessage): Promise<void> {
   // them onto the same session and preserves all follow-on context.
   const turn = current.turn.prompt({ input: data.prompt });
   void turn.result().then(
-    (message) => worker.postMessage({ type: "result", id: data.id, message }),
+    (message) => worker.postMessage({
+      type: "result",
+      id: data.id,
+      message,
+      payment: paymentSession
+        ? {
+            channelId: paymentSession.mpp.channelId,
+            cumulative: paymentSession.mpp.cumulative.toString(),
+          }
+        : undefined,
+    }),
     (error) => worker.postMessage({
       type: "error",
       id: data.id,

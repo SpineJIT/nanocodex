@@ -41,3 +41,58 @@ test("Nanocodex config owns worker lifecycle outside React", async () => {
 test("the library requires the application to provide its Worker boundary", () => {
   assert.throws(() => createConfig(), /requires worker/);
 });
+
+test("the default start command uses high reasoning", () => {
+  const commands = [];
+  const config = createConfig({
+    worker: () => ({
+      onmessage: null,
+      postMessage(command) { commands.push(command); },
+      terminate() {},
+    }),
+  });
+
+  const unmount = config.mount();
+  assert.deepEqual(commands, [
+    { type: "start", thinking: "high", reasoningMode: "standard" },
+  ]);
+  unmount();
+});
+
+test("deferred configs start and restart with application-owned commands", () => {
+  const workers = [];
+  const config = createConfig({
+    autoStart: false,
+    worker() {
+      const commands = [];
+      const worker = {
+        commands,
+        terminated: false,
+        onmessage: null,
+        postMessage(command) { commands.push(command); },
+        terminate() { worker.terminated = true; },
+      };
+      workers.push(worker);
+      return worker;
+    },
+  });
+
+  const unmount = config.mount();
+  assert.equal(config.getSnapshot().status, "idle");
+  assert.equal(workers.length, 0);
+
+  config.start({ type: "start", transport: "mpp" });
+  assert.deepEqual(workers[0].commands, [{ type: "start", transport: "mpp" }]);
+  config.restart({ type: "start", transport: "openai" });
+  assert.equal(workers[0].terminated, true);
+  assert.deepEqual(workers[1].commands, [{ type: "start", transport: "openai" }]);
+
+  config.disconnect();
+  assert.equal(workers[1].terminated, true);
+  assert.equal(config.getSnapshot().status, "idle");
+
+  config.start({ type: "start", transport: "mpp" });
+
+  unmount();
+  assert.equal(workers[2].terminated, true);
+});

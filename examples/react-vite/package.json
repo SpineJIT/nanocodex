@@ -10,15 +10,23 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "deploy": "npm run build && wrangler deploy",
-    "test": "node --test worker/*.test.mjs"
+    "test": "node --test worker/*.test.mjs",
+    "test:e2e": "playwright test",
+    "test:e2e:mpp": "LIVE_MPP_E2E=1 playwright test --headed --grep 'live browser MPP'"
   },
   "dependencies": {
+    "@tanstack/react-query": "^5.101.4",
+    "accounts": "^0.14.12",
+    "mppx": "^0.8.14",
     "nanocodex": "file:../../js/bindings",
     "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "react-dom": "19.2.6",
+    "viem": "^2.55.8",
+    "wagmi": "^3.7.4"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.45.1",
+    "@playwright/test": "^1.61.1",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",

@@ -3,6 +3,28 @@ import { test } from "node:test";
 import { WebSocketServer } from "ws";
 
 import { Actions, Agent } from "../node/index.mjs";
+import { createNodeHost } from "../node/host.mjs";
+
+test("Node host opens application sockets through MPP", async () => {
+  const socket = new ManagedSocket();
+  const endpoints = [];
+  const host = createNodeHost({
+    mpp: {
+      async ws(endpoint) {
+        endpoints.push(endpoint);
+        return socket;
+      },
+    },
+  });
+
+  assert.equal(JSON.parse(await host.connect("wss://paid.test", "mpp-managed", "session")).status, 101);
+  assert.deepEqual(endpoints, ["wss://paid.test"]);
+  socket.message('{"type":"paid"}');
+  assert.equal(JSON.parse(await host.next(1, 10)).text, '{"type":"paid"}');
+  assert.equal(JSON.parse(await host.send(1, "request")).ok, true);
+  assert.deepEqual(socket.sent.map(JSON.parse), [{ mpp: "message", data: "request" }]);
+  host.close(1);
+});
 
 test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom tools", async () => {
   const server = await startServer();
@@ -272,6 +294,27 @@ function messageReader(socket) {
       return new Promise((resolve) => { waiter = resolve; });
     },
   };
+}
+
+class ManagedSocket extends EventTarget {
+  constructor() {
+    super();
+    this.readyState = 1;
+    this.sent = [];
+  }
+
+  send(message) {
+    this.sent.push(message);
+  }
+
+  close() {
+    this.readyState = 3;
+    this.dispatchEvent(new Event("close"));
+  }
+
+  message(data) {
+    this.dispatchEvent(new MessageEvent("message", { data }));
+  }
 }
 
 function sendWarmup(socket, responseId) {

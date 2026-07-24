@@ -96,3 +96,17 @@ export type Tool = {
 };
 
 export type ToolMap = Record<string, Tool>;
+
+/** A paid WebSocket session, such as an mppx Tempo session manager. */
+export type MppSession = {
+  ws(endpoint: string | URL): Promise<MppWebSocket>;
+  close?(): unknown | Promise<unknown>;
+};
+
+export type MppWebSocket = {
+  readonly readyState: number;
+  readonly bufferedAmount?: number | undefined;
+  addEventListener(type: string, listener: (event: any) => void, options?: unknown): void;
+  send(message: string): void;
+  close(code?: number, reason?: string): void;
+};
