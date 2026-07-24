@@ -9,7 +9,7 @@ use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnord
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, Semaphore, mpsc, oneshot},
     task::JoinHandle,
     time::Duration,
 };
@@ -31,6 +31,7 @@ const DEFAULT_WAIT_YIELD: Duration = Duration::from_secs(10);
 const OBSERVER_YIELD_GRACE: Duration = Duration::from_secs(1);
 const MIN_YIELD_FOR_OBSERVER_GRACE: Duration = Duration::from_secs(10);
 const NESTED_YIELD_GRACE: Duration = Duration::from_secs(5);
+const MAX_CONCURRENT_NESTED_CALLS: usize = 128;
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const EXEC_PRAGMA_PREFIX: &str = "// @exec:";
 pub(crate) struct CodeModeRuntime {
@@ -957,6 +958,7 @@ impl EmbeddedHost {
     ) -> Result<CellTerminal, HostFailure> {
         let mut pending_calls: FuturesUnordered<BoxFuture<'_, CompletedNestedCall>> =
             FuturesUnordered::new();
+        let nested_call_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_NESTED_CALLS));
         let mut event_count = 0_u64;
         loop {
             tokio::select! {
@@ -996,7 +998,9 @@ impl EmbeddedHost {
                                 input: input.clone(),
                                 yield_after,
                             });
-                            pending_calls.push(
+                            let permit = Arc::clone(&nested_call_permits);
+                            let nested_call = async move {
+                                let _permit = permit.acquire_owned().await;
                                 execute_nested_call(
                                     tools,
                                     id,
@@ -1005,8 +1009,9 @@ impl EmbeddedHost {
                                     context,
                                     actor_started_at,
                                 )
-                                .boxed(),
-                            );
+                                .await
+                            };
+                            pending_calls.push(nested_call.boxed());
                         }
                         RuntimeEvent::Notify { text, .. } => {
                             let _ = updates.send(CellUpdate::Notification(

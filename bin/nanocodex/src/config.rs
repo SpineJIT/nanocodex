@@ -123,7 +123,6 @@ impl AgentArgs {
         &self.cwd
     }
 
-    #[cfg(test)]
     pub(crate) const fn uses_tempo(&self) -> bool {
         self.mpp.is_enabled()
     }

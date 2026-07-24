@@ -689,7 +689,7 @@ dependencies = [
 [[package]]
 name = "alloy-transport-mpp"
 version = "0.2.0"
-source = "git+https://github.com/tempoxyz/mpp-rs?rev=d4fd2b8bf842a498c93916bb7bc7698ed3f18a9f#d4fd2b8bf842a498c93916bb7bc7698ed3f18a9f"
+source = "git+https://github.com/tempoxyz/mpp-rs?rev=c5933597091230151368c426eb2061cca9192796#c5933597091230151368c426eb2061cca9192796"
 dependencies = [
  "alloy-json-rpc",
  "alloy-pubsub",
@@ -3192,8 +3192,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 [[package]]
 name = "hudsucker"
 version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a1d7c1c828ff6db12ddafb16768ecbac920df6301778d0eb78e95da0e44d94b"
+source = "git+https://github.com/gakonst/hudsucker?rev=0c7da328e446518036b9420db3e75451fca522e9#0c7da328e446518036b9420db3e75451fca522e9"
 dependencies = [
  "bstr",
  "futures",
@@ -3905,7 +3904,7 @@ dependencies = [
 [[package]]
 name = "mpp"
 version = "0.11.0"
-source = "git+https://github.com/tempoxyz/mpp-rs?rev=d4fd2b8bf842a498c93916bb7bc7698ed3f18a9f#d4fd2b8bf842a498c93916bb7bc7698ed3f18a9f"
+source = "git+https://github.com/tempoxyz/mpp-rs?rev=c5933597091230151368c426eb2061cca9192796#c5933597091230151368c426eb2061cca9192796"
 dependencies = [
  "alloy",
  "async-stream",
@@ -4033,6 +4032,7 @@ dependencies = [
  "nanocodex",
  "nanocodex-observability",
  "nanocodex-tools",
+ "nix 0.30.1",
  "pulldown-cmark",
  "ratatui",
  "reqwest",
