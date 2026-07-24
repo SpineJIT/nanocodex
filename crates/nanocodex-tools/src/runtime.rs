@@ -378,7 +378,7 @@ pub enum ToolInputError {
     #[error("expected freeform tool input")]
     ExpectedFreeform,
 
-    #[error("failed to decode tool arguments: {0}")]
+    #[error("failed to parse function arguments: {0}")]
     Decode(#[source] serde_json::Error),
 }
 
@@ -788,14 +788,14 @@ impl ToolRuntime {
         let mut handlers: Vec<Arc<dyn Tool>> = Vec::new();
         if workspace_enabled {
             handlers.extend([
+                Arc::new(apply_patch::ApplyPatchHandler::new(workspace.clone())) as Arc<dyn Tool>,
                 Arc::new(shell::ExecCommandHandler::new(
                     workspace.clone(),
                     Arc::clone(&sessions),
-                )) as Arc<dyn Tool>,
-                Arc::new(shell::WriteStdinHandler::new(Arc::clone(&sessions))),
+                )),
                 Arc::new(plan::UpdatePlanTool::new()),
-                Arc::new(apply_patch::ApplyPatchHandler::new(workspace.clone())),
                 Arc::new(view_image::ViewImageHandler::new(workspace.clone())),
+                Arc::new(shell::WriteStdinHandler::new(Arc::clone(&sessions))),
             ]);
         }
         #[cfg(feature = "remote-tools")]
@@ -1208,8 +1208,12 @@ fn definition_metadata(name: &str, definition: &ToolDefinition) -> Value {
         ToolDefinition::Function { .. } => "function",
         ToolDefinition::Custom { .. } => "freeform",
     };
+    #[cfg(feature = "code-mode")]
+    let metadata_name = code_mode::description::normalize_identifier(name);
+    #[cfg(not(feature = "code-mode"))]
+    let metadata_name = name;
     json!({
-        "name": code_mode::description::normalize_identifier(name),
+        "name": metadata_name,
         "tool_name": name,
         "description": definition.description(),
         "kind": kind,

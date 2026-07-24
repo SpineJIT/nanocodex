@@ -4183,6 +4183,7 @@ dependencies = [
  "nanocodex-core",
  "nix 0.30.1",
  "portable-pty",
+ "rand 0.9.5",
  "reqwest",
  "rquickjs",
  "schemars 0.8.22",

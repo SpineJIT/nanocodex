@@ -3,7 +3,12 @@ mod embedded;
 mod output;
 mod spec;
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
+};
 
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use serde::Deserialize;
@@ -908,6 +913,7 @@ fn expose_running_shell_sessions(
     content: &mut Vec<ToolOutputContent>,
     nested_calls: &[(u64, NestedToolCall)],
 ) {
+    let mut running = BTreeSet::new();
     for (_, call) in nested_calls {
         if !matches!(call.name.as_str(), "exec_command" | "write_stdin") {
             continue;
@@ -915,12 +921,19 @@ fn expose_running_shell_sessions(
         let ToolOutputBody::Text(result) = &call.output else {
             continue;
         };
-        let Some(session_id) = serde_json::from_str::<Value>(result)
+        let result_session_id = serde_json::from_str::<Value>(result)
             .ok()
-            .and_then(|result| result.get("session_id")?.as_i64())
-        else {
-            continue;
-        };
+            .and_then(|result| result.get("session_id")?.as_i64());
+        if call.name == "write_stdin"
+            && let Some(input_session_id) = call.input.get("session_id").and_then(Value::as_i64)
+        {
+            running.remove(&input_session_id);
+        }
+        if let Some(session_id) = result_session_id {
+            running.insert(session_id);
+        }
+    }
+    for session_id in running {
         if content
             .iter()
             .filter_map(|item| match item {

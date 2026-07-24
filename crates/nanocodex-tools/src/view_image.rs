@@ -32,6 +32,15 @@ impl Tool for ViewImageHandler {
 
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
         let arguments = input.decode_json::<ViewImageArguments>()?;
+        let detail = match arguments.detail.as_deref() {
+            None | Some("high") => ImageDetail::High,
+            Some("original") => ImageDetail::Original,
+            Some(detail) => {
+                return Ok(ToolExecution::error(format!(
+                    "view_image.detail only supports `high` or `original`; omit `detail` for default high resized behavior, got `{detail}`"
+                )));
+            }
+        };
         let path = resolve(&self.workspace, Path::new(&arguments.path));
         match tokio::fs::metadata(&path).await {
             Ok(metadata) if metadata.is_file() => {}
@@ -57,7 +66,6 @@ impl Tool for ViewImageHandler {
                 )));
             }
         };
-        let detail = arguments.detail.unwrap_or(ImageDetailArgument::High).into();
         // The model-history boundary owns image validation, resizing, and caching.
         let image_url = format!(
             "data:application/octet-stream;base64,{}",
@@ -84,23 +92,7 @@ impl Tool for ViewImageHandler {
 struct ViewImageArguments {
     path: String,
     #[serde(default)]
-    detail: Option<ImageDetailArgument>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum ImageDetailArgument {
-    High,
-    Original,
-}
-
-impl From<ImageDetailArgument> for ImageDetail {
-    fn from(detail: ImageDetailArgument) -> Self {
-        match detail {
-            ImageDetailArgument::High => Self::High,
-            ImageDetailArgument::Original => Self::Original,
-        }
-    }
+    detail: Option<String>,
 }
 
 fn resolve(workspace: &Path, path: &Path) -> PathBuf {

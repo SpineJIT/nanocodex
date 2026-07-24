@@ -103,21 +103,21 @@ struct ExecCommandArguments {
     #[serde(default)]
     tty: bool,
     #[serde(default)]
-    yield_time_ms: Option<i64>,
+    yield_time_ms: Option<u64>,
     #[serde(default)]
-    max_output_tokens: Option<i64>,
+    max_output_tokens: Option<usize>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WriteStdinArguments {
-    session_id: i64,
+    session_id: i32,
     #[serde(default)]
     chars: String,
     #[serde(default)]
-    yield_time_ms: Option<i64>,
+    yield_time_ms: Option<u64>,
     #[serde(default)]
-    max_output_tokens: Option<i64>,
+    max_output_tokens: Option<usize>,
 }
 
 #[cfg(test)]

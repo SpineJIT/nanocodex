@@ -45,7 +45,7 @@ pub(crate) fn wait_spec() -> ToolDefinition {
                 },
                 "terminate": {
                     "type": "boolean",
-                    "description": "True stops the running cell; false or omitted waits for output."
+                    "description": "True stops the running exec cell; false or omitted waits for output."
                 }
             },
             "required": ["cell_id"],

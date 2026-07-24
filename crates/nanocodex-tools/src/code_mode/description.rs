@@ -163,7 +163,7 @@ pub(super) fn exec_description(
             "\n\n{heading}\n{}\n\nexec tool declaration:\n```ts\n\
 declare const tools: {{ {global_name}({input_name}: {input_type}): Promise<{output_type}>; }};\n\
 ```",
-            spec.description().trim(),
+            spec.description(),
         );
     }
     description

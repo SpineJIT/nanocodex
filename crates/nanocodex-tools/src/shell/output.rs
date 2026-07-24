@@ -13,12 +13,9 @@ const BYTES_PER_TOKEN: usize = 4;
 const READ_BUFFER_LENGTH: usize = 8 * 1024;
 const REDACTION: &str = "[REDACTED]";
 
-pub(super) fn effective_token_limit(requested: Option<i64>) -> usize {
+pub(super) fn effective_token_limit(requested: Option<usize>) -> usize {
     requested.map_or(DEFAULT_MAX_OUTPUT_TOKENS * BYTES_PER_TOKEN, |value| {
-        usize::try_from(value)
-            .unwrap_or(0)
-            .saturating_mul(BYTES_PER_TOKEN)
-            .min(MAX_OUTPUT_BYTES)
+        value.saturating_mul(BYTES_PER_TOKEN).min(MAX_OUTPUT_BYTES)
     })
 }
 

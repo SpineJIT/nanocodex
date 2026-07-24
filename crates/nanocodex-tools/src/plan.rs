@@ -37,27 +37,25 @@ impl Tool for UpdatePlanTool {
 
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
         let plan = input.decode_json::<UpdatePlanArgs>()?;
-        if plan
-            .plan
-            .iter()
-            .filter(|item| matches!(item.status, PlanStatus::InProgress))
-            .count()
-            > 1
-        {
-            return Ok(ToolExecution::error(
-                "update_plan allows at most one in_progress step",
-            ));
+        tracing::debug!(
+            explanation = ?plan.explanation,
+            step_count = plan.plan.len(),
+            "updating plan"
+        );
+        for (index, item) in plan.plan.iter().enumerate() {
+            tracing::debug!(
+                index,
+                step = item.step,
+                status = ?item.status,
+                "updated plan item"
+            );
         }
-        if plan.plan.iter().any(|item| item.step.trim().is_empty()) {
-            return Ok(ToolExecution::error("update_plan steps must not be empty"));
-        }
-        let _ = plan.explanation.as_deref();
         *self.current.lock().await = Some(plan);
         Ok(ToolExecution::text("Plan updated").with_code_mode_value(json!({})))
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpdatePlanArgs {
     #[serde(default)]
@@ -65,14 +63,14 @@ struct UpdatePlanArgs {
     plan: Vec<PlanItem>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PlanItem {
     step: String,
     status: PlanStatus,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PlanStatus {
     Pending,

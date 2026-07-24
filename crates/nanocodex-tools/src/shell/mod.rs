@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rand::{Rng, rng};
 use serde::Serialize;
 use tokio::{sync::Mutex, task::JoinHandle, time::timeout};
 
@@ -32,8 +33,8 @@ pub(crate) struct ExecCommand {
     shell: Option<String>,
     login: Option<bool>,
     tty: bool,
-    yield_time_ms: Option<i64>,
-    max_output_tokens: Option<i64>,
+    yield_time_ms: Option<u64>,
+    max_output_tokens: Option<usize>,
 }
 
 impl ExecCommand {
@@ -43,8 +44,8 @@ impl ExecCommand {
         shell: Option<String>,
         login: Option<bool>,
         tty: bool,
-        yield_time_ms: Option<i64>,
-        max_output_tokens: Option<i64>,
+        yield_time_ms: Option<u64>,
+        max_output_tokens: Option<usize>,
     ) -> Self {
         Self {
             script,
@@ -59,18 +60,18 @@ impl ExecCommand {
 }
 
 pub(crate) struct WriteStdin {
-    session_id: i64,
+    session_id: i32,
     chars: String,
-    yield_time_ms: Option<i64>,
-    max_output_tokens: Option<i64>,
+    yield_time_ms: Option<u64>,
+    max_output_tokens: Option<usize>,
 }
 
 impl WriteStdin {
     pub(crate) const fn new(
-        session_id: i64,
+        session_id: i32,
         chars: String,
-        yield_time_ms: Option<i64>,
-        max_output_tokens: Option<i64>,
+        yield_time_ms: Option<u64>,
+        max_output_tokens: Option<usize>,
     ) -> Self {
         Self {
             session_id,
@@ -170,7 +171,8 @@ impl ShellSessions {
 
     pub(crate) async fn write_stdin(&self, request: WriteStdin) -> ExecCommandResult {
         let started_at = Instant::now();
-        let session = self.sessions.lock().await.get(request.session_id);
+        let session_id = i64::from(request.session_id);
+        let session = self.sessions.lock().await.get(session_id);
         let Some(session) = session else {
             return ExecCommandResult::failed(
                 started_at.elapsed(),
@@ -206,7 +208,7 @@ impl ShellSessions {
             .wait_for_output(yield_time, request.max_output_tokens, started_at)
             .await;
         if result.exit_code.is_some() {
-            self.sessions.lock().await.remove(request.session_id);
+            self.sessions.lock().await.remove(session_id);
         }
         result
     }
@@ -285,7 +287,6 @@ struct Session {
     drains: Mutex<Option<Vec<JoinHandle<()>>>>,
     captured: Arc<Mutex<CapturedOutput>>,
     secrets: Vec<String>,
-    next_chunk_id: AtomicU64,
     active_interactions: AtomicU64,
 }
 
@@ -322,7 +323,6 @@ impl Session {
             drains: Mutex::new(Some(drains)),
             captured,
             secrets,
-            next_chunk_id: AtomicU64::new(1),
             active_interactions: AtomicU64::new(0),
         })
     }
@@ -355,7 +355,7 @@ impl Session {
     async fn wait_for_output(
         &self,
         yield_time: Duration,
-        max_output_tokens: Option<i64>,
+        max_output_tokens: Option<usize>,
         started_at: Instant,
     ) -> ExecCommandResult {
         let status = {
@@ -381,11 +381,7 @@ impl Session {
         };
         let (output, original_token_count) = self.take_output(max_output_tokens).await;
         ExecCommandResult {
-            chunk_id: Some(format!(
-                "{}-{}",
-                self.id,
-                self.next_chunk_id.fetch_add(1, Ordering::Relaxed)
-            )),
+            chunk_id: Some(generate_chunk_id()),
             wall_time_seconds: started_at.elapsed().as_secs_f64(),
             exit_code,
             session_id: exit_code.is_none().then_some(self.id),
@@ -411,7 +407,7 @@ impl Session {
         }
     }
 
-    async fn take_output(&self, max_output_tokens: Option<i64>) -> (String, Option<usize>) {
+    async fn take_output(&self, max_output_tokens: Option<usize>) -> (String, Option<usize>) {
         let captured = self.captured.lock().await.take();
         let raw = String::from_utf8_lossy(&captured.with_omission_marker()).into_owned();
         let limit = output::effective_token_limit(max_output_tokens);
@@ -543,11 +539,17 @@ fn resolve_workdir(workspace: &Path, requested: Option<&str>) -> PathBuf {
     }
 }
 
-fn duration_ms(requested: Option<i64>, default: u64, minimum: u64, maximum: u64) -> Duration {
-    let requested = requested
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or(default);
+fn duration_ms(requested: Option<u64>, default: u64, minimum: u64, maximum: u64) -> Duration {
+    let requested = requested.unwrap_or(default);
     Duration::from_millis(requested.clamp(minimum, maximum))
+}
+
+fn generate_chunk_id() -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut rng = rng();
+    (0..6)
+        .map(|_| char::from(HEX[rng.random_range(0..HEX.len())]))
+        .collect()
 }
 
 #[cfg(test)]
@@ -561,7 +563,18 @@ mod tests {
 
     #[cfg(unix)]
     use super::WriteStdin;
-    use super::{CapturedOutput, ExecCommand, ShellSessions};
+    use super::{CapturedOutput, ExecCommand, ShellSessions, generate_chunk_id};
+
+    #[test]
+    fn chunk_ids_match_codex_shape() {
+        let chunk_id = generate_chunk_id();
+        assert_eq!(chunk_id.len(), 6);
+        assert!(
+            chunk_id
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        );
+    }
 
     #[test]
     fn bounded_capture_keeps_head_and_tail_then_accepts_the_next_poll() {

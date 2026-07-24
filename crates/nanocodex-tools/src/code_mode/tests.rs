@@ -609,6 +609,33 @@ async fn image_helper_normalizes_detail_and_honors_override() -> Result<()> {
 }
 
 #[tokio::test]
+async fn view_image_rejects_unsupported_detail_with_codex_diagnostics() -> Result<()> {
+    let workspace = temporary_workspace("view-image-detail-error")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+try {
+  await tools.view_image({ path: "missing.png", detail: "low" });
+} catch (error) {
+  text(error);
+}
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert_eq!(
+        emitted_text(&execution)?,
+        "view_image.detail only supports `high` or `original`; omit `detail` for default high resized behavior, got `low`"
+    );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn output_helpers_accept_raw_mcp_image_and_audio_blocks() -> Result<()> {
     let workspace = temporary_workspace("code-mode-mcp-media")?;
     let tools = test_tools(&workspace);
@@ -1005,6 +1032,39 @@ text(result);
 }
 
 #[tokio::test]
+async fn completed_shell_session_is_not_reported_as_running() -> Result<()> {
+    let workspace = temporary_workspace("completed-shell-session")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+const command = await tools.exec_command({
+  cmd: "read value; printf 'received:%s' \"$value\"",
+  login: false,
+  tty: true,
+  yield_time_ms: 250,
+});
+const completed = await tools.write_stdin({
+  session_id: command.session_id,
+  chars: "parity\n",
+  yield_time_ms: 5000,
+});
+text(completed.output);
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    let output = execution_output(&execution);
+    assert!(output.contains("received:parity"));
+    assert!(!output.contains("Nested shell process is still running"));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancellation_terminates_yielded_code_cells() -> Result<()> {
     let workspace = temporary_workspace("cancelled-cell")?;
     let tools = test_tools(&workspace);
@@ -1139,10 +1199,7 @@ text(result);
         .await;
 
     assert!(execution.success, "{}", execution_output(&execution));
-    assert!(
-        execution_output(&execution)
-            .contains("Success. Updated the following files:\nA created.txt")
-    );
+    assert_eq!(emitted_text(&execution)?, "{}");
     assert_eq!(execution.nested_calls.len(), 1);
     assert_eq!(
         execution.nested_calls[0].input,
@@ -1155,6 +1212,61 @@ text(result);
         std::fs::read_to_string(workspace.join("created.txt"))?,
         "created by patch\n"
     );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn freeform_apply_patch_rejects_with_codex_diagnostics() -> Result<()> {
+    let workspace = temporary_workspace("freeform-apply-patch-error")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+try {
+  await tools.apply_patch("*** Begin Patch\n*** Update File: missing.txt\n@@\n-before\n+after\n*** End Patch");
+} catch (error) {
+  text(error);
+}
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert!(
+        emitted_text(&execution)?
+            .starts_with("apply_patch verification failed: Failed to read file to update "),
+        "{}",
+        execution_output(&execution)
+    );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_plan_matches_codex_handler_acceptance() -> Result<()> {
+    let workspace = temporary_workspace("update-plan-acceptance")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+const result = await tools.update_plan({
+  plan: [
+    { step: "", status: "in_progress" },
+    { step: "also active", status: "in_progress" },
+  ],
+});
+text(result);
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert_eq!(emitted_text(&execution)?, "{}");
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -1252,6 +1364,35 @@ fn nested_shell_yields_follow_the_handlers_bounds() {
         ),
         None
     );
+}
+
+#[tokio::test]
+async fn negative_shell_limits_fail_during_codex_compatible_argument_parsing() -> Result<()> {
+    let workspace = temporary_workspace("negative-shell-limits")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+try {
+  await tools.exec_command({ cmd: "true", yield_time_ms: -1 });
+} catch (error) {
+  text(error);
+}
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert!(
+        emitted_text(&execution)?
+            .starts_with("failed to parse function arguments: invalid value: integer `-1`"),
+        "{}",
+        execution_output(&execution)
+    );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
 }
 
 #[tokio::test]
