@@ -1,12 +1,13 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { formatUnits } from "viem";
 import { WagmiProvider, useConnect, useConnection, useConnectors, useDisconnect } from "wagmi";
 import { tempo } from "wagmi/chains";
-import { Hooks } from "wagmi/tempo";
+import { Actions } from "wagmi/tempo";
 
 import type { PaymentStatus } from "./nanocodex";
 import { PATH_USD } from "./tempo-policy";
+import { provisionTempoAccessKey, type TempoAccessKey } from "./tempoAccessKey";
 import { wagmiConfig } from "./wagmi";
 
 const queryClient = new QueryClient();
@@ -15,7 +16,7 @@ export function MppControls(props: {
   jsonl: readonly string[];
   payment?: PaymentStatus;
   onDisconnect(): void;
-  onReady(): void;
+  onReady(key: TempoAccessKey): void;
 }) {
   return (
     <WagmiProvider config={wagmiConfig}>
@@ -30,38 +31,66 @@ function ConnectedMppControls({ jsonl, payment, onDisconnect, onReady }: {
   jsonl: readonly string[];
   payment?: PaymentStatus;
   onDisconnect(): void;
-  onReady(): void;
+  onReady(key: TempoAccessKey): void;
 }) {
   const connection = useConnection();
   const connectors = useConnectors();
   const connect = useConnect();
   const disconnect = useDisconnect();
   const reportedAddress = useRef<string | undefined>(undefined);
-  const balance = Hooks.token.useGetBalance({
-    account: connection.address,
-    token: PATH_USD,
-    query: {
-      enabled: connection.status === "connected",
-      refetchInterval: 5_000,
-    },
-  });
+  const [balance, setBalance] = useState<string>();
+  const [accessKeyAddress, setAccessKeyAddress] = useState<string>();
+  const [provisionError, setProvisionError] = useState("");
+  const [provisioning, setProvisioning] = useState(false);
+  const [retry, setRetry] = useState(0);
+
+  useEffect(() => {
+    if (connection.status !== "connected" || !connection.address) {
+      setBalance(undefined);
+      return;
+    }
+    let active = true;
+    const refresh = () => {
+      void Actions.token.getBalance(wagmiConfig, {
+        account: connection.address,
+        token: PATH_USD,
+      }).then((value) => {
+        if (active) setBalance(value.formatted);
+      });
+    };
+    refresh();
+    const interval = window.setInterval(refresh, 5_000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [connection.address, connection.status]);
 
   useEffect(() => {
     if (connection.status !== "connected" || !connection.address) {
       reportedAddress.current = undefined;
+      setAccessKeyAddress(undefined);
+      setProvisionError("");
+      setProvisioning(false);
       return;
     }
     if (reportedAddress.current === connection.address) return;
-    // Wagmi restores persisted connections inside its hydration boundary.
-    // Start the external agent after that render commits so its synchronous
-    // store notification cannot update this tree while Hydrate is rendering.
-    const address = connection.address;
-    const timeout = window.setTimeout(() => {
-      reportedAddress.current = address;
-      onReady();
-    }, 0);
-    return () => window.clearTimeout(timeout);
-  }, [connection.address, connection.status, onReady]);
+    let active = true;
+    setProvisioning(true);
+    setProvisionError("");
+    void provisionTempoAccessKey().then((key) => {
+      if (!active) return;
+      reportedAddress.current = connection.address;
+      setAccessKeyAddress(key.address);
+      setProvisioning(false);
+      onReady(key);
+    }, (error) => {
+      if (!active) return;
+      setProvisioning(false);
+      setProvisionError(error instanceof Error ? error.message : String(error));
+    });
+    return () => { active = false; };
+  }, [connection.address, connection.status, onReady, retry]);
 
   const connector = connectors[0];
   const connecting = connect.status === "pending";
@@ -70,7 +99,9 @@ function ConnectedMppControls({ jsonl, payment, onDisconnect, onReady }: {
       <div className="agent-byok-summary">
         <span>
           <i className={connection.status === "connected" ? "is-ready" : ""} aria-hidden="true" />
-          {connection.status === "connected" ? "Tempo Wallet connected" : "Use Tempo Wallet for MPP"}
+          {connection.status === "connected"
+            ? provisioning ? "Authorizing MPP access key…" : "Tempo Wallet connected"
+            : "Use Tempo Wallet for MPP"}
         </span>
         <div>
           {connection.status === "connected" ? (
@@ -90,12 +121,18 @@ function ConnectedMppControls({ jsonl, payment, onDisconnect, onReady }: {
         </div>
       </div>
       {connect.error ? <p className="agent-byok-error" role="alert">{connect.error.message}</p> : null}
+      {provisionError ? (
+        <p className="agent-byok-error" role="alert">
+          {provisionError}{" "}
+          <button type="button" onClick={() => setRetry((value) => value + 1)}>Retry</button>
+        </p>
+      ) : null}
       {connection.status === "connected" ? (
         <dl className="agent-mpp-details">
           <Detail label="Tempo account" value={connection.address} />
-          <Detail label="Payer" value={payment?.rootAddress ?? "Loading Tempo account…"} />
-          <Detail label="Balance" value={balance.data === undefined ? "Loading…" : `${balance.data.formatted} pathUSD`} />
-          <Detail label="Signer" value={payment?.accessKeyAddress ?? "Loading authorized access key…"} />
+          <Detail label="Payer" value={payment?.rootAddress ?? connection.address} />
+          <Detail label="Balance" value={balance === undefined ? "Loading…" : `${balance} pathUSD`} />
+          <Detail label="Signer" value={payment?.accessKeyAddress ?? accessKeyAddress ?? "Authorizing payment key…"} />
           <Detail label="Channel" value={payment?.channelId ?? "Opens on first paid request"} />
           <Detail label="Cumulative" value={payment ? `${formatUnits(BigInt(payment.cumulative), 6)} pathUSD` : "0 pathUSD"} />
         </dl>

@@ -2,6 +2,7 @@ import { Actions, Agent, type ReasoningMode, type Thinking, type ToolMap, type T
 import type { TuiTarget } from "nanocodex-tui";
 import { createBrowserTools } from "./browserTools";
 import type { PaymentStatus, WebTuiCommand } from "./nanocodex";
+import type { TempoAccessKey } from "./tempoAccessKey";
 
 type Target = TuiTarget;
 type BrowserPromptItem =
@@ -61,7 +62,12 @@ worker.onmessage = ({ data }: MessageEvent<IncomingMessage>) => {
 async function handleMessage(message: IncomingMessage): Promise<void> {
   switch (message.type) {
     case "start":
-      await start(message.thinking, message.reasoningMode, message.transport);
+      await start(
+        message.thinking,
+        message.reasoningMode,
+        message.transport,
+        message.transport === "mpp" ? message.paymentKey : undefined,
+      );
       return;
     case "prompt": {
       const branch = resolveTarget(message.target);
@@ -195,6 +201,7 @@ async function start(
   thinking: Thinking,
   reasoningMode: ReasoningMode,
   transport: "openai" | "mpp",
+  paymentKey?: TempoAccessKey,
 ): Promise<void> {
   eventWatch?.off();
   eventWatch = undefined;
@@ -227,7 +234,7 @@ async function start(
     reasoningMode,
   };
   const agent = transport === "mpp"
-    ? await createMppAgent(common)
+    ? await createMppAgent(common, paymentKey)
     : await Agent.create({
         ...common,
         apiKey: "worker-managed",
@@ -259,9 +266,10 @@ async function createMppAgent(common: {
   tools: ToolMap;
   thinking: Thinking;
   reasoningMode: ReasoningMode;
-}) {
+}, paymentKey?: TempoAccessKey) {
+  if (!paymentKey) throw new Error("MPP requires an authorized Tempo access key");
   const { createTempoMppSession } = await import("./tempo");
-  paymentSession = await createTempoMppSession();
+  paymentSession = await createTempoMppSession(paymentKey);
   return Agent.create({ ...common, fastMode: true, mpp: paymentSession.mpp });
 }
 

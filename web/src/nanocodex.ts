@@ -1,10 +1,13 @@
 import { createConfig } from "nanocodex-react";
 import type { TuiCommand, TuiMessage } from "nanocodex-tui";
+import type { TempoAccessKey } from "./tempoAccessKey";
 
 export type AgentTransport = "openai" | "mpp";
+type StartCommand = Extract<TuiCommand, { type: "start" }>;
 export type WebTuiCommand =
   | Exclude<TuiCommand, { type: "start" }>
-  | (Extract<TuiCommand, { type: "start" }> & { transport: AgentTransport });
+  | (StartCommand & { transport: "openai" })
+  | (StartCommand & { paymentKey: TempoAccessKey; transport: "mpp" });
 export type PaymentStatus = {
   rootAddress: string;
   accessKeyAddress: string;

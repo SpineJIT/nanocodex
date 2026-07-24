@@ -1,27 +1,14 @@
-import { Expiry } from "accounts";
-import { parseUnits } from "viem";
 import { createConfig, http } from "wagmi";
 import { tempo } from "wagmi/chains";
 import { tempoWallet } from "wagmi/connectors";
-
-import { PATH_USD, USDC_E } from "./tempo-policy";
 
 export const wagmiConfig = createConfig({
   chains: [tempo],
   connectors: [
     tempoWallet({
-      accessKey: {
-        authorize: () => ({
-          expiry: Expiry.days(1),
-          limits: [
-            { token: PATH_USD, limit: parseUnits("25", 6) },
-            { token: USDC_E, limit: parseUnits("25", 6) },
-          ],
-          showDeposit: { amount: "0.25", token: "pathUSD" },
-        }),
-      },
       // Tempo Wallet owns account/passkey UX. The app Worker owns only the
-      // long-lived MPP session and channel store.
+      // long-lived MPP session and channel store. A payment-scoped key is
+      // authorized separately so mppx can raw-sign streaming vouchers.
       mpp: false,
     }),
   ],

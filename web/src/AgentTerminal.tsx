@@ -14,6 +14,7 @@ import {
   type WebTuiCommand,
   type WebTuiMessage,
 } from "./nanocodex";
+import type { TempoAccessKey } from "./tempoAccessKey";
 
 const MppControls = lazy(async () => ({
   default: (await import("./MppControls")).MppControls,
@@ -73,8 +74,8 @@ function AgentTerminalDemo() {
     }
   }, [credentialSource, transport]);
 
-  const startMpp = useCallback(() => {
-    nanocodexConfig.restart(startCommand("mpp"));
+  const startMpp = useCallback((key: TempoAccessKey) => {
+    nanocodexConfig.restart(startCommand("mpp", key));
   }, []);
   const disconnectMpp = useCallback(() => nanocodexConfig.disconnect(), []);
   const selectTransport = (next: AgentTransport) => {
@@ -129,11 +130,23 @@ function AgentTerminalDemo() {
   );
 }
 
-function startCommand(transport: AgentTransport): WebTuiCommand {
+function startCommand(transport: "openai"): WebTuiCommand;
+function startCommand(transport: "mpp", paymentKey: TempoAccessKey): WebTuiCommand;
+function startCommand(transport: AgentTransport, paymentKey?: TempoAccessKey): WebTuiCommand {
+  if (transport === "mpp") {
+    if (!paymentKey) throw new Error("MPP requires an authorized Tempo access key");
+    return {
+      type: "start",
+      transport,
+      paymentKey,
+      thinking: "none",
+      reasoningMode: "standard",
+    };
+  }
   return {
     type: "start",
     transport,
-    thinking: transport === "mpp" ? "none" : "high",
+    thinking: "high",
     reasoningMode: "standard",
   };
 }
