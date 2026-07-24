@@ -1487,7 +1487,10 @@ where
     ) -> Result<(ResponseItem, Option<Usage>)> {
         let trigger = compaction::trigger();
         let mut history = history;
-        compaction::trim_tool_outputs_to_fit_context_window(&mut history, active_context_tokens);
+        compaction::trim_tool_outputs_to_fit_context_window(
+            &mut history,
+            factory.profile().prefix(),
+        );
         let started_at = Instant::now();
         self.stats.compactions += 1;
         self.events.emit(

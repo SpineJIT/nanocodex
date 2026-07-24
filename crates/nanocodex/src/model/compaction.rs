@@ -74,9 +74,13 @@ pub(super) const fn trigger() -> ResponseItem {
 
 pub(super) fn trim_tool_outputs_to_fit_context_window(
     history: &mut ResponseHistory,
-    active_context_tokens: u64,
+    request_prefix: &[ResponseItem],
 ) -> usize {
-    let mut estimated_tokens = active_context_tokens;
+    let mut estimated_tokens = request_prefix
+        .iter()
+        .chain(history.iter())
+        .map(estimate_item_tokens)
+        .fold(0_u64, u64::saturating_add);
     let mut rewritten_outputs = Vec::new();
     for item in history.iter_rev() {
         if estimated_tokens <= SOL_CONTEXT_WINDOW {
@@ -500,10 +504,13 @@ mod tests {
         let mut history = ResponseHistory::new(vec![ResponseItem::custom_tool_output(
             "call".to_owned(),
             None,
-            FunctionOutputBody::Text("x".repeat(200_000).into_boxed_str()),
+            FunctionOutputBody::Text(
+                "x".repeat(272_001 * APPROX_BYTES_PER_TOKEN)
+                    .into_boxed_str(),
+            ),
         )]);
         assert_eq!(
-            trim_tool_outputs_to_fit_context_window(&mut history, SOL_CONTEXT_WINDOW + 50_000),
+            trim_tool_outputs_to_fit_context_window(&mut history, &[]),
             1
         );
         assert!(matches!(
@@ -525,7 +532,7 @@ mod tests {
         let shared_tail = history.shared_tail();
 
         assert_eq!(
-            trim_tool_outputs_to_fit_context_window(&mut history, SOL_CONTEXT_WINDOW),
+            trim_tool_outputs_to_fit_context_window(&mut history, &[]),
             0
         );
         assert!(std::sync::Arc::ptr_eq(&history.shared_tail(), &shared_tail));
