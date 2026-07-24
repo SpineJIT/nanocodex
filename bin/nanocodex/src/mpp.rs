@@ -1,7 +1,7 @@
 use std::{
     error::Error as StdError,
     net::TcpListener as StdTcpListener,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -53,6 +53,17 @@ const DEFAULT_TOP_UP_AMOUNT: u128 = 5_000_000;
 // Five $5 refill quanta while retaining a finite client-side authorization cap.
 const DEFAULT_MAX_DEPOSIT: u128 = 25_000_000;
 const DEFAULT_MAX_EGRESS_CHARGE: u128 = 100_000;
+
+fn load_tempo_wallet(path: &Path, store: &SqliteChannelStore) -> Result<TempoWallet> {
+    match store
+        .latest_authorized_signer()
+        .map_err(|error| eyre!(error))
+        .wrap_err("failed to resolve the retained Tempo session signer")?
+    {
+        Some(access_key) => Ok(TempoWallet::load_preferred(path, access_key)?),
+        None => Ok(TempoWallet::load(path)?),
+    }
+}
 
 #[derive(Args, Clone)]
 pub(crate) struct MppArgs {
@@ -188,7 +199,6 @@ impl MppArgs {
                 .map_err(|error| eyre!(error))?
                 .with_file_name("store.json"),
         );
-        let wallet = TempoWallet::load(&wallet_path)?;
         let endpoint = payment_http_url(&self.mpp_websocket_url)?;
         let api_base_url = openai_api_base_url(&self.mpp_websocket_url)?;
         let namespace = websocket_origin(&self.mpp_websocket_url)?;
@@ -199,6 +209,7 @@ impl MppArgs {
         })
         .map_err(|error| eyre!(error))
         .wrap_err("failed to open the Tempo session channel store")?;
+        let wallet = load_tempo_wallet(&wallet_path, &store)?;
         let autoswap = AutoswapConfig::new(
             self.pay_with
                 .parse()
