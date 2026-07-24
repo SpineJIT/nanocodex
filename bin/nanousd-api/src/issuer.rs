@@ -1,27 +1,41 @@
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use alloy::{
+    eips::Encodable2718,
     network::ReceiptResponse,
     primitives::{Address, B256, U256, keccak256},
-    providers::{DynProvider, PendingTransactionBuilder, Provider, ProviderBuilder},
+    providers::{
+        DynProvider, PendingTransactionBuilder, Provider, ProviderBuilder,
+        fillers::{FillProvider, TxFiller},
+    },
 };
 use async_trait::async_trait;
 use mpp::client::tempo::wallet::TempoWallet;
-use tempo_alloy::{TempoNetwork, contracts::precompiles::ITIP20, provider::TempoProviderExt};
-use tempo_primitives::SignatureType;
+use tempo_alloy::{
+    TempoNetwork, contracts::precompiles::ITIP20, provider::TempoProviderBuilderExt,
+    rpc::TempoTransactionRequest,
+};
+use tempo_primitives::{SignatureType, TempoTxEnvelope};
 
 use crate::{db::Fulfillment, tempo_wallet::TempoAccessKeyWallet};
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedMint {
+    pub signed_transaction: Vec<u8>,
+    pub transaction_hash: String,
+    pub valid_before: u64,
+}
 
 #[async_trait]
 pub(crate) trait Issuer: Send + Sync {
     async fn balance(&self, wallet: Address) -> Result<u64, IssuerError>;
-    async fn submit(&self, order: &Fulfillment) -> Result<String, IssuerError>;
-    async fn confirm(&self, transaction_hash: &str) -> Result<(), IssuerError>;
+    async fn prepare(&self, order: &Fulfillment) -> Result<PreparedMint, IssuerError>;
+    async fn publish(&self, order: &Fulfillment, mint: &PreparedMint) -> Result<(), IssuerError>;
 }
 
 #[derive(Default)]
@@ -41,32 +55,70 @@ impl Issuer for MockIssuer {
             .unwrap_or(&0))
     }
 
-    async fn submit(&self, order: &Fulfillment) -> Result<String, IssuerError> {
-        let hash = order
-            .transaction_hash
-            .clone()
-            .unwrap_or_else(|| format!("{:#x}", keccak256(order.id.as_bytes())));
+    async fn prepare(&self, order: &Fulfillment) -> Result<PreparedMint, IssuerError> {
+        Ok(PreparedMint {
+            signed_transaction: Vec::new(),
+            transaction_hash: order
+                .transaction_hash
+                .clone()
+                .unwrap_or_else(|| format!("{:#x}", keccak256(order.id.as_bytes()))),
+            valid_before: u64::MAX,
+        })
+    }
+
+    async fn publish(&self, order: &Fulfillment, _mint: &PreparedMint) -> Result<(), IssuerError> {
         let mut fulfilled = self.fulfilled.lock().map_err(|_| IssuerError::Poisoned)?;
         if fulfilled.insert(order.id.clone()) {
             let mut balances = self.balances.lock().map_err(|_| IssuerError::Poisoned)?;
             let balance = balances.entry(order.wallet).or_default();
             *balance = balance.saturating_add(order.amount);
         }
-        Ok(hash)
-    }
-
-    async fn confirm(&self, _transaction_hash: &str) -> Result<(), IssuerError> {
         Ok(())
+    }
+}
+
+#[async_trait]
+trait TransactionPreparer: Send + Sync {
+    async fn prepare(&self, request: TempoTransactionRequest) -> Result<PreparedMint, IssuerError>;
+}
+
+#[async_trait]
+impl<F, P> TransactionPreparer for FillProvider<F, P, TempoNetwork>
+where
+    F: TxFiller<TempoNetwork> + Send + Sync,
+    P: Provider<TempoNetwork> + Send + Sync,
+{
+    async fn prepare(&self, request: TempoTransactionRequest) -> Result<PreparedMint, IssuerError> {
+        let envelope = self
+            .fill(request)
+            .await
+            .map_err(alloy_error)?
+            .try_into_envelope()
+            .map_err(alloy_error)?;
+        let TempoTxEnvelope::AA(transaction) = &envelope else {
+            return Err(IssuerError::NonTempoTransaction);
+        };
+        let valid_before = transaction
+            .tx()
+            .valid_before
+            .ok_or(IssuerError::MissingExpiry)?
+            .get();
+        let signed_transaction = envelope.encoded_2718();
+        Ok(PreparedMint {
+            transaction_hash: format!("{:#x}", keccak256(&signed_transaction)),
+            signed_transaction,
+            valid_before,
+        })
     }
 }
 
 pub(crate) struct AlloyIssuer {
     provider: DynProvider<TempoNetwork>,
+    preparer: Arc<dyn TransactionPreparer>,
     token: Address,
     fee_token: Address,
     account: Address,
     access_key: Address,
-    key_authorization: Option<tempo_primitives::transaction::SignedKeyAuthorization>,
 }
 
 impl AlloyIssuer {
@@ -82,41 +134,29 @@ impl AlloyIssuer {
         }
         let account = wallet.account;
         let access_key = wallet.access_key;
-        let key_authorization = wallet.key_authorization.as_deref().cloned();
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .with_expiring_nonces()
             .wallet(TempoAccessKeyWallet::from(&wallet))
-            .connect_http(rpc_url.parse().map_err(alloy_error)?)
-            .erased();
+            .connect_http(rpc_url.parse().map_err(alloy_error)?);
+        let preparer = Arc::new(provider.clone());
         tracing::info!(%account, %access_key, "loaded NanoUSD Alloy issuer");
         Ok(Self {
-            provider,
+            provider: provider.erased(),
+            preparer,
             token,
             fee_token,
             account,
             access_key,
-            key_authorization,
         })
     }
 
-    async fn pending_key_authorization(
-        &self,
-    ) -> Result<Option<tempo_primitives::transaction::SignedKeyAuthorization>, IssuerError> {
-        let Some(authorization) = &self.key_authorization else {
-            return Ok(None);
-        };
-        let key = self
-            .provider
-            .get_keychain_key(self.account, self.access_key)
+    async fn receipt(&self, transaction_hash: &str) -> Result<Option<bool>, IssuerError> {
+        let hash: B256 = transaction_hash.parse().map_err(alloy_error)?;
+        self.provider
+            .get_transaction_receipt(hash)
             .await
-            .map_err(alloy_error)?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| IssuerError::Clock)?
-            .as_secs();
-        Ok(
-            (key.keyId != self.access_key || key.isRevoked || key.expiry <= now)
-                .then(|| authorization.clone()),
-        )
+            .map(|receipt| receipt.map(|receipt| receipt.status()))
+            .map_err(alloy_error)
     }
 }
 
@@ -131,34 +171,42 @@ impl Issuer for AlloyIssuer {
         u64::try_from(balance).map_err(|_| IssuerError::BalanceOverflow)
     }
 
-    async fn submit(&self, order: &Fulfillment) -> Result<String, IssuerError> {
-        if let Some(hash) = &order.transaction_hash {
-            return Ok(hash.clone());
+    async fn prepare(&self, order: &Fulfillment) -> Result<PreparedMint, IssuerError> {
+        if let (Some(signed_transaction), Some(transaction_hash), Some(valid_before)) = (
+            &order.signed_transaction,
+            &order.transaction_hash,
+            order.valid_before,
+        ) && (self.receipt(transaction_hash).await?.is_some()
+            || valid_before > unix_time()?.saturating_add(1))
+        {
+            return Ok(PreparedMint {
+                signed_transaction: signed_transaction.clone(),
+                transaction_hash: transaction_hash.clone(),
+                valid_before,
+            });
         }
 
-        let nonce_key =
-            U256::from_be_bytes(keccak256(format!("nanousd-order:{}", order.id).as_bytes()).0);
         let mut request = ITIP20::new(self.token, &self.provider)
             .mint(order.wallet, U256::from(order.amount))
             .into_transaction_request()
             .with_fee_token(self.fee_token)
-            .with_nonce_key(nonce_key)
             .with_key_type(SignatureType::P256)
             .with_key_id(self.access_key);
         request.inner.from = Some(self.account);
-        request.inner.nonce = Some(0);
-        request.key_authorization = self.pending_key_authorization().await?;
-
-        let pending = self
-            .provider
-            .send_transaction(request)
-            .await
-            .map_err(alloy_error)?;
-        Ok(format!("{:#x}", pending.tx_hash()))
+        self.preparer.prepare(request).await
     }
 
-    async fn confirm(&self, transaction_hash: &str) -> Result<(), IssuerError> {
-        let hash: B256 = transaction_hash.parse().map_err(alloy_error)?;
+    async fn publish(&self, _order: &Fulfillment, mint: &PreparedMint) -> Result<(), IssuerError> {
+        if self.receipt(&mint.transaction_hash).await?.is_none()
+            && let Err(error) = self
+                .provider
+                .send_raw_transaction(&mint.signed_transaction)
+                .await
+            && self.receipt(&mint.transaction_hash).await?.is_none()
+        {
+            return Err(alloy_error(error));
+        }
+        let hash: B256 = mint.transaction_hash.parse().map_err(alloy_error)?;
         let receipt = PendingTransactionBuilder::new(self.provider.root().clone(), hash)
             .get_receipt()
             .await
@@ -167,10 +215,17 @@ impl Issuer for AlloyIssuer {
             Ok(())
         } else {
             Err(IssuerError::TransactionReverted(
-                transaction_hash.to_owned(),
+                mint.transaction_hash.clone(),
             ))
         }
     }
+}
+
+fn unix_time() -> Result<u64, IssuerError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| IssuerError::Clock)
 }
 
 fn alloy_error(error: impl std::fmt::Display) -> IssuerError {
@@ -187,6 +242,10 @@ pub(crate) enum IssuerError {
     Alloy(String),
     #[error("NanoUSD balance does not fit in the API representation")]
     BalanceOverflow,
+    #[error("Alloy prepared a non-Tempo transaction")]
+    NonTempoTransaction,
+    #[error("Alloy prepared a Tempo transaction without an expiry")]
+    MissingExpiry,
     #[error("Tempo mint transaction {0} reverted")]
     TransactionReverted(String),
     #[error("system clock is before the Unix epoch")]

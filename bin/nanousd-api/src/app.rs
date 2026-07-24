@@ -112,15 +112,18 @@ pub(crate) async fn fulfillment_worker(state: AppState) {
             }
         };
         let result = async {
-            let transaction_hash = state.issuer.submit(&order).await?;
+            let mint = state.issuer.prepare(&order).await?;
+            state.database.save_prepared_transaction(
+                &order.id,
+                &mint.signed_transaction,
+                &mint.transaction_hash,
+                mint.valid_before,
+            )?;
+            state.issuer.publish(&order, &mint).await?;
             state
                 .database
-                .save_transaction_hash(&order.id, &transaction_hash)?;
-            state.issuer.confirm(&transaction_hash).await?;
-            state
-                .database
-                .mark_fulfilled(&order.id, &transaction_hash)?;
-            Result::<_, AppError>::Ok(transaction_hash)
+                .mark_fulfilled(&order.id, &mint.transaction_hash)?;
+            Result::<_, AppError>::Ok(mint.transaction_hash)
         }
         .await;
         match result {
@@ -433,9 +436,12 @@ mod tests {
         assert_eq!(created.order.status, OrderStatus::Paid);
 
         let claimed = state.database.claim_fulfillment().unwrap().unwrap();
-        let hash = state.issuer.submit(&claimed).await.unwrap();
-        state.issuer.confirm(&hash).await.unwrap();
-        state.database.mark_fulfilled(&claimed.id, &hash).unwrap();
+        let mint = state.issuer.prepare(&claimed).await.unwrap();
+        state.issuer.publish(&claimed, &mint).await.unwrap();
+        state
+            .database
+            .mark_fulfilled(&claimed.id, &mint.transaction_hash)
+            .unwrap();
         assert_eq!(state.issuer.balance(wallet).await.unwrap(), 5_000_000);
         let order = state
             .database

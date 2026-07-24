@@ -55,18 +55,20 @@ Wallet. It adapts that key to Alloy's `NetworkWallet<TempoNetwork>`, then uses a
 typed `ITIP20::mint` call and Alloy's normal provider transaction lifecycle. It
 never invokes a shell or passes a private key on a command line. An explicit
 `NANOUSD_WALLET_STORE` selects a different Wallet store. The key must be
-authorized to call NANOUSD and have enough allowance for its configured gas fee
-token. Use a dedicated, narrowly scoped issuer key for a deployed service.
+authorized on-chain before the service starts, authorized to call NANOUSD, and
+have enough allowance for its configured gas fee token. The issuer never
+attaches a `key_authorization` payload. Use a dedicated, narrowly scoped issuer
+key for a deployed service.
 
 The default fee token is PathUSD because that is the funded token in the issuer
 account. Set `NANOUSD_FEE_TOKEN` to match both the balance and fee-token
 allowance of a different issuer account and key.
 
-Each order gets a deterministic Tempo nonce key and nonce zero. The worker
-stores the transaction hash immediately after Alloy submits it, before waiting
-for the receipt. A retry with a stored hash resumes confirmation without
-submitting another mint; the fixed nonce prevents a second submission from
-minting twice if the process stops between broadcast and persistence.
+The provider uses Tempo expiring nonces. Alloy fills and signs the typed mint,
+then the worker stores the exact signed envelope, transaction hash, and expiry
+in SQLite before broadcasting. Retries rebroadcast those same bytes. If an
+unbroadcast transaction expires, the worker first checks that its hash has no
+receipt and only then signs a replacement with a fresh expiry.
 
 ## Stripe deployment
 

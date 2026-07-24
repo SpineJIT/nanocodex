@@ -18,7 +18,9 @@ pub(crate) struct Fulfillment {
     pub id: String,
     pub wallet: Address,
     pub amount: u64,
+    pub signed_transaction: Option<Vec<u8>>,
     pub transaction_hash: Option<String>,
+    pub valid_before: Option<u64>,
 }
 
 impl Database {
@@ -42,7 +44,9 @@ impl Database {
                 checkout_url TEXT,
                 stripe_session_id TEXT UNIQUE,
                 stripe_payment_intent_id TEXT,
+                signed_transaction BLOB,
                 transaction_hash TEXT,
+                valid_before INTEGER,
                 error TEXT,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at INTEGER NOT NULL DEFAULT 0,
@@ -58,6 +62,8 @@ impl Database {
                 ON orders(status, next_attempt_at, created_at);
             ",
         )?;
+        ensure_order_column(&connection, "signed_transaction", "BLOB")?;
+        ensure_order_column(&connection, "valid_before", "INTEGER")?;
         connection.execute(
             "UPDATE orders SET status = 'paid' WHERE status = 'fulfilling'",
             [],
@@ -218,7 +224,7 @@ impl Database {
             params![id, now],
         )?;
         let result = transaction.query_row(
-            "SELECT id, wallet, nanousd_units, transaction_hash
+            "SELECT id, wallet, nanousd_units, signed_transaction, transaction_hash, valid_before
              FROM orders WHERE id = ?1",
             [&id],
             |row| {
@@ -228,7 +234,9 @@ impl Database {
                     row.get::<_, String>(0)?,
                     wallet,
                     amount,
-                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             },
         )?;
@@ -237,15 +245,30 @@ impl Database {
             id: result.0,
             wallet: result.1.parse().map_err(|_| DbError::InvalidAddress)?,
             amount: u64::try_from(result.2)?,
-            transaction_hash: result.3,
+            signed_transaction: result.3,
+            transaction_hash: result.4,
+            valid_before: result.5.map(u64::try_from).transpose()?,
         }))
     }
 
-    pub fn save_transaction_hash(&self, id: &str, transaction_hash: &str) -> Result<(), DbError> {
+    pub fn save_prepared_transaction(
+        &self,
+        id: &str,
+        signed_transaction: &[u8],
+        transaction_hash: &str,
+        valid_before: u64,
+    ) -> Result<(), DbError> {
         self.lock()?.execute(
-            "UPDATE orders SET transaction_hash = ?2, updated_at = ?3
+            "UPDATE orders SET signed_transaction = ?2, transaction_hash = ?3,
+             valid_before = ?4, updated_at = ?5
              WHERE id = ?1 AND status = 'fulfilling'",
-            params![id, transaction_hash, i64::try_from(unix_time()?)?],
+            params![
+                id,
+                signed_transaction,
+                transaction_hash,
+                i64::try_from(valid_before)?,
+                i64::try_from(unix_time()?)?
+            ],
         )?;
         Ok(())
     }
@@ -277,6 +300,22 @@ impl Database {
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, DbError> {
         self.connection.lock().map_err(|_| DbError::Poisoned)
     }
+}
+
+fn ensure_order_column(connection: &Connection, name: &str, sql_type: &str) -> Result<(), DbError> {
+    let mut statement = connection.prepare("PRAGMA table_info(orders)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == name {
+            return Ok(());
+        }
+    }
+    drop(statement);
+    connection.execute(
+        &format!("ALTER TABLE orders ADD COLUMN {name} {sql_type}"),
+        [],
+    )?;
+    Ok(())
 }
 
 fn row_to_order(row: &rusqlite::Row<'_>) -> rusqlite::Result<Order> {
@@ -356,6 +395,75 @@ pub(crate) enum DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adds_signed_transaction_columns_to_an_existing_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("orders.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE orders (
+                    id TEXT PRIMARY KEY,
+                    token_hash BLOB NOT NULL,
+                    wallet TEXT NOT NULL,
+                    package_cents INTEGER NOT NULL,
+                    nanousd_units INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    checkout_url TEXT,
+                    stripe_session_id TEXT UNIQUE,
+                    stripe_payment_intent_id TEXT,
+                    transaction_hash TEXT,
+                    error TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(&path).unwrap();
+        let connection = database.lock().unwrap();
+        let mut statement = connection.prepare("PRAGMA table_info(orders)").unwrap();
+        let columns: Vec<String> = statement
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "signed_transaction"));
+        assert!(columns.iter().any(|column| column == "valid_before"));
+    }
+
+    #[test]
+    fn prepared_transaction_survives_a_fulfillment_retry() {
+        let database = Database::memory().unwrap();
+        database
+            .create_order(
+                "ord_retry",
+                &[9; 32],
+                Address::repeat_byte(0x24),
+                CreditPackage::from_cents(500),
+                OrderStatus::Paid,
+            )
+            .unwrap();
+        let fulfillment = database.claim_fulfillment().unwrap().unwrap();
+        database
+            .save_prepared_transaction(
+                &fulfillment.id,
+                &[0x76, 0x01, 0x02],
+                "0x1234",
+                1_900_000_000,
+            )
+            .unwrap();
+        database.mark_failed(&fulfillment.id, "retry", 0).unwrap();
+
+        let retry = database.claim_fulfillment().unwrap().unwrap();
+        assert_eq!(retry.signed_transaction.unwrap(), [0x76, 0x01, 0x02]);
+        assert_eq!(retry.transaction_hash.as_deref(), Some("0x1234"));
+        assert_eq!(retry.valid_before, Some(1_900_000_000));
+    }
 
     #[test]
     fn stripe_redelivery_does_not_regress_or_reject_fulfilled_order() {
