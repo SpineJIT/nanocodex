@@ -42,11 +42,17 @@ class CliToolInstallContractTests(unittest.TestCase):
             self.assertIn(package_manager, command)
         for executable in ("curl", "bash", "node", "npm", "rg"):
             self.assertIn(f"command -v {executable}", command)
+        self.assertIn(
+            '"/opt/nanocodex-toolbox/usr/share/nodejs"',
+            command,
+        )
+        self.assertIn('rm "$node_module_entry"', command)
 
     def test_node_policy_keeps_node_and_npm_optional(self) -> None:
         command = _cli_tools_install_command(install_node=False)
 
         self.assertNotIn("nodejs", command)
+        self.assertNotIn("/opt/nanocodex-toolbox/usr/share/nodejs", command)
         self.assertNotIn("command -v node", command)
         self.assertNotIn("command -v npm", command)
         for package in ("ca-certificates", "curl", "bash", "ripgrep"):
@@ -785,6 +791,23 @@ class InterruptedRunContractTests(unittest.TestCase):
 
             with self.assertRaises(RuntimeError):
                 agent.populate_context_post_run(AgentContext())
+
+    def test_recovery_suppresses_a_repeated_normal_exit_validation_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            logs_dir = Path(directory)
+            self._write_partial_stream(logs_dir)
+            (logs_dir / "events.jsonl").write_text("not-json\n", encoding="utf-8")
+            agent = self._agent(logs_dir, interrupted=False)
+
+            with self.assertRaises(RuntimeError):
+                agent.populate_context_post_run(AgentContext())
+
+            context = AgentContext()
+            agent.populate_context_post_run(context)
+
+            self.assertTrue(context.is_empty())
 
     def test_jsonl_read_retries_a_slowly_propagated_final_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

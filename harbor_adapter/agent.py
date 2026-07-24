@@ -46,16 +46,34 @@ def _cli_tools_install_command(*, install_node: bool) -> str:
     """Build a portable installer for the stock Codex task-side CLI toolset."""
     packages = ["ca-certificates", "curl", "bash", "ripgrep"]
     checks = ["curl", "bash", "rg"]
+    node_modules_cleanup = ""
     if install_node:
         packages.extend(("nodejs", "npm"))
         checks.extend(("node", "npm"))
+        # FastDockerEnvironment exposes missing system Node modules through
+        # read-only symlinks into its shared toolbox. Remove only those links
+        # before the task package manager installs its writable Node tree.
+        node_modules_cleanup = (
+            "if [ -L /usr/share/nodejs ] && "
+            '[ "$(readlink /usr/share/nodejs)" = '
+            '"/opt/nanocodex-toolbox/usr/share/nodejs" ]; then '
+            "rm /usr/share/nodejs && mkdir -p /usr/share/nodejs; "
+            "elif [ -d /usr/share/nodejs ]; then "
+            "for node_module_entry in /usr/share/nodejs/*; do "
+            '[ -L "$node_module_entry" ] || continue; '
+            'case "$(readlink "$node_module_entry")" in '
+            "/opt/nanocodex-toolbox/usr/share/nodejs/*) "
+            'rm "$node_module_entry" ;; '
+            "esac; done; fi; "
+        )
 
     package_list = " ".join(packages)
     command_checks = "; ".join(
         f"command -v {command} >/dev/null 2>&1" for command in checks
     )
     return (
-        "if ldd --version 2>&1 | grep -qi musl || "
+        node_modules_cleanup
+        + "if ldd --version 2>&1 | grep -qi musl || "
         "[ -f /etc/alpine-release ]; then "
         f"apk add --no-cache {package_list}; "
         "elif command -v apt-get >/dev/null 2>&1; then "
@@ -120,6 +138,7 @@ class NanocodexAgent(BaseInstalledAgent):
         self._agents_md_path = self._resolve_context_file(agents_md_path, "AGENTS.md")
         self._run_interrupted = False
         self._run_failed = False
+        self._post_run_validation_failed = False
 
     @staticmethod
     def name() -> str:
@@ -187,6 +206,7 @@ class NanocodexAgent(BaseInstalledAgent):
     ) -> None:
         self._run_interrupted = False
         self._run_failed = False
+        self._post_run_validation_failed = False
         try:
             await self._run_to_completion(instruction, environment, context)
         except asyncio.CancelledError:
@@ -268,6 +288,11 @@ class NanocodexAgent(BaseInstalledAgent):
         temporary.replace(events)
 
     def populate_context_post_run(self, context: AgentContext) -> None:
+        if getattr(self, "_post_run_validation_failed", False):
+            self.logger.debug(
+                "skipping repeated nanocodex trajectory validation during recovery"
+            )
+            return
         try:
             self._populate_context_post_run_strict(context)
         except Exception:
@@ -275,6 +300,11 @@ class NanocodexAgent(BaseInstalledAgent):
                 getattr(self, "_run_interrupted", False)
                 or getattr(self, "_run_failed", False)
             ):
+                # Harbor records the first validation failure on the trial, then
+                # calls this hook again while recovering outputs. Preserve the
+                # original strict failure but do not let the recovery pass raise
+                # a second time and cancel the entire concurrent job.
+                self._post_run_validation_failed = True
                 raise
             self.logger.debug(
                 "skipping strict nanocodex trajectory validation after an incomplete run",
