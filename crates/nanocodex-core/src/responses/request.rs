@@ -403,25 +403,57 @@ impl Serialize for ResponsesInput<'_> {
     {
         let mut sequence = serializer.serialize_seq(Some(self.len()))?;
         for item in self.iter() {
-            sequence.serialize_element(&RequestResponseItem(item))?;
+            sequence.serialize_element(&RequestResponseItem {
+                item,
+                retain_ids: true,
+            })?;
         }
         sequence.end()
     }
 }
 
-struct RequestResponseItem<'a>(&'a ResponseItem);
+#[derive(Clone, Copy)]
+struct RequestInput<'a> {
+    input: ResponsesInput<'a>,
+    retain_ids: bool,
+}
+
+impl Serialize for RequestInput<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.input.len()))?;
+        for item in self.input.iter() {
+            sequence.serialize_element(&RequestResponseItem {
+                item,
+                retain_ids: self.retain_ids,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+struct RequestResponseItem<'a> {
+    item: &'a ResponseItem,
+    retain_ids: bool,
+}
 
 impl Serialize for RequestResponseItem<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        if self.0.id().is_some_and(|id| !id.is_prefixed()) {
-            let mut item = self.0.clone();
+        if self
+            .item
+            .id()
+            .is_some_and(|id| !id.is_prefixed() || !self.retain_ids)
+        {
+            let mut item = self.item.clone();
             item.set_id(None);
             item.serialize(serializer)
         } else {
-            self.0.serialize(serializer)
+            self.item.serialize(serializer)
         }
     }
 }
@@ -433,7 +465,7 @@ pub struct ResponseCreate<'a> {
     model: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_response_id: Option<&'a str>,
-    input: ResponsesInput<'a>,
+    input: RequestInput<'a>,
     tool_choice: &'static str,
     parallel_tool_calls: bool,
     reasoning: ReasoningControls,
@@ -513,13 +545,16 @@ impl<'a> ResponseCreate<'a> {
             kind: websocket.then_some("response.create"),
             model: crate::MODEL,
             previous_response_id,
-            input,
+            input: RequestInput {
+                input,
+                retain_ids: config.store_responses,
+            },
             tool_choice: "auto",
             parallel_tool_calls: false,
             reasoning: ReasoningControls {
                 mode: config.reasoning_mode.request_value(),
                 effort: policy.thinking.as_str(),
-                summary: None,
+                summary: Some("auto"),
                 context: "all_turns",
             },
             store: config.store_responses,
@@ -602,13 +637,13 @@ mod tests {
         assert_eq!(request["generate"], false);
         assert!(request.get("tools").is_none());
         assert!(request.get("instructions").is_none());
-        assert!(request["reasoning"].get("summary").is_none());
+        assert_eq!(request["reasoning"]["summary"], json!("auto"));
         assert!(request["reasoning"].get("mode").is_none());
         assert!(request.get("context_management").is_none());
     }
 
     #[test]
-    fn request_serialization_preserves_client_ids_and_only_omits_unprefixed_server_ids() {
+    fn request_serialization_matches_codex_item_id_policy_without_mutating_history() {
         let mut client_item = ResponseItem::message(
             MessageRole::User,
             [ContentItem::InputText {
@@ -630,11 +665,11 @@ mod tests {
             "server-item-id",
         )));
         let history = ResponseHistory::new(vec![client_item, server_item]);
-        let config = ModelConfig::default();
+        let stored_config = ModelConfig::default();
         let profile = RequestProfile::new("agent", "lineage", Arc::from([]));
 
-        let request = serde_json::to_value(ResponseCreate::generation(
-            &config,
+        let stored_request = serde_json::to_value(ResponseCreate::generation(
+            &stored_config,
             Thinking::Medium,
             false,
             ResponsesInput::history(&[], &history, None),
@@ -644,8 +679,26 @@ mod tests {
         ))
         .expect("request should serialize");
 
-        assert_eq!(request["input"][0]["id"], "msg_stable");
-        assert!(request["input"][1].get("id").is_none());
+        assert_eq!(stored_request["input"][0]["id"], "msg_stable");
+        assert!(stored_request["input"][1].get("id").is_none());
+
+        let ephemeral_config = ModelConfig {
+            store_responses: false,
+            ..ModelConfig::default()
+        };
+        let ephemeral_request = serde_json::to_value(ResponseCreate::generation(
+            &ephemeral_config,
+            Thinking::Medium,
+            false,
+            ResponsesInput::history(&[], &history, None),
+            None,
+            &profile,
+            None,
+        ))
+        .expect("request should serialize");
+
+        assert!(ephemeral_request["input"][0].get("id").is_none());
+        assert!(ephemeral_request["input"][1].get("id").is_none());
         assert_eq!(
             history
                 .iter()
