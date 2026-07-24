@@ -36,7 +36,7 @@ http = "1.3.1"
 http-body-util = "0.1.3"
 hmac = "0.13.0"
 hudsucker = { version = "0.25.0", git = "https://github.com/gakonst/hudsucker", rev = "0c7da328e446518036b9420db3e75451fca522e9", default-features = false, features = ["rcgen-ca", "rustls-client"] }
-mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "c5933597091230151368c426eb2061cca9192796", default-features = false }
+mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "b02d4dae4e76843ef8affa58dda86f4844a13b8b", default-features = false }
 mpp-egress = { version = "0.1.0", path = "crates/mpp-egress" }
 nanocodex = { version = "0.1.1", path = "crates/nanocodex" }
 nanocodex-core = { version = "0.1.1", path = "crates/nanocodex-core" }
