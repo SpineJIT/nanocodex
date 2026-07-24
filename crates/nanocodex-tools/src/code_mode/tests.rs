@@ -1,15 +1,128 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use eyre::{Result, eyre};
-use nanocodex_core::ResponseItem;
+use nanocodex_core::{ResponseItem, ToolDefinition};
 use serde_json::Value;
+use tokio::sync::Semaphore;
 
 use super::{
     CellUpdate, CodeModeExecution, CodeModeObserver, CodeModeUpdate, LiveCell, NestedToolCall,
     ObservationMode, nested_tool_yield_after, observe_cell, observer_yield_timeout,
     parse_exec_source,
 };
-use crate::{ToolContext, ToolOutputBody, ToolOutputContent, ToolRuntime, WebSearchConfig};
+use crate::{
+    Tool, ToolContext, ToolExecution, ToolInput, ToolOutputBody, ToolOutputContent, ToolResult,
+    ToolRuntime, Tools, WebSearchConfig,
+};
+
+struct ConcurrencyProbe {
+    state: Arc<ConcurrencyProbeState>,
+}
+
+struct ConcurrencyProbeState {
+    active: AtomicUsize,
+    maximum: AtomicUsize,
+    release: Semaphore,
+}
+
+#[async_trait::async_trait]
+impl Tool for ConcurrencyProbe {
+    fn name(&self) -> &'static str {
+        "concurrency_probe"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            self.name(),
+            "Waits until released by the test.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        let active = self.state.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.state.maximum.fetch_max(active, Ordering::SeqCst);
+        let permit = self
+            .state
+            .release
+            .acquire()
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        permit.forget();
+        self.state.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolExecution::text("released"))
+    }
+}
+
+#[tokio::test]
+async fn nested_tool_calls_are_bounded_at_128() -> Result<()> {
+    const CALLS: usize = super::MAX_CONCURRENT_NESTED_CALLS + 1;
+
+    let workspace = temporary_workspace("bounded-nested-tools")?;
+    let state = Arc::new(ConcurrencyProbeState {
+        active: AtomicUsize::new(0),
+        maximum: AtomicUsize::new(0),
+        release: Semaphore::new(0),
+    });
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(ConcurrencyProbe {
+            state: Arc::clone(&state),
+        })
+        .build()?;
+    let runtime = ToolRuntime::new_with_tools(&workspace, None, None, &tools);
+    let execution = tokio::spawn(async move {
+        let history = Vec::new();
+        runtime
+            .execute_code(
+                &format!(
+                    "await Promise.all(Array.from({{ length: {CALLS} }}, () => \
+                     tools.concurrency_probe({{}})));"
+                ),
+                test_context(&history),
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.active.load(Ordering::SeqCst) < super::MAX_CONCURRENT_NESTED_CALLS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        state.active.load(Ordering::SeqCst),
+        super::MAX_CONCURRENT_NESTED_CALLS
+    );
+    assert_eq!(
+        state.maximum.load(Ordering::SeqCst),
+        super::MAX_CONCURRENT_NESTED_CALLS
+    );
+
+    state.release.add_permits(CALLS);
+    let execution = execution.await?;
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert_eq!(execution.nested_calls.len(), CALLS);
+    assert_eq!(
+        state.maximum.load(Ordering::SeqCst),
+        super::MAX_CONCURRENT_NESTED_CALLS
+    );
+
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
 
 #[test]
 fn long_observer_yields_include_completion_grace() {

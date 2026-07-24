@@ -8,6 +8,7 @@ use std::{
     collections::HashSet,
     ffi::OsString,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::NonZeroUsize,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -49,7 +50,9 @@ use tracing::Instrument as _;
 
 const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_PAYMENT_RETRIES: usize = 4;
-const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 32;
+const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 128;
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 128;
+const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 4;
 const CA_FILENAME: &str = "mpp-egress-ca.pem";
 const MPP_REQUEST_ID: &str = "mpp-request-id";
 
@@ -66,6 +69,11 @@ pub struct EgressPolicy {
     /// challenge, so challenge lifetimes are not consumed behind payment-state
     /// serialization.
     pub max_concurrent_requests: usize,
+    /// Maximum number of concurrently accepted child proxy connections.
+    ///
+    /// Additional clients wait in the listener backlog before consuming a
+    /// process file descriptor.
+    pub max_concurrent_connections: usize,
 }
 
 impl Default for EgressPolicy {
@@ -74,6 +82,7 @@ impl Default for EgressPolicy {
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             max_payment_retries: DEFAULT_MAX_PAYMENT_RETRIES,
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+            max_concurrent_connections: DEFAULT_MAX_CONCURRENT_CONNECTIONS,
         }
     }
 }
@@ -117,6 +126,10 @@ impl MppEgress {
                 "max_concurrent_requests must be greater than zero",
             ));
         }
+        let max_concurrent_connections = NonZeroUsize::new(policy.max_concurrent_connections)
+            .ok_or(EgressError::InvalidPolicy(
+                "max_concurrent_connections must be greater than zero",
+            ))?;
 
         let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await
@@ -133,6 +146,7 @@ impl MppEgress {
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
             .build()
             .map_err(EgressError::Client)?;
         let proxy_password = random_proxy_password();
@@ -157,6 +171,7 @@ impl MppEgress {
             .with_listener(listener)
             .with_ca(authority)
             .with_rustls_connector(aws_lc_rs::default_provider())
+            .with_max_concurrent_connections(max_concurrent_connections)
             .with_http_handler(handler)
             .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
@@ -1054,6 +1069,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queues_excess_connections_before_contacting_the_origin() {
+        const CONNECTIONS: usize = 3;
+        const REQUESTS: usize = 12;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(Semaphore::new(0));
+        let app = Router::new().route(
+            "/bounded-connections",
+            get({
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                let started = Arc::clone(&started);
+                let gate = Arc::clone(&gate);
+                move || {
+                    let active = Arc::clone(&active);
+                    let maximum = Arc::clone(&maximum);
+                    let started = Arc::clone(&started);
+                    let gate = Arc::clone(&gate);
+                    async move {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(current, Ordering::SeqCst);
+                        started.notify_one();
+                        let permit = gate.acquire().await.unwrap();
+                        permit.forget();
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        "bounded"
+                    }
+                }
+            }),
+        );
+        let origin = spawn_origin(app).await;
+        let egress = MppEgress::start(
+            MockProvider::default(),
+            EgressPolicy {
+                max_concurrent_connections: CONNECTIONS,
+                max_concurrent_requests: REQUESTS,
+                ..EgressPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+        let clients = (0..REQUESTS)
+            .map(|_| proxied_client(&egress))
+            .collect::<Vec<_>>();
+        let requests = clients
+            .into_iter()
+            .map(|client| {
+                let url = format!("{origin}/bounded-connections");
+                tokio::spawn(async move { client.get(url).send().await.unwrap().status() })
+            })
+            .collect::<Vec<_>>();
+
+        while maximum.load(Ordering::SeqCst) < CONNECTIONS {
+            started.notified().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(maximum.load(Ordering::SeqCst), CONNECTIONS);
+        assert_eq!(active.load(Ordering::SeqCst), CONNECTIONS);
+
+        gate.add_permits(REQUESTS);
+        let statuses = join_all(requests)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert!(statuses.iter().all(|status| *status == AxumStatus::OK));
+        assert_eq!(maximum.load(Ordering::SeqCst), CONNECTIONS);
+        egress.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn pays_and_replays_the_exact_request_body() {
         let calls = Arc::new(AtomicUsize::new(0));
         let request_ids = Arc::new(StdMutex::new(Vec::new()));
@@ -1125,7 +1213,12 @@ mod tests {
     #[tokio::test]
     async fn pays_and_replays_ten_thousand_bounded_parallel_requests_exactly_once() {
         const REQUESTS: usize = 10_000;
-        const CONCURRENCY: usize = 100;
+        // Each in-process request owns client, proxy, and mock-origin sockets,
+        // while pooled keep-alive connections overlap request waves and the
+        // Rust test runner executes the other proxy tests concurrently. This
+        // test exercises exact-once behavior at volume; the dedicated bounds
+        // tests cover the production concurrency limits.
+        const CONCURRENCY: usize = 8;
 
         let calls = Arc::new(AtomicUsize::new(0));
         let observations = Arc::new(StdMutex::new(Vec::with_capacity(REQUESTS * 2)));

@@ -3,6 +3,7 @@ mod config;
 mod mcp;
 mod mpp;
 mod observability;
+mod resource;
 mod run;
 mod subagents;
 mod tui;
@@ -67,6 +68,14 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();
+    let uses_tempo = match &cli.command {
+        Some(Command::Run(command)) => command.agent.uses_tempo(),
+        None => cli.agent.uses_tempo(),
+        Some(Command::Auth(_) | Command::Update(_)) => false,
+    };
+    if uses_tempo {
+        resource::ensure_mpp_file_descriptor_capacity()?;
+    }
     match cli.command {
         Some(Command::Auth(command)) => command.run().await,
         Some(Command::Run(command)) => {

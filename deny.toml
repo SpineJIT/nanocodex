@@ -47,6 +47,7 @@ unknown-registry = "deny"
 unknown-git = "deny"
 required-git-spec = "rev"
 allow-git = [
+    "https://github.com/gakonst/hudsucker",
     "https://github.com/openai-oss-forks/tokio-tungstenite",
     "https://github.com/openai-oss-forks/tungstenite-rs",
     "https://github.com/tempoxyz/mpp-rs",
