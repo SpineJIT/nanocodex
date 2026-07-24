@@ -51,7 +51,7 @@ use tracing::Instrument as _;
 const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_PAYMENT_RETRIES: usize = 4;
 const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 128;
-const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 32;
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 128;
 const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 4;
 const CA_FILENAME: &str = "mpp-egress-ca.pem";
 const MPP_REQUEST_ID: &str = "mpp-request-id";
