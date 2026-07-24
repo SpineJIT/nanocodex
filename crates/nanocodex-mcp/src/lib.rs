@@ -606,7 +606,7 @@ mod tests {
             let (name, url) = entry
                 .split_once('=')
                 .expect("each smoke server must use NAME=URL");
-            let mut server = McpServer::http(url).startup_timeout(Duration::from_secs(120));
+            let mut server = McpServer::http(url).startup_timeout(Duration::from_mins(2));
             if let Some(variable) = bearers.get(name) {
                 server = server.bearer_token_env(variable);
             }

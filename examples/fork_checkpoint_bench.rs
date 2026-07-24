@@ -28,7 +28,7 @@ const DEFAULT_TURNS: usize = 10;
 const DEFAULT_PREFIX_FACTS: usize = 600;
 const HISTORICAL_FORK_TURNS: [usize; 3] = [3, 6, 9];
 const MAINLINE_CONTINUATIONS: usize = 2;
-const IO_TIMEOUT: Duration = Duration::from_secs(120);
+const IO_TIMEOUT: Duration = Duration::from_mins(2);
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 

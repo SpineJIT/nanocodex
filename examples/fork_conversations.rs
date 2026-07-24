@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
     // The fixed transport/storage policy and these layers are inherited by
     // every fork, while each fork receives fresh mutable transport state.
     let responses = configured_responses()?
-        .layer(TimeoutLayer::new(Duration::from_secs(120)))
+        .layer(TimeoutLayer::new(Duration::from_mins(2)))
         .layer(ConcurrencyLimitLayer::new(1))
         .build();
 

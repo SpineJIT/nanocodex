@@ -32,7 +32,7 @@ const DEFAULT_TURNS: usize = 4;
 const DEFAULT_PREFIX_FACTS: usize = 600;
 const DEFAULT_FORK_TURNS: &[usize] = &[2, 4];
 const DEFAULT_MAINLINE_CONTINUATIONS: usize = 1;
-const IO_TIMEOUT: Duration = Duration::from_secs(120);
+const IO_TIMEOUT: Duration = Duration::from_mins(2);
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 

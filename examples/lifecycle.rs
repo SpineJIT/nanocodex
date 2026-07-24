@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
     // custom stack uses `Responses::builder().service(|| make_stack())` so
     // cancellation, forks, and children always receive fresh mutable state.
     let responses = Responses::builder()
-        .layer(TimeoutLayer::new(Duration::from_secs(120)))
+        .layer(TimeoutLayer::new(Duration::from_mins(2)))
         .build();
 
     // `tools(tools)` is the normal path for shareable handlers. Agent-relative

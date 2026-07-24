@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// One MCP server transport and its lifecycle limits.
 #[derive(Clone)]

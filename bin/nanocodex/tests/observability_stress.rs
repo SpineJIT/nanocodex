@@ -136,7 +136,7 @@ async fn attached_subagents_share_the_parent_trace_and_overlap() -> Result<()> {
     let server = tokio::spawn(serve_subagent_responses(listener));
     let workspace = temporary_workspace()?;
     let mut command = subagent_stress_command(&websocket_url, &workspace, &otlp_endpoint);
-    let output = timeout(Duration::from_secs(60), command.output())
+    let output = timeout(Duration::from_mins(1), command.output())
         .await
         .map_err(|_| eyre!("attached-subagent stress CLI timed out"))??;
     timeout(Duration::from_secs(10), server)

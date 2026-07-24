@@ -2,7 +2,7 @@
 name = "nanousd-api"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.93"
+rust-version.workspace = true
 publish = false
 authors.workspace = true
 license.workspace = true

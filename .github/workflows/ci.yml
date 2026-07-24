@@ -28,7 +28,7 @@ jobs:
           - os: ubuntu-latest
             rust: stable
           - os: ubuntu-latest
-            rust: "1.88"
+            rust: "1.97"
           - os: macos-latest
             rust: stable
     steps:
@@ -42,9 +42,6 @@ jobs:
         with:
           cache-on-failure: true
       - run: cargo test --workspace --locked
-        if: matrix.rust != '1.88'
-      - run: cargo test --workspace --exclude nanocodex-bin --locked
-        if: matrix.rust == '1.88'
 
   quality:
     name: rustfmt, clippy, and docs

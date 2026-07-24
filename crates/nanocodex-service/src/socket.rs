@@ -23,7 +23,7 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_IDLE_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_millis(100)
 } else {
-    Duration::from_secs(300)
+    Duration::from_mins(5)
 };
 const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
 const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";

@@ -92,9 +92,9 @@ The OpenAI proxy offers native v2 before legacy v1. The v2 challenge uses:
 in-band transports without performing an unrelated HTTP POST. Its existing SSE
 helper delegates to that method and then performs the POST.
 
-Native session dependencies require Rust 1.93, newer than Nanocodex's Rust
-1.88 library baseline. The executable declares that higher MSRV while the MPP
-integration stays out of the library crates and their dependency graph.
+Nanocodex's Rust 1.97 workspace baseline covers the native session dependencies.
+The MPP integration stays out of the core agent library crates and their
+dependency graph.
 
 ## OpenAI proxy
 

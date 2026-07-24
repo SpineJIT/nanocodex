@@ -1344,7 +1344,7 @@ fn nested_shell_yields_follow_the_handlers_bounds() {
             "write_stdin",
             &serde_json::json!({ "session_id": 1, "yield_time_ms": 120_000 }),
         ),
-        Some(Duration::from_secs(120))
+        Some(Duration::from_mins(2))
     );
     assert_eq!(
         nested_tool_yield_after(

@@ -30,7 +30,7 @@ const OAUTH_SCOPE: &str =
 const CALLBACK_PATH: &str = "/auth/callback";
 const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
 const REFRESH_EARLY_SECONDS: i64 = 5 * 60;
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const LOGIN_TIMEOUT: Duration = Duration::from_mins(5);
 const AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Non-secret information about a stored `ChatGPT` authorization.

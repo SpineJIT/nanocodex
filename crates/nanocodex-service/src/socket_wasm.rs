@@ -9,7 +9,7 @@ use wasm_bindgen_futures::JsFuture;
 use crate::ResponsesError;
 use nanocodex_core::monotonic_now_ns;
 
-const EVENT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const EVENT_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
 #[wasm_bindgen]
 extern "C" {

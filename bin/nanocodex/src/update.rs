@@ -47,7 +47,7 @@ impl Update {
     pub(crate) async fn run(self) -> Result<()> {
         let client = Client::builder()
             .user_agent(format!("nanocodex/{}", version::SEMVER_VERSION))
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_mins(1))
             .build()
             .wrap_err("failed to create the update client")?;
         let release = client
