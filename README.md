@@ -711,6 +711,33 @@ The smaller boundary is the feature. A caller builds an agent, receives
 awaits independently owned `TurnResult`s. The CLI, Harbor adapter, Python
 binding, and Rust/WASM binding all consume that same API.
 
+### Codex request parity
+
+The deterministic differential drives stock Codex and Nanocodex through basic
+tools, continued PTY shells, bounded output, failures, images, WebSocket
+reconnect/replay, automatic compaction, and SIGINT cleanup:
+
+```bash
+cargo build -p nanocodex-bin
+python3 benchmarks/codex_request_parity.py \
+  --codex-bin ~/github/openai/codex/codex-rs/target/debug/codex \
+  --nanocodex-bin target/debug/nanocodex \
+  --output /tmp/nanocodex-request-parity.json
+```
+
+The default command succeeds when both implementations complete every scenario,
+preserve stable request identity, replay or compact complete history, and clean
+up cancelled descendants. Add `--check` when exact normalized request and
+transport equality is required; it currently reports the documented
+WebSocket-to-HTTPS fallback. App-owned internal turn metadata is an explicit
+normalization exclusion. Use repeated `--scenario <name>` flags to run only
+selected cases.
+
+Nanocodex deliberately defaults to `Thinking::High`; stock Codex currently
+defaults the bundled Sol model to `low`. The differential passes the same
+explicit effort to both binaries so it tests harness behavior rather than that
+product-policy choice.
+
 ### How Fast?
 
 Focused local profiling also covers the ordinary streaming and tool path. On an

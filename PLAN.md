@@ -432,9 +432,38 @@ The local upstream review is complete through
 `openai/codex@8431dc590a5bba9a1185d5579a5aabfbc469e50b`. Nanocodex adopted the
 272,000-token Sol context window and 244,800-token automatic compaction
 threshold, the generated-image no-duplicate-render hint from `7e51abbbd1`, and
-terminal invalid-tool-image handling from `8431dc590a`. Audio forwarding remains
-deferred until the supported model advertises audio input. Review and classify
-every later upstream commit before advancing this checkpoint.
+terminal invalid-tool-image handling from `8431dc590a`. It also requests Codex's
+default automatic reasoning summary and matches the current Code Mode results
+and diagnostics for `apply_patch`, `update_plan`, `view_image`, and malformed
+shell limits. The Code Mode audio helper remains model-visible because stock
+Codex advertises it even though the supported model metadata currently lists
+only text and image input; this does not add a broader audio-input SDK surface.
+
+Codex's default compaction scope still charges total active context, so its
+window IDs and prefill counters are bookkeeping rather than a different
+automatic-compaction boundary for the supported model. Its richer installation,
+window, sandbox, and workspace request metadata is likewise not a model-input
+contract; do not import that app/session subsystem without a measured backend
+behavior that requires it. The known runtime-semantic difference is
+locale-aware `Date`/`Intl`: stock Code Mode's V8 build includes ICU, while the
+embedded QuickJS runtime does not. Exact parity for that surface requires an
+ICU-capable runtime rather than a partial locale shim. The local
+`benchmarks/codex_request_parity.py` differential now exercises basic tools,
+continued PTY shells, bounded shell output, tool failures, images, WebSocket
+reconnect/replay, automatic compaction, and process cancellation against a
+Codex binary built from this checkpoint. It found and fixed stale running-shell
+notices after a completed `write_stdin` call, SIGINT cleanup in the headless
+CLI, premature tool-output rewriting based on reported token usage instead of
+estimated model-visible history, and the model-visible shell chunk-ID shape.
+The suite passes an explicit matching effort because Nanocodex deliberately
+defaults to high while the bundled Codex Sol model currently defaults to low.
+It also records two deliberate transport/surface differences instead of hiding
+them: Codex falls back to HTTPS after an exhausted WebSocket attempt while
+Nanocodex reconnects its fixed transport, and Codex carries app-owned internal
+turn metadata that the library deliberately does not expose. Both
+implementations otherwise replay complete history and install the same opaque
+compaction item. Review and classify every later upstream commit before
+advancing this checkpoint.
 
 ## Deferred and out of scope
 
