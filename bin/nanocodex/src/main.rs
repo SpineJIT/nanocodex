@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod credits;
 mod mcp;
 mod mpp;
 mod observability;
@@ -43,6 +44,8 @@ struct Cli {
 enum Command {
     /// Manage `ChatGPT` subscription login.
     Auth(auth::Auth),
+    /// Inspect or purchase Nanocodex NANOUSD credits.
+    Credits(credits::Credits),
     /// Run one prompt and stream JSONL events to stdout.
     Run(Box<RunCommand>),
     /// Update this executable from a GitHub release channel.
@@ -71,13 +74,14 @@ async fn main() -> Result<()> {
     let uses_tempo = match &cli.command {
         Some(Command::Run(command)) => command.agent.uses_tempo(),
         None => cli.agent.uses_tempo(),
-        Some(Command::Auth(_) | Command::Update(_)) => false,
+        Some(Command::Auth(_) | Command::Credits(_) | Command::Update(_)) => false,
     };
     if uses_tempo {
         resource::ensure_mpp_file_descriptor_capacity()?;
     }
     match cli.command {
         Some(Command::Auth(command)) => command.run().await,
+        Some(Command::Credits(command)) => command.run().await,
         Some(Command::Run(command)) => {
             let _observability = command.observability.install(false, command.agent.cwd())?;
             command.run.run(command.agent).await

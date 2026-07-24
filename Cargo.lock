@@ -4016,6 +4016,7 @@ dependencies = [
 name = "nanocodex-bin"
 version = "0.1.1"
 dependencies = [
+ "alloy-primitives",
  "alloy-transport-mpp",
  "arboard",
  "base64",
@@ -4032,6 +4033,7 @@ dependencies = [
  "nanocodex",
  "nanocodex-observability",
  "nanocodex-tools",
+ "nanousd",
  "nix 0.30.1",
  "pulldown-cmark",
  "ratatui",
@@ -4204,6 +4206,51 @@ version = "0.1.1"
 dependencies = [
  "nanocodex",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "nanousd"
+version = "0.1.1"
+dependencies = [
+ "alloy-primitives",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "url",
+]
+
+[[package]]
+name = "nanousd-api"
+version = "0.1.1"
+dependencies = [
+ "alloy",
+ "alloy-primitives",
+ "async-trait",
+ "axum",
+ "clap",
+ "dotenvy",
+ "eyre",
+ "getrandom 0.3.4",
+ "hex",
+ "hmac 0.13.0",
+ "mpp",
+ "nanousd",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tempo-alloy",
+ "tempo-primitives",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+ "url",
+ "uuid",
 ]
 
 [[package]]

@@ -14,6 +14,7 @@ RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf
 COPY Cargo.toml Cargo.lock ./
 COPY bin/nanocodex/Cargo.toml bin/nanocodex/Cargo.toml
 COPY bin/nanocodex/build.rs bin/nanocodex/build.rs
+COPY bin/nanousd-api/Cargo.toml bin/nanousd-api/Cargo.toml
 COPY js/bindings/Cargo.toml js/bindings/Cargo.toml
 COPY py/bindings/Cargo.toml py/bindings/Cargo.toml
 COPY crates/mpp-egress/Cargo.toml crates/mpp-egress/Cargo.toml
@@ -24,11 +25,13 @@ COPY crates/nanocodex-mcp/Cargo.toml crates/nanocodex-mcp/Cargo.toml
 COPY crates/nanocodex-observability/Cargo.toml crates/nanocodex-observability/Cargo.toml
 COPY crates/nanocodex-service/Cargo.toml crates/nanocodex-service/Cargo.toml
 COPY crates/nanocodex-tools/Cargo.toml crates/nanocodex-tools/Cargo.toml
+COPY crates/nanousd/Cargo.toml crates/nanousd/Cargo.toml
 COPY examples/Cargo.toml examples/Cargo.toml
 # Keep dependency compilation in a manifest-only layer. Source-only edits reuse
 # this layer, while the cache mounts retain Cargo downloads and target outputs.
 RUN mkdir bin/nanocodex/src \
         bin/nanocodex/benches \
+        bin/nanousd-api/src \
         js/bindings/src \
         py/bindings/src \
         crates/mpp-egress/src \
@@ -40,9 +43,11 @@ RUN mkdir bin/nanocodex/src \
         crates/nanocodex-observability/src \
         crates/nanocodex-service/src \
         crates/nanocodex-service/benches \
-        crates/nanocodex-tools/src && \
+        crates/nanocodex-tools/src \
+        crates/nanousd/src && \
     printf 'fn main() {}\n' > bin/nanocodex/src/main.rs && \
     printf 'fn main() {}\n' > bin/nanocodex/benches/tui_render.rs && \
+    printf 'fn main() {}\n' > bin/nanousd-api/src/main.rs && \
     printf '\n' > js/bindings/src/lib.rs && \
     printf '\n' > py/bindings/src/lib.rs && \
     printf '\n' > crates/mpp-egress/src/lib.rs && \
@@ -55,6 +60,7 @@ RUN mkdir bin/nanocodex/src \
     printf '\n' > crates/nanocodex-service/src/lib.rs && \
     printf 'fn main() {}\n' > crates/nanocodex-service/benches/tower_responses.rs && \
     printf '\n' > crates/nanocodex-tools/src/lib.rs && \
+    printf '\n' > crates/nanousd/src/lib.rs && \
     printf 'fn main() {}\n' > examples/minimal.rs && \
     printf 'fn main() {}\n' > examples/follow_on.rs && \
     printf 'fn main() {}\n' > examples/custom_tool.rs && \
@@ -71,6 +77,7 @@ COPY crates ./crates
 RUN --mount=type=cache,id=nanocodex-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=nanocodex-target-${TARGETARCH},target=/build/target \
     touch bin/nanocodex/src/main.rs \
+        bin/nanousd-api/src/main.rs \
         crates/mpp-egress/src/lib.rs \
         crates/nanocodex/src/lib.rs \
         crates/nanocodex-core/src/lib.rs \
@@ -78,7 +85,8 @@ RUN --mount=type=cache,id=nanocodex-cargo-registry,target=/usr/local/cargo/regis
         crates/nanocodex-mcp/src/lib.rs \
         crates/nanocodex-observability/src/lib.rs \
         crates/nanocodex-service/src/lib.rs \
-        crates/nanocodex-tools/src/lib.rs && \
+        crates/nanocodex-tools/src/lib.rs \
+        crates/nanousd/src/lib.rs && \
     cargo build --locked --profile "${CARGO_PROFILE}" && \
     mkdir /out && \
     case "${CARGO_PROFILE}" in \

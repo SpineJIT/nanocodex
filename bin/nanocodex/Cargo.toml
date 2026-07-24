@@ -13,6 +13,7 @@ build = "build.rs"
 
 [dependencies]
 arboard.workspace = true
+alloy-primitives.workspace = true
 base64.workspace = true
 alloy-transport-mpp = { version = "=0.2.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "c5933597091230151368c426eb2061cca9192796" }
 clap.workspace = true
@@ -24,6 +25,7 @@ image.workspace = true
 nanocodex.workspace = true
 nanocodex-observability.workspace = true
 nix.workspace = true
+nanousd.workspace = true
 pulldown-cmark.workspace = true
 mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "c5933597091230151368c426eb2061cca9192796", default-features = false, features = ["tempo", "ws", "sqlite", "reqwest-rustls-tls"] }
 mpp-egress.workspace = true
