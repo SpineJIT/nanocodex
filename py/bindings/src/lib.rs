@@ -21,7 +21,7 @@ struct Nanocodex {
 #[pymethods]
 impl Nanocodex {
     #[new]
-    #[pyo3(signature = (api_key = None, *, auth_file = None, thinking = "medium", reasoning_mode = "standard", fast_mode = false, workspace = None, instructions = None))]
+    #[pyo3(signature = (api_key = None, *, auth_file = None, thinking = "high", reasoning_mode = "standard", fast_mode = false, workspace = None, instructions = None))]
     fn new(
         api_key: Option<String>,
         auth_file: Option<String>,

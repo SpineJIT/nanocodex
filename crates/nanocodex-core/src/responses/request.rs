@@ -711,8 +711,8 @@ mod tests {
     }
 
     #[test]
-    fn thinking_defaults_to_medium() {
-        assert_eq!(ModelConfig::default().thinking, Thinking::Medium);
+    fn thinking_defaults_to_high() {
+        assert_eq!(ModelConfig::default().thinking, Thinking::High);
     }
 
     #[test]

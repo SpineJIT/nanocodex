@@ -2437,7 +2437,7 @@ mod tests {
         app.open_reasoning_picker();
 
         handle_key(
-            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
             &mut app,
             "main-session",
             &commands,
@@ -2455,20 +2455,20 @@ mod tests {
         assert!(matches!(
             worker.try_recv(),
             Ok(WorkerCommand::SetThinking {
-                thinking: Thinking::High
+                thinking: Thinking::Medium
             })
         ));
-        assert_eq!(app.thinking(), Thinking::Medium);
+        assert_eq!(app.thinking(), Thinking::High);
 
         handle_worker_update(
             &mut app,
             WorkerEvent::ThinkingChanged {
-                thinking: Thinking::High,
+                thinking: Thinking::Medium,
             },
             &commands,
         )
         .unwrap();
-        assert_eq!(app.thinking(), Thinking::High);
+        assert_eq!(app.thinking(), Thinking::Medium);
     }
 
     #[test]

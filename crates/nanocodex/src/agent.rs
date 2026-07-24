@@ -533,7 +533,7 @@ impl<S> NanocodexBuilder<S> {
         self
     }
 
-    /// Sets the model thinking level. The default is [`Thinking::Medium`].
+    /// Sets the model thinking level. The default is [`Thinking::High`].
     #[must_use]
     pub const fn thinking(mut self, thinking: Thinking) -> Self {
         self.config.thinking = thinking;

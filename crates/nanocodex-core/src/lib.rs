@@ -358,8 +358,8 @@ impl FromStr for ReasoningMode {
 pub enum Thinking {
     None,
     Low,
-    #[default]
     Medium,
+    #[default]
     High,
     Xhigh,
     Max,

@@ -918,7 +918,7 @@ fn new_session_id() -> String {
 }
 
 fn default_thinking() -> String {
-    "medium".to_owned()
+    "high".to_owned()
 }
 
 fn default_reasoning_mode() -> String {

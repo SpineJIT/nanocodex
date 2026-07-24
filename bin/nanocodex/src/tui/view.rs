@@ -90,7 +90,7 @@ fn render_reasoning_picker(frame: &mut Frame<'_>, app: &App) {
                 STANDARD_THINKING_OPTIONS.iter().enumerate()
             {
                 let mut label = (*label).to_owned();
-                if *thinking == nanocodex::Thinking::Medium {
+                if *thinking == nanocodex::Thinking::default() {
                     label.push_str(" (default)");
                 }
                 if *thinking == app.thinking() {
@@ -780,7 +780,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(footer.ends_with("gpt-5.6-sol · medium · fast "));
+        assert!(footer.ends_with("gpt-5.6-sol · high · fast "));
     }
 
     #[test]
@@ -793,7 +793,7 @@ mod tests {
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("Select Reasoning Level for gpt-5.6-sol"));
         assert!(rendered.contains("Low"));
-        assert!(rendered.contains("Medium (default) (current)"));
+        assert!(rendered.contains("High (default) (current)"));
         assert!(rendered.contains("Extra high"));
         assert!(rendered.contains("More reasoning…"));
         assert!(!rendered.contains("Maximum reasoning depth"));
@@ -1117,7 +1117,7 @@ mod tests {
                 "\"┌ Message → Main ──────────────────────────────┐\"\n",
                 "\"│                                              │\"\n",
                 "\"└──────────────────────────────────────────────┘\"\n",
-                "\" Ready  /btw <quest        gpt-5.6-sol · medium \"\n",
+                "\" Ready  /btw <quest          gpt-5.6-sol · high \"\n",
             )
         );
     }
