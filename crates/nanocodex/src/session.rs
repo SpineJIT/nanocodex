@@ -191,6 +191,22 @@ impl SessionSnapshot {
             checkpoint,
         })
     }
+
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn into_checkpoint(self) -> Result<(Arc<str>, Arc<str>, ModelCheckpoint)> {
+        let SessionResume {
+            lineage_id,
+            prompt_cache_key,
+            checkpoint,
+            ..
+        } = self.into_resume()?;
+        let checkpoint = checkpoint.ok_or_else(|| {
+            NanocodexError::InvalidSessionSnapshot(
+                "serialized session is missing its request prefix".to_owned(),
+            )
+        })?;
+        Ok((lineage_id, prompt_cache_key, checkpoint))
+    }
 }
 
 pub(crate) struct SessionResume {
