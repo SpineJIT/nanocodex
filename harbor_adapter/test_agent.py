@@ -16,7 +16,11 @@ from unittest.mock import AsyncMock
 import yaml
 from harbor.models.agent.context import AgentContext
 
-from harbor_adapter.agent import NanocodexAgent, _cli_tools_install_command
+from harbor_adapter.agent import (
+    NanocodexAgent,
+    _cli_tools_install_command,
+    _remote_binary_install_command,
+)
 from harbor_adapter.codex import ParityCodexAgent
 from harbor_adapter.environment import _toolbox_mount_setup_command
 from harbor_adapter.verifier import (
@@ -82,6 +86,39 @@ class CliToolInstallContractTests(unittest.TestCase):
             agent.exec_as_root.await_args_list[1].args[1],
             "chmod 0755 /installed-agent/nanocodex",
         )
+
+    def test_remote_binary_install_downloads_and_verifies_before_installing(
+        self,
+    ) -> None:
+        checksum = "a" * 64
+        command = _remote_binary_install_command(
+            binary_url="https://example.test/nanocodex",
+            binary_sha256=checksum,
+            destination="/installed-agent/nanocodex",
+        )
+
+        self.assertIn("curl --fail --location --retry 5", command)
+        self.assertIn("https://example.test/nanocodex", command)
+        self.assertIn("sha256sum", command)
+        self.assertIn(checksum, command)
+        self.assertIn("chmod 0755 /installed-agent/nanocodex", command)
+
+    def test_remote_binary_install_skips_controller_upload(self) -> None:
+        agent = object.__new__(NanocodexAgent)
+        agent._binary_path = Path("/missing-on-controller")
+        agent._binary_url = "https://example.test/nanocodex"
+        agent._binary_sha256 = "b" * 64
+        agent._install_node = True
+        agent.exec_as_root = AsyncMock()
+        environment = SimpleNamespace(upload_file=AsyncMock())
+
+        asyncio.run(agent.install(environment))
+
+        environment.upload_file.assert_not_awaited()
+        self.assertEqual(agent.exec_as_root.await_count, 2)
+        download_command = agent.exec_as_root.await_args_list[1].args[1]
+        self.assertIn(agent._binary_url, download_command)
+        self.assertIn(agent._binary_sha256, download_command)
 
 
 class WebSearchContractTests(unittest.TestCase):
@@ -858,6 +895,8 @@ class RunCancellationContractTests(unittest.IsolatedAsyncioTestCase):
                 return_value=SimpleNamespace(stdout=stream, stderr="")
             )
             environment = SimpleNamespace(capabilities=SimpleNamespace(mounted=True))
+            event_spool = agent.logs_dir / "events.jsonl.tmp"
+            event_spool.write_text(stream, encoding="utf-8")
 
             await agent.run("test", environment, AgentContext())
 
@@ -871,6 +910,7 @@ class RunCancellationContractTests(unittest.IsolatedAsyncioTestCase):
                 stream,
             )
             self.assertFalse((agent.logs_dir / "events.jsonl.host.tmp").exists())
+            self.assertFalse(event_spool.exists())
 
     def test_nonzero_exit_publishes_captured_stdout_before_classification(
         self,

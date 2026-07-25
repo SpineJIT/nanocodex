@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.96-alpine3.21 AS build
+FROM rust:1.97-alpine3.22 AS build
 
 ARG TARGETARCH
 ARG CARGO_PROFILE=dev
@@ -98,7 +98,7 @@ RUN --mount=type=cache,id=nanocodex-cargo-registry,target=/usr/local/cargo/regis
 FROM scratch AS artifact
 COPY --from=build /out/nanocodex /nanocodex
 
-FROM alpine:3.21 AS runtime
+FROM alpine:3.22 AS runtime
 RUN apk add --no-cache ca-certificates git
 COPY --from=build /out/nanocodex /usr/local/bin/nanocodex
 ENTRYPOINT ["/usr/local/bin/nanocodex"]

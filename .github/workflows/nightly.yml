@@ -29,11 +29,9 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: nanocodex-x86_64-unknown-linux-gnu
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: nanocodex-aarch64-unknown-linux-gnu
-            apt: gcc-aarch64-linux-gnu
-            linker: aarch64-linux-gnu-gcc
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: nanocodex-aarch64-apple-darwin
@@ -54,16 +52,9 @@ jobs:
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           cache-on-failure: true
-      - name: Install cross-linker
-        if: matrix.apt != ''
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes ${{ matrix.apt }}
       - name: Build nightly binary
         shell: bash
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
           TAG_NAME: nightly
           VERGEN_GIT_SHA: ${{ github.sha }}
         run: cargo build --locked --profile maxperf --package nanocodex-bin --target ${{ matrix.target }}
@@ -86,10 +77,57 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  build-harbor:
+    if: github.repository == 'gakonst/nanocodex'
+    name: build Harbor static x86_64 Linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Build static Harbor agent
+        shell: bash
+        env:
+          TAG_NAME: nightly
+          VERGEN_GIT_SHA: ${{ github.sha }}
+        run: |
+          mkdir dist
+          docker build \
+            --platform linux/amd64 \
+            --build-arg CARGO_PROFILE=maxperf \
+            --build-arg TAG_NAME="$TAG_NAME" \
+            --build-arg VERGEN_GIT_SHA="$VERGEN_GIT_SHA" \
+            --file harbor_adapter/nanocodex.Dockerfile \
+            --target artifact \
+            --output type=local,dest=dist \
+            .
+          mv dist/nanocodex dist/nanocodex-x86_64-unknown-linux-musl
+      - name: Verify the Harbor artifact is portable
+        shell: bash
+        run: |
+          file dist/nanocodex-x86_64-unknown-linux-musl
+          docker run --rm \
+            --volume "$PWD/dist:/dist:ro" \
+            alpine:3.21 \
+            /dist/nanocodex-x86_64-unknown-linux-musl --version
+          docker run --rm \
+            --volume "$PWD/dist:/dist:ro" \
+            ubuntu:22.04 \
+            /dist/nanocodex-x86_64-unknown-linux-musl --version
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nanocodex-x86_64-unknown-linux-musl
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
     if: github.repository == 'gakonst/nanocodex'
     name: publish immutable and rolling nightlies
-    needs: build
+    needs: [build, build-harbor]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
