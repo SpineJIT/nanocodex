@@ -3,19 +3,19 @@ use alloy::{
     primitives::Address,
     signers::{Error, Signer},
 };
-use mpp::client::tempo::{signing::TempoP256Signer, wallet::TempoWallet};
+use mpp::client::tempo::{signing::TempoPrimitiveSigner, wallet::TempoWallet};
 use tempo_alloy::TempoNetwork;
 use tempo_primitives::{
     TempoTxEnvelope,
     transaction::{KeychainSignature, TempoSignature, TempoTypedTransaction},
 };
 
-/// Adapts Tempo Wallet's P-256 access key to Alloy's provider wallet layer.
+/// Adapts Tempo Wallet's access key to Alloy's provider wallet layer.
 #[derive(Clone)]
 pub(crate) struct TempoAccessKeyWallet {
     account: Address,
     access_key: Address,
-    signer: TempoP256Signer,
+    signer: TempoPrimitiveSigner,
 }
 
 impl From<&TempoWallet> for TempoAccessKeyWallet {
