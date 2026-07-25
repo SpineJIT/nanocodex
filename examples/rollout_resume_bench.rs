@@ -21,6 +21,7 @@ async fn main() -> Result<()> {
     for thread_id in thread_ids {
         let mut samples = Vec::with_capacity(iterations);
         let mut history_items = 0;
+        let mut visible_messages = 0;
         let mut rollout_bytes = 0;
         let mut loaded = None;
         for _ in 0..iterations {
@@ -33,6 +34,7 @@ async fn main() -> Result<()> {
             history_items = serde_json::to_value(session.snapshot())?["history"]
                 .as_array()
                 .map_or(0, Vec::len);
+            visible_messages = session.messages().len();
             loaded = Some(session);
         }
         let session = loaded.ok_or_else(|| eyre!("iteration count must be positive"))?;
@@ -46,7 +48,7 @@ async fn main() -> Result<()> {
         let sample_count = u32::try_from(samples.len()).wrap_err("too many benchmark samples")?;
         let mean = samples.iter().sum::<f64>() / f64::from(sample_count);
         println!(
-            "{thread_id}\tbytes={rollout_bytes}\thistory={history_items}\tvalidated=true\tmin_ms={:.3}\tp50_ms={median:.3}\tmean_ms={mean:.3}\tmax_ms={:.3}",
+            "{thread_id}\tbytes={rollout_bytes}\thistory={history_items}\tmessages={visible_messages}\tvalidated=true\tmin_ms={:.3}\tp50_ms={median:.3}\tmean_ms={mean:.3}\tmax_ms={:.3}",
             samples[0],
             samples[samples.len() - 1]
         );

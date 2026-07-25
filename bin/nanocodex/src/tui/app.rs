@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nanocodex::{AgentEvent, AgentEventKind, Prompt, Thinking, UserInput};
+use nanocodex::{AgentEvent, AgentEventKind, Prompt, RolloutMessage, Thinking, UserInput};
 use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
@@ -1180,6 +1180,16 @@ impl App {
             fast_mode: false,
             thinking: Thinking::default(),
             reasoning_picker: None,
+        }
+    }
+
+    pub(super) fn restore_messages(&mut self, messages: impl IntoIterator<Item = RolloutMessage>) {
+        for message in messages {
+            let item = match message {
+                RolloutMessage::User(message) => TranscriptItem::User(message),
+                RolloutMessage::Assistant(message) => TranscriptItem::Assistant(message),
+            };
+            self.main.push_output(item);
         }
     }
 
@@ -3052,7 +3062,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use nanocodex::{AgentEvent, AgentEventKind, PromptInput, UserInput};
+    use nanocodex::{AgentEvent, AgentEventKind, PromptInput, RolloutMessage, UserInput};
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
     use serde_json::{Value, json};
 
@@ -3071,6 +3081,21 @@ mod tests {
             "payload": payload,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn restored_rollout_messages_seed_the_visible_transcript() {
+        let mut app = App::new(std::path::PathBuf::from("/worktree"));
+        app.restore_messages([
+            RolloutMessage::User("visible prompt".to_owned()),
+            RolloutMessage::Assistant("visible answer".to_owned()),
+        ]);
+
+        assert_eq!(app.main.transcript.len(), 2);
+        assert_eq!(
+            app.main.transcript.latest_user_message(),
+            Some("visible prompt")
+        );
     }
 
     #[test]

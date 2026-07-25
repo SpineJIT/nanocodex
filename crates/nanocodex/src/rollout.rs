@@ -67,6 +67,7 @@ pub struct DurableSession {
     thread_id: String,
     rollout_path: PathBuf,
     snapshot: SessionSnapshot,
+    messages: Vec<RolloutMessage>,
 }
 
 impl DurableSession {
@@ -83,7 +84,7 @@ impl DurableSession {
                 format!("no Codex rollout found for thread {thread_id}"),
             )
         })?;
-        let (workspace, history) = materialize_rollout(&rollout_path, thread_id)?;
+        let (workspace, history, messages) = materialize_rollout(&rollout_path, thread_id)?;
         let snapshot = SessionSnapshot::from_rollout(thread_id.to_owned(), workspace, history)
             .map_err(io::Error::other)?;
         Ok(Self {
@@ -91,6 +92,7 @@ impl DurableSession {
             thread_id: thread_id.to_owned(),
             rollout_path,
             snapshot,
+            messages,
         })
     }
 
@@ -118,6 +120,12 @@ impl DurableSession {
         &self.rollout_path
     }
 
+    /// Returns user and assistant messages used to restore a visible transcript.
+    #[must_use]
+    pub fn messages(&self) -> &[RolloutMessage] {
+        &self.messages
+    }
+
     /// Splits this loaded boundary into the builder inputs needed to continue it.
     #[must_use]
     pub fn into_parts(self) -> (String, SessionSnapshot, RolloutConfig) {
@@ -127,6 +135,15 @@ impl DurableSession {
             RolloutConfig::new(self.codex_home).resumed(self.rollout_path),
         )
     }
+}
+
+/// A user-visible message reconstructed from a Codex-compatible rollout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RolloutMessage {
+    /// A submitted user prompt.
+    User(String),
+    /// An assistant message displayed by the originating client.
+    Assistant(String),
 }
 
 fn find_rollout_path(codex_home: &Path, thread_id: &str) -> io::Result<Option<PathBuf>> {
@@ -175,9 +192,13 @@ fn find_rollout_path(codex_home: &Path, thread_id: &str) -> io::Result<Option<Pa
     Ok(None)
 }
 
-fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<(String, Vec<ResponseItem>)> {
+fn materialize_rollout(
+    path: &Path,
+    thread_id: &str,
+) -> io::Result<(String, Vec<ResponseItem>, Vec<RolloutMessage>)> {
     let mut workspace = None;
     let mut history = Vec::new();
+    let mut messages = Vec::new();
     for (index, line) in BufReader::new(File::open(path)?).lines().enumerate() {
         let line = line?;
         let value: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
@@ -238,6 +259,11 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<(String, Vec<
                     )
                 })?;
             }
+            Some("event_msg") => {
+                if let Some(message) = visible_rollout_message(&value["payload"]) {
+                    messages.push(message);
+                }
+            }
             _ => {}
         }
     }
@@ -257,7 +283,20 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<(String, Vec<
             ),
         )
     })?;
-    Ok((workspace, history))
+    Ok((workspace, history, messages))
+}
+
+fn visible_rollout_message(payload: &serde_json::Value) -> Option<RolloutMessage> {
+    let message = payload
+        .get("message")?
+        .as_str()
+        .filter(|message| !message.is_empty())?
+        .to_owned();
+    match payload.get("type")?.as_str()? {
+        "user_message" => Some(RolloutMessage::User(message)),
+        "agent_message" => Some(RolloutMessage::Assistant(message)),
+        _ => None,
+    }
 }
 
 /// Stable identity and file location of a recorded Nanocodex thread.
@@ -1149,6 +1188,11 @@ mod tests {
             }),
             serde_json::json!({
                 "timestamp": "2026-07-24T12:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "visible prompt"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-24T12:00:01Z",
                 "type": "response_item",
                 "payload": {
                     "type": "message",
@@ -1170,6 +1214,11 @@ mod tests {
                     "previous_window_id": "window-1",
                     "window_id": "window-2"
                 }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-24T12:00:03Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "visible answer"}
             }),
             serde_json::json!({
                 "timestamp": "2026-07-24T12:00:03Z",
@@ -1200,6 +1249,13 @@ mod tests {
         assert!(history.contains("retained"));
         assert!(history.contains("continued"));
         assert!(!history.contains("discarded"));
+        assert_eq!(
+            session.messages(),
+            [
+                RolloutMessage::User("visible prompt".to_owned()),
+                RolloutMessage::Assistant("visible answer".to_owned()),
+            ]
+        );
     }
 
     #[tokio::test]

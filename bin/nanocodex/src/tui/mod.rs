@@ -477,6 +477,10 @@ pub(crate) async fn run(
     resume: Option<DurableSession>,
 ) -> Result<()> {
     let initial_thinking = config.thinking();
+    let restored_messages = resume
+        .as_ref()
+        .map(|session| session.messages().to_vec())
+        .unwrap_or_default();
     let cwd = resume
         .as_ref()
         .map(|session| PathBuf::from(session.workspace()))
@@ -498,10 +502,9 @@ pub(crate) async fn run(
     let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
     let mut input_events = EventStream::new();
     let mut ticker = ui_ticker();
-    let mut ui = UiModel::new(
-        App::new(cwd).with_thinking(initial_thinking),
-        Arc::clone(&root_session_id),
-    );
+    let mut app = App::new(cwd).with_thinking(initial_thinking);
+    app.restore_messages(restored_messages);
+    let mut ui = UiModel::new(app, Arc::clone(&root_session_id));
     let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
     let mut stream_telemetry = StreamTelemetry::default();
     let mut view_telemetry = ViewTelemetry::new(Arc::clone(&root_session_id));

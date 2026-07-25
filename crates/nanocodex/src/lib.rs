@@ -56,7 +56,7 @@ pub use responses::{FactoryResponses, LayeredResponses, StandardResponses};
 #[cfg(not(target_family = "wasm"))]
 pub use responses::{Responses, ResponsesBuilder};
 #[cfg(not(target_family = "wasm"))]
-pub use rollout::{DurableSession, RolloutConfig, RolloutInfo};
+pub use rollout::{DurableSession, RolloutConfig, RolloutInfo, RolloutMessage};
 #[cfg(not(target_family = "wasm"))]
 pub use schemars::JsonSchema as ToolSchema;
 pub use session::SessionSnapshot;
