@@ -4039,6 +4039,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "reqwest",
+ "rustls",
  "self-replace",
  "semver 1.0.28",
  "serde",

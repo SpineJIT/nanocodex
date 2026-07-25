@@ -89,11 +89,28 @@ pub struct ResponsesService {
 impl ResponsesService {
     #[must_use]
     pub fn new(config: Arc<ModelConfig>) -> Self {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            Self::new_with_http_client(config, reqwest::Client::new())
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            Self {
+                config,
+                connection: Arc::new(Mutex::new(ConnectionState::new())),
+            }
+        }
+    }
+
+    /// Builds a transport attempt service with a caller-configured HTTPS
+    /// client.
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn new_with_http_client(config: Arc<ModelConfig>, http_client: reqwest::Client) -> Self {
         Self {
             config,
             connection: Arc::new(Mutex::new(ConnectionState::new())),
-            #[cfg(not(target_family = "wasm"))]
-            http: ResponsesHttp::new(),
+            http: ResponsesHttp::new(http_client),
         }
     }
 
@@ -101,6 +118,19 @@ impl ResponsesService {
     #[must_use]
     pub fn standard(config: Arc<ModelConfig>) -> DefaultResponsesService {
         Retry::new(ResponsesRetryPolicy, Self::new(config))
+    }
+
+    /// Builds the standard retry stack with a caller-configured HTTPS client.
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn standard_with_http_client(
+        config: Arc<ModelConfig>,
+        http_client: reqwest::Client,
+    ) -> DefaultResponsesService {
+        Retry::new(
+            ResponsesRetryPolicy,
+            Self::new_with_http_client(config, http_client),
+        )
     }
 
     async fn run(

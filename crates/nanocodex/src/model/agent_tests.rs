@@ -222,6 +222,53 @@ async fn chatgpt_https_uses_subscription_headers_and_ephemeral_replay() -> Resul
     Ok(())
 }
 
+#[tokio::test]
+async fn https_uses_the_configured_http_client() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let request = next_http_json(&listener).await?;
+        assert!(request.headers.contains("x-nanocodex-client: configured"));
+        send_http_final(request.stream, "resp-configured-client").await
+    });
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-nanocodex-client",
+        reqwest::header::HeaderValue::from_static("configured"),
+    );
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()?;
+    let workspace = temporary_workspace("https-configured-client")?;
+    let responses = Responses::builder()
+        .transport(ResponsesTransport::Https)
+        .api_base_url(endpoint)
+        .http_client(client)
+        .build();
+    let (agent, events) = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .session_id("https-configured-client")
+        .build()?;
+
+    assert_eq!(
+        agent
+            .prompt("configured client")
+            .await?
+            .result()
+            .await?
+            .final_message,
+        "done"
+    );
+    drop((agent, events));
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock HTTPS Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
 #[test]
 fn rejects_invalid_auth_storage_and_https_history_policies() {
     let stored_chatgpt = Responses::builder().store(true).build();

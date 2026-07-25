@@ -88,6 +88,8 @@ struct ResumeCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_rustls_crypto_provider();
+
     // Keep direct `cargo run` behavior consistent with the Justfile without
     // requiring shell-specific syntax to load the repository's `.env` file.
     let _ = dotenvy::dotenv();
@@ -126,6 +128,12 @@ async fn main() -> Result<()> {
     }
 }
 
+fn install_rustls_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +150,18 @@ mod tests {
 
         assert!(cli.command.is_none());
         assert!(cli.agent.uses_tempo());
+        assert_eq!(
+            cli.agent.responses_transport(),
+            nanocodex::ResponsesTransport::Https
+        );
+    }
+
+    #[test]
+    fn rustls_crypto_provider_is_installed_idempotently() {
+        install_rustls_crypto_provider();
+        install_rustls_crypto_provider();
+
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
 
     #[test]
@@ -156,8 +176,14 @@ mod tests {
         ])
         .unwrap();
 
-        assert!(matches!(cli.command, Some(Command::Run(_))));
-        assert!(cli.agent.uses_tempo());
+        let Some(Command::Run(command)) = cli.command else {
+            unreachable!();
+        };
+        assert!(command.agent.uses_tempo());
+        assert_eq!(
+            command.agent.responses_transport(),
+            nanocodex::ResponsesTransport::Https
+        );
     }
 
     #[test]
@@ -166,6 +192,26 @@ mod tests {
             .unwrap();
 
         assert!(!cli.agent.uses_tempo());
+        assert_eq!(
+            cli.agent.responses_transport(),
+            nanocodex::ResponsesTransport::WebSocket
+        );
+    }
+
+    #[test]
+    fn tempo_websocket_transport_remains_explicitly_selectable() {
+        let cli = Cli::try_parse_from([
+            "nanocodex",
+            "--provider.tempo",
+            "--responses-transport",
+            "websocket",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.agent.responses_transport(),
+            nanocodex::ResponsesTransport::WebSocket
+        );
     }
 
     #[test]

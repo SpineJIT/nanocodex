@@ -28,6 +28,8 @@ pub struct FactoryResponses<F>(pub(crate) F);
 pub struct Responses<S = StandardResponses> {
     pub(crate) websocket_url: Option<String>,
     pub(crate) api_base_url: Option<String>,
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) http_client: Option<reqwest::Client>,
     pub(crate) transport: ResponsesTransport,
     pub(crate) history: Option<ResponsesHistory>,
     pub(crate) store: Option<bool>,
@@ -39,6 +41,8 @@ impl Default for Responses<StandardResponses> {
         Self {
             websocket_url: None,
             api_base_url: None,
+            #[cfg(not(target_family = "wasm"))]
+            http_client: None,
             transport: ResponsesTransport::WebSocket,
             history: None,
             store: None,
@@ -66,6 +70,8 @@ impl ResponsesBuilder<StandardResponses> {
             responses: Responses {
                 websocket_url: self.responses.websocket_url,
                 api_base_url: self.responses.api_base_url,
+                #[cfg(not(target_family = "wasm"))]
+                http_client: self.responses.http_client,
                 transport: self.responses.transport,
                 history: self.responses.history,
                 store: self.responses.store,
@@ -85,6 +91,8 @@ impl ResponsesBuilder<StandardResponses> {
             responses: Responses {
                 websocket_url: self.responses.websocket_url,
                 api_base_url: self.responses.api_base_url,
+                #[cfg(not(target_family = "wasm"))]
+                http_client: self.responses.http_client,
                 transport: self.responses.transport,
                 history: self.responses.history,
                 store: self.responses.store,
@@ -102,6 +110,8 @@ impl<L> ResponsesBuilder<LayeredResponses<L>> {
             responses: Responses {
                 websocket_url: self.responses.websocket_url,
                 api_base_url: self.responses.api_base_url,
+                #[cfg(not(target_family = "wasm"))]
+                http_client: self.responses.http_client,
                 transport: self.responses.transport,
                 history: self.responses.history,
                 store: self.responses.store,
@@ -154,6 +164,17 @@ impl<S> ResponsesBuilder<S> {
     #[must_use]
     pub fn api_base_url(mut self, url: impl Into<String>) -> Self {
         self.responses.api_base_url = Some(url.into());
+        self
+    }
+
+    /// Replaces the client used by the standard HTTPS Responses transport.
+    ///
+    /// This permits caller-owned proxy, certificate, and connection-pool
+    /// policy without changing the Responses service or retry boundary.
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn http_client(mut self, client: reqwest::Client) -> Self {
+        self.responses.http_client = Some(client);
         self
     }
 

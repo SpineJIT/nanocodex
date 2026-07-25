@@ -30,10 +30,8 @@ pub(crate) struct HttpMetadata {
 }
 
 impl ResponsesHttp {
-    pub(crate) fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+    pub(crate) const fn new(client: reqwest::Client) -> Self {
+        Self { client }
     }
 
     pub(crate) async fn send(

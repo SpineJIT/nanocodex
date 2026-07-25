@@ -32,6 +32,7 @@ mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "
 mpp-egress.workspace = true
 ratatui.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
+rustls.workspace = true
 self-replace.workspace = true
 semver.workspace = true
 serde.workspace = true

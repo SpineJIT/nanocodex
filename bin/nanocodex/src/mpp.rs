@@ -29,6 +29,7 @@ use mpp::{
     protocol::intents::ChargeRequest,
 };
 use mpp_egress::{EgressPolicy, MppEgress};
+use nanocodex::ResponsesTransport;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{oneshot, watch},
@@ -190,6 +191,7 @@ impl MppArgs {
     pub(crate) async fn start(
         self,
         direct_websocket_url: String,
+        responses_transport: ResponsesTransport,
     ) -> Result<(String, Option<MppAdapter>)> {
         if self.openai || !self.enabled {
             return Ok((direct_websocket_url, None));
@@ -261,33 +263,49 @@ impl MppArgs {
             .await
             .wrap_err("failed to start the embedded MPP egress proxy")?;
 
-        let listener = StdTcpListener::bind("127.0.0.1:0")
-            .wrap_err("failed to bind the local MPP WebSocket adapter")?;
-        listener
-            .set_nonblocking(true)
-            .wrap_err("failed to configure the local MPP WebSocket adapter")?;
-        let address = listener
-            .local_addr()
-            .wrap_err("failed to read the local MPP WebSocket adapter address")?;
-        let listener = TcpListener::from_std(listener)
-            .wrap_err("failed to start the local MPP WebSocket adapter")?;
-        let config = Arc::new(BridgeConfig {
-            endpoint: self.mpp_websocket_url,
-            api_key: self.mpp_api_key,
-            payment,
-        });
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let task = tokio::spawn(serve(listener, config, shutdown_rx));
+        let (websocket_url, shutdown_tx, task) =
+            if matches!(responses_transport, ResponsesTransport::WebSocket) {
+                let (websocket_url, shutdown_tx, task) =
+                    start_websocket_bridge(self.mpp_websocket_url, self.mpp_api_key, payment)?;
+                (websocket_url, Some(shutdown_tx), Some(task))
+            } else {
+                (direct_websocket_url, None, None)
+            };
         Ok((
-            format!("ws://{address}/v1/responses"),
+            websocket_url,
             Some(MppAdapter {
                 api_base_url,
-                shutdown_tx: Some(shutdown_tx),
-                task: Some(task),
+                shutdown_tx,
+                task,
                 egress: Some(egress),
             }),
         ))
     }
+}
+
+fn start_websocket_bridge(
+    endpoint: String,
+    api_key: Option<String>,
+    payment: NativeSession,
+) -> Result<(String, oneshot::Sender<()>, JoinHandle<Result<()>>)> {
+    let listener = StdTcpListener::bind("127.0.0.1:0")
+        .wrap_err("failed to bind the local MPP WebSocket adapter")?;
+    listener
+        .set_nonblocking(true)
+        .wrap_err("failed to configure the local MPP WebSocket adapter")?;
+    let address = listener
+        .local_addr()
+        .wrap_err("failed to read the local MPP WebSocket adapter address")?;
+    let listener = TcpListener::from_std(listener)
+        .wrap_err("failed to start the local MPP WebSocket adapter")?;
+    let config = Arc::new(BridgeConfig {
+        endpoint,
+        api_key,
+        payment,
+    });
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(serve(listener, config, shutdown_rx));
+    Ok((format!("ws://{address}/v1/responses"), shutdown_tx, task))
 }
 
 #[derive(Clone)]
@@ -387,7 +405,7 @@ impl MppAdapter {
             .map_or_else(Vec::new, MppEgress::environment)
     }
 
-    pub(crate) fn tool_http_client(&self) -> Result<reqwest::Client> {
+    pub(crate) fn http_client(&self) -> Result<reqwest::Client> {
         let egress = self
             .egress
             .as_ref()
@@ -402,7 +420,7 @@ impl MppAdapter {
             .proxy(proxy)
             .add_root_certificate(certificate)
             .build()
-            .wrap_err("failed to configure the MPP-aware tool HTTP client")
+            .wrap_err("failed to configure the MPP-aware HTTP client")
     }
 
     pub(crate) async fn shutdown(mut self) -> Result<()> {
@@ -418,7 +436,7 @@ impl MppAdapter {
                     Err(error).wrap_err("timed out closing the paid MPP session")
                 }
             },
-            None => Err(eyre!("MPP WebSocket adapter task is missing")),
+            None => Ok(()),
         };
         let egress_result = if let Some(egress) = self.egress.take() {
             egress
@@ -904,7 +922,10 @@ mod tests {
     #[tokio::test]
     async fn mpp_is_opt_in() {
         let (url, adapter) = args(false)
-            .start("wss://api.openai.com/v1/responses".to_owned())
+            .start(
+                "wss://api.openai.com/v1/responses".to_owned(),
+                ResponsesTransport::WebSocket,
+            )
             .await
             .unwrap();
         assert_eq!(url, "wss://api.openai.com/v1/responses");

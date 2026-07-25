@@ -1,34 +1,43 @@
-# MPP Responses WebSocket integration
+# MPP Responses integration
 
 ## Boundary
 
 MPP is composed by `bin/nanocodex` and the private, non-published `mpp-egress`
 support crate. No public Nanocodex library crate depends on or contains payment
-code. The CLI starts an in-process loopback WebSocket adapter and gives its URL
-to the normal Nanocodex Responses configuration.
-Consequently the existing persistent socket, typed stream processing, retry
+code.
+
+Tempo defaults to the HTTPS/SSE Responses transport. The CLI gives the standard
+Responses service a caller-configured HTTP client routed through the in-process
+MPP forwarder. The forwarder handles the one-time `402` challenge, signs an MPP
+Charge credential, replays the exact request, and then streams the paid SSE
+response. The charge is the proxy's estimate for that complete response and is
+paid before generation starts.
+
+The WebSocket session transport remains available with
+`--responses-transport websocket`. In that mode the CLI starts an in-process
+loopback WebSocket adapter and gives its URL to the normal Nanocodex Responses
+configuration. The existing persistent socket, typed stream processing, retry
 policy, retained history, `previous_response_id`, and `store: false` behavior
 remain unchanged.
 
 ```text
-Nanocodex ResponsesService (unchanged)
-               |
-       ordinary OpenAI frames
-               |
-      CLI loopback WS adapter
-               |
- alloy-transport-mpp application socket
-               |
- canonical MPP frames + native TIP-1034 vouchers
-               |
-          mpp-proxy/mppx
-               |
-      OpenAI Responses WebSocket
+HTTPS/SSE (default)                       WebSocket (explicit)
+Nanocodex ResponsesService                Nanocodex ResponsesService
+           |                                         |
+caller-configured reqwest client             CLI loopback WS adapter
+           |                                         |
+embedded MPP HTTP forwarder             alloy-transport-mpp application socket
+           |                                         |
+MPP Charge credential + replay          MPP frames + native TIP-1034 vouchers
+           |                                         |
+           +---------------- mpp-proxy/mppx ----------+
+                                      |
+                             OpenAI Responses API
 ```
 
-The loopback adapter does not forward Nanocodex's OpenAI bearer credential.
-It forwards only the Responses beta, cache/session identity, timing, and user
-agent headers needed by the upstream proxy.
+Neither adapter forwards a real OpenAI bearer credential. They forward only
+the Responses request and the cache/session identity, timing, and user-agent
+headers needed by the upstream proxy.
 
 ## Canonical paid socket
 
@@ -153,7 +162,6 @@ Enable the adapter with:
 ```text
 --provider.openai
 --provider.tempo
---provider.tempo.egress                    # opt-in HTTP(S) tool egress
 --provider.tempo.responses-websocket-url <ws-or-wss-url>
 --provider.tempo.wallet-store <path>       # default ~/.tempo/wallet/store.json
 --provider.tempo.channel-store <path>      # default ~/.tempo/wallet/channels.db
@@ -169,35 +177,39 @@ interactive TUI and the headless one-shot runner:
 ```text
 nanocodex --provider.tempo --prompt "say hello"
 nanocodex run "say hello" --provider.tempo
+nanocodex run "say hello" --provider.tempo --responses-transport websocket
 ```
 
-The defaults target Tempo mainnet and
-`wss://openai.mpp.tempo.xyz/v1/responses`. Direct OpenAI is the default;
-`--provider.openai` makes that selection explicit. `--provider.tempo` does not
-require an OpenAI API key because the proxy owns the upstream credential.
+Tempo defaults to HTTPS/SSE and derives
+`https://openai.mpp.tempo.xyz/v1` from its configured
+`wss://openai.mpp.tempo.xyz/v1/responses` endpoint. The explicit WebSocket
+transport uses that `wss:` endpoint directly. Direct OpenAI defaults to its
+persistent WebSocket; `--provider.openai` makes that selection explicit.
+`--provider.tempo` does not require an OpenAI API key because the proxy owns the
+upstream credential.
 
 The eventual login surface follows the same namespace: `nanocodex login`
 defaults to OpenAI OAuth, while `nanocodex login --provider.tempo` runs the
 Tempo Wallet login flow and writes the shared Accounts SDK store. OpenAI OAuth
 is intentionally not stubbed by this integration.
 
-Both paths retain the adapter until the agent handle is dropped and then
-perform the canonical signed session close. TUI teardown restores the terminal
-before waiting for that network handshake.
+Both Tempo paths retain their adapter until the agent handle is dropped. The
+WebSocket path then performs the canonical signed session close; the Charge
+path has no retained payment session to close. TUI teardown restores the
+terminal before waiting for any network shutdown.
 
 ## HTTP(S) tool egress
 
-`--provider.tempo.egress` starts a private HTTP forward proxy on an ephemeral
-loopback port. Nanocodex injects authenticated `HTTP_PROXY`/`HTTPS_PROXY`
-variants and an ephemeral CA path into workspace-tool child processes only.
-It clears inherited proxy-bypass lists for those children, but does not change
-the parent process environment, the model WebSocket, web search, image
-generation, or MCP transports. Ordinary commands such as `curl` therefore need
-no MPP-specific wrapper:
+`--provider.tempo` starts a private HTTP forward proxy on an ephemeral loopback
+port. Nanocodex uses a dedicated client through that proxy for HTTPS Responses
+and in-process remote HTTP tools. It also injects authenticated
+`HTTP_PROXY`/`HTTPS_PROXY` variants and an ephemeral CA path into workspace-tool
+child processes only. It does not change the parent process environment, the
+model WebSocket, or MCP transports. Ordinary commands such as `curl` therefore
+need no MPP-specific wrapper:
 
 ```text
-nanocodex --provider.tempo --provider.tempo.egress \
-  --prompt "curl the paid endpoint and summarize the response"
+nanocodex --provider.tempo --prompt "curl the paid endpoint and summarize the response"
 ```
 
 For HTTPS, the proxy terminates the child's TLS connection with the ephemeral
@@ -227,7 +239,7 @@ the record as structured JSON with:
 
 ```text
 nanocodex run "curl the paid endpoint" \
-  --provider.tempo --provider.tempo.egress \
+  --provider.tempo \
   --log-format json --log-file .nanocodex/logs/mpp-egress.jsonl
 ```
 
@@ -251,6 +263,9 @@ Required validation before merging:
   test.
 - Nanocodex: rustfmt, Clippy with warnings denied, CLI tests, and unchanged
   library tests.
-- Live: use the logged-in mainnet wallet access key, rehydrate or open a native
-  v2 channel, and complete two sequential real OpenAI Responses turns through
-  one paid WebSocket without exposing either the wallet JWK or OpenAI secret.
+- Live Charge: use the logged-in mainnet wallet access key and complete a real
+  HTTPS/SSE OpenAI Responses turn, retaining the MPP receipt and verifying the
+  expected stablecoin debit without exposing either the wallet JWK or OpenAI
+  secret.
+- Live session: explicitly select WebSocket, rehydrate or open a native v2
+  channel, and complete two sequential real turns through one paid socket.

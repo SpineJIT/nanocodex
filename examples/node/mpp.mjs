@@ -12,13 +12,21 @@ class ObservedWebSocket extends WebSocket {
   constructor(...parameters) {
     super(...parameters);
     this.addEventListener("message", (event) => {
-      console.error(`MPP <- ${frameKind(event.data)}`);
+      console.error(`MPP <- ${frameSummary(event.data)}`);
+    });
+    this.addEventListener("close", (event) => {
+      console.error(`MPP socket closed (${event.code}${event.reason ? `: ${event.reason}` : ""})`);
     });
   }
 
   send(data, ...parameters) {
-    console.error(`MPP -> ${frameKind(data)}`);
+    console.error(`MPP -> ${frameSummary(data)}`);
     return super.send(data, ...parameters);
+  }
+
+  close(code, reason) {
+    console.error(`MPP socket close requested (${code ?? 1000}${reason ? `: ${reason}` : ""})`);
+    return super.close(code, reason);
   }
 }
 
@@ -136,9 +144,28 @@ async function waitForHydration(store) {
   });
 }
 
-function frameKind(data) {
+function frameSummary(data) {
   try {
     const value = JSON.parse(String(data));
+    if (value.mpp === "message") {
+      try {
+        const application = JSON.parse(value.data);
+        return `message ${application.type ?? "application"}`;
+      } catch {
+        return "message application";
+      }
+    }
+    if (value.mpp === "payment-need-voucher") {
+      const required = value.data?.requiredCumulative;
+      return `payment-need-voucher${required === undefined ? "" : ` required=${required}`}`;
+    }
+    if (value.mpp === "payment-receipt") {
+      const cumulative = value.data?.acceptedCumulative;
+      const spent = value.data?.spent;
+      return `payment-receipt${cumulative === undefined ? "" : ` cumulative=${cumulative}`}${
+        spent === undefined ? "" : ` spent=${spent}`
+      }`;
+    }
     return typeof value.mpp === "string" ? value.mpp : "application";
   } catch {
     return "non-json";
