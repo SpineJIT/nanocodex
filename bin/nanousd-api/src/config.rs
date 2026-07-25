@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    str::FromStr,
+    time::Duration,
+};
 
 use alloy_primitives::Address;
 use clap::{Parser, ValueEnum};
@@ -90,8 +95,15 @@ impl Config {
             ));
         }
         if self.payment_mode == PaymentMode::Stripe {
-            if public.scheme() != "https" {
-                return Err(eyre!("Stripe mode requires an HTTPS public URL"));
+            let loopback_http = public.scheme() == "http"
+                && public.host_str().is_some_and(|host| {
+                    host.eq_ignore_ascii_case("localhost")
+                        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+                });
+            if public.scheme() != "https" && !loopback_http {
+                return Err(eyre!(
+                    "Stripe mode requires an HTTPS public URL or an HTTP loopback URL"
+                ));
             }
             if self.stripe_secret_key.is_none() || self.stripe_webhook_secret.is_none() {
                 return Err(eyre!(
@@ -106,5 +118,40 @@ impl Config {
 
     pub const fn worker_interval(&self) -> Duration {
         Duration::from_millis(self.fulfillment_poll_ms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stripe_config(public_url: &str) -> Config {
+        Config::try_parse_from([
+            "nanousd-api",
+            "--payment-mode",
+            "stripe",
+            "--public-url",
+            public_url,
+            "--stripe-secret-key",
+            "sk_test_example",
+            "--stripe-webhook-secret",
+            "whsec_example",
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn stripe_allows_http_loopback_for_ssh_development() {
+        stripe_config("http://127.0.0.1:8789").validate().unwrap();
+        stripe_config("http://localhost:8789").validate().unwrap();
+    }
+
+    #[test]
+    fn stripe_rejects_http_on_non_loopback_hosts() {
+        let error = stripe_config("http://credits.example.com")
+            .validate()
+            .unwrap_err();
+
+        assert!(error.to_string().contains("HTTPS public URL"));
     }
 }
