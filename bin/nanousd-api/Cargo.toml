@@ -21,7 +21,6 @@ eyre.workspace = true
 getrandom.workspace = true
 hex = "0.4"
 hmac.workspace = true
-mpp = { workspace = true, features = ["client", "server", "tempo", "sqlite", "reqwest-rustls-tls"] }
 nanousd.workspace = true
 reqwest = { workspace = true, features = ["form"] }
 rusqlite.workspace = true

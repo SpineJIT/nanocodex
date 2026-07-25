@@ -2,7 +2,7 @@ use std::{path::PathBuf, process::Command, time::Duration};
 
 use clap::{Args, Subcommand};
 use eyre::{Context, Result, eyre};
-use mpp::client::tempo::wallet::{TempoWallet, default_wallet_store_path};
+use mpp::client::tempo::wallet::{TempoAccountsWallet, default_accounts_store_path};
 use nanousd::{
     CreateOrderRequest, CreateOrderResponse, CreditsClient, DEFAULT_API_URL, NANOUSD_DECIMALS,
     Order, OrderStatus,
@@ -87,14 +87,15 @@ impl Credits {
     pub(crate) async fn run(self) -> Result<()> {
         let wallet_path = self
             .wallet_store
-            .map_or_else(default_wallet_store_path, Ok)?;
-        let wallet = TempoWallet::load(&wallet_path).wrap_err_with(|| {
-            format!("failed to load Tempo Wallet at {}", wallet_path.display())
+            .map_or_else(default_accounts_store_path, Ok)?;
+        let wallet = TempoAccountsWallet::from_store(&wallet_path).wrap_err_with(|| {
+            format!("failed to load Tempo Accounts at {}", wallet_path.display())
         })?;
+        let account = wallet.account();
         let client = CreditsClient::new(&self.api_url)?;
         match self.command {
-            CreditsCommand::Status(args) => status(&client, wallet.account, args.json).await,
-            CreditsCommand::Buy(args) => buy(&client, wallet.account, args).await,
+            CreditsCommand::Status(args) => status(&client, account, args.json).await,
+            CreditsCommand::Buy(args) => buy(&client, account, args).await,
             CreditsCommand::Wait(args) => {
                 let order = wait_for_order(
                     &client,

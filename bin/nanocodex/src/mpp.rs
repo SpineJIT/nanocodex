@@ -22,8 +22,7 @@ use mpp::{
             session::store::{
                 SqliteChannelStore, SqliteChannelStoreOptions, default_channel_database_path,
             },
-            signing::{KeychainVersion, TempoSigningMode},
-            wallet::TempoWallet,
+            wallet::{TempoAccessKey, TempoAccountsWallet},
         },
     },
     protocol::intents::ChargeRequest,
@@ -56,14 +55,24 @@ const DEFAULT_MAX_DEPOSIT: u128 = 25_000_000;
 const DEFAULT_MAX_EGRESS_CHARGE: u128 = 100_000;
 const RESPONSES_ACCEPT_PAYMENT: &str = "tempo/session, tempo/charge;q=0.5";
 
-fn load_tempo_wallet(path: &Path, store: &SqliteChannelStore) -> Result<TempoWallet> {
+fn load_tempo_access_key(path: &Path, store: &SqliteChannelStore) -> Result<TempoAccessKey> {
+    let wallet = TempoAccountsWallet::from_store(path)
+        .wrap_err_with(|| format!("failed to load Tempo Accounts at {}", path.display()))?;
     match store
-        .latest_authorized_signer()
+        .latest_credential()
         .map_err(|error| eyre!(error))
-        .wrap_err("failed to resolve the retained Tempo session signer")?
+        .wrap_err("failed to resolve the retained Tempo session credential")?
     {
-        Some(access_key) => Ok(TempoWallet::load_preferred(path, access_key)?),
-        None => Ok(TempoWallet::load(path)?),
+        Some(credential) => wallet
+            .access_key(
+                credential.account,
+                credential.chain_id,
+                credential.authorized_signer,
+            )
+            .wrap_err("the retained Tempo session access key is not locally signable"),
+        None => wallet
+            .active_access_key()
+            .wrap_err("failed to select an active Tempo access key"),
     }
 }
 
@@ -212,30 +221,20 @@ impl MppArgs {
         })
         .map_err(|error| eyre!(error))
         .wrap_err("failed to open the Tempo session channel store")?;
-        let wallet = load_tempo_wallet(&wallet_path, &store)?;
+        let access_key = load_tempo_access_key(&wallet_path, &store)?;
+        let chain_id = access_key.chain_id();
         let autoswap = AutoswapConfig::new(
             self.pay_with
                 .parse()
                 .wrap_err("invalid provider.tempo.pay-with token address")?,
             self.swap_slippage_bps,
         );
-        let charge = TempoProvider::new(wallet.signer.clone(), &self.rpc_url)
+        let charge = TempoProvider::from_access_key(access_key.clone(), &self.rpc_url)
             .wrap_err("failed to configure the native Tempo charge provider")?
-            .with_signing_mode(TempoSigningMode::Keychain {
-                wallet: wallet.account,
-                key_authorization: wallet.key_authorization.clone(),
-                version: KeychainVersion::V2,
-            })
-            .with_expected_chain_id(wallet.chain_id)
+            .with_expected_chain_id(chain_id)
             .with_autoswap(autoswap.clone());
-        let session = TempoSessionProvider::new(wallet.signer, &self.rpc_url)
+        let session = TempoSessionProvider::from_access_key(access_key, &self.rpc_url)
             .wrap_err("failed to configure the native Tempo session provider")?
-            .with_signing_mode(TempoSigningMode::Keychain {
-                wallet: wallet.account,
-                key_authorization: wallet.key_authorization,
-                version: KeychainVersion::V2,
-            })
-            .with_authorized_signer(wallet.access_key)
             .with_channel_store(Arc::new(store))
             .with_default_deposit(DEFAULT_SESSION_DEPOSIT)
             .with_max_deposit(self.max_deposit)
@@ -501,14 +500,13 @@ impl PaymentProvider for NativeSession {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        self.session
-            .application_websocket_credential_with_top_up(
-                &self.client,
-                &self.management_url,
-                self.management_headers.clone(),
-                challenge,
-            )
-            .await
+        Box::pin(self.session.application_websocket_credential_with_top_up(
+            &self.client,
+            &self.management_url,
+            self.management_headers.clone(),
+            challenge,
+        ))
+        .await
     }
 
     async fn pay_with_context(
@@ -516,14 +514,13 @@ impl PaymentProvider for NativeSession {
         challenge: &PaymentChallenge,
         context: PaymentContext,
     ) -> Result<PaymentCredential, MppError> {
-        self.session
-            .application_websocket_credential_with_top_up(
-                &self.client,
-                context.url.as_str(),
-                context.headers,
-                challenge,
-            )
-            .await
+        Box::pin(self.session.application_websocket_credential_with_top_up(
+            &self.client,
+            context.url.as_str(),
+            context.headers,
+            challenge,
+        ))
+        .await
     }
 
     async fn prepare_application_websocket_challenge(
@@ -572,16 +569,15 @@ impl VoucherProvider for NativeSession {
         let deposit = request.deposit.parse().map_err(|error| {
             MppError::InvalidConfig(format!("invalid channel deposit amount: {error}"))
         })?;
-        self.session
-            .voucher_credential_with_top_up(
-                &self.client,
-                &self.management_url,
-                self.management_headers.clone(),
-                &request.channel_id,
-                cumulative,
-                deposit,
-            )
-            .await
+        Box::pin(self.session.voucher_credential_with_top_up(
+            &self.client,
+            &self.management_url,
+            self.management_headers.clone(),
+            &request.channel_id,
+            cumulative,
+            deposit,
+        ))
+        .await
     }
 
     async fn next_voucher_for_challenge(
@@ -597,17 +593,16 @@ impl VoucherProvider for NativeSession {
         let deposit = request.deposit.parse().map_err(|error| {
             MppError::InvalidConfig(format!("invalid channel deposit amount: {error}"))
         })?;
-        self.session
-            .voucher_credential_with_top_up_for_challenge(
-                &self.client,
-                &self.management_url,
-                self.management_headers.clone(),
-                challenge,
-                &request.channel_id,
-                cumulative,
-                deposit,
-            )
-            .await
+        Box::pin(self.session.voucher_credential_with_top_up_for_challenge(
+            &self.client,
+            &self.management_url,
+            self.management_headers.clone(),
+            challenge,
+            &request.channel_id,
+            cumulative,
+            deposit,
+        ))
+        .await
     }
 }
 
@@ -742,7 +737,7 @@ async fn bridge(
             HeaderValue::from_str(api_key)?,
         );
     }
-    let upstream = match connector.connect().await {
+    let upstream = match Box::pin(connector.connect()).await {
         Ok(upstream) => upstream,
         Err(error) if is_terminal_mpp_error(&error) => {
             send_terminal_mpp_error(&mut downstream, &error).await?;
@@ -752,7 +747,7 @@ async fn bridge(
             return Err(error).wrap_err("failed to open the paid MPP WebSocket");
         }
     };
-    relay(downstream, upstream, shutdown).await
+    Box::pin(relay(downstream, upstream, shutdown)).await
 }
 
 async fn relay(
