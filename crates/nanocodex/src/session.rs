@@ -43,7 +43,7 @@ impl CommittedSession {
             lineage_id: self.lineage_id.to_string(),
             prompt_cache_key: self.model.prompt_cache_key().to_owned(),
             workspace: self.model.workspace().to_owned(),
-            request_prefix: self.model.request_prefix().to_vec(),
+            request_prefix: Some(self.model.request_prefix().to_vec()),
             canonical_context: self.model.canonical_context().clone(),
             history: self.model.snapshot_history(),
         }
@@ -65,7 +65,8 @@ pub struct SessionSnapshot {
     lineage_id: String,
     prompt_cache_key: String,
     workspace: String,
-    request_prefix: Vec<ResponseItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_prefix: Option<Vec<ResponseItem>>,
     canonical_context: ResponseItem,
     history: Vec<ResponseItem>,
 }
@@ -82,13 +83,45 @@ impl fmt::Debug for SessionSnapshot {
 }
 
 impl SessionSnapshot {
+    pub(crate) fn from_rollout(
+        thread_id: String,
+        workspace: String,
+        history: Vec<ResponseItem>,
+    ) -> Result<Self> {
+        let canonical_context = history
+            .iter()
+            .find(|item| item.is_user_message())
+            .cloned()
+            .ok_or_else(|| {
+                NanocodexError::InvalidSessionSnapshot(
+                    "rollout does not contain a user message".to_owned(),
+                )
+            })?;
+        Ok(Self {
+            version: SESSION_SNAPSHOT_VERSION,
+            model: MODEL.to_owned(),
+            lineage_id: thread_id.clone(),
+            prompt_cache_key: thread_id,
+            workspace,
+            request_prefix: None,
+            canonical_context,
+            history,
+        })
+    }
+
     /// Snapshot format version understood by this Nanocodex release.
     #[must_use]
     pub const fn version(&self) -> u32 {
         self.version
     }
 
-    pub(crate) fn into_checkpoint(self) -> Result<(Arc<str>, Arc<str>, ModelCheckpoint)> {
+    /// Returns the absolute workspace retained by this session boundary.
+    #[must_use]
+    pub fn workspace(&self) -> &str {
+        &self.workspace
+    }
+
+    pub(crate) fn into_resume(self) -> Result<SessionResume> {
         if self.version != SESSION_SNAPSHOT_VERSION {
             return Err(NanocodexError::InvalidSessionSnapshot(format!(
                 "unsupported format version {}; expected {SESSION_SNAPSHOT_VERSION}",
@@ -116,37 +149,55 @@ impl SessionSnapshot {
                 "workspace must not be empty".to_owned(),
             ));
         }
-        if self.request_prefix.is_empty() {
-            return Err(NanocodexError::InvalidSessionSnapshot(
-                "request prefix must not be empty".to_owned(),
-            ));
-        }
-        if !matches!(
-            self.request_prefix.as_slice(),
-            [
-                ResponseItem::AdditionalTools {
-                    role: MessageRole::Developer,
-                    ..
-                },
-                ResponseItem::Message {
-                    role: MessageRole::Developer,
-                    ..
-                }
-            ]
-        ) {
+        if let Some(request_prefix) = self.request_prefix.as_ref()
+            && !matches!(
+                request_prefix.as_slice(),
+                [
+                    ResponseItem::AdditionalTools {
+                        role: MessageRole::Developer,
+                        ..
+                    },
+                    ResponseItem::Message {
+                        role: MessageRole::Developer,
+                        ..
+                    }
+                ]
+            )
+        {
             return Err(NanocodexError::InvalidSessionSnapshot(
                 "request prefix does not match the supported model contract".to_owned(),
             ));
         }
         let lineage_id = Arc::<str>::from(self.lineage_id);
         let prompt_cache_key = Arc::<str>::from(self.prompt_cache_key);
-        let checkpoint = ModelCheckpoint::resume(
-            self.workspace,
-            self.request_prefix,
-            Arc::clone(&prompt_cache_key),
-            self.canonical_context,
-            self.history,
-        )?;
-        Ok((lineage_id, prompt_cache_key, checkpoint))
+        let checkpoint = self
+            .request_prefix
+            .map(|request_prefix| {
+                ModelCheckpoint::resume(
+                    self.workspace.clone(),
+                    request_prefix,
+                    Arc::clone(&prompt_cache_key),
+                    self.canonical_context.clone(),
+                    self.history.clone(),
+                )
+            })
+            .transpose()?;
+        Ok(SessionResume {
+            lineage_id,
+            prompt_cache_key,
+            workspace: self.workspace,
+            canonical_context: self.canonical_context,
+            history: self.history,
+            checkpoint,
+        })
     }
+}
+
+pub(crate) struct SessionResume {
+    pub(crate) lineage_id: Arc<str>,
+    pub(crate) prompt_cache_key: Arc<str>,
+    pub(crate) workspace: String,
+    pub(crate) canonical_context: ResponseItem,
+    pub(crate) history: Vec<ResponseItem>,
+    pub(crate) checkpoint: Option<ModelCheckpoint>,
 }

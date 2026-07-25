@@ -534,6 +534,12 @@ Recording appends Codex's model-context response items and its legacy turn and
 message events after each completed or cancelled turn, so both resumed model
 context and the visible Codex transcript are restored. Compaction uses explicit
 replacement-history records, and failed partial output is excluded.
+`nanocodex resume <thread-id>` discovers the same rollout beneath
+`$CODEX_HOME/sessions` (or `archived_sessions`) that `codex resume` uses and
+materializes its latest replacement-history boundary plus subsequent response
+items. No Nanocodex-specific sidecar is required, so Codex-created threads can
+be continued directly. Pass `--prompt "..."` to submit a follow-on prompt as
+soon as the TUI opens.
 The rollout writer projects the same committed session boundary exposed by
 `TurnResult::snapshot()` rather than maintaining a second conversation state.
 `flush_rollout()` retries pending writes and provides a durability barrier.

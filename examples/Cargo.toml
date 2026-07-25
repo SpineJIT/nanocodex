@@ -68,5 +68,9 @@ path = "response_transport_bench.rs"
 name = "codex-parity-bench"
 path = "codex_parity_bench.rs"
 
+[[bin]]
+name = "rollout-resume-bench"
+path = "rollout_resume_bench.rs"
+
 [lints]
 workspace = true

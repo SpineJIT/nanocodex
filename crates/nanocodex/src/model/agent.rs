@@ -585,6 +585,44 @@ pub(crate) fn prepare_resumed_checkpoint(
     Ok(prepared)
 }
 
+pub(crate) fn prepare_rollout_checkpoint(
+    workspace: String,
+    canonical_context: ResponseItem,
+    history: Vec<ResponseItem>,
+    prompt_cache_key: Arc<str>,
+    config: &ModelConfig,
+    tools: &Tools,
+    session_id: &str,
+) -> Result<PreparedCheckpoint> {
+    let runtime = tool_runtime(&workspace, config, tools);
+    #[cfg(not(target_family = "wasm"))]
+    let tool_specs = {
+        let _ = session_id;
+        runtime.model_specs()
+    };
+    #[cfg(target_family = "wasm")]
+    let tool_specs = runtime.model_specs(session_id);
+    let request_prefix = request_profile(
+        "rollout-resume",
+        "rollout-resume",
+        tool_specs,
+        config.system_prompt(),
+    )
+    .prefix()
+    .to_vec();
+    let checkpoint = ModelCheckpoint::resume(
+        workspace,
+        request_prefix,
+        prompt_cache_key,
+        canonical_context,
+        history,
+    )?;
+    Ok(PreparedCheckpoint {
+        checkpoint,
+        runtime,
+    })
+}
+
 fn without_response_item_ids(items: &[ResponseItem]) -> Vec<ResponseItem> {
     items
         .iter()

@@ -26,8 +26,8 @@ use crossterm::event::{
 use eyre::{Result, WrapErr};
 use futures_util::StreamExt;
 use nanocodex::{
-    AgentEvent, AgentEvents, Nanocodex, NanocodexError, Thinking, TimedAgentEvent, TurnControl,
-    TurnResult,
+    AgentEvent, AgentEvents, DurableSession, Nanocodex, NanocodexError, Thinking, TimedAgentEvent,
+    TurnControl, TurnResult,
 };
 use tokio::{
     sync::mpsc,
@@ -471,10 +471,21 @@ enum Submission {
     clippy::too_many_lines,
     reason = "the ordered terminal, agent, worker, and render event loop is intentionally cohesive"
 )]
-pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Result<()> {
+pub(crate) async fn run(
+    config: AgentArgs,
+    initial_prompt: Option<String>,
+    resume: Option<DurableSession>,
+) -> Result<()> {
     let initial_thinking = config.thinking();
-    let cwd = resolve_cwd(&config)?;
-    let configured = config.build().await?;
+    let cwd = resume
+        .as_ref()
+        .map(|session| PathBuf::from(session.workspace()))
+        .unwrap_or(resolve_cwd(&config)?);
+    let configured = if let Some(session) = resume {
+        config.build_resumed(session).await?
+    } else {
+        config.build().await?
+    };
     let agent = configured.handle;
     let mut agent_events = configured.events;
     let root_session_id = Arc::<str>::from(agent_events.request_id());
