@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { WebSocketServer } from "ws";
 
@@ -179,6 +180,58 @@ test("WASM snapshots resume authoritative history in a fresh agent", async () =>
   spawned.dispose();
   resumed.dispose();
   await resumedServer.close();
+});
+
+test("Node can load an application-owned web module and resume Codex rollout history", async () => {
+  const server = await startServer();
+  const wasm = await readFile(new URL("../pkg-web/nanocodex_bg.wasm", import.meta.url));
+  const canonicalContext = {
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: "remember amber" }],
+  };
+  const snapshot = {
+    version: 1,
+    model: "gpt-5.6-sol",
+    lineage_id: "codex-rollout-lineage",
+    prompt_cache_key: "codex-rollout-lineage",
+    workspace: process.cwd(),
+    canonical_context: canonicalContext,
+    history: [
+      canonicalContext,
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "stored" }],
+        status: "completed",
+      },
+    ],
+  };
+  const agent = await Agent.create({
+    apiKey: "test-key",
+    module: wasm,
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: "raycast-runtime",
+    resume: snapshot,
+  });
+  const scenario = (async () => {
+    const socket = await server.connection;
+    const request = await messageReader(socket).next();
+    assert.equal(request.previous_response_id, undefined);
+    assert.equal(request.prompt_cache_key, snapshot.prompt_cache_key);
+    assert.match(JSON.stringify(request.input), /remember amber/);
+    assert.match(JSON.stringify(request.input), /what color/);
+    sendFinal(socket, "resp-rollout-resumed", "amber");
+  })();
+
+  assert.equal(
+    await agent.turn.prompt({ input: "what color did I ask you to remember?" }).result(),
+    "amber",
+  );
+  await scenario;
+  agent.dispose();
+  await server.close();
 });
 
 test("independent agents keep their host connections isolated", async () => {

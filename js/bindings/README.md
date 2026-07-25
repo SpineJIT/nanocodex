@@ -111,6 +111,21 @@ so the first resumed request safely replays the committed conversation. Resume
 with the same instructions and tool definitions, and release the original
 agent before handing its snapshot to another writer.
 
+Node embedders whose bundler relocates package assets may compile and pass the
+web-target artifact explicitly. The runtime still uses the Node host for
+WebSockets and Code Mode:
+
+```js
+const module = await WebAssembly.compile(await readFile(wasmAssetPath));
+const agent = await Agent.create({ apiKey, module });
+```
+
+A Codex-compatible rollout can also be resumed by materializing its committed
+`response_item` history into a snapshot with no `request_prefix`. Nanocodex
+rebuilds the current prefix from the supplied instructions and JavaScript tools
+while preserving the rollout's workspace, lineage, cache key, canonical user
+context, and typed history.
+
 `Agent` and `Actions` are module namespaces, not classes. `Agent.create` returns
 an owned client decorated with matching domain actions:
 

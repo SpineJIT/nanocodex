@@ -83,6 +83,7 @@ impl fmt::Debug for SessionSnapshot {
 }
 
 impl SessionSnapshot {
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn from_rollout(
         thread_id: String,
         workspace: String,
@@ -190,22 +191,6 @@ impl SessionSnapshot {
             history: self.history,
             checkpoint,
         })
-    }
-
-    #[cfg(target_family = "wasm")]
-    pub(crate) fn into_checkpoint(self) -> Result<(Arc<str>, Arc<str>, ModelCheckpoint)> {
-        let SessionResume {
-            lineage_id,
-            prompt_cache_key,
-            checkpoint,
-            ..
-        } = self.into_resume()?;
-        let checkpoint = checkpoint.ok_or_else(|| {
-            NanocodexError::InvalidSessionSnapshot(
-                "serialized session is missing its request prefix".to_owned(),
-            )
-        })?;
-        Ok((lineage_id, prompt_cache_key, checkpoint))
     }
 }
 

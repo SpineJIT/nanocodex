@@ -16,6 +16,7 @@ export declare namespace create {
     maxFrameBytes?: number | undefined;
     maxQueuedBytes?: number | undefined;
     maxQueuedMessages?: number | undefined;
+    module?: unknown;
     sendTimeoutMs?: number | undefined;
     tools?: ToolMap | undefined;
     websocketUrl?: string | undefined;
