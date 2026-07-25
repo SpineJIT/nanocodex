@@ -485,9 +485,9 @@ impl Conversation {
         }
         self.materialize_code_parent(&payload.call_id);
         let arguments = summarize_tool_arguments(&payload.tool, &payload.arguments);
-        self.status = format!("Running {}", payload.tool);
+        let name = present_tool_name(&payload.tool, &payload.arguments);
+        self.status = format!("Running {name}");
         let call_id = payload.call_id;
-        let name = present_tool_name(&payload.tool, &payload.arguments).to_owned();
         let status = ToolStatus::Running;
         if self.transcript.has_tool_parent(&call_id) {
             self.note_tail_will_change();
@@ -2857,6 +2857,9 @@ fn summarize_tool_arguments(tool: &str, arguments: &Value) -> String {
         {
             return summary;
         }
+        if let Some(summary) = summarize_mcp_arguments(tool, object) {
+            return summary;
+        }
         let preferred = match tool {
             "view_image" => object.get("path").and_then(Value::as_str),
             "read_file" => object
@@ -2878,14 +2881,21 @@ fn summarize_tool_arguments(tool: &str, arguments: &Value) -> String {
     compact_arguments(arguments)
 }
 
-fn present_tool_name<'a>(tool: &'a str, arguments: &Value) -> &'a str {
+fn present_tool_name(tool: &str, arguments: &Value) -> String {
+    if tool == "tool_search" {
+        return "MCP discovery".to_owned();
+    }
+    if let Some((server, operation)) = mcp_tool_parts(tool) {
+        let operation = mcp_wrapper_target(operation, arguments).unwrap_or(operation);
+        return format!("{server} › {}", present_mcp_operation(operation));
+    }
     if tool != "web__run" {
-        return tool;
+        return tool.to_owned();
     }
     let Some(object) = arguments.as_object() else {
-        return "Web";
+        return "Web".to_owned();
     };
-    if object.contains_key("search_query") {
+    let name = if object.contains_key("search_query") {
         "Web search"
     } else if object.contains_key("image_query") {
         "Image search"
@@ -2899,6 +2909,57 @@ fn present_tool_name<'a>(tool: &'a str, arguments: &Value) -> &'a str {
         "Sports"
     } else {
         "Web"
+    };
+    name.to_owned()
+}
+
+fn summarize_mcp_arguments(tool: &str, object: &serde_json::Map<String, Value>) -> Option<String> {
+    if tool == "tool_search" {
+        return object
+            .get("query")
+            .and_then(Value::as_str)
+            .map(compact_tool_text);
+    }
+    let (_, operation) = mcp_tool_parts(tool)?;
+    if operation == "get_tool_details" {
+        return object
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| compact_tool_text(name.trim_start_matches('_')));
+    }
+    let target = matches!(operation, "call_read_tool" | "call_write_tool")
+        .then(|| object.get("name").and_then(Value::as_str))
+        .flatten();
+    let effective = if matches!(operation, "call_read_tool" | "call_write_tool") {
+        object.get("arguments").and_then(Value::as_object)
+    } else {
+        Some(object)
+    };
+    if let Some(effective) = effective {
+        for field in ["query", "q", "name", "path", "url", "ref_id"] {
+            if let Some(value) = effective.get(field).and_then(Value::as_str) {
+                return Some(compact_tool_text(value));
+            }
+        }
+    }
+    target.map(|target| compact_tool_text(target.trim_start_matches('_')))
+}
+
+fn mcp_tool_parts(tool: &str) -> Option<(&str, &str)> {
+    tool.strip_prefix("mcp__")?.split_once("__")
+}
+
+fn mcp_wrapper_target<'a>(operation: &str, arguments: &'a Value) -> Option<&'a str> {
+    matches!(operation, "call_read_tool" | "call_write_tool")
+        .then(|| arguments.get("name").and_then(Value::as_str))
+        .flatten()
+}
+
+fn present_mcp_operation(operation: &str) -> &str {
+    match operation.trim_start_matches('_') {
+        "search_tools" => "Search tools",
+        "get_tool_details" => "Tool details",
+        operation => operation,
     }
 }
 
@@ -3110,6 +3171,115 @@ mod tests {
             summarize_tool_arguments("web__run", &arguments),
             "Rust async cancellation · Tokio process groups"
         );
+    }
+
+    #[test]
+    fn mcp_discovery_and_gateway_calls_present_the_semantic_operation() {
+        let discovery = json!({ "query": "centaur domain ownership" });
+        assert_eq!(
+            present_tool_name("tool_search", &discovery),
+            "MCP discovery"
+        );
+        assert_eq!(
+            summarize_tool_arguments("tool_search", &discovery),
+            "centaur domain ownership"
+        );
+
+        let search = json!({
+            "name": "_search_tools",
+            "arguments": { "query": "innovationreception.org" }
+        });
+        assert_eq!(
+            present_tool_name("mcp__centaur-paradigm__call_read_tool", &search),
+            "centaur-paradigm › Search tools"
+        );
+        assert_eq!(
+            summarize_tool_arguments("mcp__centaur-paradigm__call_read_tool", &search),
+            "innovationreception.org"
+        );
+
+        let details = json!({ "name": "_search_tools" });
+        assert_eq!(
+            present_tool_name("mcp__centaur-paradigm__get_tool_details", &details),
+            "centaur-paradigm › Tool details"
+        );
+        assert_eq!(
+            summarize_tool_arguments("mcp__centaur-paradigm__get_tool_details", &details),
+            "search_tools"
+        );
+    }
+
+    #[test]
+    fn mcp_activity_renders_without_gateway_plumbing() {
+        let mut app = App::new(".".into());
+        app.main.on_agent_event(&event(
+            AgentEventKind::ToolCall,
+            &json!({
+                "call_id": "call-exec",
+                "tool": "exec",
+                "arguments": "await discover();"
+            }),
+        ));
+        app.main.on_agent_event(&event(
+            AgentEventKind::ToolCall,
+            &json!({
+                "call_id": "call-exec/code-1",
+                "tool": "tool_search",
+                "arguments": { "query": "centaur domain ownership" }
+            }),
+        ));
+        app.main.on_agent_event(&event(
+            AgentEventKind::ToolResult,
+            &json!({
+                "call_id": "call-exec/code-1",
+                "tool": "tool_search",
+                "status": "completed",
+                "result": { "tools": [{ "name": "mcp__centaur-paradigm__call_read_tool" }] }
+            }),
+        ));
+        app.main.on_agent_event(&event(
+            AgentEventKind::ToolCall,
+            &json!({
+                "call_id": "call-exec/code-2",
+                "tool": "mcp__centaur-paradigm__call_read_tool",
+                "arguments": {
+                    "name": "_search_tools",
+                    "arguments": { "query": "innovationreception.org" }
+                }
+            }),
+        ));
+        app.main.on_agent_event(&event(
+            AgentEventKind::ToolResult,
+            &json!({
+                "call_id": "call-exec/code-2",
+                "tool": "mcp__centaur-paradigm__call_read_tool",
+                "status": "completed",
+                "result": { "content": [] }
+            }),
+        ));
+
+        let area = Rect::new(0, 0, 100, 12);
+        let mut buffer = Buffer::empty(area);
+        app.main
+            .transcript
+            .widget(0, None, None, "empty")
+            .render(area, &mut buffer);
+        let rendered = buffer
+            .content
+            .chunks(usize::from(area.width))
+            .map(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("MCP discovery  centaur domain ownership"));
+        assert!(rendered.contains("centaur-paradigm › Search tools  innovationreception.org"));
+        assert!(!rendered.contains("call_read_tool"));
+        assert!(!rendered.contains("_search_tools"));
+        assert!(!rendered.contains("{\"query\""));
     }
 
     #[test]

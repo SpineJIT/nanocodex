@@ -1,27 +1,89 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, process::Stdio, sync::Arc};
 
 use http::{HeaderName, HeaderValue};
 use rmcp::{
     ServiceExt,
-    model::Tool,
+    model::{CallToolRequestParams, CallToolResult, Tool},
     service::{RoleClient, RunningService},
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
         streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tracing::{Instrument, Span, info_span};
 
-use crate::config::{McpServer, McpTransport};
+use crate::config::{McpServer, McpTransport, SecretSource};
+use crate::oauth::{McpOAuthStore, OAuthRuntime, transport_from_credentials};
 
-pub(crate) type Client = Arc<RunningService<RoleClient, ()>>;
+pub(crate) type Client = Arc<ClientInner>;
+
+pub(crate) struct ClientInner {
+    service: Arc<RunningService<RoleClient, ()>>,
+    oauth: Option<Arc<OAuthRuntime>>,
+}
+
+impl ClientInner {
+    pub(crate) async fn call_tool(
+        &self,
+        params: CallToolRequestParams,
+    ) -> Result<CallToolResult, rmcp::service::ServiceError> {
+        let result = self.service.call_tool(params).await;
+        if let Some(oauth) = &self.oauth
+            && let Err(error) = oauth.persist_if_changed().await
+        {
+            tracing::warn!(%error, "failed to persist refreshed MCP OAuth credentials");
+        }
+        result
+    }
+
+    async fn list_all_tools(&self) -> Result<Vec<Tool>, rmcp::service::ServiceError> {
+        let tools = self.service.list_all_tools().await;
+        if let Some(oauth) = &self.oauth
+            && let Err(error) = oauth.persist_if_changed().await
+        {
+            tracing::warn!(%error, "failed to persist refreshed MCP OAuth credentials");
+        }
+        tools
+    }
+}
 
 pub(crate) struct ConnectedServer {
     pub client: Client,
     pub tools: Vec<Tool>,
 }
 
-pub(crate) async fn connect(server: &McpServer) -> Result<ConnectedServer, String> {
-    match &server.transport {
+pub(crate) async fn connect(
+    server_name: &str,
+    server: &McpServer,
+    oauth_store: Option<Arc<dyn McpOAuthStore>>,
+    parent: &Span,
+) -> Result<ConnectedServer, String> {
+    let (transport_name, auth_mode) = match &server.transport {
+        McpTransport::Stdio { .. } => ("stdio", "none"),
+        McpTransport::StreamableHttp { bearer, .. } if bearer.is_some() => {
+            ("streamable_http", "bearer")
+        }
+        McpTransport::StreamableHttp { .. } if oauth_store.is_some() => {
+            ("streamable_http", "oauth_store")
+        }
+        McpTransport::StreamableHttp { .. } => ("streamable_http", "none"),
+    };
+    let span = info_span!(
+        target: "nanocodex_mcp",
+        parent: parent,
+        "mcp.transport_connect",
+        otel.kind = "client",
+        otel.status_code = tracing::field::Empty,
+        mcp.server = server_name,
+        mcp.transport = transport_name,
+        mcp.auth = auth_mode,
+        status = tracing::field::Empty,
+    );
+    // Keep this operation span out of the current tracing context. RMCP's initialize call
+    // creates a long-lived transport task which inherits the current context; entering this
+    // span would therefore keep the complete startup/reload trace open until client shutdown.
+    let result = match &server.transport {
         McpTransport::Stdio {
             command,
             args,
@@ -36,76 +98,264 @@ pub(crate) async fn connect(server: &McpServer) -> Result<ConnectedServer, Strin
             if let Some(cwd) = cwd {
                 command.current_dir(cwd);
             }
-            let transport = TokioChildProcess::new(command)
+            let (transport, stderr) = TokioChildProcess::builder(command)
+                .stderr(Stdio::piped())
+                .spawn()
                 .map_err(|error| format!("failed to launch stdio transport: {error}"))?;
-            let client = tokio::time::timeout(server.startup_timeout, ().serve(transport))
-                .await
-                .map_err(|_| startup_timeout(server, "initialize"))?
-                .map_err(|error| format!("MCP initialize failed: {}", error_chain(&error)))?;
-            finish_startup(server, client).await
+            if let Some(stderr) = stderr {
+                drain_server_stderr(server_name.to_owned(), stderr);
+            }
+            let client = connect_transport(server, transport, &span).await?;
+            finish_startup(server, client, None, &span).await
         }
         McpTransport::StreamableHttp {
             url,
             bearer,
             headers,
         } => {
-            // rmcp deliberately leaves the rustls crypto provider to its host.
-            // Installing ring is idempotent and keeps this crate usable without
-            // requiring nanocodex-service to have opened a WebSocket first.
-            drop(rustls::crypto::ring::default_provider().install_default());
-            let http_client = reqwest::Client::builder()
-                // Match RMCP's default: its streamed handshake responses are not always fully
-                // consumed before the next request, so retaining them as idle connections causes
-                // stalls or failed sends with real peers.
-                .pool_max_idle_per_host(0)
-                .build()
-                .map_err(|error| format!("failed to build MCP HTTP client: {error}"))?;
-            if url.trim().is_empty() {
-                return Err("Streamable HTTP URL must not be empty".to_owned());
+            connect_http(
+                server_name,
+                server,
+                url,
+                bearer.as_ref(),
+                headers,
+                oauth_store,
+                &span,
+            )
+            .await
+        }
+    };
+    span.record(
+        "status",
+        if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+    );
+    span.record(
+        "otel.status_code",
+        if result.is_ok() { "OK" } else { "ERROR" },
+    );
+    result
+}
+
+async fn connect_http(
+    server_name: &str,
+    server: &McpServer,
+    url: &str,
+    bearer: Option<&SecretSource>,
+    headers: &std::collections::BTreeMap<String, SecretSource>,
+    oauth_store: Option<Arc<dyn McpOAuthStore>>,
+    parent: &Span,
+) -> Result<ConnectedServer, String> {
+    // rmcp deliberately leaves the rustls crypto provider to its host.
+    // Installing ring is idempotent and keeps this crate usable without
+    // requiring nanocodex-service to have opened a WebSocket first.
+    drop(rustls::crypto::ring::default_provider().install_default());
+    if url.trim().is_empty() {
+        return Err("Streamable HTTP URL must not be empty".to_owned());
+    }
+    let mut resolved_headers = HashMap::with_capacity(headers.len());
+    let mut default_headers = reqwest::header::HeaderMap::with_capacity(headers.len());
+    for (name, source) in headers {
+        let name = name
+            .parse::<HeaderName>()
+            .map_err(|error| format!("invalid HTTP header name `{name}`: {error}"))?;
+        let value = source.resolve()?;
+        let mut value = HeaderValue::from_str(&value)
+            .map_err(|error| format!("invalid value for HTTP header `{name}`: {error}"))?;
+        value.set_sensitive(true);
+        resolved_headers.insert(name.clone(), value.clone());
+        default_headers.insert(name, value);
+    }
+    let http_client = reqwest::Client::builder()
+        // Match RMCP's default: its streamed handshake responses are not always fully consumed
+        // before the next request, so retaining them as idle connections can stall real peers.
+        .pool_max_idle_per_host(0)
+        .default_headers(default_headers)
+        .build()
+        .map_err(|error| format!("failed to build MCP HTTP client: {error}"))?;
+    let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_owned())
+        .custom_headers(resolved_headers)
+        .reinit_on_expired_session(true);
+    if let Some(bearer) = bearer {
+        let token = bearer.resolve()?;
+        if token.trim().is_empty() {
+            return Err("resolved bearer token must not be empty".to_owned());
+        }
+        config = config.auth_header(token);
+        let transport = StreamableHttpClientTransport::with_client(http_client, config);
+        let client = connect_transport(server, transport, parent).await?;
+        return finish_startup(server, client, None, parent).await;
+    }
+    if let Some(store) = oauth_store {
+        let load_span = info_span!(
+            target: "nanocodex_mcp",
+            parent: parent,
+            "mcp.oauth.credentials_load",
+            otel.kind = "internal",
+            otel.status_code = tracing::field::Empty,
+            status = tracing::field::Empty,
+            credential.found = tracing::field::Empty,
+        );
+        let credentials = store
+            .load(server_name, url)
+            .instrument(load_span.clone())
+            .await;
+        load_span.record(
+            "status",
+            if credentials.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+        );
+        load_span.record(
+            "otel.status_code",
+            if credentials.is_ok() { "OK" } else { "ERROR" },
+        );
+        if let Ok(credentials) = &credentials {
+            load_span.record("credential.found", credentials.is_some());
+        }
+        let credentials = credentials?;
+        if let Some(credentials) = credentials {
+            let restore_span = info_span!(
+                target: "nanocodex_mcp",
+                parent: parent,
+                "mcp.oauth.restore",
+                otel.kind = "internal",
+                otel.status_code = tracing::field::Empty,
+                status = tracing::field::Empty,
+            );
+            let oauth =
+                transport_from_credentials(server_name, url, http_client, store, credentials)
+                    .instrument(restore_span.clone())
+                    .await;
+            restore_span.record("status", if oauth.is_ok() { "completed" } else { "failed" });
+            restore_span.record(
+                "otel.status_code",
+                if oauth.is_ok() { "OK" } else { "ERROR" },
+            );
+            let oauth = oauth?;
+            let runtime = oauth.runtime;
+            let transport = StreamableHttpClientTransport::with_client(oauth.client, config);
+            let client = connect_transport(server, transport, parent).await;
+            if let Err(error) = runtime.persist_if_changed().await {
+                tracing::warn!(%error, "failed to persist refreshed MCP OAuth credentials");
             }
-            let mut resolved_headers = HashMap::with_capacity(headers.len());
-            for (name, source) in headers {
-                let name = name
-                    .parse::<HeaderName>()
-                    .map_err(|error| format!("invalid HTTP header name `{name}`: {error}"))?;
-                let value = source.resolve()?;
-                let mut value = HeaderValue::from_str(&value)
-                    .map_err(|error| format!("invalid value for HTTP header `{name}`: {error}"))?;
-                value.set_sensitive(true);
-                resolved_headers.insert(name, value);
-            }
-            let mut config = StreamableHttpClientTransportConfig::with_uri(url.clone())
-                .custom_headers(resolved_headers)
-                .reinit_on_expired_session(true);
-            if let Some(bearer) = bearer {
-                let token = bearer.resolve()?;
-                if token.trim().is_empty() {
-                    return Err("resolved bearer token must not be empty".to_owned());
-                }
-                config = config.auth_header(token);
-            }
-            let transport = StreamableHttpClientTransport::with_client(http_client, config);
-            let client = tokio::time::timeout(server.startup_timeout, ().serve(transport))
-                .await
-                .map_err(|_| startup_timeout(server, "initialize"))?
-                .map_err(|error| format!("MCP initialize failed: {}", error_chain(&error)))?;
-            finish_startup(server, client).await
+            let client = client?;
+            return finish_startup(server, client, Some(runtime), parent).await;
         }
     }
+    let transport = StreamableHttpClientTransport::with_client(http_client, config);
+    let client = connect_transport(server, transport, parent).await?;
+    finish_startup(server, client, None, parent).await
+}
+
+async fn connect_transport<T, E, A>(
+    server: &McpServer,
+    transport: T,
+    parent: &Span,
+) -> Result<RunningService<RoleClient, ()>, String>
+where
+    T: rmcp::transport::IntoTransport<RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let span = info_span!(
+        target: "nanocodex_mcp",
+        parent: parent,
+        "mcp.initialize",
+        otel.kind = "client",
+        otel.status_code = tracing::field::Empty,
+        status = tracing::field::Empty,
+    );
+    // Do not instrument `serve` with this span. RMCP's returned service retains the transport
+    // task, which would retain this span and every parent until the client is dropped. The span's
+    // own lifetime still measures the awaited initialize handshake without leaking into the
+    // long-lived transport.
+    let result = match tokio::time::timeout(server.startup_timeout, ().serve(transport)).await {
+        Ok(Ok(client)) => Ok(client),
+        Ok(Err(error)) => Err(format!("MCP initialize failed: {}", error_chain(&error))),
+        Err(_) => Err(startup_timeout(server, "initialize")),
+    };
+    span.record(
+        "status",
+        if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+    );
+    span.record(
+        "otel.status_code",
+        if result.is_ok() { "OK" } else { "ERROR" },
+    );
+    result
+}
+
+fn drain_server_stderr(server_name: String, stderr: tokio::process::ChildStderr) {
+    drop(tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => tracing::info!(
+                    target: "nanocodex_mcp",
+                    server = %server_name,
+                    message = %line,
+                    "MCP server stderr"
+                ),
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "nanocodex_mcp",
+                        server = %server_name,
+                        %error,
+                        "failed to read MCP server stderr"
+                    );
+                    break;
+                }
+            }
+        }
+    }));
 }
 
 async fn finish_startup(
     server: &McpServer,
     client: RunningService<RoleClient, ()>,
+    oauth: Option<Arc<OAuthRuntime>>,
+    parent: &Span,
 ) -> Result<ConnectedServer, String> {
-    let client = Arc::new(client);
-    let tools = tokio::time::timeout(server.startup_timeout, client.list_all_tools())
-        .await
-        .map_err(|_| startup_timeout(server, "tools/list"))?
-        .map_err(|error| format!("MCP tools/list failed: {}", error_chain(&error)))?
-        .into_iter()
-        .filter(|tool| server.includes_tool(tool.name.as_ref()))
-        .collect();
+    let client = Arc::new(ClientInner {
+        service: Arc::new(client),
+        oauth,
+    });
+    let span = info_span!(
+        target: "nanocodex_mcp",
+        parent: parent,
+        "mcp.tools_list",
+        otel.kind = "client",
+        otel.status_code = tracing::field::Empty,
+        status = tracing::field::Empty,
+        tool.count = tracing::field::Empty,
+    );
+    let tools = match tokio::time::timeout(server.startup_timeout, client.list_all_tools()).await {
+        Ok(Ok(tools)) => Ok(tools
+            .into_iter()
+            .filter(|tool| server.includes_tool(tool.name.as_ref()))
+            .collect::<Vec<_>>()),
+        Ok(Err(error)) => Err(format!("MCP tools/list failed: {}", error_chain(&error))),
+        Err(_) => Err(startup_timeout(server, "tools/list")),
+    };
+    span.record("status", if tools.is_ok() { "completed" } else { "failed" });
+    span.record(
+        "otel.status_code",
+        if tools.is_ok() { "OK" } else { "ERROR" },
+    );
+    if let Ok(tools) = &tools {
+        span.record("tool.count", tools.len());
+    }
+    let tools = tools?;
     Ok(ConnectedServer { client, tools })
 }
 

@@ -23,13 +23,14 @@ bm25.workspace = true
 http.workspace = true
 nanocodex-core.workspace = true
 nanocodex-tools.workspace = true
+oauth2.workspace = true
 reqwest.workspace = true
 rmcp.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["process", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "net", "process", "rt", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]

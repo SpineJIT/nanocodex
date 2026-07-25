@@ -3,6 +3,7 @@
 mod catalog;
 mod client;
 mod config;
+mod oauth;
 
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -25,6 +26,7 @@ use serde_json::{Value, json};
 use tracing::{Instrument, info_span};
 
 pub use config::McpServer;
+pub use oauth::{McpOAuthCredentials, McpOAuthStore};
 
 const TOOL_SEARCH_NAME: &str = "tool_search";
 
@@ -33,6 +35,7 @@ pub struct Mcp {
     servers: Arc<[NamedServer]>,
     state: Arc<ProviderState>,
     search: Arc<McpSearch>,
+    oauth_store: Option<Arc<dyn McpOAuthStore>>,
     started: AtomicBool,
 }
 
@@ -45,7 +48,40 @@ struct NamedServer {
 #[derive(Default)]
 pub struct McpBuilder {
     servers: BTreeMap<String, McpServer>,
+    oauth_store: Option<Arc<dyn McpOAuthStore>>,
     duplicate: Option<String>,
+}
+
+/// Cheap control handle for reconnecting and authorizing a running MCP provider.
+#[derive(Clone)]
+pub struct McpHandle {
+    servers: Arc<[NamedServer]>,
+    state: Arc<ProviderState>,
+    oauth_store: Option<Arc<dyn McpOAuthStore>>,
+}
+
+/// An in-progress browser OAuth login.
+pub struct McpLogin {
+    authorization_url: String,
+    completion: tokio::task::JoinHandle<Result<usize, McpControlError>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum McpControlError {
+    #[error("unknown MCP server `{0}`")]
+    UnknownServer(String),
+    #[error("MCP server `{0}` does not use Streamable HTTP")]
+    NotHttp(String),
+    #[error("MCP server `{0}` has explicit bearer authentication")]
+    ExplicitBearer(String),
+    #[error("no MCP OAuth credential store is configured")]
+    NoOAuthStore,
+    #[error("MCP OAuth login failed: {0}")]
+    OAuth(String),
+    #[error("MCP server `{server}` failed to reload: {error}")]
+    Reload { server: String, error: String },
+    #[error("MCP OAuth login task stopped: {0}")]
+    LoginTask(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -72,9 +108,25 @@ impl Mcp {
     pub fn builder() -> McpBuilder {
         McpBuilder::default()
     }
+
+    #[must_use]
+    pub fn handle(&self) -> McpHandle {
+        McpHandle {
+            servers: Arc::clone(&self.servers),
+            state: Arc::clone(&self.state),
+            oauth_store: self.oauth_store.clone(),
+        }
+    }
 }
 
 impl McpBuilder {
+    /// Installs caller-owned persistence for OAuth-capable Streamable HTTP servers.
+    #[must_use]
+    pub fn oauth_store(mut self, store: Arc<dyn McpOAuthStore>) -> Self {
+        self.oauth_store = Some(store);
+        self
+    }
+
     /// Adds a named stdio or Streamable HTTP MCP server.
     #[must_use]
     pub fn server(mut self, name: impl Into<String>, server: McpServer) -> Self {
@@ -114,7 +166,10 @@ impl McpBuilder {
             });
         }
         let servers: Arc<[NamedServer]> = named.into();
-        let state = Arc::new(ProviderState::new(servers.len(), discovery_timeout));
+        let state = Arc::new(ProviderState::new(
+            servers.iter().map(|server| server.name.clone()),
+            discovery_timeout,
+        ));
         let search = Arc::new(McpSearch {
             state: Arc::clone(&state),
             description: search_description(&servers),
@@ -123,8 +178,212 @@ impl McpBuilder {
             servers,
             state,
             search,
+            oauth_store: self.oauth_store,
             started: AtomicBool::new(false),
         })
+    }
+}
+
+impl McpHandle {
+    /// Reconnects one configured server and atomically replaces its discovered tools.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the server name is unknown or the replacement connection cannot
+    /// initialize and list its tools.
+    pub async fn reload(&self, server_name: &str) -> Result<usize, McpControlError> {
+        let span = info_span!(
+            target: "nanocodex_mcp",
+            parent: None,
+            "mcp.server_reload",
+            otel.kind = "client",
+            otel.status_code = tracing::field::Empty,
+            mcp.server = server_name,
+            status = tracing::field::Empty,
+            tool.count = tracing::field::Empty,
+        );
+        // Do not enter this span while connecting. RMCP's transport task inherits the current
+        // tracing context and outlives the reload operation; children use explicit parents.
+        let result = self.reload_inner(server_name, &span).await;
+        span.record(
+            "status",
+            if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+        );
+        span.record(
+            "otel.status_code",
+            if result.is_ok() { "OK" } else { "ERROR" },
+        );
+        if let Ok(tool_count) = &result {
+            span.record("tool.count", tool_count);
+        }
+        result
+    }
+
+    async fn reload_inner(
+        &self,
+        server_name: &str,
+        parent: &tracing::Span,
+    ) -> Result<usize, McpControlError> {
+        let server = self
+            .servers
+            .iter()
+            .find(|server| server.name == server_name)
+            .ok_or_else(|| McpControlError::UnknownServer(server_name.to_owned()))?;
+        let generation = self.state.begin_server(server_name);
+        let result = client::connect(
+            server_name,
+            &server.config,
+            self.oauth_store.clone(),
+            parent,
+        )
+        .await;
+        match result {
+            Ok(connected) => {
+                let count = connected.tools.len();
+                let entries = connected
+                    .tools
+                    .into_iter()
+                    .map(|tool| {
+                        ToolEntry::new(
+                            server_name,
+                            &tool,
+                            Arc::clone(&connected.client),
+                            server.config.tool_timeout,
+                        )
+                    })
+                    .collect();
+                self.state
+                    .complete_server(server_name, generation, Ok(entries));
+                Ok(count)
+            }
+            Err(error) => {
+                self.state
+                    .complete_server(server_name, generation, Err(error.clone()));
+                Err(McpControlError::Reload {
+                    server: server_name.to_owned(),
+                    error,
+                })
+            }
+        }
+    }
+
+    /// Starts an OAuth browser login for one server.
+    ///
+    /// Await [`McpLogin::wait`] after opening [`McpLogin::authorization_url`]. A successful login
+    /// persists the credentials and hot-reloads the server before completing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown or unsupported server, a missing OAuth store, or when the
+    /// authorization flow cannot be initialized.
+    pub async fn login(&self, server_name: &str) -> Result<McpLogin, McpControlError> {
+        let span = info_span!(
+            target: "nanocodex_mcp",
+            parent: None,
+            "mcp.oauth.login",
+            otel.kind = "client",
+            otel.status_code = tracing::field::Empty,
+            mcp.server = server_name,
+            status = tracing::field::Empty,
+            tool.count = tracing::field::Empty,
+        );
+        self.login_inner(server_name, span).await
+    }
+
+    async fn login_inner(
+        &self,
+        server_name: &str,
+        span: tracing::Span,
+    ) -> Result<McpLogin, McpControlError> {
+        let server = self
+            .servers
+            .iter()
+            .find(|server| server.name == server_name)
+            .ok_or_else(|| McpControlError::UnknownServer(server_name.to_owned()))?;
+        let store = self
+            .oauth_store
+            .clone()
+            .ok_or(McpControlError::NoOAuthStore)?;
+        let (url, bearer, headers) = match &server.config.transport {
+            config::McpTransport::StreamableHttp {
+                url,
+                bearer,
+                headers,
+            } => (url.clone(), bearer.is_some(), headers.clone()),
+            config::McpTransport::Stdio { .. } => {
+                return Err(McpControlError::NotHttp(server_name.to_owned()));
+            }
+        };
+        if bearer {
+            return Err(McpControlError::ExplicitBearer(server_name.to_owned()));
+        }
+        let flow = oauth::begin_login(server_name.to_owned(), url, headers, store)
+            .instrument(span.clone())
+            .await
+            .map_err(|error| {
+                span.record("status", "failed");
+                span.record("otel.status_code", "ERROR");
+                McpControlError::OAuth(error)
+            })?;
+        let handle = self.clone();
+        let name = server_name.to_owned();
+        let completion_span = span.clone();
+        let completion = tokio::spawn(
+            async move {
+                let result = async {
+                    flow.completion
+                        .await
+                        .map_err(|error| McpControlError::LoginTask(error.to_string()))?
+                        .map_err(McpControlError::OAuth)?;
+                    handle.reload(&name).await
+                }
+                .await;
+                completion_span.record(
+                    "status",
+                    if result.is_ok() {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
+                );
+                completion_span.record(
+                    "otel.status_code",
+                    if result.is_ok() { "OK" } else { "ERROR" },
+                );
+                if let Ok(tool_count) = &result {
+                    completion_span.record("tool.count", tool_count);
+                }
+                result
+            }
+            .instrument(span),
+        );
+        Ok(McpLogin {
+            authorization_url: flow.authorization_url,
+            completion,
+        })
+    }
+}
+
+impl McpLogin {
+    #[must_use]
+    pub fn authorization_url(&self) -> &str {
+        &self.authorization_url
+    }
+
+    /// Waits for the browser callback and the automatic server reload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when authorization, credential persistence, or the subsequent hot reload
+    /// fails.
+    pub async fn wait(self) -> Result<usize, McpControlError> {
+        self.completion
+            .await
+            .map_err(|error| McpControlError::LoginTask(error.to_string()))?
     }
 }
 
@@ -138,6 +397,7 @@ impl DynamicToolProvider for Mcp {
             let name = server.name.clone();
             let config = server.config.clone();
             let state = Arc::clone(&self.state);
+            let oauth_store = self.oauth_store.clone();
             let span = info_span!(
                 target: "nanocodex_mcp",
                 parent: None,
@@ -148,9 +408,10 @@ impl DynamicToolProvider for Mcp {
                 status = tracing::field::Empty,
                 tool.count = tracing::field::Empty,
             );
-            drop(tokio::spawn(
-                async move {
-                    let result = client::connect(&config).await.map(|connected| {
+            drop(tokio::spawn(async move {
+                let result = client::connect(&name, &config, oauth_store, &span)
+                    .await
+                    .map(|connected| {
                         connected
                             .tools
                             .into_iter()
@@ -164,26 +425,23 @@ impl DynamicToolProvider for Mcp {
                             })
                             .collect::<Vec<_>>()
                     });
-                    let current = tracing::Span::current();
-                    current.record(
-                        "status",
-                        if result.is_ok() {
-                            "completed"
-                        } else {
-                            "failed"
-                        },
-                    );
-                    current.record(
-                        "otel.status_code",
-                        if result.is_ok() { "OK" } else { "ERROR" },
-                    );
-                    if let Ok(tools) = &result {
-                        current.record("tool.count", tools.len());
-                    }
-                    state.complete_server(&name, result);
+                span.record(
+                    "status",
+                    if result.is_ok() {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
+                );
+                span.record(
+                    "otel.status_code",
+                    if result.is_ok() { "OK" } else { "ERROR" },
+                );
+                if let Ok(tools) = &result {
+                    span.record("tool.count", tools.len());
                 }
-                .instrument(span),
-            ));
+                state.complete_server(&name, 0, result);
+            }));
         }
     }
 
@@ -321,7 +579,39 @@ impl Tool for McpSearch {
 
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
         let input = input.decode_json::<SearchInput>()?;
-        Ok(match self.state.search(&input.query, input.limit).await {
+        let span = info_span!(
+            target: "nanocodex_mcp",
+            "mcp.catalog_search",
+            otel.kind = "internal",
+            otel.status_code = tracing::field::Empty,
+            query.bytes = input.query.len(),
+            result.count = tracing::field::Empty,
+            pending_servers = tracing::field::Empty,
+            status = tracing::field::Empty,
+        );
+        tracing::info!(parent: &span, query = %input.query, limit = input.limit, "MCP catalog search");
+        let result = self
+            .state
+            .search(&input.query, input.limit)
+            .instrument(span.clone())
+            .await;
+        span.record(
+            "status",
+            if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+        );
+        span.record(
+            "otel.status_code",
+            if result.is_ok() { "OK" } else { "ERROR" },
+        );
+        if let Ok(result) = &result {
+            span.record("result.count", result.tool_count());
+            span.record("pending_servers", result.pending_server_count());
+        }
+        Ok(match result {
             Ok(result) => ToolExecution::json(&result),
             Err(error) => ToolExecution::error(error),
         })
@@ -479,6 +769,60 @@ mod tests {
         assert!(matches!(
             execution.output,
             ToolOutputBody::Text(output) if output.contains("fixture:hello")
+        ));
+    }
+
+    #[tokio::test]
+    async fn reload_replaces_a_live_server_without_restarting_or_deactivating_tools() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/stdio-server.mjs");
+        let mcp = Mcp::builder()
+            .server(
+                "fixture",
+                McpServer::stdio("node").arg(fixture.to_string_lossy()),
+            )
+            .build()
+            .unwrap();
+        let handle = mcp.handle();
+        mcp.start();
+        let context = ToolContext {
+            model: MODEL,
+            session_id: "reload-session",
+            call_id: "search-call",
+            history: &[],
+            output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
+        };
+        let search = mcp
+            .search
+            .execute(
+                ToolInput::Function(to_raw_value(&json!({ "query": "echo message" })).unwrap()),
+                context,
+            )
+            .await
+            .unwrap();
+        assert!(search.success);
+
+        assert_eq!(handle.reload("fixture").await.unwrap(), 1);
+        assert!(
+            mcp.available_definitions()
+                .iter()
+                .any(|definition| definition.name() == "mcp__fixture__echo")
+        );
+        let execution = mcp
+            .execute(
+                "mcp__fixture__echo",
+                json!({ "message": "after-reload" }),
+                ToolContext {
+                    call_id: "tool-call",
+                    ..context
+                },
+            )
+            .await
+            .unwrap();
+        assert!(execution.success);
+        assert!(matches!(
+            execution.output,
+            ToolOutputBody::Text(output) if output.contains("fixture:after-reload")
         ));
     }
 
