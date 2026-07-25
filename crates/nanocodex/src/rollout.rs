@@ -67,7 +67,7 @@ pub struct DurableSession {
     thread_id: String,
     rollout_path: PathBuf,
     snapshot: SessionSnapshot,
-    messages: Vec<RolloutMessage>,
+    transcript: Vec<RolloutTranscriptItem>,
 }
 
 impl DurableSession {
@@ -84,7 +84,7 @@ impl DurableSession {
                 format!("no Codex rollout found for thread {thread_id}"),
             )
         })?;
-        let (workspace, history, messages) = materialize_rollout(&rollout_path, thread_id)?;
+        let (workspace, history, transcript) = materialize_rollout(&rollout_path, thread_id)?;
         let snapshot = SessionSnapshot::from_rollout(thread_id.to_owned(), workspace, history)
             .map_err(io::Error::other)?;
         Ok(Self {
@@ -92,7 +92,7 @@ impl DurableSession {
             thread_id: thread_id.to_owned(),
             rollout_path,
             snapshot,
-            messages,
+            transcript,
         })
     }
 
@@ -120,10 +120,10 @@ impl DurableSession {
         &self.rollout_path
     }
 
-    /// Returns user and assistant messages used to restore a visible transcript.
+    /// Returns the visible activity used to restore the originating transcript.
     #[must_use]
-    pub fn messages(&self) -> &[RolloutMessage] {
-        &self.messages
+    pub fn transcript(&self) -> &[RolloutTranscriptItem] {
+        &self.transcript
     }
 
     /// Splits this loaded boundary into the builder inputs needed to continue it.
@@ -137,13 +137,24 @@ impl DurableSession {
     }
 }
 
-/// A user-visible message reconstructed from a Codex-compatible rollout.
+/// User-visible activity reconstructed from a Codex-compatible rollout.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RolloutMessage {
+pub enum RolloutTranscriptItem {
     /// A submitted user prompt.
     User(String),
+    /// A reasoning summary displayed while the assistant was working.
+    Reasoning(String),
     /// An assistant message displayed by the originating client.
     Assistant(String),
+    /// A tool invocation displayed by the originating client.
+    Tool {
+        /// Stable call identifier from the rollout.
+        call_id: String,
+        /// Tool name sent by the model.
+        name: String,
+        /// Serialized tool arguments sent by the model.
+        arguments: String,
+    },
 }
 
 fn find_rollout_path(codex_home: &Path, thread_id: &str) -> io::Result<Option<PathBuf>> {
@@ -195,10 +206,10 @@ fn find_rollout_path(codex_home: &Path, thread_id: &str) -> io::Result<Option<Pa
 fn materialize_rollout(
     path: &Path,
     thread_id: &str,
-) -> io::Result<(String, Vec<ResponseItem>, Vec<RolloutMessage>)> {
+) -> io::Result<(String, Vec<ResponseItem>, Vec<RolloutTranscriptItem>)> {
     let mut workspace = None;
     let mut history = Vec::new();
-    let mut messages = Vec::new();
+    let mut transcript = Vec::new();
     for (index, line) in BufReader::new(File::open(path)?).lines().enumerate() {
         let line = line?;
         let value: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
@@ -234,6 +245,9 @@ fn materialize_rollout(
                 );
             }
             Some("response_item") => {
+                if let Some(item) = visible_tool_call(&value["payload"]) {
+                    transcript.push(item);
+                }
                 let item = serde_json::from_value(value["payload"].clone()).map_err(|error| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -260,8 +274,8 @@ fn materialize_rollout(
                 })?;
             }
             Some("event_msg") => {
-                if let Some(message) = visible_rollout_message(&value["payload"]) {
-                    messages.push(message);
+                if let Some(item) = visible_rollout_event(&value["payload"]) {
+                    transcript.push(item);
                 }
             }
             _ => {}
@@ -283,20 +297,58 @@ fn materialize_rollout(
             ),
         )
     })?;
-    Ok((workspace, history, messages))
+    Ok((workspace, history, transcript))
 }
 
-fn visible_rollout_message(payload: &serde_json::Value) -> Option<RolloutMessage> {
-    let message = payload
-        .get("message")?
-        .as_str()
-        .filter(|message| !message.is_empty())?
-        .to_owned();
+fn visible_rollout_event(payload: &serde_json::Value) -> Option<RolloutTranscriptItem> {
     match payload.get("type")?.as_str()? {
-        "user_message" => Some(RolloutMessage::User(message)),
-        "agent_message" => Some(RolloutMessage::Assistant(message)),
+        "user_message" => visible_text(payload, "message").map(RolloutTranscriptItem::User),
+        "agent_reasoning" => visible_text(payload, "text").map(RolloutTranscriptItem::Reasoning),
+        "agent_message" => visible_text(payload, "message").map(RolloutTranscriptItem::Assistant),
+        "mcp_tool_call_end" => {
+            let invocation = payload.get("invocation")?;
+            let server = invocation.get("server")?.as_str()?;
+            let tool = invocation.get("tool")?.as_str()?;
+            Some(RolloutTranscriptItem::Tool {
+                call_id: payload.get("call_id")?.as_str()?.to_owned(),
+                name: format!("{server}.{tool}"),
+                arguments: serde_json::to_string(invocation.get("arguments")?).ok()?,
+            })
+        }
+        "web_search_end" => Some(RolloutTranscriptItem::Tool {
+            call_id: payload.get("call_id")?.as_str()?.to_owned(),
+            name: "web_search".to_owned(),
+            arguments: serde_json::to_string(payload.get("action")?).ok()?,
+        }),
         _ => None,
     }
+}
+
+fn visible_text(payload: &serde_json::Value, key: &str) -> Option<String> {
+    payload
+        .get(key)?
+        .as_str()
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+fn visible_tool_call(payload: &serde_json::Value) -> Option<RolloutTranscriptItem> {
+    let (name, arguments) = match payload.get("type")?.as_str()? {
+        "custom_tool_call" => (
+            payload.get("name")?.as_str()?.to_owned(),
+            payload.get("input")?.as_str()?.to_owned(),
+        ),
+        "function_call" => (
+            payload.get("name")?.as_str()?.to_owned(),
+            payload.get("arguments")?.as_str()?.to_owned(),
+        ),
+        _ => return None,
+    };
+    Some(RolloutTranscriptItem::Tool {
+        call_id: payload.get("call_id")?.as_str()?.to_owned(),
+        name,
+        arguments,
+    })
 }
 
 /// Stable identity and file location of a recorded Nanocodex thread.
@@ -1218,6 +1270,11 @@ mod tests {
             serde_json::json!({
                 "timestamp": "2026-07-24T12:00:03Z",
                 "type": "event_msg",
+                "payload": {"type": "agent_reasoning", "text": "checking the workspace"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-24T12:00:03Z",
+                "type": "event_msg",
                 "payload": {"type": "agent_message", "message": "visible answer"}
             }),
             serde_json::json!({
@@ -1250,11 +1307,71 @@ mod tests {
         assert!(history.contains("continued"));
         assert!(!history.contains("discarded"));
         assert_eq!(
-            session.messages(),
+            session.transcript(),
             [
-                RolloutMessage::User("visible prompt".to_owned()),
-                RolloutMessage::Assistant("visible answer".to_owned()),
+                RolloutTranscriptItem::User("visible prompt".to_owned()),
+                RolloutTranscriptItem::Reasoning("checking the workspace".to_owned()),
+                RolloutTranscriptItem::Assistant("visible answer".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn reconstructs_custom_function_and_mcp_tool_activity() {
+        assert_eq!(
+            visible_tool_call(&serde_json::json!({
+                "type": "custom_tool_call",
+                "call_id": "custom-1",
+                "name": "exec",
+                "input": "text(true);"
+            })),
+            Some(RolloutTranscriptItem::Tool {
+                call_id: "custom-1".to_owned(),
+                name: "exec".to_owned(),
+                arguments: "text(true);".to_owned(),
+            })
+        );
+        assert_eq!(
+            visible_tool_call(&serde_json::json!({
+                "type": "function_call",
+                "call_id": "function-1",
+                "name": "wait",
+                "arguments": "{\"cell_id\":\"1\"}"
+            })),
+            Some(RolloutTranscriptItem::Tool {
+                call_id: "function-1".to_owned(),
+                name: "wait".to_owned(),
+                arguments: "{\"cell_id\":\"1\"}".to_owned(),
+            })
+        );
+        assert_eq!(
+            visible_rollout_event(&serde_json::json!({
+                "type": "mcp_tool_call_end",
+                "call_id": "mcp-1",
+                "invocation": {
+                    "server": "node_repl",
+                    "tool": "js",
+                    "arguments": {"code": "return true"}
+                }
+            })),
+            Some(RolloutTranscriptItem::Tool {
+                call_id: "mcp-1".to_owned(),
+                name: "node_repl.js".to_owned(),
+                arguments: "{\"code\":\"return true\"}".to_owned(),
+            })
+        );
+        assert_eq!(
+            visible_rollout_event(&serde_json::json!({
+                "type": "web_search_end",
+                "call_id": "search-1",
+                "query": "Nanocodex",
+                "action": {"type": "search", "queries": ["Nanocodex"]}
+            })),
+            Some(RolloutTranscriptItem::Tool {
+                call_id: "search-1".to_owned(),
+                name: "web_search".to_owned(),
+                arguments: "{\"queries\":[\"Nanocodex\"],\"type\":\"search\"}".to_owned(),
+            })
         );
     }
 

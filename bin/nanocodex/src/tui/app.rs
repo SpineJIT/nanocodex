@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nanocodex::{AgentEvent, AgentEventKind, Prompt, RolloutMessage, Thinking, UserInput};
+use nanocodex::{AgentEvent, AgentEventKind, Prompt, RolloutTranscriptItem, Thinking, UserInput};
 use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
@@ -1183,11 +1183,25 @@ impl App {
         }
     }
 
-    pub(super) fn restore_messages(&mut self, messages: impl IntoIterator<Item = RolloutMessage>) {
-        for message in messages {
-            let item = match message {
-                RolloutMessage::User(message) => TranscriptItem::User(message),
-                RolloutMessage::Assistant(message) => TranscriptItem::Assistant(message),
+    pub(super) fn restore_transcript(
+        &mut self,
+        transcript: impl IntoIterator<Item = RolloutTranscriptItem>,
+    ) {
+        for activity in transcript {
+            let item = match activity {
+                RolloutTranscriptItem::User(message) => TranscriptItem::User(message),
+                RolloutTranscriptItem::Reasoning(message) => TranscriptItem::Reasoning(message),
+                RolloutTranscriptItem::Assistant(message) => TranscriptItem::Assistant(message),
+                RolloutTranscriptItem::Tool {
+                    call_id,
+                    name,
+                    arguments,
+                } => TranscriptItem::Tool {
+                    call_id,
+                    name,
+                    arguments,
+                    status: ToolStatus::Completed,
+                },
             };
             self.main.push_output(item);
         }
@@ -3062,7 +3076,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use nanocodex::{AgentEvent, AgentEventKind, PromptInput, RolloutMessage, UserInput};
+    use nanocodex::{AgentEvent, AgentEventKind, PromptInput, RolloutTranscriptItem, UserInput};
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
     use serde_json::{Value, json};
 
@@ -3084,14 +3098,20 @@ mod tests {
     }
 
     #[test]
-    fn restored_rollout_messages_seed_the_visible_transcript() {
+    fn restored_rollout_activity_seeds_the_visible_transcript() {
         let mut app = App::new(std::path::PathBuf::from("/worktree"));
-        app.restore_messages([
-            RolloutMessage::User("visible prompt".to_owned()),
-            RolloutMessage::Assistant("visible answer".to_owned()),
+        app.restore_transcript([
+            RolloutTranscriptItem::User("visible prompt".to_owned()),
+            RolloutTranscriptItem::Reasoning("thinking".to_owned()),
+            RolloutTranscriptItem::Tool {
+                call_id: "call-1".to_owned(),
+                name: "exec".to_owned(),
+                arguments: "pwd".to_owned(),
+            },
+            RolloutTranscriptItem::Assistant("visible answer".to_owned()),
         ]);
 
-        assert_eq!(app.main.transcript.len(), 2);
+        assert_eq!(app.main.transcript.len(), 4);
         assert_eq!(
             app.main.transcript.latest_user_message(),
             Some("visible prompt")
