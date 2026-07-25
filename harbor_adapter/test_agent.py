@@ -858,6 +858,8 @@ class RunCancellationContractTests(unittest.IsolatedAsyncioTestCase):
                 return_value=SimpleNamespace(stdout=stream, stderr="")
             )
             environment = SimpleNamespace(capabilities=SimpleNamespace(mounted=True))
+            event_spool = agent.logs_dir / "events.jsonl.tmp"
+            event_spool.write_text(stream, encoding="utf-8")
 
             await agent.run("test", environment, AgentContext())
 
@@ -871,6 +873,7 @@ class RunCancellationContractTests(unittest.IsolatedAsyncioTestCase):
                 stream,
             )
             self.assertFalse((agent.logs_dir / "events.jsonl.host.tmp").exists())
+            self.assertFalse(event_spool.exists())
 
     def test_nonzero_exit_publishes_captured_stdout_before_classification(
         self,

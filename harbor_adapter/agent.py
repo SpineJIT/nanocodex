@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -253,10 +252,6 @@ class NanocodexAgent(BaseInstalledAgent):
         finally:
             await self._remove_staged_api_key(environment)
         self._publish_events(result.stdout)
-        if result.stdout:
-            print(result.stdout, end="", flush=True)
-        if result.stderr:
-            print(result.stderr, end="", file=sys.stderr, flush=True)
 
     def _run_arguments(self, prompt: str) -> list[str]:
         return [
@@ -286,6 +281,7 @@ class NanocodexAgent(BaseInstalledAgent):
         temporary = events.with_name(f"{events.name}.host.tmp")
         temporary.write_text(stdout, encoding="utf-8")
         temporary.replace(events)
+        (self.logs_dir / Path(self._EVENTS_TMP).name).unlink(missing_ok=True)
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         if getattr(self, "_post_run_validation_failed", False):
