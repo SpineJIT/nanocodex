@@ -36,6 +36,7 @@ pub struct Mcp {
     state: Arc<ProviderState>,
     search: Arc<McpSearch>,
     oauth_store: Option<Arc<dyn McpOAuthStore>>,
+    oauth_metadata: Arc<oauth::OAuthMetadataCache>,
     started: AtomicBool,
 }
 
@@ -58,6 +59,7 @@ pub struct McpHandle {
     servers: Arc<[NamedServer]>,
     state: Arc<ProviderState>,
     oauth_store: Option<Arc<dyn McpOAuthStore>>,
+    oauth_metadata: Arc<oauth::OAuthMetadataCache>,
 }
 
 /// An in-progress browser OAuth login.
@@ -115,6 +117,7 @@ impl Mcp {
             servers: Arc::clone(&self.servers),
             state: Arc::clone(&self.state),
             oauth_store: self.oauth_store.clone(),
+            oauth_metadata: Arc::clone(&self.oauth_metadata),
         }
     }
 }
@@ -179,6 +182,7 @@ impl McpBuilder {
             state,
             search,
             oauth_store: self.oauth_store,
+            oauth_metadata: Arc::new(oauth::OAuthMetadataCache::default()),
             started: AtomicBool::new(false),
         })
     }
@@ -238,6 +242,7 @@ impl McpHandle {
             server_name,
             &server.config,
             self.oauth_store.clone(),
+            Arc::clone(&self.oauth_metadata),
             parent,
         )
         .await;
@@ -398,6 +403,7 @@ impl DynamicToolProvider for Mcp {
             let config = server.config.clone();
             let state = Arc::clone(&self.state);
             let oauth_store = self.oauth_store.clone();
+            let oauth_metadata = Arc::clone(&self.oauth_metadata);
             let span = info_span!(
                 target: "nanocodex_mcp",
                 parent: None,
@@ -409,7 +415,7 @@ impl DynamicToolProvider for Mcp {
                 tool.count = tracing::field::Empty,
             );
             drop(tokio::spawn(async move {
-                let result = client::connect(&name, &config, oauth_store, &span)
+                let result = client::connect(&name, &config, oauth_store, oauth_metadata, &span)
                     .await
                     .map(|connected| {
                         connected

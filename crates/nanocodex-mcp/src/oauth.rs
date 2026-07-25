@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -9,12 +9,15 @@ use http::{HeaderName, HeaderValue};
 use oauth2::{AccessToken, RefreshToken, Scope, TokenResponse, basic::BasicTokenType};
 use rmcp::transport::{
     AuthorizationManager,
-    auth::{AuthClient, OAuthState, OAuthTokenResponse, VendorExtraTokenFields},
+    auth::{
+        AuthClient, AuthorizationMetadata, CredentialStore, InMemoryCredentialStore, OAuthState,
+        OAuthTokenResponse, StoredCredentials, VendorExtraTokenFields,
+    },
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    sync::Mutex,
+    sync::{Mutex, RwLock},
     task::JoinHandle,
 };
 use tracing::{Instrument, info_span};
@@ -23,6 +26,28 @@ use crate::config::SecretSource;
 
 const LOGIN_TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_CALLBACK_BYTES: usize = 16 * 1024;
+
+#[derive(Default)]
+pub(crate) struct OAuthMetadataCache {
+    entries: RwLock<HashMap<(String, String), AuthorizationMetadata>>,
+}
+
+impl OAuthMetadataCache {
+    async fn get(&self, server_name: &str, server_url: &str) -> Option<AuthorizationMetadata> {
+        self.entries
+            .read()
+            .await
+            .get(&(server_name.to_owned(), server_url.to_owned()))
+            .cloned()
+    }
+
+    async fn insert(&self, server_name: &str, server_url: &str, metadata: AuthorizationMetadata) {
+        self.entries
+            .write()
+            .await
+            .insert((server_name.to_owned(), server_url.to_owned()), metadata);
+    }
+}
 
 /// OAuth credentials for one Streamable HTTP MCP server.
 ///
@@ -238,6 +263,7 @@ impl OAuthRuntime {
 pub(crate) struct OAuthTransport {
     pub(crate) client: AuthClient<reqwest::Client>,
     pub(crate) runtime: Arc<OAuthRuntime>,
+    pub(crate) metadata_cache_hit: bool,
 }
 
 pub(crate) async fn transport_from_credentials(
@@ -246,17 +272,47 @@ pub(crate) async fn transport_from_credentials(
     http_client: reqwest::Client,
     store: Arc<dyn McpOAuthStore>,
     credentials: McpOAuthCredentials,
+    metadata_cache: &OAuthMetadataCache,
 ) -> Result<OAuthTransport, String> {
-    let mut state = OAuthState::new(server_url, Some(http_client.clone()))
+    let mut manager = AuthorizationManager::new(server_url)
         .await
-        .map_err(|error| format!("failed to discover MCP OAuth metadata: {error}"))?;
-    state
-        .set_credentials(&credentials.client_id, credentials.to_token_response())
+        .map_err(|error| format!("failed to initialize MCP OAuth state: {error}"))?;
+    manager
+        .with_client(http_client.clone())
+        .map_err(|error| format!("failed to configure MCP OAuth HTTP client: {error}"))?;
+    let (metadata, metadata_cache_hit) =
+        if let Some(metadata) = metadata_cache.get(server_name, server_url).await {
+            (metadata, true)
+        } else {
+            let metadata = manager
+                .discover_metadata()
+                .await
+                .map_err(|error| format!("failed to discover MCP OAuth metadata: {error}"))?;
+            metadata_cache
+                .insert(server_name, server_url, metadata.clone())
+                .await;
+            (metadata, false)
+        };
+    manager.set_metadata(metadata);
+
+    let credential_store = InMemoryCredentialStore::new();
+    credential_store
+        .save(StoredCredentials::new(
+            credentials.client_id.clone(),
+            Some(credentials.to_token_response()),
+            credentials.scopes.clone(),
+            Some(now_seconds()),
+        ))
+        .await
+        .map_err(|error| format!("failed to stage MCP OAuth credentials: {error}"))?;
+    manager.set_credential_store(credential_store);
+    let restored = manager
+        .initialize_from_store()
         .await
         .map_err(|error| format!("failed to restore MCP OAuth credentials: {error}"))?;
-    let manager = state
-        .into_authorization_manager()
-        .ok_or_else(|| "restored MCP OAuth state was not authorized".to_owned())?;
+    if !restored {
+        return Err("restored MCP OAuth state was not authorized".to_owned());
+    }
     let client = AuthClient::new(http_client, manager);
     let runtime = Arc::new(OAuthRuntime::new(
         server_name.to_owned(),
@@ -265,7 +321,11 @@ pub(crate) async fn transport_from_credentials(
         store,
         credentials,
     ));
-    Ok(OAuthTransport { client, runtime })
+    Ok(OAuthTransport {
+        client,
+        runtime,
+        metadata_cache_hit,
+    })
 }
 
 pub(crate) struct OAuthLoginFlow {
@@ -519,4 +579,101 @@ fn now_millis() -> u64 {
         .unwrap_or(Duration::ZERO)
         .as_millis();
     u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingStore {
+        saved: Mutex<Vec<McpOAuthCredentials>>,
+    }
+
+    #[async_trait]
+    impl McpOAuthStore for RecordingStore {
+        async fn load(
+            &self,
+            _server_name: &str,
+            _server_url: &str,
+        ) -> Result<Option<McpOAuthCredentials>, String> {
+            Ok(None)
+        }
+
+        async fn save(
+            &self,
+            _server_name: &str,
+            _server_url: &str,
+            credentials: &McpOAuthCredentials,
+        ) -> Result<(), String> {
+            self.saved.lock().await.push(credentials.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_metadata_preserves_refresh_and_rotated_token_persistence() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).contains("POST /token"));
+            let body = r#"{"access_token":"refreshed-access","token_type":"Bearer","expires_in":3600,"refresh_token":"rotated-refresh","scope":"mcp:tools"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let server_name = "cached";
+        let server_url = "http://127.0.0.1:9/mcp";
+        let metadata: AuthorizationMetadata = serde_json::from_value(serde_json::json!({
+            "authorization_endpoint": "http://127.0.0.1:9/authorize",
+            "token_endpoint": token_endpoint,
+        }))
+        .unwrap();
+        let metadata_cache = OAuthMetadataCache::default();
+        metadata_cache
+            .insert(server_name, server_url, metadata)
+            .await;
+        let store = Arc::new(RecordingStore::default());
+        let credentials = McpOAuthCredentials::new("client", "expired-access")
+            .refresh_token("refresh-token")
+            .expires_at_millis(0)
+            .scopes(["mcp:tools"]);
+
+        let transport = transport_from_credentials(
+            server_name,
+            server_url,
+            reqwest::Client::new(),
+            store.clone(),
+            credentials,
+            &metadata_cache,
+        )
+        .await
+        .unwrap();
+        assert!(transport.metadata_cache_hit);
+        assert_eq!(
+            transport.client.get_access_token().await.unwrap(),
+            "refreshed-access"
+        );
+        transport.runtime.persist_if_changed().await.unwrap();
+        responder.await.unwrap();
+
+        let saved = store.saved.lock().await;
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].access_token(), "refreshed-access");
+        assert_eq!(saved[0].refresh_token_value(), Some("rotated-refresh"));
+        assert_eq!(saved[0].granted_scopes(), ["mcp:tools"]);
+    }
 }

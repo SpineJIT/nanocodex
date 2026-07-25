@@ -14,7 +14,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{Instrument, Span, info_span};
 
 use crate::config::{McpServer, McpTransport, SecretSource};
-use crate::oauth::{McpOAuthStore, OAuthRuntime, transport_from_credentials};
+use crate::oauth::{McpOAuthStore, OAuthMetadataCache, OAuthRuntime, transport_from_credentials};
 
 pub(crate) type Client = Arc<ClientInner>;
 
@@ -53,10 +53,33 @@ pub(crate) struct ConnectedServer {
     pub tools: Vec<Tool>,
 }
 
+struct HttpConnect<'a> {
+    server_name: &'a str,
+    server: &'a McpServer,
+    url: &'a str,
+    bearer: Option<&'a SecretSource>,
+    headers: &'a std::collections::BTreeMap<String, SecretSource>,
+    oauth_store: Option<Arc<dyn McpOAuthStore>>,
+    oauth_metadata: Arc<OAuthMetadataCache>,
+    parent: &'a Span,
+}
+
+struct StoredOAuthConnect<'a> {
+    server_name: &'a str,
+    server: &'a McpServer,
+    url: &'a str,
+    http_client: reqwest::Client,
+    config: StreamableHttpClientTransportConfig,
+    store: Arc<dyn McpOAuthStore>,
+    metadata: Arc<OAuthMetadataCache>,
+    parent: &'a Span,
+}
+
 pub(crate) async fn connect(
     server_name: &str,
     server: &McpServer,
     oauth_store: Option<Arc<dyn McpOAuthStore>>,
+    oauth_metadata: Arc<OAuthMetadataCache>,
     parent: &Span,
 ) -> Result<ConnectedServer, String> {
     let (transport_name, auth_mode) = match &server.transport {
@@ -113,15 +136,16 @@ pub(crate) async fn connect(
             bearer,
             headers,
         } => {
-            connect_http(
+            connect_http(HttpConnect {
                 server_name,
                 server,
                 url,
-                bearer.as_ref(),
+                bearer: bearer.as_ref(),
                 headers,
                 oauth_store,
-                &span,
-            )
+                oauth_metadata,
+                parent: &span,
+            })
             .await
         }
     };
@@ -140,15 +164,17 @@ pub(crate) async fn connect(
     result
 }
 
-async fn connect_http(
-    server_name: &str,
-    server: &McpServer,
-    url: &str,
-    bearer: Option<&SecretSource>,
-    headers: &std::collections::BTreeMap<String, SecretSource>,
-    oauth_store: Option<Arc<dyn McpOAuthStore>>,
-    parent: &Span,
-) -> Result<ConnectedServer, String> {
+async fn connect_http(input: HttpConnect<'_>) -> Result<ConnectedServer, String> {
+    let HttpConnect {
+        server_name,
+        server,
+        url,
+        bearer,
+        headers,
+        oauth_store,
+        oauth_metadata,
+        parent,
+    } = input;
     // rmcp deliberately leaves the rustls crypto provider to its host.
     // Installing ring is idempotent and keeps this crate usable without
     // requiring nanocodex-service to have opened a WebSocket first.
@@ -190,67 +216,98 @@ async fn connect_http(
         return finish_startup(server, client, None, parent).await;
     }
     if let Some(store) = oauth_store {
-        let load_span = info_span!(
-            target: "nanocodex_mcp",
-            parent: parent,
-            "mcp.oauth.credentials_load",
-            otel.kind = "internal",
-            otel.status_code = tracing::field::Empty,
-            status = tracing::field::Empty,
-            credential.found = tracing::field::Empty,
-        );
-        let credentials = store
-            .load(server_name, url)
-            .instrument(load_span.clone())
-            .await;
-        load_span.record(
-            "status",
-            if credentials.is_ok() {
-                "completed"
-            } else {
-                "failed"
-            },
-        );
-        load_span.record(
-            "otel.status_code",
-            if credentials.is_ok() { "OK" } else { "ERROR" },
-        );
-        if let Ok(credentials) = &credentials {
-            load_span.record("credential.found", credentials.is_some());
-        }
-        let credentials = credentials?;
-        if let Some(credentials) = credentials {
-            let restore_span = info_span!(
-                target: "nanocodex_mcp",
-                parent: parent,
-                "mcp.oauth.restore",
-                otel.kind = "internal",
-                otel.status_code = tracing::field::Empty,
-                status = tracing::field::Empty,
-            );
-            let oauth =
-                transport_from_credentials(server_name, url, http_client, store, credentials)
-                    .instrument(restore_span.clone())
-                    .await;
-            restore_span.record("status", if oauth.is_ok() { "completed" } else { "failed" });
-            restore_span.record(
-                "otel.status_code",
-                if oauth.is_ok() { "OK" } else { "ERROR" },
-            );
-            let oauth = oauth?;
-            let runtime = oauth.runtime;
-            let transport = StreamableHttpClientTransport::with_client(oauth.client, config);
-            let client = connect_transport(server, transport, parent).await;
-            if let Err(error) = runtime.persist_if_changed().await {
-                tracing::warn!(%error, "failed to persist refreshed MCP OAuth credentials");
-            }
-            let client = client?;
-            return finish_startup(server, client, Some(runtime), parent).await;
-        }
+        return connect_stored_oauth(StoredOAuthConnect {
+            server_name,
+            server,
+            url,
+            http_client,
+            config,
+            store,
+            metadata: oauth_metadata,
+            parent,
+        })
+        .await;
     }
     let transport = StreamableHttpClientTransport::with_client(http_client, config);
     let client = connect_transport(server, transport, parent).await?;
     finish_startup(server, client, None, parent).await
+}
+
+async fn connect_stored_oauth(input: StoredOAuthConnect<'_>) -> Result<ConnectedServer, String> {
+    let StoredOAuthConnect {
+        server_name,
+        server,
+        url,
+        http_client,
+        config,
+        store,
+        metadata,
+        parent,
+    } = input;
+    let load_span = info_span!(
+        target: "nanocodex_mcp",
+        parent: parent,
+        "mcp.oauth.credentials_load",
+        otel.kind = "internal",
+        otel.status_code = tracing::field::Empty,
+        status = tracing::field::Empty,
+        credential.found = tracing::field::Empty,
+    );
+    let credentials = store
+        .load(server_name, url)
+        .instrument(load_span.clone())
+        .await;
+    load_span.record(
+        "status",
+        if credentials.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+    );
+    load_span.record(
+        "otel.status_code",
+        if credentials.is_ok() { "OK" } else { "ERROR" },
+    );
+    if let Ok(credentials) = &credentials {
+        load_span.record("credential.found", credentials.is_some());
+    }
+    let Some(credentials) = credentials? else {
+        let transport = StreamableHttpClientTransport::with_client(http_client, config);
+        let client = connect_transport(server, transport, parent).await?;
+        return finish_startup(server, client, None, parent).await;
+    };
+
+    let restore_span = info_span!(
+        target: "nanocodex_mcp",
+        parent: parent,
+        "mcp.oauth.restore",
+        otel.kind = "internal",
+        otel.status_code = tracing::field::Empty,
+        status = tracing::field::Empty,
+        metadata.cache_hit = tracing::field::Empty,
+    );
+    let oauth =
+        transport_from_credentials(server_name, url, http_client, store, credentials, &metadata)
+            .instrument(restore_span.clone())
+            .await;
+    restore_span.record("status", if oauth.is_ok() { "completed" } else { "failed" });
+    restore_span.record(
+        "otel.status_code",
+        if oauth.is_ok() { "OK" } else { "ERROR" },
+    );
+    if let Ok(oauth) = &oauth {
+        restore_span.record("metadata.cache_hit", oauth.metadata_cache_hit);
+    }
+    let oauth = oauth?;
+    let runtime = oauth.runtime;
+    let transport = StreamableHttpClientTransport::with_client(oauth.client, config);
+    let client = connect_transport(server, transport, parent).await;
+    if let Err(error) = runtime.persist_if_changed().await {
+        tracing::warn!(%error, "failed to persist refreshed MCP OAuth credentials");
+    }
+    let client = client?;
+    finish_startup(server, client, Some(runtime), parent).await
 }
 
 async fn connect_transport<T, E, A>(
