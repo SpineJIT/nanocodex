@@ -719,7 +719,7 @@ wheels = [
 
 [[package]]
 name = "harbor"
-version = "0.18.1.dev202607150126"
+version = "0.20.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "dirhash" },
@@ -744,9 +744,9 @@ dependencies = [
     { name = "typer" },
     { name = "uvicorn" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e9/0b/b0f5ccbfac0b3226c7bb1989b9abe4aef479052e28c447add9fcd819e784/harbor-0.18.1.dev202607150126.tar.gz", hash = "sha256:10d06af650a2c60637552bd978a17805ae89dd56983e1c593b0473320b5321f1", size = 1586969 }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/da/5a26998c6e7d9455321ab39bc8e9122993892ece13c3ad4f2b0de986aaf6/harbor-0.20.0.tar.gz", hash = "sha256:e2e5e88f772690fd121553ca34fd5d6dd6b4aaa51c8fae635abc84b112303112", size = 1590870 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e9/3d/7c1b146793c678f08a0d37c680307c3ae944fdd5db7d4bbbf33aad357ba8/harbor-0.18.1.dev202607150126-py3-none-any.whl", hash = "sha256:af4961086240097dcb48cb267f4b586b16455bfe552577c959244dca48cdf0fc", size = 1786778 },
+    { url = "https://files.pythonhosted.org/packages/76/03/b6617f32385295729f3af0ae0d512cf87ba4793b9ce462ea020d776a9025/harbor-0.20.0-py3-none-any.whl", hash = "sha256:4b7e48223aea2384cdb8c9eff35eaebd482fc9b1ec09f8193a121c47356ff19a", size = 1792416 },
 ]
 
 [package.optional-dependencies]
@@ -1231,7 +1231,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "harbor", extras = ["daytona"], specifier = "==0.18.1.dev202607150126" },
+    { name = "harbor", extras = ["daytona"], specifier = "==0.20.0" },
     { name = "litellm", specifier = "==1.86.2" },
 ]
 
