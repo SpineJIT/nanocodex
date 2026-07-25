@@ -4,6 +4,8 @@
 # leave environment, verifier, timeouts, and resources unset so Harbor uses the
 # canonical task definitions and default execution policy.
 jobs_dir: .nanocodex/harbor/jobs
+n_attempts: 5
+timeout_multiplier: 1.0
 
 agents:
   - import_path: harbor_adapter.agent:NanocodexAgent
