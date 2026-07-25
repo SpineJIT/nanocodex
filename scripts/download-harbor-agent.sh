@@ -43,5 +43,7 @@ if [[ "$actual" != "$expected" ]]; then
 fi
 
 chmod 0755 "$temporary_dir/$artifact"
+printf '%s\n' "$actual" > "$temporary_dir/$artifact.sha256"
 mv -f "$temporary_dir/$artifact" "$destination"
+mv -f "$temporary_dir/$artifact.sha256" "$destination.sha256"
 printf 'Installed %s from %s (%s)\n' "$destination" "$release_tag" "$actual"

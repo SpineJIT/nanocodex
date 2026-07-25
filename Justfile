@@ -8,7 +8,9 @@ agent_artifact_dir := ".nanocodex/installed"
 agent_artifact := agent_artifact_dir + "/nanocodex"
 hosted_agent_artifact_dir := agent_artifact_dir + "/daytona-amd64"
 hosted_agent_artifact := hosted_agent_artifact_dir + "/nanocodex"
+hosted_agent_checksum := hosted_agent_artifact + ".sha256"
 hosted_agent_release_tag := env_var_or_default("NANOCODEX_HOSTED_AGENT_RELEASE_TAG", "nightly")
+hosted_agent_url := "https://github.com/gakonst/nanocodex/releases/download/" + hosted_agent_release_tag + "/nanocodex-x86_64-unknown-linux-musl"
 default_eval := "evals/terminal-bench-2.yaml"
 default_jobs := ".nanocodex/harbor/jobs"
 setup_jobs := ".nanocodex/harbor/setup"
@@ -190,7 +192,7 @@ build-agent-hosted:
 # Harbor environments. The release checksum manifest is always verified.
 download-agent-hosted:
     ./scripts/download-harbor-agent.sh "{{hosted_agent_release_tag}}" "{{hosted_agent_artifact}}"
-    @test -f "{{hosted_agent_artifact}}" && test -x "{{hosted_agent_artifact}}"
+    @test -f "{{hosted_agent_artifact}}" && test -x "{{hosted_agent_artifact}}" && test -s "{{hosted_agent_checksum}}"
 
 check-hosted-auth:
     @test -n "${DAYTONA_API_KEY:-}" || { test -n "${DAYTONA_JWT_TOKEN:-}" && test -n "${DAYTONA_ORGANIZATION_ID:-}"; } || { echo "set DAYTONA_API_KEY (or DAYTONA_JWT_TOKEN and DAYTONA_ORGANIZATION_ID) in .env" >&2; exit 2; }
@@ -229,25 +231,29 @@ eval-task task effort="low" config=default_eval: build-agent
 eval-hosted config=default_eval: check-hosted-auth download-agent-hosted
     @test -x "{{harbor}}" || { echo "run 'just bootstrap' first" >&2; exit 2; }
     @job_name="$(date +%Y-%m-%d__%H-%M-%S)-eval-daytona-$BASHPID"; \
-        HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --env daytona --verifier "{{canonical_verifier}}" --agent-kwarg "binary_path={{hosted_agent_artifact}}" --agent-kwarg "install_node=true" --job-name "$job_name" --n-concurrent "{{hosted_eval_concurrency}}"
+        agent_sha=$(<"{{hosted_agent_checksum}}"); \
+        HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --env daytona --verifier "{{canonical_verifier}}" --agent-kwarg "binary_url={{hosted_agent_url}}" --agent-kwarg "binary_sha256=$agent_sha" --agent-kwarg "install_node=true" --job-name "$job_name" --n-concurrent "{{hosted_eval_concurrency}}"
 
 eval-task-hosted task effort="low" config=default_eval: check-hosted-auth download-agent-hosted
     @test -x "{{harbor}}" || { echo "run 'just bootstrap' first" >&2; exit 2; }
     @task="{{task}}"; \
+        agent_sha=$(<"{{hosted_agent_checksum}}"); \
         dataset=$(HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --print-config | jq -er '.datasets | if length == 1 then .[0] | "\(.name)@\(.ref)" else error("expected exactly one dataset") end'); \
         job_name="$(date +%Y-%m-%d__%H-%M-%S)-${task##*/}-daytona-$BASHPID"; \
-        HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --env daytona --verifier "{{canonical_verifier}}" --dataset "$dataset" --include-task-name "$task" --job-name "$job_name" --agent-kwarg "binary_path={{hosted_agent_artifact}}" --agent-kwarg "install_node=true" --agent-kwarg "effort={{effort}}"
+        HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --env daytona --verifier "{{canonical_verifier}}" --dataset "$dataset" --include-task-name "$task" --job-name "$job_name" --agent-kwarg "binary_url={{hosted_agent_url}}" --agent-kwarg "binary_sha256=$agent_sha" --agent-kwarg "install_node=true" --agent-kwarg "effort={{effort}}"
 
 # Run the exact k=5, stock-timeout Terminal-Bench 2.1 leaderboard job in
 # hosted AMD64 sandboxes. Upload remains a separate post-validation step.
 eval-leaderboard-hosted: check-hosted-auth download-agent-hosted
     @test -x "{{harbor}}" || { echo "run 'just bootstrap' first" >&2; exit 2; }
     @job_name="$(date +%Y-%m-%d__%H-%M-%S)-terminal-bench-2-1-leaderboard-$BASHPID"; \
+        agent_sha=$(<"{{hosted_agent_checksum}}"); \
         HARBOR_TELEMETRY=off "{{harbor}}" run \
             --config "evals/terminal-bench-2-1-leaderboard-high.yaml" \
             --env daytona \
             --verifier "{{canonical_verifier}}" \
-            --agent-kwarg "binary_path={{hosted_agent_artifact}}" \
+            --agent-kwarg "binary_url={{hosted_agent_url}}" \
+            --agent-kwarg "binary_sha256=$agent_sha" \
             --agent-kwarg "install_node=true" \
             --job-name "$job_name" \
             --n-attempts 5 \
