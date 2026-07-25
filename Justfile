@@ -252,7 +252,9 @@ eval-leaderboard-hosted: check-hosted-auth download-agent-hosted
             --job-name "$job_name" \
             --n-attempts 5 \
             --timeout-multiplier 1 \
-            --n-concurrent "{{hosted_eval_concurrency}}"
+            --n-concurrent "{{hosted_eval_concurrency}}" \
+            --quiet \
+            --yes
 
 # Open all locally retained Harbor jobs unless another jobs directory is supplied.
 view jobs=default_jobs:
