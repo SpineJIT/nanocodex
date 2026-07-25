@@ -622,12 +622,19 @@ nanocodex auth login
 nanocodex --auth-file "${CODEX_HOME:-$HOME/.codex}/auth.json"
 ```
 
-The CLI starts the deferred `openaiDeveloperDocs`, `tempo`, and `cloudflare`
-Streamable HTTP MCP providers by default. Their catalogs stay out of the stable
-model prompt until Code Mode calls `tool_search`. Disable the set with
-`--mcp-defaults false`, or override and extend it with the existing `--mcp` and
-`--mcp-stdio` options. `NANOCODEX_MCP_DEFAULTS=false` is the environment
-equivalent.
+The CLI merges enabled MCP servers from
+`${CODEX_HOME:-$HOME/.codex}/config.toml` with its deferred
+`openaiDeveloperDocs`, `tempo`, and `cloudflare` defaults. Explicit `--mcp` and
+`--mcp-stdio` entries take precedence over Codex config, and Codex entries take
+precedence over same-named defaults. Their catalogs stay out of the stable
+model prompt until Code Mode calls `tool_search`. Disable the built-in set with
+`--mcp-defaults false` and Codex config loading with
+`--mcp-codex-config false`; the environment equivalents are
+`NANOCODEX_MCP_DEFAULTS=false` and `NANOCODEX_MCP_CODEX_CONFIG=false`.
+Streamable HTTP servers also reuse Codex's file-backed MCP OAuth credentials.
+Expired access tokens refresh through the server's OAuth metadata and rotated
+credentials are persisted back to `.credentials.json` under the same
+cross-process lock as Codex.
 
 Provider prewarming is scheduled before agent construction returns, so the TUI
 does not wait for HTTP client setup, DNS/TLS, MCP handshakes, `tools/list`, or
@@ -655,7 +662,10 @@ while the mainline continues. The fork inherits the last completed response ID
 plus complete tool results and applied steers after that response; partial model
 output and unmatched tool calls remain excluded. With local telemetry running,
 `/trace` opens Jaeger filtered to every turn in the focused main or `/btw`
-session. The complete keybinding reference, retained Amp and Codex research, and
+session. `/mcp login <server>` opens browser OAuth and hot-reloads that server's
+tools into the running session after the callback; `/mcp reload <server>` retries
+discovery without restarting the TUI. The complete keybinding reference,
+retained Amp and Codex research, and
 prioritized Ratatui backlog live in
 [`docs/TUI_NOTES.md`](docs/TUI_NOTES.md). The headless `nanocodex run` adapter
 emits flushed JSONL for scripts and Harbor.

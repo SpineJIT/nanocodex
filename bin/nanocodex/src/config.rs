@@ -6,11 +6,12 @@ use std::{
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr, eyre};
 use nanocodex::{
-    AgentEvents, DurableSession, Nanocodex, OpenAiAuth, OpenAiAuthMode, ReasoningMode, Responses,
-    ResponsesHistory, ResponsesTransport, RolloutConfig, SessionSnapshot, Thinking, Tools,
+    AgentEvents, DurableSession, McpHandle, Nanocodex, OpenAiAuth, OpenAiAuthMode, ReasoningMode,
+    Responses, ResponsesHistory, ResponsesTransport, RolloutConfig, SessionSnapshot, Thinking,
+    Tools,
 };
 
-use crate::mcp::McpArgs;
+use crate::mcp::{ConfiguredMcp, McpArgs};
 use crate::mpp::{MppAdapter, MppArgs};
 use crate::subagents::{self, ChildAgents};
 
@@ -19,6 +20,7 @@ pub(crate) struct ConfiguredAgent {
     pub(crate) events: AgentEvents,
     pub(crate) child_agents: Option<Arc<ChildAgents>>,
     pub(crate) mpp_adapter: Option<MppAdapter>,
+    pub(crate) mcp: Option<McpHandle>,
 }
 
 struct SessionBuild {
@@ -178,8 +180,10 @@ impl AgentArgs {
         let mut tools = Tools::builder()
             .web_search(self.web_search)
             .image_generation(self.image_generation);
-        if let Some(mcp) = self.mcp.build()? {
-            tools = tools.provider(mcp);
+        let mcp = self.mcp.build(&codex_home)?;
+        let mcp_handle = mcp.as_ref().map(|mcp| mcp.handle.clone());
+        if let Some(ConfiguredMcp { provider, .. }) = mcp {
+            tools = tools.provider(provider);
         }
         if let Some(mpp_adapter) = &mpp_adapter {
             tools = tools
@@ -223,6 +227,7 @@ impl AgentArgs {
             events,
             child_agents,
             mpp_adapter,
+            mcp: mcp_handle,
         })
     }
 }
@@ -434,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn standard_mcp_servers_are_enabled_by_default() {
+    fn standard_and_codex_config_mcp_servers_are_enabled_by_default() {
         let command = crate::Cli::command();
         let mcp_defaults = command
             .get_arguments()
@@ -442,6 +447,12 @@ mod tests {
             .expect("the CLI should expose the MCP defaults argument");
 
         assert_eq!(mcp_defaults.get_default_values(), ["true"]);
+
+        let codex_config = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "mcp_codex_config")
+            .expect("the CLI should expose the Codex MCP config argument");
+        assert_eq!(codex_config.get_default_values(), ["true"]);
     }
 
     #[test]

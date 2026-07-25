@@ -31,7 +31,8 @@ struct Catalog {
     active: BTreeSet<String>,
     failures: BTreeMap<String, String>,
     search_index: Option<Arc<SearchIndex>>,
-    pending_servers: usize,
+    pending_servers: BTreeSet<String>,
+    generations: BTreeMap<String, u64>,
 }
 
 struct SearchIndex {
@@ -52,6 +53,16 @@ pub(crate) struct SearchResponse {
     failed_servers: BTreeMap<String, String>,
 }
 
+impl SearchResponse {
+    pub(crate) fn tool_count(&self) -> usize {
+        self.tools.len()
+    }
+
+    pub(crate) const fn pending_server_count(&self) -> usize {
+        self.pending_servers
+    }
+}
+
 #[derive(Serialize)]
 struct SearchTool {
     name: String,
@@ -62,15 +73,25 @@ struct SearchTool {
 }
 
 impl ProviderState {
-    pub(crate) fn new(server_count: usize, discovery_timeout: Duration) -> Self {
-        let (remaining, _) = watch::channel(server_count);
+    pub(crate) fn new(
+        server_names: impl IntoIterator<Item = String>,
+        discovery_timeout: Duration,
+    ) -> Self {
+        let pending_servers = server_names.into_iter().collect::<BTreeSet<_>>();
+        let generations = pending_servers
+            .iter()
+            .cloned()
+            .map(|name| (name, 0))
+            .collect();
+        let (remaining, _) = watch::channel(pending_servers.len());
         Self {
             catalog: Mutex::new(Catalog {
                 entries: BTreeMap::new(),
                 active: BTreeSet::new(),
                 failures: BTreeMap::new(),
                 search_index: None,
-                pending_servers: server_count,
+                pending_servers,
+                generations,
             }),
             remaining,
             discovery_timeout,
@@ -80,11 +101,25 @@ impl ProviderState {
     pub(crate) fn complete_server(
         &self,
         server_name: &str,
+        generation: u64,
         result: Result<Vec<ToolEntry>, String>,
     ) {
         let mut catalog = self.catalog();
+        if catalog.generations.get(server_name).copied() != Some(generation) {
+            return;
+        }
         match result {
             Ok(entries) => {
+                let removed = catalog
+                    .entries
+                    .iter()
+                    .filter_map(|(name, entry)| {
+                        (entry.server_name == server_name).then_some(name.clone())
+                    })
+                    .collect::<Vec<_>>();
+                for name in removed {
+                    catalog.entries.remove(&name);
+                }
                 for entry in entries {
                     if catalog.entries.contains_key(&entry.canonical_name) {
                         catalog.failures.insert(
@@ -100,13 +135,15 @@ impl ProviderState {
                         .entries
                         .insert(entry.canonical_name.clone(), Arc::new(entry));
                 }
+                let available = catalog.entries.keys().cloned().collect::<BTreeSet<_>>();
+                catalog.active.retain(|name| available.contains(name));
             }
             Err(error) => {
                 catalog.failures.insert(server_name.to_owned(), error);
             }
         }
-        catalog.pending_servers = catalog.pending_servers.saturating_sub(1);
-        if catalog.pending_servers == 0 {
+        catalog.pending_servers.remove(server_name);
+        if catalog.pending_servers.is_empty() {
             tracing::info!(
                 target: "nanocodex_mcp",
                 tool_count = catalog.entries.len(),
@@ -118,9 +155,25 @@ impl ProviderState {
         } else {
             catalog.search_index = None;
         }
-        let pending_servers = catalog.pending_servers;
+        let pending_servers = catalog.pending_servers.len();
         drop(catalog);
         self.remaining.send_replace(pending_servers);
+    }
+
+    pub(crate) fn begin_server(&self, server_name: &str) -> u64 {
+        let mut catalog = self.catalog();
+        let generation = catalog
+            .generations
+            .entry(server_name.to_owned())
+            .and_modify(|generation| *generation = generation.saturating_add(1))
+            .or_insert(0);
+        let generation = *generation;
+        catalog.failures.remove(server_name);
+        catalog.pending_servers.insert(server_name.to_owned());
+        let pending_servers = catalog.pending_servers.len();
+        drop(catalog);
+        self.remaining.send_replace(pending_servers);
+        generation
     }
 
     pub(crate) async fn search(
@@ -152,7 +205,7 @@ impl ProviderState {
             .search_index
             .clone()
             .ok_or_else(|| "MCP search index was not initialized".to_owned())?;
-        let pending_servers = catalog.pending_servers;
+        let pending_servers = catalog.pending_servers.len();
         let failed_servers = catalog.failures.clone();
         drop(catalog);
 
@@ -195,6 +248,9 @@ impl ProviderState {
     }
 
     async fn wait_for_startup(&self) {
+        if self.catalog().search_index.is_some() {
+            return;
+        }
         let mut remaining = self.remaining.subscribe();
         if *remaining.borrow() == 0 {
             return;

@@ -26,8 +26,8 @@ use crossterm::event::{
 use eyre::{Result, WrapErr};
 use futures_util::StreamExt;
 use nanocodex::{
-    AgentEvent, AgentEvents, DurableSession, Nanocodex, NanocodexError, Thinking, TimedAgentEvent,
-    TurnControl, TurnResult,
+    AgentEvent, AgentEvents, DurableSession, McpHandle, Nanocodex, NanocodexError, Thinking,
+    TimedAgentEvent, TurnControl, TurnResult,
 };
 use tokio::{
     sync::mpsc,
@@ -98,6 +98,12 @@ enum WorkerCommand {
     },
     SetThinking {
         thinking: Thinking,
+    },
+    McpLogin {
+        name: String,
+    },
+    McpReload {
+        name: String,
     },
 }
 
@@ -196,6 +202,18 @@ enum WorkerEvent {
         thinking: Thinking,
     },
     ThinkingChangeFailed {
+        error: String,
+    },
+    McpLoginStarted {
+        name: String,
+    },
+    McpReady {
+        name: String,
+        tool_count: usize,
+        authenticated: bool,
+    },
+    McpFailed {
+        name: String,
         error: String,
     },
 }
@@ -464,6 +482,8 @@ enum Submission {
     Trace,
     Fast(Option<bool>),
     ReasoningPicker,
+    McpLogin(String),
+    McpReload(String),
     InvalidCommand(String),
 }
 
@@ -495,9 +515,16 @@ pub(crate) async fn run(
     let root_session_id = Arc::<str>::from(agent_events.request_id());
     let child_agents = configured.child_agents;
     let mpp_adapter = configured.mpp_adapter;
+    let mcp = configured.mcp;
     let (worker_tx, worker_rx) = mpsc::unbounded_channel();
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
-    let worker = spawn_agent_worker(agent, Arc::clone(&root_session_id), worker_rx, update_tx);
+    let worker = spawn_agent_worker(
+        agent,
+        Arc::clone(&root_session_id),
+        mcp,
+        worker_rx,
+        update_tx,
+    );
 
     let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
     let mut input_events = EventStream::new();
@@ -856,6 +883,24 @@ fn handle_worker_update(
         WorkerEvent::FastModeChangeFailed { error } => app.fast_mode_change_failed(&error),
         WorkerEvent::ThinkingChanged { thinking } => app.thinking_changed(thinking),
         WorkerEvent::ThinkingChangeFailed { error } => app.thinking_change_failed(&error),
+        WorkerEvent::McpLoginStarted { name } => {
+            app.set_active_status(format!("Authorizing MCP server {name} in browser"));
+        }
+        WorkerEvent::McpReady {
+            name,
+            tool_count,
+            authenticated,
+        } => {
+            let action = if authenticated {
+                "Authenticated and reloaded"
+            } else {
+                "Reloaded"
+            };
+            app.set_active_status(format!("{action} MCP server {name} ({tool_count} tools)"));
+        }
+        WorkerEvent::McpFailed { name, error } => {
+            app.push_active_error(format!("MCP server {name}: {error}"));
+        }
     }
     Ok(())
 }
@@ -863,6 +908,7 @@ fn handle_worker_update(
 fn spawn_agent_worker(
     root: Nanocodex,
     root_session_id: Arc<str>,
+    mcp: Option<McpHandle>,
     mut commands: mpsc::UnboundedReceiver<WorkerCommand>,
     updates: mpsc::UnboundedSender<WorkerEvent>,
 ) -> tokio::task::JoinHandle<()> {
@@ -882,6 +928,7 @@ fn spawn_agent_worker(
             btw: None,
             finished: finished_tx,
             updates,
+            mcp,
         };
         loop {
             tokio::select! {
@@ -906,6 +953,7 @@ struct AgentWorker {
     btw: Option<BtwWorker>,
     finished: mpsc::UnboundedSender<FinishedTurn>,
     updates: mpsc::UnboundedSender<WorkerEvent>,
+    mcp: Option<McpHandle>,
 }
 
 impl AgentWorker {
@@ -948,7 +996,86 @@ impl AgentWorker {
             WorkerCommand::SwitchMainBranch { id } => self.switch_main_branch(id),
             WorkerCommand::SetFastMode { enabled } => self.set_fast_mode(enabled).await,
             WorkerCommand::SetThinking { thinking } => self.set_thinking(thinking).await,
+            WorkerCommand::McpLogin { name } => self.mcp_login(name),
+            WorkerCommand::McpReload { name } => self.mcp_reload(name),
         }
+    }
+
+    fn mcp_login(&self, name: String) {
+        let Some(mcp) = self.mcp.clone() else {
+            drop(self.updates.send(WorkerEvent::McpFailed {
+                name,
+                error: "MCP is not configured".to_owned(),
+            }));
+            return;
+        };
+        let updates = self.updates.clone();
+        drop(tokio::spawn(async move {
+            let login = match mcp.login(&name).await {
+                Ok(login) => login,
+                Err(error) => {
+                    drop(updates.send(WorkerEvent::McpFailed {
+                        name,
+                        error: error.to_string(),
+                    }));
+                    return;
+                }
+            };
+            let authorization_url = login.authorization_url().to_owned();
+            if let Err(error) = open_browser(&authorization_url) {
+                drop(updates.send(WorkerEvent::McpFailed {
+                    name,
+                    error: format!(
+                        "failed to open OAuth page: {error}; open {authorization_url} manually"
+                    ),
+                }));
+                return;
+            }
+            drop(updates.send(WorkerEvent::McpLoginStarted { name: name.clone() }));
+            match login.wait().await {
+                Ok(tool_count) => {
+                    drop(updates.send(WorkerEvent::McpReady {
+                        name,
+                        tool_count,
+                        authenticated: true,
+                    }));
+                }
+                Err(error) => {
+                    drop(updates.send(WorkerEvent::McpFailed {
+                        name,
+                        error: error.to_string(),
+                    }));
+                }
+            }
+        }));
+    }
+
+    fn mcp_reload(&self, name: String) {
+        let Some(mcp) = self.mcp.clone() else {
+            drop(self.updates.send(WorkerEvent::McpFailed {
+                name,
+                error: "MCP is not configured".to_owned(),
+            }));
+            return;
+        };
+        let updates = self.updates.clone();
+        drop(tokio::spawn(async move {
+            match mcp.reload(&name).await {
+                Ok(tool_count) => {
+                    drop(updates.send(WorkerEvent::McpReady {
+                        name,
+                        tool_count,
+                        authenticated: false,
+                    }));
+                }
+                Err(error) => {
+                    drop(updates.send(WorkerEvent::McpFailed {
+                        name,
+                        error: error.to_string(),
+                    }));
+                }
+            }
+        }));
     }
 
     async fn set_fast_mode(&mut self, enabled: bool) {
@@ -2240,6 +2367,12 @@ fn submit(
             send_command(commands, WorkerCommand::SetFastMode { enabled })?;
         }
         Submission::ReasoningPicker => app.open_reasoning_picker(),
+        Submission::McpLogin(name) => {
+            send_command(commands, WorkerCommand::McpLogin { name })?;
+        }
+        Submission::McpReload(name) => {
+            send_command(commands, WorkerCommand::McpReload { name })?;
+        }
         Submission::InvalidCommand(error) => app.push_active_error(error),
     }
     Ok(())
@@ -2293,6 +2426,27 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
     if trimmed.starts_with("/model ") || trimmed.starts_with("/thinking ") {
         return Submission::InvalidCommand("Usage: /model or /thinking".to_owned());
     }
+    if let Some(name) = trimmed.strip_prefix("/mcp login ") {
+        let name = name.trim();
+        return if name.is_empty() || name.split_whitespace().count() != 1 {
+            Submission::InvalidCommand("Usage: /mcp login <server>".to_owned())
+        } else {
+            Submission::McpLogin(name.to_owned())
+        };
+    }
+    if let Some(name) = trimmed.strip_prefix("/mcp reload ") {
+        let name = name.trim();
+        return if name.is_empty() || name.split_whitespace().count() != 1 {
+            Submission::InvalidCommand("Usage: /mcp reload <server>".to_owned())
+        } else {
+            Submission::McpReload(name.to_owned())
+        };
+    }
+    if trimmed == "/mcp" || trimmed.starts_with("/mcp ") {
+        return Submission::InvalidCommand(
+            "Usage: /mcp login <server> or /mcp reload <server>".to_owned(),
+        );
+    }
     Submission::Prompt(input)
 }
 
@@ -2323,7 +2477,11 @@ fn open_session_traces(session_id: &str) -> Result<()> {
     let base_url =
         std::env::var(JAEGER_UI_URL_ENV).unwrap_or_else(|_| DEFAULT_JAEGER_UI_URL.to_owned());
     let url = session_trace_url(&base_url, session_id)?;
-    let mut command = browser_command(url.as_str());
+    open_browser(url.as_str())
+}
+
+fn open_browser(url: &str) -> Result<()> {
+    let mut command = browser_command(url);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2425,6 +2583,20 @@ mod tests {
         assert_eq!(
             classify_submission("/thinking high"),
             Submission::InvalidCommand("Usage: /model or /thinking".to_owned())
+        );
+        assert_eq!(
+            classify_submission(" /mcp login centaur-tempo "),
+            Submission::McpLogin("centaur-tempo".to_owned())
+        );
+        assert_eq!(
+            classify_submission("/mcp reload centaur-paradigm"),
+            Submission::McpReload("centaur-paradigm".to_owned())
+        );
+        assert_eq!(
+            classify_submission("/mcp login"),
+            Submission::InvalidCommand(
+                "Usage: /mcp login <server> or /mcp reload <server>".to_owned()
+            )
         );
         assert_eq!(
             classify_submission("/btw-not-a-command".to_owned()),
@@ -2743,6 +2915,7 @@ mod tests {
         spawn_agent_worker(
             agent,
             std::sync::Arc::from("tui-steer-test"),
+            None,
             worker_rx,
             updates,
         );
@@ -2856,6 +3029,7 @@ mod tests {
         spawn_agent_worker(
             agent,
             std::sync::Arc::from("tui-historical-edit-test"),
+            None,
             worker_rx,
             updates,
         );
