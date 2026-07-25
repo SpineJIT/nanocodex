@@ -870,7 +870,7 @@ fn handle_worker_update(
         WorkerEvent::ThinkingChanged { thinking } => app.thinking_changed(thinking),
         WorkerEvent::ThinkingChangeFailed { error } => app.thinking_change_failed(&error),
         WorkerEvent::McpLoginStarted { name } => {
-            app.set_active_status(format!("Waiting for MCP authentication: {name}"));
+            app.set_active_status(format!("Authorizing MCP server {name} in browser"));
         }
         WorkerEvent::McpReady {
             name,
