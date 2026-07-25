@@ -1360,18 +1360,26 @@ mod tests {
                 arguments: "{\"code\":\"return true\"}".to_owned(),
             })
         );
+        let web_search = visible_rollout_event(&serde_json::json!({
+            "type": "web_search_end",
+            "call_id": "search-1",
+            "query": "Nanocodex",
+            "action": {"type": "search", "queries": ["Nanocodex"]}
+        }))
+        .expect("web search activity");
+        let RolloutTranscriptItem::Tool {
+            call_id,
+            name,
+            arguments,
+        } = web_search
+        else {
+            panic!("web search must reconstruct as tool activity");
+        };
+        assert_eq!(call_id, "search-1");
+        assert_eq!(name, "web_search");
         assert_eq!(
-            visible_rollout_event(&serde_json::json!({
-                "type": "web_search_end",
-                "call_id": "search-1",
-                "query": "Nanocodex",
-                "action": {"type": "search", "queries": ["Nanocodex"]}
-            })),
-            Some(RolloutTranscriptItem::Tool {
-                call_id: "search-1".to_owned(),
-                name: "web_search".to_owned(),
-                arguments: "{\"queries\":[\"Nanocodex\"],\"type\":\"search\"}".to_owned(),
-            })
+            serde_json::from_str::<serde_json::Value>(&arguments).expect("web search arguments"),
+            serde_json::json!({"type": "search", "queries": ["Nanocodex"]})
         );
     }
 
