@@ -8,10 +8,12 @@ code.
 
 Tempo defaults to the HTTPS/SSE Responses transport. The CLI gives the standard
 Responses service a caller-configured HTTP client routed through the in-process
-MPP forwarder. The forwarder handles the one-time `402` challenge, signs an MPP
-Charge credential, replays the exact request, and then streams the paid SSE
-response. The charge is the proxy's estimate for that complete response and is
-paid before generation starts.
+MPP forwarder. That dedicated client advertises
+`tempo/session, tempo/charge;q=0.5`, so Responses prefers the server's native
+session challenge and retains Charge as a fallback. The forwarder signs the
+cumulative voucher, replays the exact request, and then streams the paid SSE
+response. Tool clients do not impose this ranking and continue to follow each
+paid service's offered challenge order.
 
 The WebSocket session transport remains available with
 `--responses-transport websocket`. In that mode the CLI starts an in-process
@@ -28,7 +30,7 @@ caller-configured reqwest client             CLI loopback WS adapter
            |                                         |
 embedded MPP HTTP forwarder             alloy-transport-mpp application socket
            |                                         |
-MPP Charge credential + replay          MPP frames + native TIP-1034 vouchers
+session voucher + replay                MPP frames + native TIP-1034 vouchers
            |                                         |
            +---------------- mpp-proxy/mppx ----------+
                                       |
@@ -193,10 +195,10 @@ defaults to OpenAI OAuth, while `nanocodex login --provider.tempo` runs the
 Tempo Wallet login flow and writes the shared Accounts SDK store. OpenAI OAuth
 is intentionally not stubbed by this integration.
 
-Both Tempo paths retain their adapter until the agent handle is dropped. The
-WebSocket path then performs the canonical signed session close; the Charge
-path has no retained payment session to close. TUI teardown restores the
-terminal before waiting for any network shutdown.
+Both Tempo paths retain their adapter until the agent handle is dropped. HTTPS
+leaves its bounded paid channel available for later process reuse. The
+WebSocket path performs the canonical signed session close. TUI teardown
+restores the terminal before waiting for any network shutdown.
 
 ## HTTP(S) tool egress
 
@@ -263,9 +265,9 @@ Required validation before merging:
   test.
 - Nanocodex: rustfmt, Clippy with warnings denied, CLI tests, and unchanged
   library tests.
-- Live Charge: use the logged-in mainnet wallet access key and complete a real
-  HTTPS/SSE OpenAI Responses turn, retaining the MPP receipt and verifying the
-  expected stablecoin debit without exposing either the wallet JWK or OpenAI
-  secret.
+- Live HTTPS: use the logged-in mainnet wallet access key and complete a real
+  HTTPS/SSE OpenAI Responses turn, verifying that the native v2 voucher advances
+  by the server's requested amount against the retained bounded deposit without
+  exposing either the wallet JWK or OpenAI secret.
 - Live session: explicitly select WebSocket, rehydrate or open a native v2
   channel, and complete two sequential real turns through one paid socket.

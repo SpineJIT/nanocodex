@@ -191,7 +191,7 @@ impl AgentArgs {
         if matches!(responses_transport, ResponsesTransport::Https)
             && let Some(mpp_adapter) = &mpp_adapter
         {
-            responses = responses.http_client(mpp_adapter.http_client()?);
+            responses = responses.http_client(mpp_adapter.responses_http_client()?);
         }
         let responses = responses.build();
         let mut tools = Tools::builder()
@@ -205,7 +205,7 @@ impl AgentArgs {
         if let Some(mpp_adapter) = &mpp_adapter {
             tools = tools
                 .process_environment(mpp_adapter.tool_environment())
-                .remote_http_client(mpp_adapter.http_client()?);
+                .remote_http_client(mpp_adapter.tool_http_client()?);
         }
         let tools = tools.build()?;
         let child_agents = self.subagents.then(|| Arc::new(ChildAgents::default()));

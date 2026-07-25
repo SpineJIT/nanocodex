@@ -54,6 +54,7 @@ const DEFAULT_TOP_UP_AMOUNT: u128 = 5_000_000;
 // Five $5 refill quanta while retaining a finite client-side authorization cap.
 const DEFAULT_MAX_DEPOSIT: u128 = 25_000_000;
 const DEFAULT_MAX_EGRESS_CHARGE: u128 = 100_000;
+const RESPONSES_ACCEPT_PAYMENT: &str = "tempo/session, tempo/charge;q=0.5";
 
 fn load_tempo_wallet(path: &Path, store: &SqliteChannelStore) -> Result<TempoWallet> {
     match store
@@ -405,7 +406,7 @@ impl MppAdapter {
             .map_or_else(Vec::new, MppEgress::environment)
     }
 
-    pub(crate) fn http_client(&self) -> Result<reqwest::Client> {
+    fn http_client_builder(&self) -> Result<reqwest::ClientBuilder> {
         let egress = self
             .egress
             .as_ref()
@@ -416,11 +417,21 @@ impl MppAdapter {
             .wrap_err("failed to parse the MPP egress CA certificate")?;
         let proxy = reqwest::Proxy::all(egress.proxy_url())
             .wrap_err("failed to configure the MPP egress proxy")?;
-        reqwest::Client::builder()
+        Ok(reqwest::Client::builder()
             .proxy(proxy)
-            .add_root_certificate(certificate)
+            .add_root_certificate(certificate))
+    }
+
+    pub(crate) fn responses_http_client(&self) -> Result<reqwest::Client> {
+        prefer_session_payments(self.http_client_builder()?)
             .build()
-            .wrap_err("failed to configure the MPP-aware HTTP client")
+            .wrap_err("failed to configure the MPP-aware Responses HTTP client")
+    }
+
+    pub(crate) fn tool_http_client(&self) -> Result<reqwest::Client> {
+        self.http_client_builder()?
+            .build()
+            .wrap_err("failed to configure the MPP-aware tool HTTP client")
     }
 
     pub(crate) async fn shutdown(mut self) -> Result<()> {
@@ -449,6 +460,19 @@ impl MppAdapter {
         websocket_result?;
         egress_result
     }
+}
+
+fn prefer_session_payments(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder.default_headers(responses_payment_headers())
+}
+
+fn responses_payment_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::HeaderName::from_static("accept-payment"),
+        reqwest::header::HeaderValue::from_static(RESPONSES_ACCEPT_PAYMENT),
+    );
+    headers
 }
 
 impl Drop for MppAdapter {
@@ -971,6 +995,16 @@ mod tests {
 
         assert_eq!(commits.load(Ordering::SeqCst), 1);
         assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn responses_prefer_session_payments_with_charge_fallback() {
+        let headers = responses_payment_headers();
+
+        assert_eq!(
+            headers.get("accept-payment").unwrap(),
+            RESPONSES_ACCEPT_PAYMENT
+        );
     }
 
     #[test]
