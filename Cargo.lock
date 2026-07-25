@@ -565,7 +565,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-serde",
  "alloy-sol-types",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "serde",
  "serde_json",
  "serde_with",
@@ -718,7 +718,7 @@ checksum = "23ecd298fb0e6a31bd90c72efba2728e3d7569f1c89a3719576fb0e4e40b0fc8"
 dependencies = [
  "alloy-json-rpc",
  "alloy-transport",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "reqwest",
  "serde_json",
  "tower",
@@ -4073,9 +4073,9 @@ dependencies = [
  "serde_json_canonicalizer",
  "sha2 0.11.0",
  "subtle",
- "tempo-alloy",
- "tempo-contracts",
- "tempo-primitives",
+ "tempo-alloy 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=f3d7db8c5dc94546f390033d5f8495882fe81d63)",
+ "tempo-contracts 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=f3d7db8c5dc94546f390033d5f8495882fe81d63)",
+ "tempo-primitives 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=f3d7db8c5dc94546f390033d5f8495882fe81d63)",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -4395,8 +4395,8 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
- "tempo-alloy",
- "tempo-primitives",
+ "tempo-alloy 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e)",
+ "tempo-primitives 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e)",
  "thiserror 2.0.18",
  "tokio",
  "tower",
@@ -5291,7 +5291,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -7565,6 +7565,45 @@ dependencies = [
 [[package]]
 name = "tempo-alloy"
 version = "1.10.1"
+source = "git+https://github.com/tempoxyz/tempo?rev=4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e#4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e"
+dependencies = [
+ "alloy-consensus",
+ "alloy-contract",
+ "alloy-eips",
+ "alloy-json-rpc",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-client",
+ "alloy-rpc-types-eth",
+ "alloy-serde",
+ "alloy-signer",
+ "alloy-signer-local",
+ "alloy-sol-types",
+ "alloy-transport",
+ "async-trait",
+ "base64",
+ "dashmap",
+ "derive_more",
+ "dirs-next",
+ "futures",
+ "http",
+ "p256",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempo-chainspec 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e)",
+ "tempo-contracts 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e)",
+ "tempo-primitives 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e)",
+ "thiserror 2.0.18",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "tempo-alloy"
+version = "1.10.1"
 source = "git+https://github.com/tempoxyz/tempo?rev=f3d7db8c5dc94546f390033d5f8495882fe81d63#f3d7db8c5dc94546f390033d5f8495882fe81d63"
 dependencies = [
  "alloy-consensus",
@@ -7593,12 +7632,28 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "tempo-chainspec",
- "tempo-contracts",
- "tempo-primitives",
+ "tempo-chainspec 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=f3d7db8c5dc94546f390033d5f8495882fe81d63)",
+ "tempo-contracts 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=f3d7db8c5dc94546f390033d5f8495882fe81d63)",
+ "tempo-primitives 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=f3d7db8c5dc94546f390033d5f8495882fe81d63)",
  "thiserror 2.0.18",
  "tower",
  "tracing",
+]
+
+[[package]]
+name = "tempo-chainspec"
+version = "1.10.1"
+source = "git+https://github.com/tempoxyz/tempo?rev=4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e#4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e"
+dependencies = [
+ "alloy-eips",
+ "alloy-genesis",
+ "alloy-primitives",
+ "once_cell",
+ "paste",
+ "serde",
+ "serde_json",
+ "tempo-hardfork 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e)",
+ "tempo-primitives 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e)",
 ]
 
 [[package]]
@@ -7613,8 +7668,20 @@ dependencies = [
  "paste",
  "serde",
  "serde_json",
- "tempo-hardfork",
- "tempo-primitives",
+ "tempo-hardfork 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=f3d7db8c5dc94546f390033d5f8495882fe81d63)",
+ "tempo-primitives 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=f3d7db8c5dc94546f390033d5f8495882fe81d63)",
+]
+
+[[package]]
+name = "tempo-contracts"
+version = "1.10.1"
+source = "git+https://github.com/tempoxyz/tempo?rev=4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e#4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e"
+dependencies = [
+ "alloy-contract",
+ "alloy-primitives",
+ "alloy-sol-types",
+ "serde",
+ "tempo-hardfork 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e)",
 ]
 
 [[package]]
@@ -7626,7 +7693,19 @@ dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
  "serde",
- "tempo-hardfork",
+ "tempo-hardfork 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=f3d7db8c5dc94546f390033d5f8495882fe81d63)",
+]
+
+[[package]]
+name = "tempo-hardfork"
+version = "1.10.1"
+source = "git+https://github.com/tempoxyz/tempo?rev=4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e#4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e"
+dependencies = [
+ "alloy-eips",
+ "alloy-evm",
+ "alloy-hardforks",
+ "paste",
+ "serde",
 ]
 
 [[package]]
@@ -7639,6 +7718,38 @@ dependencies = [
  "alloy-hardforks",
  "paste",
  "serde",
+]
+
+[[package]]
+name = "tempo-primitives"
+version = "1.10.1"
+source = "git+https://github.com/tempoxyz/tempo?rev=4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e#4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-evm",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-eth",
+ "alloy-serde",
+ "aws-lc-rs",
+ "base64",
+ "derive_more",
+ "ed25519-consensus",
+ "modular-bitfield",
+ "once_cell",
+ "p256",
+ "reth-codecs",
+ "reth-db-api",
+ "reth-ethereum-primitives",
+ "reth-primitives-traits",
+ "reth-rpc-convert",
+ "revm",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempo-contracts 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e)",
 ]
 
 [[package]]
@@ -7670,7 +7781,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "tempo-contracts",
+ "tempo-contracts 1.10.1 (git+https://github.com/tempoxyz/tempo?rev=f3d7db8c5dc94546f390033d5f8495882fe81d63)",
 ]
 
 [[package]]

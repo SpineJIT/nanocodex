@@ -7,7 +7,7 @@ use std::{
 
 use alloy::{
     eips::Encodable2718,
-    network::ReceiptResponse,
+    network::{IntoWallet, ReceiptResponse},
     primitives::{Address, B256, U256, keccak256},
     providers::{
         DynProvider, PendingTransactionBuilder, Provider, ProviderBuilder,
