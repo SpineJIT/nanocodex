@@ -170,6 +170,29 @@ test("a completed turn seals a reasoning-only streaming tail", () => {
   ]);
 });
 
+test("warmup and reconnect progress remains visible without changing the transcript", () => {
+  const started = applyAgentEvents(initialTerminalState(), [
+    event(1, "run.started", {}),
+    event(2, "model.warmup.started", {}),
+  ]);
+  assert.equal(started.status, "Prewarming model...");
+  assert.equal(started.entries.length, 0);
+
+  const connected = applyAgentEvents(started, [
+    event(3, "model.warmup.completed", {}),
+    event(4, "model.connection.started", {}),
+    event(5, "model.call.started", {}),
+  ]);
+  assert.equal(connected.status, "Thinking...");
+  assert.equal(connected.entries, started.entries);
+
+  const retrying = applyAgentEvents(connected, [
+    event(6, "model.attempt.retrying", {}),
+  ]);
+  assert.equal(retrying.status, "Retrying...");
+  assert.equal(retrying.entries, started.entries);
+});
+
 test("native queue and steer lifecycles stay visually distinct", () => {
   let state = queuePrompt(initialTerminalState(), 1, "first");
   state = applyAgentEvents(state, [event(1, "run.started", {})]);
