@@ -5,7 +5,8 @@ All language consumers live at this repository boundary:
 - Rust: `minimal.rs`, `follow_on.rs`, `lifecycle.rs`, `custom_tool.rs`, `subagents.rs`,
   `resume.rs`, `fork_conversations.rs`, `fork_checkpoint_bench.rs`, and `mcp.rs` are binaries
   in the `nanocodex-examples` package.
-- Python: `python/` uses the native PyO3 binding.
+- Python: `python/` uses the native PyO3 binding (`follow_on.py`, `events.py`,
+  `lifecycle.py`).
 - Node.js: `node/` uses the shared Rust/WASM package with a Node WebSocket host.
 - Browser: `react-vite/` runs that WASM agent in a module Worker and renders its
   ordered events in React.

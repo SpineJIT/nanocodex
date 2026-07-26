@@ -17,6 +17,12 @@ releases the GIL, so applications can consume it from a normal Python thread.
 `agent.set_thinking("high")` changes the effort for subsequently accepted turns
 without replacing the session. `agent.set_fast_mode(True)` similarly enables
 priority service for subsequently accepted turns.
+
+Turn control matches the native SDK surface: `turn.steer(...)` injects input at
+the next safe model boundary, and `turn.cancel()` stops that exact unfinished
+turn. Session branching is also exposed: `agent.spawn()` starts a clean sibling,
+`agent.fork()` forks the latest safe boundary, and `agent.fork_from(turn)` forks
+from a completed turn's retained checkpoint.
 The Rust runtime, tools, transport, retries, history, and event ordering stay
 inside the extension; no app server or per-tool Python bridge is involved.
 
@@ -41,4 +47,5 @@ agent, events = Nanocodex(
 
 Runnable consumers live together at the repository boundary under
 [`examples/python`](../../examples/python): `follow_on.py` demonstrates retained
-conversation state and `events.py` consumes the ordered event receiver.
+conversation state, `events.py` consumes the ordered event receiver, and
+`lifecycle.py` exercises steer, spawn, and historical fork.

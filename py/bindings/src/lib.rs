@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use nanocodex::{
     AgentEvents as RustAgentEvents, Nanocodex as RustNanocodex, OpenAiAuth, ReasoningMode,
-    Thinking, load_chatgpt_auth,
+    Thinking, TurnControl as RustTurnControl, TurnResult as RustTurnResult, load_chatgpt_auth,
 };
 use pyo3::{
     Bound, PyResult, Python,
@@ -61,16 +61,7 @@ impl Nanocodex {
                 builder.build()
             })
             .map_err(runtime_error)?;
-        Ok((
-            Self {
-                runtime: Arc::clone(&runtime),
-                agent,
-            },
-            AgentEvents {
-                runtime,
-                events: Arc::new(tokio::sync::Mutex::new(events)),
-            },
-        ))
+        Ok(wrap_agent(runtime, agent, events))
     }
 
     /// Accept a prompt and immediately return its independently awaitable turn.
@@ -82,6 +73,7 @@ impl Nanocodex {
             .map_err(runtime_error)?;
         Ok(Turn {
             runtime: Arc::clone(&self.runtime),
+            control: turn.control(),
             state: Mutex::new(TurnState::Pending(turn)),
         })
     }
@@ -103,6 +95,39 @@ impl Nanocodex {
             .map_err(runtime_error)
     }
 
+    /// Start a clean sibling agent with the same private configuration.
+    ///
+    /// The sibling does not inherit conversation history.
+    fn spawn(&self, py: Python<'_>) -> PyResult<(Self, AgentEvents)> {
+        let runtime = Arc::clone(&self.runtime);
+        let agent = self.agent.clone();
+        let (child, events) = py
+            .detach(move || runtime.block_on(agent.spawn()))
+            .map_err(runtime_error)?;
+        Ok(wrap_agent(Arc::clone(&self.runtime), child, events))
+    }
+
+    /// Fork from the latest safe model boundary into an independently driven agent.
+    fn fork(&self, py: Python<'_>) -> PyResult<(Self, AgentEvents)> {
+        let runtime = Arc::clone(&self.runtime);
+        let agent = self.agent.clone();
+        let (child, events) = py
+            .detach(move || runtime.block_on(agent.fork()))
+            .map_err(runtime_error)?;
+        Ok(wrap_agent(Arc::clone(&self.runtime), child, events))
+    }
+
+    /// Fork from the exact checkpoint retained by a completed historical turn.
+    fn fork_from(&self, py: Python<'_>, turn: &Turn) -> PyResult<(Self, AgentEvents)> {
+        let completed = turn.completed_result()?;
+        let runtime = Arc::clone(&self.runtime);
+        let agent = self.agent.clone();
+        let (child, events) = py
+            .detach(move || runtime.block_on(agent.fork_from(&completed)))
+            .map_err(runtime_error)?;
+        Ok(wrap_agent(Arc::clone(&self.runtime), child, events))
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Nanocodex(runtime_references={})",
@@ -114,24 +139,56 @@ impl Nanocodex {
 #[pyclass(module = "nanocodex._native")]
 struct Turn {
     runtime: Arc<Runtime>,
+    control: RustTurnControl,
     state: Mutex<TurnState>,
 }
 
 enum TurnState {
     Pending(nanocodex::Turn),
     Waiting,
-    Completed(String),
+    Completed(RustTurnResult),
     Failed(String),
+}
+
+impl Turn {
+    fn completed_result(&self) -> PyResult<RustTurnResult> {
+        let state = self.state.lock().map_err(lock_error)?;
+        match &*state {
+            TurnState::Completed(result) => Ok(result.clone()),
+            TurnState::Pending(_) | TurnState::Waiting => Err(PyRuntimeError::new_err(
+                "turn has not completed; await result() before fork_from",
+            )),
+            TurnState::Failed(error) => Err(PyRuntimeError::new_err(format!(
+                "turn failed and has no checkpoint: {error}"
+            ))),
+        }
+    }
 }
 
 #[pymethods]
 impl Turn {
+    /// Inject additional input into this turn at its next safe model boundary.
+    fn steer(&self, py: Python<'_>, instruction: String) -> PyResult<()> {
+        let runtime = Arc::clone(&self.runtime);
+        let control = self.control.clone();
+        py.detach(move || runtime.block_on(control.steer(instruction)))
+            .map_err(runtime_error)
+    }
+
+    /// Cancel this exact unfinished turn.
+    fn cancel(&self, py: Python<'_>) -> PyResult<()> {
+        let runtime = Arc::clone(&self.runtime);
+        let control = self.control.clone();
+        py.detach(move || runtime.block_on(control.cancel()))
+            .map_err(runtime_error)
+    }
+
     /// Block until the turn completes and return its final assistant message.
     fn result(&self, py: Python<'_>) -> PyResult<String> {
         let turn = {
             let mut state = self.state.lock().map_err(lock_error)?;
             match &*state {
-                TurnState::Completed(message) => return Ok(message.clone()),
+                TurnState::Completed(result) => return Ok(result.final_message.clone()),
                 TurnState::Failed(error) => return Err(PyRuntimeError::new_err(error.clone())),
                 TurnState::Waiting => {
                     return Err(PyRuntimeError::new_err(
@@ -149,8 +206,8 @@ impl Turn {
         let runtime = Arc::clone(&self.runtime);
         match py.detach(move || runtime.block_on(turn.result())) {
             Ok(result) => {
-                let message = result.final_message;
-                *self.state.lock().map_err(lock_error)? = TurnState::Completed(message.clone());
+                let message = result.final_message.clone();
+                *self.state.lock().map_err(lock_error)? = TurnState::Completed(result);
                 Ok(message)
             }
             Err(error) => {
@@ -180,6 +237,23 @@ impl AgentEvents {
             .map(|event| serde_json::to_string(&event).map_err(runtime_error))
             .transpose()
     }
+}
+
+fn wrap_agent(
+    runtime: Arc<Runtime>,
+    agent: RustNanocodex,
+    events: RustAgentEvents,
+) -> (Nanocodex, AgentEvents) {
+    (
+        Nanocodex {
+            runtime: Arc::clone(&runtime),
+            agent,
+        },
+        AgentEvents {
+            runtime,
+            events: Arc::new(tokio::sync::Mutex::new(events)),
+        },
+    )
 }
 
 fn build_runtime() -> PyResult<Arc<Runtime>> {
