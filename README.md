@@ -645,7 +645,15 @@ byte-stable for prompt-cache reuse.
 
 The CLI records Codex-compatible rollouts beneath
 `${CODEX_HOME:-$HOME/.codex}/sessions` by default. The `request_id` in headless
-JSONL is the resumable UUID, so a completed handoff is:
+JSONL is the resumable UUID. Restore its workspace, committed typed history, and
+rollout identity in Nanocodex with:
+
+```sh
+nanocodex resume <request_id>
+nanocodex resume <request_id> --prompt "Continue where we left off"
+```
+
+Or hand the interoperable rollout to Codex:
 
 ```sh
 nanocodex run "Remember this thread"

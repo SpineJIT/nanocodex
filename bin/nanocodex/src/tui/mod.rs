@@ -404,7 +404,10 @@ impl UiModel {
                     Event::FocusGained => {
                         self.terminal_focused = true;
                         self.pending_notification = None;
-                        return Ok(UiUpdate::Ignore);
+                        // tmux can resize this pane before returning focus to it. The resize
+                        // frame may be presented while tmux is still repainting its layout, so
+                        // redraw once more after focus has settled on this pane.
+                        return Ok(UiUpdate::Redraw(RedrawPriority::Immediate));
                     }
                     Event::FocusLost => {
                         self.terminal_focused = false;
@@ -2821,7 +2824,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_notification_is_queued_only_while_unfocused() {
+    fn focus_gain_redraws_and_clears_an_unfocused_completion_notification() {
         let (commands, _worker) = mpsc::unbounded_channel();
         let mut ui = UiModel::new(
             App::new("/workspace".into()),
@@ -2844,8 +2847,11 @@ mod tests {
             Some("Nanocodex finished")
         );
 
-        ui.update(UiAction::Terminal(Event::FocusGained), &commands)
-            .unwrap();
+        assert_eq!(
+            ui.update(UiAction::Terminal(Event::FocusGained), &commands)
+                .unwrap(),
+            UiUpdate::Redraw(RedrawPriority::Immediate)
+        );
         assert!(ui.pending_notification.is_none());
         ui.update(
             UiAction::Worker(WorkerEvent::TurnFinished {

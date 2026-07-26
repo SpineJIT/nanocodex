@@ -2870,7 +2870,10 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
         let mut resumed = accept_async(stream).await?;
         let replay = next_json(&mut resumed).await?;
         assert!(replay.get("previous_response_id").is_none());
-        assert_eq!(replay["prompt_cache_key"], "durable-cache");
+        assert_eq!(
+            replay["prompt_cache_key"],
+            "019c0d31-c308-7d91-bff4-5dca82d15ac6"
+        );
         assert_eq!(replay["input"][0]["type"], "additional_tools");
         assert!(replay["input"][0].get("id").is_none());
         assert_eq!(replay["input"][1]["role"], "developer");
@@ -2905,6 +2908,14 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
     let first = agent.prompt("first prompt").await?.result().await?;
     let encoded = serde_json::to_vec(&first.snapshot())?;
     agent.flush_rollout().await?;
+    let durable_config = RolloutConfig::new(&rollout_home);
+    let durable = durable_config.load_session("019c0d31-c308-7d91-bff4-5dca82d15ac6")?;
+    assert_eq!(durable.thread_id(), agent.session_id());
+    assert_eq!(
+        Path::new(durable.workspace()).canonicalize()?,
+        workspace.canonicalize()?
+    );
+    assert_eq!(durable.rollout_path(), rollout_path.canonicalize()?);
     let snapshot_json = serde_json::from_slice::<Value>(&encoded)?;
     let request_prefix = snapshot_json["request_prefix"]
         .as_array()
@@ -2919,7 +2930,7 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
                 item.get("id").is_some_and(Value::is_string) || item["type"] == "compaction_trigger"
             }))
     );
-    let rollout_history = std::fs::read_to_string(rollout_path)?
+    let rollout_history = std::fs::read_to_string(&rollout_path)?
         .lines()
         .map(serde_json::from_str::<Value>)
         .collect::<serde_json::Result<Vec<_>>>()?
@@ -2928,9 +2939,9 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
         .map(|line| line["payload"].clone())
         .collect::<Vec<_>>();
     assert_eq!(
-        snapshot_json["history"].as_array(),
+        serde_json::to_value(durable.snapshot())?["history"].as_array(),
         Some(&rollout_history),
-        "native snapshots and Codex rollouts must project the same committed history"
+        "rollout resume must materialize the recorded committed history"
     );
     let snapshot: SessionSnapshot = serde_json::from_slice(&encoded)?;
     drop((agent, events, first));
@@ -2985,15 +2996,20 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
             if message.contains("prompt cache key")
     ));
 
+    let (thread_id, snapshot, rollout) = durable.into_parts();
     let responses = Responses::builder().websocket_url(endpoint).build();
     let (resumed, resumed_events) = Nanocodex::builder("test-key")
         .instructions("durable instructions")
         .thinking(Thinking::Low)
         .responses(responses)
-        .session_id("resumed-runtime")
+        .session_id(thread_id)
         .resume(snapshot)
+        .rollout(rollout)
         .build()?;
-    assert_eq!(resumed_events.request_id(), "resumed-runtime");
+    assert_eq!(
+        resumed_events.request_id(),
+        "019c0d31-c308-7d91-bff4-5dca82d15ac6"
+    );
     assert_eq!(
         resumed
             .prompt("resume prompt")
@@ -3003,6 +3019,29 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
             .final_message,
         "done"
     );
+    resumed.flush_rollout().await?;
+    assert_eq!(
+        resumed
+            .rollout()
+            .map(|rollout| rollout.path().canonicalize())
+            .transpose()?,
+        Some(rollout_path.canonicalize()?)
+    );
+    let durable = durable_config.load_session("019c0d31-c308-7d91-bff4-5dca82d15ac6")?;
+    let durable_json = serde_json::to_value(durable.snapshot())?;
+    assert!(
+        durable_json["history"]
+            .to_string()
+            .contains("resume prompt")
+    );
+    let session_meta_count = std::fs::read_to_string(&rollout_path)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<serde_json::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|line| line["type"] == "session_meta")
+        .count();
+    assert_eq!(session_meta_count, 1);
 
     drop((resumed, resumed_events));
     timeout(std::time::Duration::from_secs(5), server)
