@@ -5,7 +5,9 @@ use std::{
     sync::Arc,
 };
 
-use nanocodex_core::{EventSink, ModelConfig, Prompt, ReasoningMode, Thinking, UserInput};
+use nanocodex_core::{
+    EventSink, ModelConfig, Prompt, ReasoningMode, ResponseItem, Thinking, UserInput,
+};
 use nanocodex_service::{
     DefaultResponsesService, ResponsesClient, ResponsesService, TransportStats,
 };
@@ -18,11 +20,11 @@ use wasm_bindgen_futures::spawn_local;
 use crate::{
     NanocodexError, SessionSnapshot,
     model::agent::{
-        CompletedModelTurn, ModelRun, ModelTurnOutcome, PreparedCheckpoint, prepare_checkpoint,
-        prepare_resumed_checkpoint,
+        CompletedModelTurn, ModelCheckpoint, ModelRun, ModelTurnOutcome, PreparedCheckpoint,
+        prepare_checkpoint, prepare_resumed_checkpoint, prepare_rollout_checkpoint,
     },
     prompt_cache::ModelPromptCache,
-    session::CommittedSession,
+    session::{CommittedSession, SessionResume},
 };
 
 const STEER_CAPACITY: usize = 8;
@@ -65,6 +67,16 @@ struct WasmAgentFactory {
     lineage_id: Arc<str>,
     prompt_cache_key: Option<Arc<str>>,
     prompt_cache: ModelPromptCache,
+}
+
+enum WasmInitialResume {
+    Exact(Box<ModelCheckpoint>),
+    Rollout {
+        workspace: String,
+        canonical_context: ResponseItem,
+        history: Vec<ResponseItem>,
+        prompt_cache_key: Arc<str>,
+    },
 }
 
 #[derive(Clone)]
@@ -168,24 +180,39 @@ impl WasmNanocodex {
                 .map_or_else(|| ModelConfig::default().system_prompt, Arc::from),
         });
         let configured_workspace = config.workspace.map(Arc::<str>::from);
-        let (lineage_id, prompt_cache_key, initial_checkpoint, workspace) =
+        let (lineage_id, prompt_cache_key, initial_resume, workspace) =
             if let Some(snapshot) = config.resume {
-                let (lineage_id, prompt_cache_key, checkpoint) =
-                    snapshot.into_checkpoint().map_err(js_error)?;
+                let SessionResume {
+                    lineage_id,
+                    prompt_cache_key,
+                    workspace,
+                    canonical_context,
+                    history,
+                    checkpoint,
+                } = snapshot.into_resume().map_err(js_error)?;
                 if let Some(configured) = configured_workspace.as_deref()
-                    && configured != checkpoint.workspace()
+                    && configured != workspace
                 {
                     return Err(js_error(NanocodexError::WorkspaceChanged {
-                        current: checkpoint.workspace().to_owned(),
+                        current: workspace,
                         requested: configured.to_owned(),
                     }));
                 }
-                let workspace = Some(Arc::<str>::from(checkpoint.workspace()));
+                let active_workspace = Some(Arc::<str>::from(workspace.as_str()));
+                let initial_resume = checkpoint.map_or_else(
+                    || WasmInitialResume::Rollout {
+                        workspace,
+                        canonical_context,
+                        history,
+                        prompt_cache_key: Arc::clone(&prompt_cache_key),
+                    },
+                    |checkpoint| WasmInitialResume::Exact(Box::new(checkpoint)),
+                );
                 (
                     lineage_id,
                     Some(prompt_cache_key),
-                    Some(checkpoint),
-                    workspace,
+                    Some(initial_resume),
+                    active_workspace,
                 )
             } else {
                 let lineage_id = Arc::<str>::from(session_id.as_str());
@@ -203,9 +230,28 @@ impl WasmNanocodex {
             prompt_cache_key,
             prompt_cache,
         };
-        let initial_model = initial_checkpoint
-            .map(|checkpoint| {
-                prepare_resumed_checkpoint(checkpoint, &factory.config, &factory.tools, &session_id)
+        let initial_model = initial_resume
+            .map(|resume| match resume {
+                WasmInitialResume::Exact(checkpoint) => prepare_resumed_checkpoint(
+                    *checkpoint,
+                    &factory.config,
+                    &factory.tools,
+                    &session_id,
+                ),
+                WasmInitialResume::Rollout {
+                    workspace,
+                    canonical_context,
+                    history,
+                    prompt_cache_key,
+                } => prepare_rollout_checkpoint(
+                    workspace,
+                    canonical_context,
+                    history,
+                    prompt_cache_key,
+                    &factory.config,
+                    &factory.tools,
+                    &session_id,
+                ),
             })
             .transpose()
             .map_err(js_error)?;
@@ -325,6 +371,10 @@ impl WasmNanocodex {
     }
 
     /// Enable or disable priority processing for subsequently accepted turns.
+    ///
+    /// # Errors
+    ///
+    /// Rejects after the agent driver stops.
     #[wasm_bindgen(js_name = setFastMode)]
     pub async fn set_fast_mode(&self, enabled: bool) -> Result<(), JsValue> {
         request_command(&self.commands, |result| Command::SetFastMode {

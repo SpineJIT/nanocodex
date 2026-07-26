@@ -3,7 +3,6 @@ mod config;
 mod db;
 mod issuer;
 mod stripe;
-mod tempo_wallet;
 
 use clap::Parser;
 use eyre::{Context, Result};

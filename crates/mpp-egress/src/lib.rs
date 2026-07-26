@@ -111,6 +111,7 @@ impl MppEgress {
     where
         P: PaymentProvider + 'static,
     {
+        drop(rustls::crypto::ring::default_provider().install_default());
         if policy.max_request_bytes == 0 {
             return Err(EgressError::InvalidPolicy(
                 "max_request_bytes must be greater than zero",

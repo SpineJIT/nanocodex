@@ -279,6 +279,24 @@ export function applyAgentEvents(
           status: "Steer applied",
         });
         break;
+      case "model.warmup.started":
+        next.status = "Prewarming model...";
+        break;
+      case "model.warmup.completed":
+        next.status = "Thinking...";
+        break;
+      case "model.warmup.failed":
+        next.status = "Warmup unavailable; continuing";
+        break;
+      case "model.connection.started":
+        next.status = "Connecting...";
+        break;
+      case "model.call.started":
+        next.status = "Thinking...";
+        break;
+      case "model.attempt.retrying":
+        next.status = "Retrying...";
+        break;
       case "assistant.message": {
         const text = payloadString(event.payload, "text") ?? "";
         const tail = next.entries.at(-1);

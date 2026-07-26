@@ -101,12 +101,11 @@ pub(crate) struct AgentArgs {
     websocket_url: Option<String>,
 
     /// Responses transport fixed for the complete agent session.
-    #[arg(
-        long,
-        env = "NANOCODEX_RESPONSES_TRANSPORT",
-        default_value_t = ResponsesTransport::WebSocket
-    )]
-    responses_transport: ResponsesTransport,
+    ///
+    /// Defaults to HTTPS for the Tempo provider and WebSocket for direct
+    /// `OpenAI`.
+    #[arg(long, env = "NANOCODEX_RESPONSES_TRANSPORT")]
+    responses_transport: Option<ResponsesTransport>,
 
     /// Incremental response-ID chaining or complete history replay.
     #[arg(long, env = "NANOCODEX_RESPONSES_HISTORY")]
@@ -140,6 +139,15 @@ impl AgentArgs {
         self.thinking
     }
 
+    pub(crate) fn responses_transport(&self) -> ResponsesTransport {
+        self.responses_transport
+            .unwrap_or(if self.mpp.is_enabled() {
+                ResponsesTransport::Https
+            } else {
+                ResponsesTransport::WebSocket
+            })
+    }
+
     pub(crate) async fn build(self) -> Result<ConfiguredAgent> {
         self.build_inner(None).await
     }
@@ -150,18 +158,24 @@ impl AgentArgs {
 
     async fn build_inner(self, durable: Option<DurableSession>) -> Result<ConfiguredAgent> {
         let codex_home = default_codex_home()?;
+        let responses_transport = self.responses_transport();
         let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
         let mpp_enabled = self.mpp.is_enabled();
+        if mpp_enabled && !matches!(responses_transport, ResponsesTransport::Https) {
+            return Err(eyre!(
+                "the Tempo provider currently supports HTTPS Responses with Charge only"
+            ));
+        }
         let auth = if mpp_enabled {
             OpenAiAuth::api_key("tempo-proxy")
         } else {
             select_auth(self.api_key, self.auth_file, environment_api_key()?)?
         };
         let direct_websocket_url = direct_websocket_url(self.websocket_url, auth.mode());
-        let (websocket_url, mpp_adapter) = self.mpp.start(direct_websocket_url).await?;
+        let mpp_adapter = self.mpp.start().await?;
         let mut responses = Responses::builder()
-            .transport(self.responses_transport)
-            .websocket_url(websocket_url);
+            .transport(responses_transport)
+            .websocket_url(direct_websocket_url);
         if let Some(history) = self.responses_history {
             responses = responses.history(history);
         }
@@ -175,6 +189,11 @@ impl AgentArgs {
         });
         if let Some(api_base_url) = api_base_url {
             responses = responses.api_base_url(api_base_url);
+        }
+        if matches!(responses_transport, ResponsesTransport::Https)
+            && let Some(mpp_adapter) = &mpp_adapter
+        {
+            responses = responses.http_client(mpp_adapter.responses_http_client()?);
         }
         let responses = responses.build();
         let mut tools = Tools::builder()
@@ -462,7 +481,7 @@ mod tests {
             .get_arguments()
             .find(|argument| argument.get_id() == "responses_transport")
             .expect("the CLI should expose the Responses transport argument");
-        assert_eq!(transport.get_default_values(), ["websocket"]);
+        assert!(transport.get_default_values().is_empty());
 
         let history = command
             .get_arguments()

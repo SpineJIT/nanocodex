@@ -31,7 +31,7 @@ export type SessionSnapshot = Readonly<{
   lineage_id: string;
   prompt_cache_key: string;
   workspace: string;
-  request_prefix: readonly Record<string, unknown>[];
+  request_prefix?: readonly Record<string, unknown>[] | undefined;
   canonical_context: Record<string, unknown>;
   history: readonly Record<string, unknown>[];
 }>;

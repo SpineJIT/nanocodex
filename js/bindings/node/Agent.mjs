@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import initWeb, { Nanocodex as WebNanocodex } from "../pkg-web/nanocodex.js";
 
 import { agentActions } from "../actions/index.mjs";
 import {
@@ -12,8 +13,8 @@ import {
 } from "../internal.mjs";
 import { createNodeHost } from "./host.mjs";
 
-const require = createRequire(import.meta.url);
-const { Nanocodex } = require("../pkg-node/nanocodex.js");
+let initializedWeb;
+let NodeNanocodex;
 
 export function create(options = {}) {
   const {
@@ -27,6 +28,7 @@ export function create(options = {}) {
     mpp,
     websocketUrl,
     apiBaseUrl,
+    module,
     ...hostOptions
   } = options;
   const events = createEventChannel();
@@ -39,7 +41,11 @@ export function create(options = {}) {
     key: "node-wasm",
     name: "Nanocodex Node WASM",
     type: "node",
-    create(config) {
+    async create(config) {
+      activateHost(host);
+      const Nanocodex = module === undefined
+        ? loadNodeNanocodex()
+        : await loadWebNanocodex(module);
       activateHost(host);
       return new Nanocodex(JSON.stringify(toWasmConfig({
         apiKey: apiKey ?? (mpp === undefined ? undefined : "mpp-managed"),
@@ -63,4 +69,16 @@ export function create(options = {}) {
     sessionId,
     resume,
   });
+}
+
+function loadNodeNanocodex() {
+  const require = createRequire(import.meta.url);
+  NodeNanocodex ||= require("../pkg-node/nanocodex.js").Nanocodex;
+  return NodeNanocodex;
+}
+
+async function loadWebNanocodex(module) {
+  initializedWeb ||= initWeb({ module_or_path: module });
+  await initializedWeb;
+  return WebNanocodex;
 }

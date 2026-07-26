@@ -718,9 +718,26 @@ impl NanocodexBuilder<StandardResponses> {
             self.codex.rollout.as_ref(),
         )?;
         let config = Arc::new(self.config);
+        #[cfg(not(target_family = "wasm"))]
+        let http_client = self.responses.http_client;
         let service_factory: ServiceFactory<DefaultResponsesService> = Arc::new({
             let config = Arc::clone(&config);
-            move || ResponsesService::standard(Arc::clone(&config))
+            move || {
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    http_client.as_ref().map_or_else(
+                        || ResponsesService::standard(Arc::clone(&config)),
+                        |client| {
+                            ResponsesService::standard_with_http_client(
+                                Arc::clone(&config),
+                                client.clone(),
+                            )
+                        },
+                    )
+                }
+                #[cfg(target_family = "wasm")]
+                ResponsesService::standard(Arc::clone(&config))
+            }
         });
         build_agent(
             config,
@@ -760,12 +777,24 @@ where
         )?;
         let config = Arc::new(self.config);
         let layers = self.responses.service.0;
+        #[cfg(not(target_family = "wasm"))]
+        let http_client = self.responses.http_client;
         let service_factory: ServiceFactory<L::Service> = Arc::new({
             let config = Arc::clone(&config);
             move || {
-                layers
-                    .clone()
-                    .service(ResponsesService::standard(Arc::clone(&config)))
+                #[cfg(not(target_family = "wasm"))]
+                let service = http_client.as_ref().map_or_else(
+                    || ResponsesService::standard(Arc::clone(&config)),
+                    |client| {
+                        ResponsesService::standard_with_http_client(
+                            Arc::clone(&config),
+                            client.clone(),
+                        )
+                    },
+                );
+                #[cfg(target_family = "wasm")]
+                let service = ResponsesService::standard(Arc::clone(&config));
+                layers.clone().service(service)
             }
         });
         build_agent(

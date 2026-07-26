@@ -42,6 +42,22 @@ async function check() {
       async close() {},
     },
   });
+  await Agent.create({ apiKey, module: new WebAssembly.Module(new Uint8Array()) });
+
+  const rolloutSnapshot: SessionSnapshot = {
+    version: 1,
+    model: "gpt-5.6-sol",
+    lineage_id: "thread",
+    prompt_cache_key: "thread",
+    workspace: "/tmp",
+    canonical_context: {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "hello" }],
+    },
+    history: [],
+  };
+  await Agent.create({ apiKey, resume: rolloutSnapshot });
 
   // @ts-expect-error actions are domain-grouped on the decorated Agent.
   agent.prompt("hello");
