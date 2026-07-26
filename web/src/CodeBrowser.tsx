@@ -9,11 +9,13 @@ import { FileTree, useFileTree } from "@pierre/trees/react";
 import { ChevronRight, FileQuestion, GitBranch, PanelLeft, Search, X } from "lucide-react";
 import {
   forwardRef,
+  memo,
   useEffect,
   useImperativeHandle,
   useMemo,
   useRef,
   useState,
+  type ForwardedRef,
 } from "react";
 import { fuzzyScore } from "./fuzzy";
 import { usePierreRenderer } from "./PierreWorkerProvider";
@@ -59,16 +61,31 @@ function formatBytes(value: number | null) {
   return `${(value / 1_000_000).toFixed(1)} MB`;
 }
 
-export const CodeBrowser = forwardRef<CodeBrowserHandle, CodeBrowserProps>(function CodeBrowser(
-  { files, treeInput, branch, head, theme },
-  ref,
+function countLines(contents: string | null): number | null {
+  if (contents === null) return null;
+  if (!contents) return 0;
+  let lines = 1;
+  for (let index = 0; index < contents.length; index += 1) {
+    if (contents.charCodeAt(index) === 10) lines += 1;
+  }
+  return lines;
+}
+
+function CodeBrowserComponent(
+  { files, treeInput, branch, head, theme }: CodeBrowserProps,
+  ref: ForwardedRef<CodeBrowserHandle>,
 ) {
-  const defaultPath =
-    files.find((file) => file.path === "src/main.rs")?.path ??
-    files.find((file) => file.path === "README.md")?.path ??
-    files[0]?.path ??
-    "";
+  const defaultPath = useMemo(
+    () =>
+      files.find((file) => file.path === "src/main.rs")?.path ??
+      files.find((file) => file.path === "README.md")?.path ??
+      files[0]?.path ??
+      "",
+    [files],
+  );
   const [selectedPath, setSelectedPath] = useState(defaultPath);
+  const selectedPathRef = useRef(selectedPath);
+  selectedPathRef.current = selectedPath;
   const [contents, setContents] = useState<string | null>(null);
   const [loadedObjectId, setLoadedObjectId] = useState<string | null>(null);
   const [fileError, setFileError] = useState(false);
@@ -145,6 +162,7 @@ export const CodeBrowser = forwardRef<CodeBrowserHandle, CodeBrowserProps>(funct
   );
 
   const selectFile = (path: string) => {
+    selectedPathRef.current = path;
     model.closeSearch();
     for (const selectedFile of model.getSelectedPaths()) {
       if (selectedFile !== path) model.getItem(selectedFile)?.deselect();
@@ -206,12 +224,13 @@ export const CodeBrowser = forwardRef<CodeBrowserHandle, CodeBrowserProps>(funct
         .slice()
         .reverse()
         .find((path) => files.some((file) => file.path === path));
-      if (nextPath && nextPath !== selectedPath) {
+      if (nextPath && nextPath !== selectedPathRef.current) {
+        selectedPathRef.current = nextPath;
         setSelectedPath(nextPath);
         setTreeOpen(false);
       }
     });
-  }, [files, model, selectedPath]);
+  }, [files, model]);
 
   useEffect(() => {
     if (!selected?.contentUrl) {
@@ -240,7 +259,7 @@ export const CodeBrowser = forwardRef<CodeBrowserHandle, CodeBrowserProps>(funct
     return () => controller.abort();
   }, [selected?.contentUrl, selected?.objectId]);
 
-  const lineCount = contents === null ? null : contents ? contents.split("\n").length : 0;
+  const lineCount = useMemo(() => countLines(contents), [contents]);
   const codeItems = useMemo<CodeViewItem<undefined>[]>(
     () =>
       codeReady
@@ -430,4 +449,6 @@ export const CodeBrowser = forwardRef<CodeBrowserHandle, CodeBrowserProps>(funct
       ) : null}
     </section>
   );
-});
+}
+
+export const CodeBrowser = memo(forwardRef(CodeBrowserComponent));

@@ -1,4 +1,13 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import {
+  lazy,
+  memo,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
 import {
   NanocodexProvider,
   useNanocodex,
@@ -21,13 +30,13 @@ const MppControls = lazy(async () => ({
 }));
 
 /** Website policy around the reusable TUI: credential UX and the site theme. */
-export function AgentTerminal() {
+export const AgentTerminal = memo(function AgentTerminal() {
   return (
     <NanocodexProvider config={nanocodexConfig}>
       <AgentTerminalDemo />
     </NanocodexProvider>
   );
-}
+});
 
 function AgentTerminalDemo() {
   const agent = useNanocodex<WebTuiCommand>();

@@ -3,7 +3,15 @@ import type { SpecialLanguage, ThemeRegistrationRaw } from "shiki/core";
 
 const MAX_HIGHLIGHT_CHARS = 50_000;
 const MAX_CACHE_ENTRIES = 256;
-const htmlCache = new Map<string, Promise<string>>();
+const MAX_CACHE_BYTES = 16 * 1024 * 1024;
+
+type HighlightCacheEntry = {
+  promise: Promise<string>;
+  retainedBytes: number;
+};
+
+const htmlCache = new Map<string, HighlightCacheEntry>();
+let htmlCacheBytes = 0;
 
 const languageLoaders = {
   bash: () => import("@shikijs/langs/bash"),
@@ -118,17 +126,57 @@ function resolveLanguage(language?: string): SyntaxLanguage {
 function highlightedHtml(code: string, language: SyntaxLanguage): Promise<string> {
   const key = `${language}\0${code}`;
   const cached = htmlCache.get(key);
-  if (cached) return cached;
-  if (htmlCache.size >= MAX_CACHE_ENTRIES) {
-    const oldest = htmlCache.keys().next().value;
-    if (oldest !== undefined) htmlCache.delete(oldest);
-  }
-  const rendered = renderHighlightedHtml(code, language).catch((error) => {
+  if (cached) {
     htmlCache.delete(key);
-    throw error;
-  });
-  htmlCache.set(key, rendered);
-  return rendered;
+    htmlCache.set(key, cached);
+    return cached.promise;
+  }
+
+  const entry: HighlightCacheEntry = {
+    promise: Promise.resolve(""),
+    retainedBytes: estimatedStringBytes(key),
+  };
+  entry.promise = renderHighlightedHtml(code, language)
+    .then((html) => {
+      if (htmlCache.get(key) === entry) {
+        const renderedBytes = estimatedStringBytes(html);
+        entry.retainedBytes += renderedBytes;
+        htmlCacheBytes += renderedBytes;
+        trimHtmlCache();
+      }
+      return html;
+    })
+    .catch((error) => {
+      removeHtmlCacheEntry(key, entry);
+      throw error;
+    });
+  htmlCache.set(key, entry);
+  htmlCacheBytes += entry.retainedBytes;
+  trimHtmlCache();
+  return entry.promise;
+}
+
+function estimatedStringBytes(value: string): number {
+  return value.length * 2;
+}
+
+function removeHtmlCacheEntry(key: string, entry: HighlightCacheEntry) {
+  if (htmlCache.get(key) !== entry) return;
+  htmlCache.delete(key);
+  htmlCacheBytes = Math.max(0, htmlCacheBytes - entry.retainedBytes);
+}
+
+function trimHtmlCache() {
+  while (
+    htmlCache.size > MAX_CACHE_ENTRIES ||
+    htmlCacheBytes > MAX_CACHE_BYTES
+  ) {
+    const oldestKey = htmlCache.keys().next().value;
+    if (oldestKey === undefined) return;
+    const oldest = htmlCache.get(oldestKey);
+    if (oldest === undefined) return;
+    removeHtmlCacheEntry(oldestKey, oldest);
+  }
 }
 
 async function renderHighlightedHtml(code: string, language: SyntaxLanguage): Promise<string> {

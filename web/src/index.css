@@ -1197,6 +1197,12 @@ html[data-theme="dark"] .agent-tui {
 .agent-tui-composer textarea:disabled { color: var(--tui-dark-gray); }
 .tui-draft-preserved { display: block; padding: 0 1ch; }
 
+.agent-tui-loading {
+  display: grid;
+  color: var(--text-muted);
+  place-items: center;
+}
+
 .agent-tui-footer {
   min-width: 0;
   overflow: hidden;
