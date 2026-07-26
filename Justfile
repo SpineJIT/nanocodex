@@ -56,6 +56,14 @@ test-python: build-python
 smoke-python: build-python
     "{{python_binding_bin}}" examples/python/follow_on.py
 
+# Run the Python events consumer against the live Responses API.
+smoke-python-events: build-python
+    "{{python_binding_bin}}" examples/python/events.py
+
+# Run the Python steer/spawn/fork lifecycle example against the live Responses API.
+smoke-python-lifecycle: build-python
+    "{{python_binding_bin}}" examples/python/lifecycle.py
+
 # Build one Rust/WASM artifact and generate both Node.js and browser bindings.
 build-wasm:
     @command -v wasm-bindgen >/dev/null || { echo "install wasm-bindgen-cli matching Cargo.lock" >&2; exit 2; }
