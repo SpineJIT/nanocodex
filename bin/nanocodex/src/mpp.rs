@@ -12,7 +12,6 @@ use nanousd::{NANOUSD_ADDRESS, TEMPO_MAINNET_CHAIN_ID};
 use tempo_alloy::accounts::{TempoAccountsWallet, default_accounts_store_path};
 
 const DEFAULT_MPP_API_BASE_URL: &str = "https://openai.mpp.tempo.xyz/v1";
-const DEFAULT_TEMPO_RPC_URL: &str = "https://rpc.mainnet.tempo.xyz";
 const DEFAULT_TEMPO_SWAP_SLIPPAGE_BPS: u16 = 100;
 const DEFAULT_MAX_EGRESS_CHARGE: u128 = 100_000;
 const RESPONSES_ACCEPT_PAYMENT: &str = "tempo/charge";
@@ -60,16 +59,6 @@ pub(crate) struct MppArgs {
     )]
     wallet_store: Option<PathBuf>,
 
-    /// Tempo RPC used to prepare and sign `NanoUSD` Charge payments.
-    #[arg(
-        long = "provider.tempo.rpc-url",
-        global = true,
-        env = "NANOCODEX_PROVIDER_TEMPO_RPC_URL",
-        default_value = DEFAULT_TEMPO_RPC_URL,
-        value_parser = NonEmptyStringValueParser::new()
-    )]
-    rpc_url: String,
-
     /// Maximum slippage for automatic swaps from `NanoUSD`, in basis points.
     #[arg(
         long = "provider.tempo.swap-slippage-bps",
@@ -116,8 +105,7 @@ impl MppArgs {
         let wallet = TempoAccountsWallet::from_store(&wallet_path).wrap_err_with(|| {
             format!("failed to load Tempo Accounts at {}", wallet_path.display())
         })?;
-        let provider = TempoAccountsProvider::new(wallet, &self.rpc_url)
-            .wrap_err("failed to configure the Tempo Accounts Charge provider")?
+        let provider = TempoAccountsProvider::new(wallet)
             .with_expected_chain_id(TEMPO_MAINNET_CHAIN_ID)
             .with_autoswap(AutoswapConfig::new(NANOUSD_ADDRESS, self.swap_slippage_bps));
         let provider = CappedChargeProvider {
@@ -341,7 +329,6 @@ mod tests {
             enabled: false,
             api_base_url: DEFAULT_MPP_API_BASE_URL.to_owned(),
             wallet_store: None,
-            rpc_url: DEFAULT_TEMPO_RPC_URL.to_owned(),
             swap_slippage_bps: DEFAULT_TEMPO_SWAP_SLIPPAGE_BPS,
             egress_max_charge: DEFAULT_MAX_EGRESS_CHARGE,
             mpp_api_key: None,

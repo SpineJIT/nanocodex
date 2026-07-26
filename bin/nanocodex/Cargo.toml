@@ -27,7 +27,7 @@ nanocodex-observability.workspace = true
 nix.workspace = true
 nanousd.workspace = true
 pulldown-cmark.workspace = true
-mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "0566d6eb0914dcd79dd078ae9d33bf7421f71bc5", default-features = false, features = ["client", "tempo", "reqwest-rustls-tls"] }
+mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "75fe974d9fcf7e09b18f12f255db8e16df379cda", default-features = false, features = ["client", "tempo", "reqwest-rustls-tls"] }
 mpp-egress.workspace = true
 ratatui.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }

@@ -44,7 +44,8 @@ signing.
 There is no Nanocodex wallet wrapper, signer enum, or signing-mode flag.
 `tempo-alloy` implements Alloy's existing wallet and filler traits;
 `mpp-rs` owns Challenge decoding, Charge transaction construction, optional
-fee sponsorship, and receipt lifecycle; Nanocodex only supplies configuration.
+fee sponsorship, settlement-RPC selection from the challenge chain, and
+receipt lifecycle; Nanocodex only supplies application policy.
 
 NanoUSD on Tempo mainnet is the configured payment input. A service that
 charges NanoUSD is paid directly. For another supported stablecoin challenge,
@@ -67,7 +68,6 @@ Relevant global options:
 --provider.tempo
 --provider.tempo.api-base-url <https-url>  # default https://openai.mpp.tempo.xyz/v1
 --provider.tempo.wallet-store <path>       # default ~/.tempo/wallet/store.json
---provider.tempo.rpc-url <url>             # default Tempo mainnet RPC
 --provider.tempo.swap-slippage-bps <bps>   # default 100
 --provider.tempo.egress-max-charge <units> # default 100000 NanoUSD atomic units
 --provider.tempo.api-key <key>             # optional gated deployment key
