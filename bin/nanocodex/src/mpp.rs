@@ -44,6 +44,7 @@ pub(crate) struct MppArgs {
     /// Paid MPP API base used for HTTPS Responses.
     #[arg(
         long = "provider.tempo.api-base-url",
+        id = "tempo_api_base_url",
         global = true,
         env = "NANOCODEX_PROVIDER_TEMPO_API_BASE_URL",
         default_value = DEFAULT_MPP_API_BASE_URL,
