@@ -50,15 +50,15 @@ cargo run -p nanousd-api -- \
   --issuer-mode alloy
 ```
 
-The Alloy issuer loads the active account and P-256 access key from Tempo
-Wallet. It adapts that key to Alloy's `NetworkWallet<TempoNetwork>`, then uses a
-typed `ITIP20::mint` call and Alloy's normal provider transaction lifecycle. It
-never invokes a shell or passes a private key on a command line. An explicit
-`NANOUSD_WALLET_STORE` selects a different Wallet store. The key must be
-authorized on-chain before the service starts, authorized to call NANOUSD, and
-have enough allowance for its configured gas fee token. The issuer never
-attaches a `key_authorization` payload. Use a dedicated, narrowly scoped issuer
-key for a deployed service.
+The Alloy issuer uses `tempo-alloy`'s `TempoAccountsWallet`, which directly
+implements Alloy's wallet and transaction-filler traits and lazily selects an
+authorized P-256 access key. It then uses a typed `ITIP20::mint` call and
+Alloy's normal provider transaction lifecycle. It never invokes a shell or
+passes a private key on a command line. An explicit `NANOUSD_WALLET_STORE`
+selects a different Wallet store. The key must be authorized on-chain before
+the service starts, authorized to call NANOUSD, and have enough allowance for
+its configured gas fee token. The issuer never attaches a `key_authorization`
+payload. Use a dedicated, narrowly scoped issuer key for a deployed service.
 
 The default fee token is PathUSD because that is the funded token in the issuer
 account. Set `NANOUSD_FEE_TOKEN` to match both the balance and fee-token

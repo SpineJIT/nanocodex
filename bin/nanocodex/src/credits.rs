@@ -1,12 +1,12 @@
 use std::{path::PathBuf, process::Command, time::Duration};
 
 use clap::{Args, Subcommand};
-use eyre::{Context, Result, eyre};
+use eyre::{Result, eyre};
 use nanousd::{
     CreateOrderRequest, CreateOrderResponse, CreditsClient, DEFAULT_API_URL, NANOUSD_DECIMALS,
     Order, OrderStatus,
 };
-use tempo_alloy::accounts::{TempoAccountsWallet, default_accounts_store_path};
+use tempo_alloy::accounts::TempoAccountsStore;
 
 #[derive(Args)]
 pub(crate) struct Credits {
@@ -85,13 +85,10 @@ struct WaitArgs {
 
 impl Credits {
     pub(crate) async fn run(self) -> Result<()> {
-        let wallet_path = self
+        let store = self
             .wallet_store
-            .map_or_else(default_accounts_store_path, Ok)?;
-        let wallet = TempoAccountsWallet::from_store(&wallet_path).wrap_err_with(|| {
-            format!("failed to load Tempo Accounts at {}", wallet_path.display())
-        })?;
-        let account = wallet.account();
+            .map_or_else(TempoAccountsStore::open_default, TempoAccountsStore::open)?;
+        let account = store.active_account()?;
         let client = CreditsClient::new(&self.api_url)?;
         match self.command {
             CreditsCommand::Status(args) => status(&client, account, args.json).await,

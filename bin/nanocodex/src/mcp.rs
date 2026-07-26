@@ -24,7 +24,7 @@ const DEFAULT_MCP_SERVERS: [(&str, &str, &str); 3] = [
     ),
     (
         "tempo",
-        "https://api.tempo.xyz/mcp",
+        "https://mcp.tempo.xyz",
         "Tempo network and protocol tools.",
     ),
     (

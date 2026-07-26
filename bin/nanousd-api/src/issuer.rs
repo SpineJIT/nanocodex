@@ -17,9 +17,8 @@ use alloy::{
 use async_trait::async_trait;
 use tempo_alloy::{
     TempoNetwork, accounts::TempoAccountsWallet, contracts::precompiles::ITIP20,
-    provider::TempoProviderBuilderExt, rpc::TempoTransactionRequest,
+    primitives::TempoTxEnvelope, provider::TempoProviderBuilderExt, rpc::TempoTransactionRequest,
 };
-use tempo_primitives::TempoTxEnvelope;
 
 use crate::db::Fulfillment;
 

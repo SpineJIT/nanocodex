@@ -5,16 +5,18 @@ use eyre::{Context, Result, eyre};
 use mpp::{
     MppError, PaymentChallenge, PaymentCredential,
     client::{PaymentProvider, TempoAccountsProvider, tempo::AutoswapConfig},
-    protocol::intents::ChargeRequest,
+    protocol::{
+        core::accept_payment::{ACCEPT_PAYMENT_HEADER, from_methods},
+        intents::ChargeRequest,
+        methods::tempo::{INTENT_CHARGE, METHOD_NAME},
+    },
 };
 use mpp_egress::{EgressPolicy, MppEgress};
 use nanousd::{NANOUSD_ADDRESS, TEMPO_MAINNET_CHAIN_ID};
-use tempo_alloy::accounts::{TempoAccountsWallet, default_accounts_store_path};
 
 const DEFAULT_MPP_API_BASE_URL: &str = "https://openai.mpp.tempo.xyz/v1";
 const DEFAULT_TEMPO_SWAP_SLIPPAGE_BPS: u16 = 100;
 const DEFAULT_MAX_EGRESS_CHARGE: u128 = 100_000;
-const RESPONSES_ACCEPT_PAYMENT: &str = "tempo/charge";
 
 #[derive(Args, Clone)]
 pub(crate) struct MppArgs {
@@ -98,14 +100,11 @@ impl MppArgs {
             return Ok(None);
         }
 
-        let wallet_path = self
-            .wallet_store
-            .map_or_else(default_accounts_store_path, Ok)
-            .map_err(|error| eyre!(error))?;
-        let wallet = TempoAccountsWallet::from_store(&wallet_path).wrap_err_with(|| {
-            format!("failed to load Tempo Accounts at {}", wallet_path.display())
-        })?;
-        let provider = TempoAccountsProvider::new(wallet)
+        let provider = self.wallet_store.map_or_else(
+            TempoAccountsProvider::from_default_store,
+            TempoAccountsProvider::from_store,
+        )?;
+        let provider = provider
             .with_expected_chain_id(TEMPO_MAINNET_CHAIN_ID)
             .with_autoswap(AutoswapConfig::new(NANOUSD_ADDRESS, self.swap_slippage_bps));
         let provider = CappedChargeProvider {
@@ -260,8 +259,9 @@ impl MppAdapter {
 fn responses_payment_headers(api_key: Option<&str>) -> Result<reqwest::header::HeaderMap> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
-        reqwest::header::HeaderName::from_static("accept-payment"),
-        reqwest::header::HeaderValue::from_static(RESPONSES_ACCEPT_PAYMENT),
+        ACCEPT_PAYMENT_HEADER,
+        reqwest::header::HeaderValue::from_str(&from_methods(&[(METHOD_NAME, INTENT_CHARGE)]))
+            .wrap_err("failed to encode the Tempo Charge payment preference")?,
     );
     if let Some(api_key) = api_key {
         headers.insert(

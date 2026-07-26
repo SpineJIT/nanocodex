@@ -10,7 +10,7 @@ use clap::{Parser, ValueEnum};
 use eyre::{Result, eyre};
 use nanousd::{DEFAULT_API_URL, NANOUSD_ADDRESS};
 
-const DEFAULT_RPC_URL: &str = "https://rpc.mainnet.tempo.xyz";
+const DEFAULT_RPC_URL: &str = "https://rpc.tempo.xyz";
 // The issuer account is funded in PathUSD. Deployments may override this to
 // match their dedicated issuer account and access-key policy.
 const DEFAULT_FEE_TOKEN: &str = "0x20c0000000000000000000000000000000000000";
