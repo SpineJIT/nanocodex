@@ -5,6 +5,26 @@ All notable changes to Nanocodex are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0](https://github.com/gakonst/nanocodex/releases/tag/v0.2.0) - 2026-07-26
+
+### Bug Fixes
+
+- Align Responses request serialization with Codex
+
+### Features
+
+- Default to high reasoning
+- Preserve stable response item IDs
+- Align code mode with Codex
+- [agent] Resume sessions from durable snapshots ([#13](https://github.com/gakonst/nanocodex/issues/13))
+- [agent] Support dynamic fast mode ([#14](https://github.com/gakonst/nanocodex/issues/14))
+- Support HTTPS and Responses replay policies ([#12](https://github.com/gakonst/nanocodex/issues/12))
+- [agent] Support changing thinking between turns
+
+### Performance
+
+- Preserve COW history during compaction
+
 ## [0.1.1](https://github.com/gakonst/nanocodex/releases/tag/v0.1.1) - 2026-07-23
 
 ### Bug Fixes
@@ -27,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Miscellaneous Tasks
 
+- [release] Prepare 0.1.1
 - [eval] Remove benchmark-specific tuning
 - [release] Prepare 0.1.0
 - [release] Refresh 0.1.0 changelogs

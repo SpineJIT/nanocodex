@@ -5,6 +5,142 @@ All notable changes to Nanocodex are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0](https://github.com/gakonst/nanocodex/releases/tag/v0.2.0) - 2026-07-26
+
+### Bug Fixes
+
+- Preserve recovered resume and TUI work
+- [mpp] Prevent paid request replays
+- [cli] Disambiguate Tempo API base argument
+- [mpp] Prefer session payments for Responses
+- [tui] Show model connection progress
+- [bindings] Resume rollout snapshots in Node
+- [mpp] Harden paid Responses transports
+- [credits] Support primitive Tempo wallet signers
+- [wasm] Retain snapshot resume compatibility
+- [harbor] Make leaderboard runs non-interactive
+- [cli] Retain Tempo session access keys
+- [web] Provision scoped Tempo payment keys
+- [nanousd] Persist signed mints before broadcast
+- [cli] Honor Tempo session deposit default
+- Use the Tempo API MCP endpoint
+- Harden Harbor run recovery
+- Cancel headless turns on interrupt
+- Estimate visible context before compaction
+- Match Codex tool behavior
+- Align Responses request serialization with Codex
+- Retry API errors classified by type
+- [cli] Bound MPP egress concurrency
+- Omit IDs from Responses Lite tools ([#26](https://github.com/gakonst/nanocodex/issues/26))
+- [cli] Bound MPP egress origin concurrency ([#20](https://github.com/gakonst/nanocodex/issues/20))
+- [cli] Surface terminal MPP payment failures ([#19](https://github.com/gakonst/nanocodex/issues/19))
+- Match Codex compaction boundaries
+- Compact before follow-on sampling
+- [cli] Keep MCP tests last
+- [mpp] Correlate paid egress retries ([#15](https://github.com/gakonst/nanocodex/issues/15))
+- [tui] Refine running activity presentation
+- [cli] Batch Tempo session top-ups
+- [cli] Take charge autoswap fixes
+- [cli] Avoid replaying Tempo key authorizations
+- [tui] Match Amp markdown selection semantics
+- [tui] Render live code-mode activity
+- [tui] Copy fenced code without chrome
+- [ci] Resolve linked website dependencies
+- [tui] Highlight TypeScript patches
+
+### Dependencies
+
+- [deps] Finalize Tempo accounts pins
+- [deps] Update Tempo Accounts wallet
+- [deps] Update Tempo Alloy accounts wallet
+- Bump mpp-rs autoswap diagnostics ([#25](https://github.com/gakonst/nanocodex/issues/25))
+- Bump mpp-rs session rollback ([#22](https://github.com/gakonst/nanocodex/issues/22))
+- Bump mpp-rs session fixes ([#21](https://github.com/gakonst/nanocodex/issues/21))
+- Merge pull request [#17](https://github.com/gakonst/nanocodex/issues/17) from gakonst/fix/mpp-rpc-rate-limit-retry
+- [mpp] Bump RPC retry support
+
+### Features
+
+- [python] Expose steer, cancel, spawn, and fork controls
+- [tempo] Use NanoUSD Charge over HTTPS
+- [credits] Support loopback Stripe deployment
+- [tui] Restore rollout activity
+- [tui] Render resumed rollout messages
+- Resume Codex rollouts in Nanocodex
+- [mcp] Add OAuth login and hot reload
+- Add MPP-backed JavaScript agent sessions
+- Add NanoUSD credits service
+- Default to high reasoning
+- Preserve stable response item IDs
+- Align code mode with Codex
+- [mcp] Prewarm deferred default servers
+- [tui] Add runtime mode controls
+- [cli] Autoswap Tempo session deposits
+- [cli] Route OpenAI through Tempo MPP
+- [agent] Resume sessions from durable snapshots ([#13](https://github.com/gakonst/nanocodex/issues/13))
+- [code-mode] Stream nested tool lifecycles
+- [tui] Improve tool activity presentation
+- [tools] Track nested call start offsets
+- [agent] Support dynamic fast mode ([#14](https://github.com/gakonst/nanocodex/issues/14))
+- Support HTTPS and Responses replay policies ([#12](https://github.com/gakonst/nanocodex/issues/12))
+- [agent] Support changing thinking between turns
+- [web] Render plan updates in browser TUI
+- [tui] Render plan updates as checklists
+- [agent] Load global Codex instructions
+
+### Miscellaneous Tasks
+
+- [tempo] Use final shared SDK revisions
+- [tempo] Finalize Accounts dependency stack
+- [tempo] Pin Accounts wallet fixes
+- Publish Harbor-compatible nightlies
+- [mcp] Clarify browser login status
+- Raise Rust baseline to 1.97
+- Refresh Harbor Rust builder
+- [ci] Allow bounded Hudsucker fork
+- [mpp] Take expiring session nonces
+
+### Other
+
+- Merge pull request [#44](https://github.com/gakonst/nanocodex/issues/44) from gakonst/chore/tempo-accounts-final
+- Merge pull request [#41](https://github.com/gakonst/nanocodex/issues/41) from Ayush7614/feat/python-lifecycle-controls
+- Merge pull request [#39](https://github.com/gakonst/nanocodex/issues/39) from gakonst/agent/mpp-charge-runtime-safety
+- Merge pull request [#35](https://github.com/gakonst/nanocodex/issues/35) from gakonst/agent/mpp-runtime-fixes
+- Merge pull request [#36](https://github.com/gakonst/nanocodex/issues/36) from gakonst/feat/nanousd-http-charge
+- Merge pull request [#30](https://github.com/gakonst/nanocodex/issues/30) from gakonst/bench/mcp-oauth-hot-reload
+- Merge remote-tracking branch 'origin/master' into bench/mcp-oauth-hot-reload
+- Merge pull request [#31](https://github.com/gakonst/nanocodex/issues/31) from gakonst/codex/rollout-resume-bench
+- Merge pull request [#29](https://github.com/gakonst/nanocodex/issues/29) from gakonst/agent/harbor-nightly-binary
+- Merge pull request [#27](https://github.com/gakonst/nanocodex/issues/27) from gakonst/fix/mpp-egress-resource-bounds
+- Merge pull request [#18](https://github.com/gakonst/nanocodex/issues/18) from clabby/cl/compact-before-turn
+- Merge pull request [#2](https://github.com/gakonst/nanocodex/issues/2) from gakonst/feat/mpp-integration
+- [tui] Gate code-mode completion churn
+
+### Performance
+
+- [tempo] Minimize SDK integration surface
+- [tui] Incrementally render reasoning streams
+- [web] Defer repository surfaces
+- [harbor] Download hosted agents in sandbox
+- [harbor] Avoid duplicate event logs
+- [mcp] Cache OAuth metadata across reloads
+- [cli] Allow 128 concurrent MPP requests
+- Preserve COW history during compaction
+- [cli] Accelerate Tempo session cold starts
+- [tui] Cache nested tools and streaming markdown
+
+### Refactor
+
+- [mpp] Use Tempo Accounts charge provider
+
+### Testing
+
+- Ignore JSON argument key order
+- Add xhigh Terminal-Bench presets
+- Add stock Codex parity differential
+- Stress parallel MPP egress replay ([#24](https://github.com/gakonst/nanocodex/issues/24))
+- Synchronize code cell termination output ([#23](https://github.com/gakonst/nanocodex/issues/23))
+
 ## [0.1.1](https://github.com/gakonst/nanocodex/releases/tag/v0.1.1) - 2026-07-23
 
 ### Bug Fixes
@@ -68,6 +204,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Miscellaneous Tasks
 
+- [release] Prepare 0.1.1
 - [web] Refresh repository data
 - Add code mode validation batch
 - [eval] Remove benchmark-specific tuning

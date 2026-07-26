@@ -5,6 +5,32 @@ All notable changes to Nanocodex are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0](https://github.com/gakonst/nanocodex/releases/tag/v0.2.0) - 2026-07-26
+
+### Bug Fixes
+
+- [mpp] Prevent paid request replays
+- [mpp] Harden paid Responses transports
+- Retry API errors classified by type
+- Match Codex compaction boundaries
+
+### Features
+
+- Preserve stable response item IDs
+- [agent] Support dynamic fast mode ([#14](https://github.com/gakonst/nanocodex/issues/14))
+- Support HTTPS and Responses replay policies ([#12](https://github.com/gakonst/nanocodex/issues/12))
+- [agent] Support changing thinking between turns
+
+### Miscellaneous Tasks
+
+- Raise Rust baseline to 1.97
+
+### Other
+
+- Merge pull request [#39](https://github.com/gakonst/nanocodex/issues/39) from gakonst/agent/mpp-charge-runtime-safety
+- Merge pull request [#35](https://github.com/gakonst/nanocodex/issues/35) from gakonst/agent/mpp-runtime-fixes
+- Merge pull request [#18](https://github.com/gakonst/nanocodex/issues/18) from clabby/cl/compact-before-turn
+
 ## [0.1.1](https://github.com/gakonst/nanocodex/releases/tag/v0.1.1) - 2026-07-23
 
 ### Bug Fixes
@@ -27,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Miscellaneous Tasks
 
+- [release] Prepare 0.1.1
 - [release] Prepare 0.1.0
 - [release] Refresh 0.1.0 changelogs
 - [release] Add per-crate changelogs

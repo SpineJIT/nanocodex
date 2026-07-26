@@ -5,6 +5,17 @@ All notable changes to Nanocodex are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0](https://github.com/gakonst/nanocodex/releases/tag/v0.2.0) - 2026-07-26
+
+### Features
+
+- [mcp] Prewarm deferred default servers
+- [cli] Route OpenAI through Tempo MPP
+
+### Other
+
+- Merge pull request [#2](https://github.com/gakonst/nanocodex/issues/2) from gakonst/feat/mpp-integration
+
 ## [0.1.1](https://github.com/gakonst/nanocodex/releases/tag/v0.1.1) - 2026-07-23
 
 ### Bug Fixes
@@ -19,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Miscellaneous Tasks
 
+- [release] Prepare 0.1.1
 - [release] Prepare 0.1.0
 - [release] Refresh 0.1.0 changelogs
 - [release] Add per-crate changelogs

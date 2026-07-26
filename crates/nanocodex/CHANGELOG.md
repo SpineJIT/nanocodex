@@ -5,6 +5,59 @@ All notable changes to Nanocodex are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0](https://github.com/gakonst/nanocodex/releases/tag/v0.2.0) - 2026-07-26
+
+### Bug Fixes
+
+- Preserve recovered resume and TUI work
+- [mpp] Prevent paid request replays
+- [bindings] Resume rollout snapshots in Node
+- [mpp] Harden paid Responses transports
+- [wasm] Retain snapshot resume compatibility
+- Estimate visible context before compaction
+- Omit IDs from Responses Lite tools ([#26](https://github.com/gakonst/nanocodex/issues/26))
+- Match Codex compaction boundaries
+- Compact before follow-on sampling
+
+### Features
+
+- [tui] Restore rollout activity
+- [tui] Render resumed rollout messages
+- Resume Codex rollouts in Nanocodex
+- [mcp] Add OAuth login and hot reload
+- Default to high reasoning
+- Preserve stable response item IDs
+- Align code mode with Codex
+- [mcp] Prewarm deferred default servers
+- [agent] Resume sessions from durable snapshots ([#13](https://github.com/gakonst/nanocodex/issues/13))
+- [code-mode] Stream nested tool lifecycles
+- [tools] Track nested call start offsets
+- [agent] Support dynamic fast mode ([#14](https://github.com/gakonst/nanocodex/issues/14))
+- Support HTTPS and Responses replay policies ([#12](https://github.com/gakonst/nanocodex/issues/12))
+- [agent] Support changing thinking between turns
+- [agent] Load global Codex instructions
+
+### Miscellaneous Tasks
+
+- Raise Rust baseline to 1.97
+
+### Other
+
+- Merge pull request [#39](https://github.com/gakonst/nanocodex/issues/39) from gakonst/agent/mpp-charge-runtime-safety
+- Merge pull request [#35](https://github.com/gakonst/nanocodex/issues/35) from gakonst/agent/mpp-runtime-fixes
+- Merge pull request [#30](https://github.com/gakonst/nanocodex/issues/30) from gakonst/bench/mcp-oauth-hot-reload
+- Merge remote-tracking branch 'origin/master' into bench/mcp-oauth-hot-reload
+- Merge pull request [#31](https://github.com/gakonst/nanocodex/issues/31) from gakonst/codex/rollout-resume-bench
+- Merge pull request [#18](https://github.com/gakonst/nanocodex/issues/18) from clabby/cl/compact-before-turn
+
+### Performance
+
+- Preserve COW history during compaction
+
+### Testing
+
+- Ignore JSON argument key order
+
 ## [0.1.1](https://github.com/gakonst/nanocodex/releases/tag/v0.1.1) - 2026-07-23
 
 ### Bug Fixes
@@ -47,6 +100,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Miscellaneous Tasks
 
+- [release] Prepare 0.1.1
 - [release] Prepare 0.1.0
 - [release] Refresh 0.1.0 changelogs
 - [release] Add per-crate changelogs
