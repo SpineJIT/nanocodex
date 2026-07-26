@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicU32, AtomicU64, Ordering},
+use std::{
+    num::NonZeroU32,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
 };
 
 use nanocodex_core::{
@@ -11,7 +14,7 @@ use serde::Serialize;
 
 use crate::stream::{CompactionResult, TurnResult};
 
-const RESPONSE_MAX_ATTEMPTS: u32 = 5;
+const RESPONSE_MAX_ATTEMPTS: NonZeroU32 = NonZeroU32::new(5).unwrap();
 
 /// Kind of Responses operation passed through the Tower service stack.
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -188,7 +191,7 @@ impl ResponsesAttempt {
             profile,
             observer,
             attempt: 1,
-            max_attempts: RESPONSE_MAX_ATTEMPTS,
+            max_attempts: RESPONSE_MAX_ATTEMPTS.get(),
             full_replay: previous_response_id.is_none(),
         }
     }
@@ -219,7 +222,7 @@ impl ResponsesAttempt {
             profile,
             observer,
             attempt: 1,
-            max_attempts: RESPONSE_MAX_ATTEMPTS,
+            max_attempts: RESPONSE_MAX_ATTEMPTS.get(),
             full_replay: previous_response_id.is_none(),
         }
     }
@@ -307,6 +310,10 @@ impl ResponsesAttempt {
         self.attempt += 1;
         self.full_replay = true;
         true
+    }
+
+    pub(crate) fn limit_attempts(&mut self, max_attempts: NonZeroU32) {
+        self.max_attempts = self.max_attempts.min(max_attempts.get());
     }
 
     pub(crate) fn force_full_replay(&mut self) {

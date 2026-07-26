@@ -1,3 +1,6 @@
+use std::num::NonZeroU32;
+
+use nanocodex_service::ResponsesRetryPolicy;
 use tower::{
     ServiceBuilder,
     layer::util::{Identity, Stack},
@@ -33,6 +36,7 @@ pub struct Responses<S = StandardResponses> {
     pub(crate) transport: ResponsesTransport,
     pub(crate) history: Option<ResponsesHistory>,
     pub(crate) store: Option<bool>,
+    pub(crate) max_attempts: NonZeroU32,
     pub(crate) service: S,
 }
 
@@ -46,6 +50,7 @@ impl Default for Responses<StandardResponses> {
             transport: ResponsesTransport::WebSocket,
             history: None,
             store: None,
+            max_attempts: ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS,
             service: StandardResponses,
         }
     }
@@ -75,6 +80,7 @@ impl ResponsesBuilder<StandardResponses> {
                 transport: self.responses.transport,
                 history: self.responses.history,
                 store: self.responses.store,
+                max_attempts: self.responses.max_attempts,
                 service: LayeredResponses(ServiceBuilder::new().layer(layer)),
             },
         }
@@ -96,6 +102,7 @@ impl ResponsesBuilder<StandardResponses> {
                 transport: self.responses.transport,
                 history: self.responses.history,
                 store: self.responses.store,
+                max_attempts: self.responses.max_attempts,
                 service: FactoryResponses(factory),
             },
         }
@@ -115,6 +122,7 @@ impl<L> ResponsesBuilder<LayeredResponses<L>> {
                 transport: self.responses.transport,
                 history: self.responses.history,
                 store: self.responses.store,
+                max_attempts: self.responses.max_attempts,
                 service: LayeredResponses(self.responses.service.0.layer(layer)),
             },
         }
@@ -152,6 +160,18 @@ impl<S> ResponsesBuilder<S> {
     #[must_use]
     pub const fn store(mut self, store: bool) -> Self {
         self.responses.store = Some(store);
+        self
+    }
+
+    /// Sets the maximum number of total attempts made by the SDK's standard
+    /// Responses retry stack, including the initial request.
+    ///
+    /// Set this to one when replaying a request could repeat an external side
+    /// effect, such as an up-front payment. Caller-supplied service factories
+    /// own their own retry policy.
+    #[must_use]
+    pub const fn max_attempts(mut self, max_attempts: NonZeroU32) -> Self {
+        self.responses.max_attempts = max_attempts;
         self
     }
 

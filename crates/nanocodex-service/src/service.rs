@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    num::NonZeroU32,
     pin::Pin,
     sync::{Arc, atomic::Ordering},
     task::{Context, Poll},
@@ -82,6 +83,7 @@ impl ConnectionState {
 pub struct ResponsesService {
     config: Arc<ModelConfig>,
     connection: Arc<Mutex<ConnectionState>>,
+    max_attempts: NonZeroU32,
     #[cfg(not(target_family = "wasm"))]
     http: ResponsesHttp,
 }
@@ -98,6 +100,7 @@ impl ResponsesService {
             Self {
                 config,
                 connection: Arc::new(Mutex::new(ConnectionState::new())),
+                max_attempts: ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS,
             }
         }
     }
@@ -110,14 +113,33 @@ impl ResponsesService {
         Self {
             config,
             connection: Arc::new(Mutex::new(ConnectionState::new())),
+            max_attempts: ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS,
             http: ResponsesHttp::new(http_client),
         }
+    }
+
+    const fn with_max_attempts(mut self, max_attempts: NonZeroU32) -> Self {
+        self.max_attempts = max_attempts;
+        self
     }
 
     /// Builds the configured standard Responses service with retry policy.
     #[must_use]
     pub fn standard(config: Arc<ModelConfig>) -> DefaultResponsesService {
-        Retry::new(ResponsesRetryPolicy, Self::new(config))
+        Self::standard_with_max_attempts(config, ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS)
+    }
+
+    /// Builds the configured standard Responses service with a fixed total
+    /// attempt limit.
+    #[must_use]
+    pub fn standard_with_max_attempts(
+        config: Arc<ModelConfig>,
+        max_attempts: NonZeroU32,
+    ) -> DefaultResponsesService {
+        Retry::new(
+            ResponsesRetryPolicy::new(max_attempts),
+            Self::new(config).with_max_attempts(max_attempts),
+        )
     }
 
     /// Builds the standard retry stack with a caller-configured HTTPS client.
@@ -127,9 +149,25 @@ impl ResponsesService {
         config: Arc<ModelConfig>,
         http_client: reqwest::Client,
     ) -> DefaultResponsesService {
+        Self::standard_with_http_client_and_max_attempts(
+            config,
+            http_client,
+            ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS,
+        )
+    }
+
+    /// Builds the standard retry stack with a caller-configured HTTPS client
+    /// and fixed total-attempt limit.
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn standard_with_http_client_and_max_attempts(
+        config: Arc<ModelConfig>,
+        http_client: reqwest::Client,
+        max_attempts: NonZeroU32,
+    ) -> DefaultResponsesService {
         Retry::new(
-            ResponsesRetryPolicy,
-            Self::new_with_http_client(config, http_client),
+            ResponsesRetryPolicy::new(max_attempts),
+            Self::new_with_http_client(config, http_client).with_max_attempts(max_attempts),
         )
     }
 
@@ -707,6 +745,7 @@ impl Service<ResponsesAttempt> for ResponsesService {
     }
 
     fn call(&mut self, mut request: ResponsesAttempt) -> Self::Future {
+        request.limit_attempts(self.max_attempts);
         let service = self.clone();
         Box::pin(async move {
             let mut connection = service.connection.lock().await;

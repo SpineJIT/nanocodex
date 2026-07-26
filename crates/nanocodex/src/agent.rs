@@ -718,6 +718,7 @@ impl NanocodexBuilder<StandardResponses> {
             self.codex.rollout.as_ref(),
         )?;
         let config = Arc::new(self.config);
+        let max_attempts = self.responses.max_attempts;
         #[cfg(not(target_family = "wasm"))]
         let http_client = self.responses.http_client;
         let service_factory: ServiceFactory<DefaultResponsesService> = Arc::new({
@@ -726,17 +727,23 @@ impl NanocodexBuilder<StandardResponses> {
                 #[cfg(not(target_family = "wasm"))]
                 {
                     http_client.as_ref().map_or_else(
-                        || ResponsesService::standard(Arc::clone(&config)),
+                        || {
+                            ResponsesService::standard_with_max_attempts(
+                                Arc::clone(&config),
+                                max_attempts,
+                            )
+                        },
                         |client| {
-                            ResponsesService::standard_with_http_client(
+                            ResponsesService::standard_with_http_client_and_max_attempts(
                                 Arc::clone(&config),
                                 client.clone(),
+                                max_attempts,
                             )
                         },
                     )
                 }
                 #[cfg(target_family = "wasm")]
-                ResponsesService::standard(Arc::clone(&config))
+                ResponsesService::standard_with_max_attempts(Arc::clone(&config), max_attempts)
             }
         });
         build_agent(
@@ -777,6 +784,7 @@ where
         )?;
         let config = Arc::new(self.config);
         let layers = self.responses.service.0;
+        let max_attempts = self.responses.max_attempts;
         #[cfg(not(target_family = "wasm"))]
         let http_client = self.responses.http_client;
         let service_factory: ServiceFactory<L::Service> = Arc::new({
@@ -784,16 +792,23 @@ where
             move || {
                 #[cfg(not(target_family = "wasm"))]
                 let service = http_client.as_ref().map_or_else(
-                    || ResponsesService::standard(Arc::clone(&config)),
+                    || {
+                        ResponsesService::standard_with_max_attempts(
+                            Arc::clone(&config),
+                            max_attempts,
+                        )
+                    },
                     |client| {
-                        ResponsesService::standard_with_http_client(
+                        ResponsesService::standard_with_http_client_and_max_attempts(
                             Arc::clone(&config),
                             client.clone(),
+                            max_attempts,
                         )
                     },
                 );
                 #[cfg(target_family = "wasm")]
-                let service = ResponsesService::standard(Arc::clone(&config));
+                let service =
+                    ResponsesService::standard_with_max_attempts(Arc::clone(&config), max_attempts);
                 layers.clone().service(service)
             }
         });

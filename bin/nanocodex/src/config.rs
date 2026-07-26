@@ -1,4 +1,5 @@
 use std::{
+    num::NonZeroU32,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -176,17 +177,19 @@ impl AgentArgs {
         let mut responses = Responses::builder()
             .transport(responses_transport)
             .websocket_url(direct_websocket_url);
+        if mpp_enabled {
+            responses = responses.max_attempts(NonZeroU32::MIN);
+        }
         if let Some(history) = self.responses_history {
             responses = responses.history(history);
         }
         if let Some(store) = self.store_responses {
             responses = responses.store(store);
         }
-        let api_base_url = self.api_base_url.or_else(|| {
-            mpp_adapter
-                .as_ref()
-                .map(|adapter| adapter.api_base_url().to_owned())
-        });
+        let api_base_url = selected_api_base_url(
+            self.api_base_url,
+            mpp_adapter.as_ref().map(MppAdapter::api_base_url),
+        );
         if let Some(api_base_url) = api_base_url {
             responses = responses.api_base_url(api_base_url);
         }
@@ -293,6 +296,10 @@ fn direct_websocket_url(explicit: Option<String>, auth_mode: OpenAiAuthMode) -> 
     explicit.unwrap_or_else(|| auth_mode.default_websocket_url().to_owned())
 }
 
+fn selected_api_base_url(generic: Option<String>, tempo: Option<&str>) -> Option<String> {
+    tempo.map(str::to_owned).or(generic)
+}
+
 fn select_auth(
     explicit_api_key: Option<String>,
     auth_file: Option<PathBuf>,
@@ -388,7 +395,9 @@ mod tests {
     use clap::CommandFactory;
     use nanocodex::OpenAiAuthMode;
 
-    use super::{direct_websocket_url, select_auth, select_auth_with_default};
+    use super::{
+        direct_websocket_url, select_auth, select_auth_with_default, selected_api_base_url,
+    };
 
     #[test]
     fn default_websocket_url_follows_the_selected_auth_mode() {
@@ -406,6 +415,21 @@ mod tests {
                 OpenAiAuthMode::ChatGpt,
             ),
             "ws://127.0.0.1:1234/responses"
+        );
+    }
+
+    #[test]
+    fn tempo_api_base_overrides_the_generic_openai_base() {
+        assert_eq!(
+            selected_api_base_url(
+                Some("https://generic.example/v1".to_owned()),
+                Some("https://tempo.example/v1"),
+            ),
+            Some("https://tempo.example/v1".to_owned())
+        );
+        assert_eq!(
+            selected_api_base_url(Some("https://generic.example/v1".to_owned()), None),
+            Some("https://generic.example/v1".to_owned())
         );
     }
 

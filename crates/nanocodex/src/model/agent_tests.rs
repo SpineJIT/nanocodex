@@ -1,4 +1,5 @@
 use std::{
+    num::NonZeroU32,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -262,6 +263,66 @@ async fn https_uses_the_configured_http_client() -> Result<()> {
         "done"
     );
     drop((agent, events));
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock HTTPS Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn configured_attempt_limit_prevents_a_paid_request_replay() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let request = next_http_json(&listener).await?;
+        send_http_unexpected_end(request.stream).await?;
+        if timeout(std::time::Duration::from_millis(100), listener.accept())
+            .await
+            .is_ok()
+        {
+            return Err(eyre!("Responses client replayed the failed paid request"));
+        }
+        Ok(())
+    });
+
+    let workspace = temporary_workspace("https-single-attempt")?;
+    let responses = Responses::builder()
+        .transport(ResponsesTransport::Https)
+        .api_base_url(endpoint)
+        .max_attempts(NonZeroU32::MIN)
+        .build();
+    let (agent, mut events) = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .session_id("https-single-attempt")
+        .build()?;
+
+    let result = agent.prompt("paid request").await?.result().await;
+    assert!(result.is_err());
+    drop(agent);
+
+    let mut generation_attempts = 0;
+    let mut reported_max_attempts = None;
+    let mut observed_retry = false;
+    while let Some(event) = events.recv().await {
+        match event.kind {
+            nanocodex_core::AgentEventKind::ModelAttemptStarted => {
+                let payload = event.decode_payload::<Value>()?;
+                if payload["phase"] == "generation" {
+                    generation_attempts += 1;
+                    reported_max_attempts = payload["max_attempts"].as_u64();
+                }
+            }
+            nanocodex_core::AgentEventKind::ModelAttemptRetrying => observed_retry = true,
+            _ => {}
+        }
+    }
+    assert_eq!(generation_attempts, 1);
+    assert_eq!(reported_max_attempts, Some(1));
+    assert!(!observed_retry);
+
     timeout(std::time::Duration::from_secs(5), server)
         .await
         .map_err(|_| eyre!("mock HTTPS Responses server did not finish"))???;
@@ -3231,6 +3292,16 @@ async fn send_http_final(mut stream: TcpStream, response_id: &str) -> Result<()>
         body.len()
     );
     stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
+async fn send_http_unexpected_end(mut stream: TcpStream) -> Result<()> {
+    stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await?;
     stream.shutdown().await?;
     Ok(())
 }
