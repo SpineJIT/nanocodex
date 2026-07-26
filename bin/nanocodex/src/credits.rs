@@ -2,11 +2,11 @@ use std::{path::PathBuf, process::Command, time::Duration};
 
 use clap::{Args, Subcommand};
 use eyre::{Context, Result, eyre};
-use mpp::client::tempo::wallet::{TempoAccountsWallet, default_accounts_store_path};
 use nanousd::{
     CreateOrderRequest, CreateOrderResponse, CreditsClient, DEFAULT_API_URL, NANOUSD_DECIMALS,
     Order, OrderStatus,
 };
+use tempo_alloy::accounts::{TempoAccountsWallet, default_accounts_store_path};
 
 #[derive(Args)]
 pub(crate) struct Credits {
