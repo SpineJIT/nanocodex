@@ -34,12 +34,12 @@ deployment access key.
 
 ## Accounts and signing
 
-The CLI opens the Tempo Accounts SDK store at
-`~/.tempo/wallet/store.json` by default. `tempo-alloy` owns the concrete
-`TempoAccountsWallet` and lazily selects an authorized access key when a
-payment transaction is prepared. The resulting `TempoAccessKey` pins that
-exact key through authorization resolution, gas filling, sponsorship, and
-signing.
+`mpp-rs` opens the Tempo Accounts SDK store at
+`~/.tempo/wallet/store.json` by default. Its `TempoAccountsProvider` uses the
+concrete `TempoAccountsWallet` from `tempo-alloy`, which lazily selects an
+authorized access key when a payment transaction is prepared. The resulting
+`TempoAccessKey` pins that exact key through authorization resolution, gas
+filling, sponsorship, and signing.
 
 There is no Nanocodex wallet wrapper, signer enum, or signing-mode flag.
 `tempo-alloy` implements Alloy's existing wallet and filler traits;

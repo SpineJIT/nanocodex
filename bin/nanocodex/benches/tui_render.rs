@@ -1515,28 +1515,35 @@ mod tui {
     }
 
     pub(super) fn folded_tool_benchmarks(criterion: &mut Criterion) {
-        criterion.bench_function("tui_tool_tree/fold_3471_activities", |bencher| {
-            bencher.iter_batched_ref(
-                || {
-                    let mut transcript = Transcript::default();
-                    for index in 0..3_471 {
-                        transcript.push(TranscriptItem::Tool {
-                            call_id: format!("call-{index}"),
-                            name: "exec_command".to_owned(),
-                            arguments: format!("cargo test package-{index}"),
-                            status: ToolStatus::Completed,
-                        });
-                    }
-                    let shared = transcript.clone();
-                    (transcript, shared)
-                },
-                |(transcript, shared)| {
-                    transcript.set_tool_details_expanded(false);
-                    black_box((transcript.len(), shared.len()));
-                },
-                BatchSize::LargeInput,
-            );
-        });
+        const TOGGLES: usize = 1_024;
+        criterion.bench_function(
+            "tui_tool_tree/fold_expand_3471_activities_x1024",
+            |bencher| {
+                bencher.iter_batched_ref(
+                    || {
+                        let mut transcript = Transcript::default();
+                        for index in 0..3_471 {
+                            transcript.push(TranscriptItem::Tool {
+                                call_id: format!("call-{index}"),
+                                name: "exec_command".to_owned(),
+                                arguments: format!("cargo test package-{index}"),
+                                status: ToolStatus::Completed,
+                            });
+                        }
+                        let shared = transcript.clone();
+                        (transcript, shared)
+                    },
+                    |state| {
+                        for _ in 0..TOGGLES {
+                            state.0.set_tool_details_expanded(false);
+                            state.0.set_tool_details_expanded(true);
+                        }
+                        black_box((state.0.len(), state.1.len()));
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
 
         criterion.bench_function("tui_tool_tree/folded_tail_frame/120x40", |bencher| {
             let mut transcript = Transcript::default();

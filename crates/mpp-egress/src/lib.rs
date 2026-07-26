@@ -39,7 +39,10 @@ use hudsucker::{
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     },
 };
-use mpp::client::{AcceptPaymentPolicy, ClientEvent, ClientEvents, Fetch, PaymentProvider};
+use mpp::client::{
+    AcceptPaymentPolicy, ClientEvent, ClientEvents, DEFAULT_MAX_PAYMENT_RETRIES, Fetch,
+    PaymentProvider,
+};
 use tempfile::TempDir;
 use tokio::{
     net::TcpListener,
@@ -49,7 +52,6 @@ use tokio::{
 use tracing::Instrument as _;
 
 const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
-const DEFAULT_MAX_PAYMENT_RETRIES: usize = 4;
 const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 128;
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 128;
 const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 4;
@@ -428,7 +430,7 @@ where
             .request(parts.method, parts.uri.to_string())
             .headers(parts.headers)
             .body(body);
-        let events = payment_events();
+        let events = ClientEvents::default();
         let _subscription = events.on_any(|event| async move {
             record_payment_event(&event);
         });
@@ -451,10 +453,6 @@ where
         );
         Ok(convert_response(response, &tracing::Span::current()))
     }
-}
-
-fn payment_events() -> ClientEvents {
-    ClientEvents::default()
 }
 
 fn record_payment_event(event: &ClientEvent) {
