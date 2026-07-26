@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    num::NonZeroU32,
     pin::Pin,
     sync::{Arc, atomic::Ordering},
     time::Duration,
@@ -21,8 +22,28 @@ type RetryFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[cfg(target_family = "wasm")]
 type RetryFuture = Pin<Box<dyn Future<Output = ()>>>;
 
-#[derive(Clone, Copy, Default)]
-pub struct ResponsesRetryPolicy;
+/// Retry policy for the SDK-owned Responses transport stack.
+#[derive(Clone, Copy, Debug)]
+pub struct ResponsesRetryPolicy {
+    max_attempts: NonZeroU32,
+}
+
+impl ResponsesRetryPolicy {
+    /// Default number of total attempts, including the initial request.
+    pub const DEFAULT_MAX_ATTEMPTS: NonZeroU32 = NonZeroU32::new(5).unwrap();
+
+    /// Creates a retry policy with a fixed total-attempt limit.
+    #[must_use]
+    pub const fn new(max_attempts: NonZeroU32) -> Self {
+        Self { max_attempts }
+    }
+}
+
+impl Default for ResponsesRetryPolicy {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_MAX_ATTEMPTS)
+    }
+}
 
 impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
     for ResponsesRetryPolicy
@@ -34,6 +55,7 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
         request: &mut ResponsesAttempt,
         result: &mut Result<ResponsesServiceResponse, ResponsesServiceError>,
     ) -> Option<Self::Future> {
+        request.limit_attempts(self.max_attempts);
         let failure = result.as_ref().err()?;
         let checkpoint_missing =
             failure.is_checkpoint_missing() && request.previous_response_id().is_some();
@@ -112,7 +134,9 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
     }
 
     fn clone_request(&mut self, request: &ResponsesAttempt) -> Option<ResponsesAttempt> {
-        Some(request.clone())
+        let mut request = request.clone();
+        request.limit_attempts(self.max_attempts);
+        Some(request)
     }
 }
 

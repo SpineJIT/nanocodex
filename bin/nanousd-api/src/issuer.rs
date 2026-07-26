@@ -7,7 +7,7 @@ use std::{
 
 use alloy::{
     eips::Encodable2718,
-    network::{IntoWallet, ReceiptResponse},
+    network::{ReceiptResponse, TransactionBuilder},
     primitives::{Address, B256, U256, keccak256},
     providers::{
         DynProvider, PendingTransactionBuilder, Provider, ProviderBuilder,
@@ -129,18 +129,13 @@ impl AlloyIssuer {
             TempoAccountsWallet::from_default_store,
             TempoAccountsWallet::from_store,
         )?;
-        let access_key = wallet.active_access_key()?;
-        if access_key.chain_id() != nanousd::TEMPO_MAINNET_CHAIN_ID {
-            return Err(IssuerError::WrongChain(access_key.chain_id()));
-        }
-        let account = access_key.account();
-        let access_key_address = access_key.address();
+        let account = wallet.account();
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .with_expiring_nonces()
-            .filler(access_key.into_wallet())
+            .filler(wallet)
             .connect_http(rpc_url.parse().map_err(alloy_error)?);
         let preparer = Arc::new(provider.clone());
-        tracing::info!(%account, access_key = %access_key_address, "loaded NanoUSD Alloy issuer");
+        tracing::info!(%account, "loaded NanoUSD Alloy issuer");
         Ok(Self {
             provider: provider.erased(),
             preparer,
@@ -188,6 +183,7 @@ impl Issuer for AlloyIssuer {
         let request = ITIP20::new(self.token, &self.provider)
             .mint(order.wallet, U256::from(order.amount))
             .into_transaction_request()
+            .with_chain_id(nanousd::TEMPO_MAINNET_CHAIN_ID)
             .with_fee_token(self.fee_token);
         self.preparer.prepare(request).await
     }
@@ -232,8 +228,6 @@ fn alloy_error(error: impl std::fmt::Display) -> IssuerError {
 pub(crate) enum IssuerError {
     #[error("failed to load the Tempo issuer wallet: {0}")]
     Wallet(#[from] tempo_alloy::accounts::TempoAccountsError),
-    #[error("issuer wallet is configured for chain {0}, expected Tempo mainnet")]
-    WrongChain(u64),
     #[error("Tempo Alloy operation failed: {0}")]
     Alloy(String),
     #[error("NanoUSD balance does not fit in the API representation")]
@@ -248,4 +242,58 @@ pub(crate) enum IssuerError {
     Clock,
     #[error("mock issuer balance lock was poisoned")]
     Poisoned,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use alloy::primitives::Address;
+    use serde_json::json;
+
+    use super::AlloyIssuer;
+
+    const ROOT: &str = "0x1111111111111111111111111111111111111111";
+    const TOKEN: &str = "0x2222222222222222222222222222222222222222";
+    const FEE_TOKEN: &str = "0x3333333333333333333333333333333333333333";
+
+    #[test]
+    fn construction_keeps_scoped_accounts_keys_lazy() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path().join("store.json");
+        fs::write(
+            &store,
+            serde_json::to_vec(&json!({
+                "tempo-cli.store": {
+                    "state": {
+                        "activeAccount": 0,
+                        "chainId": nanousd::TEMPO_MAINNET_CHAIN_ID,
+                        "accounts": [{ "address": ROOT }],
+                        "accessKeys": [{
+                            "access": ROOT,
+                            "address": "0x4444444444444444444444444444444444444444",
+                            "chainId": nanousd::TEMPO_MAINNET_CHAIN_ID,
+                            "keyType": "p256",
+                            "privateKey": format!("0x{}", "01".repeat(32)),
+                            "scopes": [{
+                                "address": TOKEN,
+                                "selector": "mint(address,uint256)",
+                            }],
+                        }],
+                    },
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let issuer = AlloyIssuer::new(
+            "http://127.0.0.1:1",
+            TOKEN.parse::<Address>().unwrap(),
+            FEE_TOKEN.parse::<Address>().unwrap(),
+            Some(&store),
+        );
+
+        assert!(issuer.is_ok());
+    }
 }
