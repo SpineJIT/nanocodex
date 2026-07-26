@@ -1774,10 +1774,11 @@ impl MarkdownContent {
     }
 
     fn reasoning(source: &str) -> Self {
+        let source = format!("• {}", indent_reasoning(source));
         Self {
-            source: format!("• {}", indent_reasoning(source)),
+            plain_streaming: is_plain_streaming_markdown(&source),
+            source,
             streaming: true,
-            plain_streaming: false,
             base_style: Style::default().add_modifier(Modifier::DIM),
             show_header: false,
             cached: Mutex::new(None),
@@ -1819,6 +1820,7 @@ impl MarkdownContent {
                     replace_tail,
                     &self.source[tail_start..],
                     self.base_style,
+                    self.show_header,
                 );
             }
         } else {
@@ -1827,15 +1829,34 @@ impl MarkdownContent {
     }
 
     fn append_reasoning(&mut self, delta: &str) {
+        let delta = indent_reasoning(delta);
         if self.source.ends_with("**") && delta.starts_with("**") {
             self.source.push_str("\n• ");
         }
-        self.source.push_str(&indent_reasoning(delta));
+        let incremental =
+            self.plain_streaming && plain_markdown_extension_is_safe(&self.source, &delta);
+        let tail_start = self
+            .source
+            .rfind('\n')
+            .map_or(0, |index| index.saturating_add(1));
+        let replace_tail = !self.source.is_empty() && !self.source.ends_with('\n');
+        self.source.push_str(&delta);
         *self
             .logical_copy
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
-        *self.cached.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.plain_streaming = incremental;
+        let mut cached = self.cached.lock().unwrap_or_else(PoisonError::into_inner);
+        if incremental && let Some(rendered) = cached.as_mut() {
+            rendered.replace_plain_tail(
+                replace_tail,
+                &self.source[tail_start..],
+                self.base_style,
+                self.show_header,
+            );
+        } else {
+            *cached = None;
+        }
     }
 
     fn finalize(&mut self, source: &str) {
@@ -1940,16 +1961,37 @@ impl RenderedText {
         }
     }
 
-    fn replace_plain_tail(&mut self, replace_tail: bool, tail: &str, base_style: Style) {
+    fn replace_plain_tail(
+        &mut self,
+        replace_tail: bool,
+        tail: &str,
+        base_style: Style,
+        show_header: bool,
+    ) {
         self.pop_line();
         if replace_tail {
             self.pop_line();
         }
+        let mut first_line = !show_header && self.text.lines.is_empty();
         for line in tail.split_terminator('\n') {
-            self.push_line(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(line.to_owned(), Style::default().fg(Color::White)),
-            ]));
+            let line = if first_line {
+                Line::from(Span::styled(
+                    line.to_owned(),
+                    Style::default().fg(Color::White),
+                ))
+            } else {
+                let line = if show_header {
+                    line
+                } else {
+                    line.strip_prefix("  ").unwrap_or(line)
+                };
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(line.to_owned(), Style::default().fg(Color::White)),
+                ])
+            };
+            self.push_line(line);
+            first_line = false;
         }
         self.text.style = base_style;
         self.push_line(Line::raw(""));
@@ -2607,6 +2649,31 @@ mod tests {
                 incremental.append(delta);
 
                 let fresh = MarkdownContent::streaming(&format!("{source}{delta}"));
+                assert_eq!(
+                    incremental.materialized_text(width),
+                    fresh.materialized_text(width),
+                    "source={source:?} delta={delta:?} width={width}",
+                );
+                assert_eq!(incremental.height(width), fresh.height(width));
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_plain_reasoning_append_matches_a_fresh_parse() {
+        for (source, delta) in [
+            ("plain words", " added words"),
+            ("first line\nsecond line", "\nthird λ line"),
+            ("first line", "\nsecond line"),
+            ("plain", " *styled*"),
+            ("plain", "\n\nnext paragraph"),
+        ] {
+            for width in [20, 80] {
+                let mut incremental = MarkdownContent::reasoning(source);
+                let _ = incremental.height(width);
+                incremental.append_reasoning(delta);
+
+                let fresh = MarkdownContent::reasoning(&format!("{source}{delta}"));
                 assert_eq!(
                     incremental.materialized_text(width),
                     fresh.materialized_text(width),
