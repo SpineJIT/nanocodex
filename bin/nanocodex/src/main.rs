@@ -199,22 +199,6 @@ mod tests {
     }
 
     #[test]
-    fn tempo_websocket_transport_remains_explicitly_selectable() {
-        let cli = Cli::try_parse_from([
-            "nanocodex",
-            "--provider.tempo",
-            "--responses-transport",
-            "websocket",
-        ])
-        .unwrap();
-
-        assert_eq!(
-            cli.agent.responses_transport(),
-            nanocodex::ResponsesTransport::WebSocket
-        );
-    }
-
-    #[test]
     fn provider_selection_is_exclusive() {
         let error = Cli::try_parse_from(["nanocodex", "--provider.openai", "--provider.tempo"])
             .err()

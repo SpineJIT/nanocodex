@@ -16,7 +16,6 @@ arboard.workspace = true
 async-trait.workspace = true
 alloy-primitives.workspace = true
 base64.workspace = true
-alloy-transport-mpp = { version = "=0.2.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "dd7835124cd3e28f7e18a613a7f7e799538ed1ad" }
 clap.workspace = true
 crossterm.workspace = true
 dotenvy.workspace = true
@@ -28,7 +27,7 @@ nanocodex-observability.workspace = true
 nix.workspace = true
 nanousd.workspace = true
 pulldown-cmark.workspace = true
-mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "dd7835124cd3e28f7e18a613a7f7e799538ed1ad", default-features = false, features = ["tempo", "ws", "sqlite", "reqwest-rustls-tls"] }
+mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "0566d6eb0914dcd79dd078ae9d33bf7421f71bc5", default-features = false, features = ["client", "tempo", "reqwest-rustls-tls"] }
 mpp-egress.workspace = true
 ratatui.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
@@ -45,6 +44,7 @@ tempfile.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite.workspace = true
+tempo-alloy.workspace = true
 tracing.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true

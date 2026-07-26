@@ -7,7 +7,7 @@ use std::{
 
 use alloy::{
     eips::Encodable2718,
-    network::ReceiptResponse,
+    network::{IntoWallet, ReceiptResponse},
     primitives::{Address, B256, U256, keccak256},
     providers::{
         DynProvider, PendingTransactionBuilder, Provider, ProviderBuilder,
@@ -15,14 +15,13 @@ use alloy::{
     },
 };
 use async_trait::async_trait;
-use mpp::client::tempo::wallet::TempoWallet;
 use tempo_alloy::{
-    TempoNetwork, contracts::precompiles::ITIP20, provider::TempoProviderBuilderExt,
-    rpc::TempoTransactionRequest,
+    TempoNetwork, accounts::TempoAccountsWallet, contracts::precompiles::ITIP20,
+    provider::TempoProviderBuilderExt, rpc::TempoTransactionRequest,
 };
-use tempo_primitives::{SignatureType, TempoTxEnvelope};
+use tempo_primitives::TempoTxEnvelope;
 
-use crate::{db::Fulfillment, tempo_wallet::TempoAccessKeyWallet};
+use crate::db::Fulfillment;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedMint {
@@ -117,8 +116,6 @@ pub(crate) struct AlloyIssuer {
     preparer: Arc<dyn TransactionPreparer>,
     token: Address,
     fee_token: Address,
-    account: Address,
-    access_key: Address,
 }
 
 impl AlloyIssuer {
@@ -128,25 +125,27 @@ impl AlloyIssuer {
         fee_token: Address,
         wallet_store: Option<&Path>,
     ) -> Result<Self, IssuerError> {
-        let wallet = wallet_store.map_or_else(TempoWallet::load_default, TempoWallet::load)?;
-        if wallet.chain_id != nanousd::TEMPO_MAINNET_CHAIN_ID {
-            return Err(IssuerError::WrongChain(wallet.chain_id));
+        let wallet = wallet_store.map_or_else(
+            TempoAccountsWallet::from_default_store,
+            TempoAccountsWallet::from_store,
+        )?;
+        let access_key = wallet.active_access_key()?;
+        if access_key.chain_id() != nanousd::TEMPO_MAINNET_CHAIN_ID {
+            return Err(IssuerError::WrongChain(access_key.chain_id()));
         }
-        let account = wallet.account;
-        let access_key = wallet.access_key;
+        let account = access_key.account();
+        let access_key_address = access_key.address();
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .with_expiring_nonces()
-            .wallet(TempoAccessKeyWallet::from(&wallet))
+            .filler(access_key.into_wallet())
             .connect_http(rpc_url.parse().map_err(alloy_error)?);
         let preparer = Arc::new(provider.clone());
-        tracing::info!(%account, %access_key, "loaded NanoUSD Alloy issuer");
+        tracing::info!(%account, access_key = %access_key_address, "loaded NanoUSD Alloy issuer");
         Ok(Self {
             provider: provider.erased(),
             preparer,
             token,
             fee_token,
-            account,
-            access_key,
         })
     }
 
@@ -186,13 +185,10 @@ impl Issuer for AlloyIssuer {
             });
         }
 
-        let mut request = ITIP20::new(self.token, &self.provider)
+        let request = ITIP20::new(self.token, &self.provider)
             .mint(order.wallet, U256::from(order.amount))
             .into_transaction_request()
-            .with_fee_token(self.fee_token)
-            .with_key_type(SignatureType::P256)
-            .with_key_id(self.access_key);
-        request.inner.from = Some(self.account);
+            .with_fee_token(self.fee_token);
         self.preparer.prepare(request).await
     }
 
@@ -235,7 +231,7 @@ fn alloy_error(error: impl std::fmt::Display) -> IssuerError {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IssuerError {
     #[error("failed to load the Tempo issuer wallet: {0}")]
-    Wallet(#[from] mpp::client::tempo::wallet::TempoWalletError),
+    Wallet(#[from] tempo_alloy::accounts::TempoAccountsError),
     #[error("issuer wallet is configured for chain {0}, expected Tempo mainnet")]
     WrongChain(u64),
     #[error("Tempo Alloy operation failed: {0}")]

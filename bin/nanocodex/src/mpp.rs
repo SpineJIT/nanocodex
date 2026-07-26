@@ -1,71 +1,21 @@
-use std::{
-    error::Error as StdError,
-    net::TcpListener as StdTcpListener,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::path::PathBuf;
 
-use alloy_transport_mpp::{
-    CloseProvider, CloseRequest, MppApplicationWs, MppApplicationWsConnect, MppWsError,
-    VoucherProvider, VoucherRequest,
-};
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Context, Result, eyre};
-use futures_util::{SinkExt, StreamExt};
 use mpp::{
     MppError, PaymentChallenge, PaymentCredential,
-    client::{
-        MultiProvider, PaymentContext, PaymentProvider, TempoProvider, TempoSessionProvider,
-        tempo::{
-            AutoswapConfig,
-            session::store::{
-                SqliteChannelStore, SqliteChannelStoreOptions, default_channel_database_path,
-            },
-            signing::{KeychainVersion, TempoSigningMode},
-            wallet::TempoWallet,
-        },
-    },
+    client::{PaymentProvider, TempoAccountsProvider, tempo::AutoswapConfig},
     protocol::intents::ChargeRequest,
 };
 use mpp_egress::{EgressPolicy, MppEgress};
-use nanocodex::ResponsesTransport;
-use tokio::{
-    net::{TcpListener, TcpStream},
-    sync::{oneshot, watch},
-    task::{JoinHandle, JoinSet},
-    time::timeout,
-};
-use tokio_tungstenite::{
-    WebSocketStream, accept_hdr_async,
-    tungstenite::{
-        Message,
-        handshake::server::{Request, Response},
-        http::{HeaderName, HeaderValue},
-    },
-};
+use nanousd::{NANOUSD_ADDRESS, TEMPO_MAINNET_CHAIN_ID};
+use tempo_alloy::accounts::{TempoAccountsWallet, default_accounts_store_path};
 
-const DEFAULT_MPP_WEBSOCKET_URL: &str = "wss://openai.mpp.tempo.xyz/v1/responses";
+const DEFAULT_MPP_API_BASE_URL: &str = "https://openai.mpp.tempo.xyz/v1";
 const DEFAULT_TEMPO_RPC_URL: &str = "https://rpc.mainnet.tempo.xyz";
-const DEFAULT_TEMPO_PAY_WITH: &str = "0x20c0000000000000000000000000000000000000";
 const DEFAULT_TEMPO_SWAP_SLIPPAGE_BPS: u16 = 100;
-const DEFAULT_SESSION_DEPOSIT: u128 = 5_000_000;
-const DEFAULT_TOP_UP_AMOUNT: u128 = 5_000_000;
-// Five $5 refill quanta while retaining a finite client-side authorization cap.
-const DEFAULT_MAX_DEPOSIT: u128 = 25_000_000;
 const DEFAULT_MAX_EGRESS_CHARGE: u128 = 100_000;
-const RESPONSES_ACCEPT_PAYMENT: &str = "tempo/session, tempo/charge;q=0.5";
-
-fn load_tempo_wallet(path: &Path, store: &SqliteChannelStore) -> Result<TempoWallet> {
-    match store
-        .latest_authorized_signer()
-        .map_err(|error| eyre!(error))
-        .wrap_err("failed to resolve the retained Tempo session signer")?
-    {
-        Some(access_key) => Ok(TempoWallet::load_preferred(path, access_key)?),
-        None => Ok(TempoWallet::load(path)?),
-    }
-}
+const RESPONSES_ACCEPT_PAYMENT: &str = "tempo/charge";
 
 #[derive(Args, Clone)]
 pub(crate) struct MppArgs {
@@ -80,7 +30,7 @@ pub(crate) struct MppArgs {
     )]
     openai: bool,
 
-    /// Pay for the Responses WebSocket through MPP.
+    /// Pay for HTTPS Responses and tool requests with `NanoUSD` Charge.
     #[arg(
         long = "provider.tempo",
         id = "tempo",
@@ -91,17 +41,18 @@ pub(crate) struct MppArgs {
     )]
     enabled: bool,
 
-    /// Paid MPP WebSocket endpoint.
+    /// Paid MPP API base used for HTTPS Responses.
     #[arg(
-        long = "provider.tempo.responses-websocket-url",
+        long = "provider.tempo.api-base-url",
+        id = "tempo_api_base_url",
         global = true,
-        env = "NANOCODEX_PROVIDER_TEMPO_RESPONSES_WEBSOCKET_URL",
-        default_value = DEFAULT_MPP_WEBSOCKET_URL,
+        env = "NANOCODEX_PROVIDER_TEMPO_API_BASE_URL",
+        default_value = DEFAULT_MPP_API_BASE_URL,
         value_parser = NonEmptyStringValueParser::new()
     )]
-    mpp_websocket_url: String,
+    api_base_url: String,
 
-    /// Tempo Wallet state containing the logged-in account and access key.
+    /// Tempo Accounts state containing the logged-in account and access keys.
     #[arg(
         long = "provider.tempo.wallet-store",
         global = true,
@@ -109,15 +60,7 @@ pub(crate) struct MppArgs {
     )]
     wallet_store: Option<PathBuf>,
 
-    /// `SQLite` channel store shared with Tempo Wallet and `MPPx` CLIs.
-    #[arg(
-        long = "provider.tempo.channel-store",
-        global = true,
-        env = "NANOCODEX_PROVIDER_TEMPO_CHANNEL_STORE"
-    )]
-    channel_store: Option<PathBuf>,
-
-    /// Tempo RPC used for native TIP-1034 channel operations.
+    /// Tempo RPC used to prepare and sign `NanoUSD` Charge payments.
     #[arg(
         long = "provider.tempo.rpc-url",
         global = true,
@@ -127,17 +70,7 @@ pub(crate) struct MppArgs {
     )]
     rpc_url: String,
 
-    /// Stablecoin used to acquire the MPP service's requested currency.
-    #[arg(
-        long = "provider.tempo.pay-with",
-        global = true,
-        env = "NANOCODEX_PROVIDER_TEMPO_PAY_WITH",
-        default_value = DEFAULT_TEMPO_PAY_WITH,
-        value_parser = NonEmptyStringValueParser::new()
-    )]
-    pay_with: String,
-
-    /// Maximum slippage for automatic stablecoin swaps, in basis points.
+    /// Maximum slippage for automatic swaps from `NanoUSD`, in basis points.
     #[arg(
         long = "provider.tempo.swap-slippage-bps",
         global = true,
@@ -146,25 +79,7 @@ pub(crate) struct MppArgs {
     )]
     swap_slippage_bps: u16,
 
-    /// Maximum total native session deposit in token atomic units.
-    #[arg(
-        long = "provider.tempo.max-deposit",
-        global = true,
-        env = "NANOCODEX_PROVIDER_TEMPO_MAX_DEPOSIT",
-        default_value_t = DEFAULT_MAX_DEPOSIT
-    )]
-    max_deposit: u128,
-
-    /// Preferred automatic session top-up in token atomic units.
-    #[arg(
-        long = "provider.tempo.top-up-amount",
-        global = true,
-        env = "NANOCODEX_PROVIDER_TEMPO_TOP_UP_AMOUNT",
-        default_value_t = DEFAULT_TOP_UP_AMOUNT
-    )]
-    top_up_amount: u128,
-
-    /// Maximum one-shot egress charge in token atomic units.
+    /// Maximum one-shot Charge payment in `NanoUSD` atomic units.
     #[arg(
         long = "provider.tempo.egress-max-charge",
         global = true,
@@ -173,7 +88,7 @@ pub(crate) struct MppArgs {
     )]
     egress_max_charge: u128,
 
-    /// Optional access key for gated MPP deployments such as Moderato staging.
+    /// Optional access key for gated MPP deployments.
     #[arg(
         long = "provider.tempo.api-key",
         global = true,
@@ -189,124 +104,36 @@ impl MppArgs {
         self.enabled
     }
 
-    pub(crate) async fn start(
-        self,
-        direct_websocket_url: String,
-        responses_transport: ResponsesTransport,
-    ) -> Result<(String, Option<MppAdapter>)> {
+    pub(crate) async fn start(self) -> Result<Option<MppAdapter>> {
         if self.openai || !self.enabled {
-            return Ok((direct_websocket_url, None));
+            return Ok(None);
         }
-        let wallet_path = self.wallet_store.unwrap_or(
-            default_channel_database_path()
-                .map_err(|error| eyre!(error))?
-                .with_file_name("store.json"),
-        );
-        let endpoint = payment_http_url(&self.mpp_websocket_url)?;
-        let api_base_url = openai_api_base_url(&self.mpp_websocket_url)?;
-        let namespace = websocket_origin(&self.mpp_websocket_url)?;
-        let store = SqliteChannelStore::open(SqliteChannelStoreOptions {
-            namespace,
-            path: self.channel_store,
-            request_url: Some(self.mpp_websocket_url.clone()),
-        })
-        .map_err(|error| eyre!(error))
-        .wrap_err("failed to open the Tempo session channel store")?;
-        let wallet = load_tempo_wallet(&wallet_path, &store)?;
-        let autoswap = AutoswapConfig::new(
-            self.pay_with
-                .parse()
-                .wrap_err("invalid provider.tempo.pay-with token address")?,
-            self.swap_slippage_bps,
-        );
-        let charge = TempoProvider::new(wallet.signer.clone(), &self.rpc_url)
-            .wrap_err("failed to configure the native Tempo charge provider")?
-            .with_signing_mode(TempoSigningMode::Keychain {
-                wallet: wallet.account,
-                key_authorization: wallet.key_authorization.clone(),
-                version: KeychainVersion::V2,
-            })
-            .with_expected_chain_id(wallet.chain_id)
-            .with_autoswap(autoswap.clone());
-        let session = TempoSessionProvider::new(wallet.signer, &self.rpc_url)
-            .wrap_err("failed to configure the native Tempo session provider")?
-            .with_signing_mode(TempoSigningMode::Keychain {
-                wallet: wallet.account,
-                key_authorization: wallet.key_authorization,
-                version: KeychainVersion::V2,
-            })
-            .with_authorized_signer(wallet.access_key)
-            .with_channel_store(Arc::new(store))
-            .with_default_deposit(DEFAULT_SESSION_DEPOSIT)
-            .with_max_deposit(self.max_deposit)
-            .with_top_up_amount(self.top_up_amount)
-            .with_autoswap(autoswap);
-        let mut management_headers = reqwest::header::HeaderMap::new();
-        if let Some(api_key) = &self.mpp_api_key {
-            management_headers.insert(
-                reqwest::header::HeaderName::from_static("x-api-key"),
-                reqwest::header::HeaderValue::from_str(api_key)?,
-            );
-        }
-        let payment = NativeSession {
-            session,
-            client: reqwest::Client::new(),
-            management_url: endpoint.to_string(),
-            management_headers,
+
+        let wallet_path = self
+            .wallet_store
+            .map_or_else(default_accounts_store_path, Ok)
+            .map_err(|error| eyre!(error))?;
+        let wallet = TempoAccountsWallet::from_store(&wallet_path).wrap_err_with(|| {
+            format!("failed to load Tempo Accounts at {}", wallet_path.display())
+        })?;
+        let provider = TempoAccountsProvider::new(wallet, &self.rpc_url)
+            .wrap_err("failed to configure the Tempo Accounts Charge provider")?
+            .with_expected_chain_id(TEMPO_MAINNET_CHAIN_ID)
+            .with_autoswap(AutoswapConfig::new(NANOUSD_ADDRESS, self.swap_slippage_bps));
+        let provider = CappedChargeProvider {
+            provider,
+            max_charge: self.egress_max_charge,
         };
-        let provider = MultiProvider::new()
-            .with(CappedChargeProvider {
-                provider: charge,
-                max_charge: self.egress_max_charge,
-            })
-            .with(payment.session.clone());
         let egress = MppEgress::start(provider, EgressPolicy::default())
             .await
             .wrap_err("failed to start the embedded MPP egress proxy")?;
 
-        let (websocket_url, shutdown_tx, task) =
-            if matches!(responses_transport, ResponsesTransport::WebSocket) {
-                let (websocket_url, shutdown_tx, task) =
-                    start_websocket_bridge(self.mpp_websocket_url, self.mpp_api_key, payment)?;
-                (websocket_url, Some(shutdown_tx), Some(task))
-            } else {
-                (direct_websocket_url, None, None)
-            };
-        Ok((
-            websocket_url,
-            Some(MppAdapter {
-                api_base_url,
-                shutdown_tx,
-                task,
-                egress: Some(egress),
-            }),
-        ))
+        Ok(Some(MppAdapter {
+            api_base_url: normalize_api_base_url(&self.api_base_url)?,
+            mpp_api_key: self.mpp_api_key,
+            egress: Some(egress),
+        }))
     }
-}
-
-fn start_websocket_bridge(
-    endpoint: String,
-    api_key: Option<String>,
-    payment: NativeSession,
-) -> Result<(String, oneshot::Sender<()>, JoinHandle<Result<()>>)> {
-    let listener = StdTcpListener::bind("127.0.0.1:0")
-        .wrap_err("failed to bind the local MPP WebSocket adapter")?;
-    listener
-        .set_nonblocking(true)
-        .wrap_err("failed to configure the local MPP WebSocket adapter")?;
-    let address = listener
-        .local_addr()
-        .wrap_err("failed to read the local MPP WebSocket adapter address")?;
-    let listener = TcpListener::from_std(listener)
-        .wrap_err("failed to start the local MPP WebSocket adapter")?;
-    let config = Arc::new(BridgeConfig {
-        endpoint,
-        api_key,
-        payment,
-    });
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let task = tokio::spawn(serve(listener, config, shutdown_rx));
-    Ok((format!("ws://{address}/v1/responses"), shutdown_tx, task))
 }
 
 #[derive(Clone)]
@@ -352,46 +179,42 @@ where
     }
 }
 
-fn payment_http_url(websocket_url: &str) -> Result<reqwest::Url> {
-    let mut url =
-        reqwest::Url::parse(websocket_url).wrap_err("Tempo Responses WebSocket URL is invalid")?;
-    let scheme = match url.scheme() {
-        "ws" => "http",
-        "wss" => "https",
-        scheme => return Err(eyre!("unsupported Tempo WebSocket URL scheme {scheme}")),
-    };
-    url.set_scheme(scheme)
-        .map_err(|()| eyre!("failed to derive the Tempo payment bootstrap URL"))?;
-    Ok(url)
-}
-
-fn openai_api_base_url(websocket_url: &str) -> Result<String> {
-    let mut url = payment_http_url(websocket_url)?;
-    let api_path = url
-        .path()
-        .strip_suffix("/responses")
-        .filter(|path| !path.is_empty())
-        .ok_or_else(|| eyre!("Tempo Responses WebSocket URL must end in /responses"))?
-        .to_owned();
-    url.set_path(&api_path);
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url.to_string().trim_end_matches('/').to_owned())
-}
-
-fn websocket_origin(websocket_url: &str) -> Result<String> {
-    let url =
-        reqwest::Url::parse(websocket_url).wrap_err("Tempo Responses WebSocket URL is invalid")?;
+fn normalize_api_base_url(value: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(value).wrap_err("Tempo MPP API base URL is invalid")?;
     match url.scheme() {
-        "ws" | "wss" => Ok(url.origin().ascii_serialization()),
-        scheme => Err(eyre!("unsupported Tempo WebSocket URL scheme {scheme}")),
+        "http" | "https" => {}
+        scheme => return Err(eyre!("unsupported Tempo MPP API URL scheme {scheme}")),
     }
+    if url.cannot_be_a_base() {
+        return Err(eyre!("Tempo MPP API URL must be an absolute HTTP URL"));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| eyre!("Tempo MPP API URL must be an absolute HTTP URL"))?;
+    if url.scheme() == "http" {
+        let is_loopback = host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback());
+        if !is_loopback {
+            return Err(eyre!(
+                "Tempo MPP API URL must use HTTPS unless it is loopback"
+            ));
+        }
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(eyre!(
+            "Tempo MPP API URL must not include a query or fragment"
+        ));
+    }
+    let path = url.path().trim_end_matches('/').to_owned();
+    url.set_path(&path);
+    Ok(url.to_string().trim_end_matches('/').to_owned())
 }
 
 pub(crate) struct MppAdapter {
     api_base_url: String,
-    shutdown_tx: Option<oneshot::Sender<()>>,
-    task: Option<JoinHandle<Result<()>>>,
+    mpp_api_key: Option<String>,
     egress: Option<MppEgress>,
 }
 
@@ -423,7 +246,8 @@ impl MppAdapter {
     }
 
     pub(crate) fn responses_http_client(&self) -> Result<reqwest::Client> {
-        prefer_session_payments(self.http_client_builder()?)
+        self.http_client_builder()?
+            .default_headers(responses_payment_headers(self.mpp_api_key.as_deref())?)
             .build()
             .wrap_err("failed to configure the MPP-aware Responses HTTP client")
     }
@@ -435,452 +259,51 @@ impl MppAdapter {
     }
 
     pub(crate) async fn shutdown(mut self) -> Result<()> {
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
-        }
-        let websocket_result = match self.task.take() {
-            Some(mut task) => match timeout(Duration::from_secs(30), &mut task).await {
-                Ok(Ok(completed)) => completed.wrap_err("MPP WebSocket adapter failed"),
-                Ok(Err(error)) => Err(error).wrap_err("MPP WebSocket adapter task failed"),
-                Err(error) => {
-                    task.abort();
-                    Err(error).wrap_err("timed out closing the paid MPP session")
-                }
-            },
-            None => Ok(()),
-        };
-        let egress_result = if let Some(egress) = self.egress.take() {
+        if let Some(egress) = self.egress.take() {
             egress
                 .shutdown()
                 .await
-                .wrap_err("failed to stop the embedded MPP egress proxy")
-        } else {
-            Ok(())
-        };
-        websocket_result?;
-        egress_result
+                .wrap_err("failed to stop the embedded MPP egress proxy")?;
+        }
+        Ok(())
     }
 }
 
-fn prefer_session_payments(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    builder.default_headers(responses_payment_headers())
-}
-
-fn responses_payment_headers() -> reqwest::header::HeaderMap {
+fn responses_payment_headers(api_key: Option<&str>) -> Result<reqwest::header::HeaderMap> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::HeaderName::from_static("accept-payment"),
         reqwest::header::HeaderValue::from_static(RESPONSES_ACCEPT_PAYMENT),
     );
-    headers
-}
-
-impl Drop for MppAdapter {
-    fn drop(&mut self) {
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
-        }
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-        drop(self.egress.take());
-    }
-}
-
-#[derive(Clone)]
-struct NativeSession {
-    session: TempoSessionProvider,
-    client: reqwest::Client,
-    management_url: String,
-    management_headers: reqwest::header::HeaderMap,
-}
-
-impl PaymentProvider for NativeSession {
-    fn supports(&self, method: &str, intent: &str) -> bool {
-        self.session.supports(method, intent)
-    }
-
-    async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        self.session
-            .application_websocket_credential_with_top_up(
-                &self.client,
-                &self.management_url,
-                self.management_headers.clone(),
-                challenge,
-            )
-            .await
-    }
-
-    async fn pay_with_context(
-        &self,
-        challenge: &PaymentChallenge,
-        context: PaymentContext,
-    ) -> Result<PaymentCredential, MppError> {
-        self.session
-            .application_websocket_credential_with_top_up(
-                &self.client,
-                context.url.as_str(),
-                context.headers,
-                challenge,
-            )
-            .await
-    }
-
-    async fn prepare_application_websocket_challenge(
-        &self,
-        challenge: &PaymentChallenge,
-        context: PaymentContext,
-    ) -> Result<PaymentChallenge, MppError> {
-        self.session
-            .recover_application_websocket_challenge_with_headers(
-                &self.client,
-                context.url.as_str(),
-                context.headers,
-                challenge,
-            )
-            .await
-    }
-
-    async fn commit_payment(
-        &self,
-        challenge: &PaymentChallenge,
-        credential: &PaymentCredential,
-    ) -> Result<(), MppError> {
-        self.session.commit_payment(challenge, credential).await
-    }
-
-    async fn rollback_payment(
-        &self,
-        challenge: &PaymentChallenge,
-        credential: &PaymentCredential,
-    ) -> Result<(), MppError> {
-        self.session.rollback_payment(challenge, credential).await
-    }
-
-    fn accept_payment_header(&self) -> Option<String> {
-        self.session.accept_payment_header()
-    }
-}
-
-impl VoucherProvider for NativeSession {
-    async fn next_voucher(&self, request: &VoucherRequest) -> Result<PaymentCredential, MppError> {
-        let cumulative = request.required_cumulative.parse().map_err(|error| {
-            MppError::InvalidConfig(format!(
-                "invalid required cumulative voucher amount: {error}"
-            ))
-        })?;
-        let deposit = request.deposit.parse().map_err(|error| {
-            MppError::InvalidConfig(format!("invalid channel deposit amount: {error}"))
-        })?;
-        self.session
-            .voucher_credential_with_top_up(
-                &self.client,
-                &self.management_url,
-                self.management_headers.clone(),
-                &request.channel_id,
-                cumulative,
-                deposit,
-            )
-            .await
-    }
-
-    async fn next_voucher_for_challenge(
-        &self,
-        challenge: &PaymentChallenge,
-        request: &VoucherRequest,
-    ) -> Result<PaymentCredential, MppError> {
-        let cumulative = request.required_cumulative.parse().map_err(|error| {
-            MppError::InvalidConfig(format!(
-                "invalid required cumulative voucher amount: {error}"
-            ))
-        })?;
-        let deposit = request.deposit.parse().map_err(|error| {
-            MppError::InvalidConfig(format!("invalid channel deposit amount: {error}"))
-        })?;
-        self.session
-            .voucher_credential_with_top_up_for_challenge(
-                &self.client,
-                &self.management_url,
-                self.management_headers.clone(),
-                challenge,
-                &request.channel_id,
-                cumulative,
-                deposit,
-            )
-            .await
-    }
-}
-
-impl CloseProvider for NativeSession {
-    async fn close_credential(
-        &self,
-        request: &CloseRequest,
-    ) -> Result<PaymentCredential, MppError> {
-        let cumulative = request.cumulative_amount.parse().map_err(|error| {
-            MppError::InvalidConfig(format!("invalid close-ready cumulative amount: {error}"))
-        })?;
-        self.session
-            .close_credential_at(&request.channel_id, cumulative)
-            .await
-    }
-
-    async fn close_credential_for_challenge(
-        &self,
-        challenge: &PaymentChallenge,
-        request: &CloseRequest,
-    ) -> Result<PaymentCredential, MppError> {
-        let cumulative = request.cumulative_amount.parse().map_err(|error| {
-            MppError::InvalidConfig(format!("invalid close-ready cumulative amount: {error}"))
-        })?;
-        self.session
-            .close_credential_at_for_challenge(challenge, &request.channel_id, cumulative)
-            .await
-    }
-}
-
-struct BridgeConfig {
-    endpoint: String,
-    api_key: Option<String>,
-    payment: NativeSession,
-}
-
-async fn serve(
-    listener: TcpListener,
-    config: Arc<BridgeConfig>,
-    mut shutdown: oneshot::Receiver<()>,
-) -> Result<()> {
-    let mut bridges = JoinSet::new();
-    let (bridge_shutdown_tx, _) = watch::channel(false);
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => break,
-            accepted = listener.accept() => {
-                let Ok((stream, _)) = accepted else {
-                    break;
-                };
-                let config = Arc::clone(&config);
-                let bridge_shutdown = bridge_shutdown_tx.subscribe();
-                bridges.spawn(async move {
-                    Box::pin(bridge(stream, &config, bridge_shutdown)).await
-                });
-            }
-            completed = bridges.join_next(), if !bridges.is_empty() => {
-                record_bridge_result(completed);
-            }
-        }
-    }
-    let _ = bridge_shutdown_tx.send(true);
-    while let Some(completed) = bridges.join_next().await {
-        record_bridge_result(Some(completed));
-    }
-    Ok(())
-}
-
-fn record_bridge_result(
-    completed: Option<std::result::Result<Result<()>, tokio::task::JoinError>>,
-) {
-    match completed {
-        Some(Ok(Err(error))) => {
-            tracing::warn!(error = ?error, "MPP WebSocket adapter closed");
-        }
-        Some(Err(error)) => {
-            tracing::warn!(%error, "MPP WebSocket adapter task failed");
-        }
-        Some(Ok(Ok(()))) | None => {}
-    }
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "tungstenite fixes the handshake callback's rejection response type"
-)]
-async fn bridge(
-    stream: TcpStream,
-    config: &BridgeConfig,
-    shutdown: watch::Receiver<bool>,
-) -> Result<()> {
-    let downstream_headers = Arc::new(Mutex::new(None));
-    let captured = Arc::clone(&downstream_headers);
-    let mut downstream = accept_hdr_async(stream, move |request: &Request, response: Response| {
-        if let Ok(mut headers) = captured.lock() {
-            *headers = Some(request.headers().clone());
-        }
-        Ok(response)
-    })
-    .await
-    .wrap_err("local Responses WebSocket handshake failed")?;
-    let headers = downstream_headers
-        .lock()
-        .map_err(|_| eyre!("local Responses WebSocket header capture was poisoned"))?
-        .take()
-        .ok_or_else(|| eyre!("local Responses WebSocket headers were not captured"))?;
-
-    let mut connector = MppApplicationWsConnect::new(
-        &config.endpoint,
-        config.payment.clone(),
-        config.payment.clone(),
-    );
-    for name in [
-        "openai-beta",
-        "x-openai-internal-codex-responses-lite",
-        "session-id",
-        "thread-id",
-        "x-client-request-id",
-        "x-responsesapi-include-timing-metrics",
-        "user-agent",
-    ] {
-        if let Some(value) = headers.get(name) {
-            connector = connector.with_header(
-                HeaderName::from_static(name),
-                HeaderValue::from_bytes(value.as_bytes())?,
-            );
-        }
-    }
-    if let Some(api_key) = &config.api_key {
-        connector = connector.with_header(
-            HeaderName::from_static("x-api-key"),
-            HeaderValue::from_str(api_key)?,
+    if let Some(api_key) = api_key {
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-api-key"),
+            reqwest::header::HeaderValue::from_str(api_key)
+                .wrap_err("invalid provider.tempo.api-key header value")?,
         );
     }
-    let upstream = match connector.connect().await {
-        Ok(upstream) => upstream,
-        Err(error) if is_terminal_mpp_error(&error) => {
-            send_terminal_mpp_error(&mut downstream, &error).await?;
-            return Ok(());
-        }
-        Err(error) => {
-            return Err(error).wrap_err("failed to open the paid MPP WebSocket");
-        }
-    };
-    relay(downstream, upstream, shutdown).await
-}
-
-async fn relay(
-    mut downstream: WebSocketStream<TcpStream>,
-    mut upstream: MppApplicationWs<NativeSession>,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
-    let relay_result = loop {
-        tokio::select! {
-            _ = shutdown.changed() => break Ok(()),
-            inbound = downstream.next() => match inbound {
-                Some(Ok(Message::Text(text))) => {
-                    if let Err(error) = upstream.send(text.to_string()).await {
-                        return Err(error.into());
-                    }
-                }
-                Some(Ok(Message::Ping(payload))) => {
-                    if let Err(error) = downstream.send(Message::Pong(payload)).await {
-                        if *shutdown.borrow() {
-                            break Ok(());
-                        }
-                        break Err(error.into());
-                    }
-                }
-                Some(Ok(Message::Close(_))) | None => break Ok(()),
-                Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
-                Some(Ok(Message::Binary(_))) => {
-                    break Err(eyre!("Responses WebSocket sent a binary frame"));
-                }
-                Some(Err(error)) => {
-                    if *shutdown.borrow() {
-                        break Ok(());
-                    }
-                    break Err(error.into());
-                }
-            },
-            outbound = upstream.next() => {
-                let text = match outbound {
-                    Ok(text) => text,
-                    Err(error) if is_terminal_mpp_error(&error) => {
-                        send_terminal_mpp_error(&mut downstream, &error).await?;
-                        break Ok(());
-                    }
-                    Err(error) => {
-                        break Err(error).wrap_err("paid MPP WebSocket receive failed");
-                    }
-                };
-                if let Err(error) = downstream.send(Message::Text(text.into())).await {
-                    if *shutdown.borrow() {
-                        break Ok(());
-                    }
-                    break Err(error.into());
-                }
-            }
-        }
-    };
-    upstream
-        .disconnect()
-        .await
-        .wrap_err("failed to disconnect the paid MPP WebSocket")?;
-    relay_result
-}
-
-fn is_terminal_mpp_error(error: &MppWsError) -> bool {
-    matches!(
-        error,
-        MppWsError::ProbeStatus { .. }
-            | MppWsError::UnsupportedChallenge
-            | MppWsError::Payment(_)
-            | MppWsError::InvalidHeader(_)
-            | MppWsError::MalformedFrame(_)
-            | MppWsError::PaymentError { .. }
-    )
-}
-
-async fn send_terminal_mpp_error(
-    downstream: &mut WebSocketStream<TcpStream>,
-    error: &MppWsError,
-) -> Result<()> {
-    let event = terminal_mpp_error_event(error);
-    downstream
-        .send(Message::Text(event.into()))
-        .await
-        .wrap_err("failed to send the MPP error to the Responses client")?;
-    downstream
-        .close(None)
-        .await
-        .wrap_err("failed to close the Responses WebSocket after an MPP error")
-}
-
-fn terminal_mpp_error_event(error: &MppWsError) -> String {
-    serde_json::json!({
-        "type": "error",
-        "error": {
-            "code": "mpp_payment_failed",
-            "message": error_chain(error),
-        }
-    })
-    .to_string()
-}
-
-fn error_chain(error: &(dyn StdError + 'static)) -> String {
-    let mut message = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        message.push_str(": ");
-        message.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    message
+    Ok(headers)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use mpp::{Base64UrlJson, PaymentPayload};
 
     use super::*;
 
     #[derive(Clone, Default)]
-    struct MockChargeProvider {
+    struct MockProvider {
         payments: Arc<AtomicUsize>,
         commits: Arc<AtomicUsize>,
         rollbacks: Arc<AtomicUsize>,
     }
 
-    impl PaymentProvider for MockChargeProvider {
+    impl PaymentProvider for MockProvider {
         fn supports(&self, method: &str, intent: &str) -> bool {
             method == "tempo" && intent == "charge"
         }
@@ -912,78 +335,62 @@ mod tests {
         }
     }
 
-    fn charge_challenge(amount: &str) -> PaymentChallenge {
-        PaymentChallenge::new(
-            "charge-id",
-            "service.example",
-            "tempo",
-            "charge",
-            Base64UrlJson::from_value(&serde_json::json!({
-                "amount": amount,
-                "currency": "0x20c000000000000000000000b9537d11c60e8b50"
-            }))
-            .unwrap(),
-        )
-    }
-
-    fn args(enabled: bool) -> MppArgs {
+    fn test_args() -> MppArgs {
         MppArgs {
             openai: false,
-            enabled,
-            mpp_websocket_url: DEFAULT_MPP_WEBSOCKET_URL.to_owned(),
+            enabled: false,
+            api_base_url: DEFAULT_MPP_API_BASE_URL.to_owned(),
             wallet_store: None,
-            channel_store: None,
             rpc_url: DEFAULT_TEMPO_RPC_URL.to_owned(),
-            pay_with: DEFAULT_TEMPO_PAY_WITH.to_owned(),
             swap_slippage_bps: DEFAULT_TEMPO_SWAP_SLIPPAGE_BPS,
-            max_deposit: DEFAULT_MAX_DEPOSIT,
-            top_up_amount: DEFAULT_TOP_UP_AMOUNT,
             egress_max_charge: DEFAULT_MAX_EGRESS_CHARGE,
             mpp_api_key: None,
         }
     }
 
-    #[tokio::test]
-    async fn mpp_is_opt_in() {
-        let (url, adapter) = args(false)
-            .start(
-                "wss://api.openai.com/v1/responses".to_owned(),
-                ResponsesTransport::WebSocket,
-            )
-            .await
-            .unwrap();
-        assert_eq!(url, "wss://api.openai.com/v1/responses");
-        assert!(adapter.is_none());
+    fn challenge(amount: &str) -> PaymentChallenge {
+        let request = Base64UrlJson::from_value(&serde_json::json!({
+            "amount": amount,
+            "currency": NANOUSD_ADDRESS,
+            "recipient": "0x1111111111111111111111111111111111111111",
+            "methodDetails": {"chainId": TEMPO_MAINNET_CHAIN_ID},
+        }))
+        .unwrap();
+        PaymentChallenge::new("challenge", "api.example.com", "tempo", "charge", request)
     }
 
     #[tokio::test]
-    async fn egress_charge_cap_is_checked_before_payment() {
-        let inner = MockChargeProvider::default();
+    async fn mpp_is_opt_in() {
+        assert!(test_args().start().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn charge_cap_is_checked_before_payment() {
+        let inner = MockProvider::default();
         let payments = Arc::clone(&inner.payments);
         let provider = CappedChargeProvider {
             provider: inner,
             max_charge: 100,
         };
 
-        provider.pay(&charge_challenge("100")).await.unwrap();
-        let error = provider.pay(&charge_challenge("101")).await.unwrap_err();
+        let error = provider.pay(&challenge("101")).await.unwrap_err();
 
         assert!(matches!(error, MppError::AmountExceedsMax { .. }));
-        assert_eq!(payments.load(Ordering::SeqCst), 1);
+        assert_eq!(payments.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn capped_charge_provider_forwards_payment_lifecycle() {
-        let inner = MockChargeProvider::default();
+    async fn capped_provider_forwards_payment_lifecycle() {
+        let inner = MockProvider::default();
+        let payments = Arc::clone(&inner.payments);
         let commits = Arc::clone(&inner.commits);
         let rollbacks = Arc::clone(&inner.rollbacks);
         let provider = CappedChargeProvider {
             provider: inner,
             max_charge: 100,
         };
-        let challenge = charge_challenge("100");
+        let challenge = challenge("100");
         let credential = provider.pay(&challenge).await.unwrap();
-
         provider
             .commit_payment(&challenge, &credential)
             .await
@@ -993,64 +400,48 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(payments.load(Ordering::SeqCst), 1);
         assert_eq!(commits.load(Ordering::SeqCst), 1);
         assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn responses_prefer_session_payments_with_charge_fallback() {
-        let headers = responses_payment_headers();
+    fn responses_request_charge_only() {
+        let headers = responses_payment_headers(Some("secret")).unwrap();
 
+        assert_eq!(headers.get("accept-payment").unwrap(), "tempo/charge");
+        assert_eq!(headers.get("x-api-key").unwrap(), "secret");
+    }
+
+    #[test]
+    fn accepts_https_and_loopback_http_api_bases() {
         assert_eq!(
-            headers.get("accept-payment").unwrap(),
-            RESPONSES_ACCEPT_PAYMENT
+            normalize_api_base_url("https://openai.mpp.tempo.xyz/v1/").unwrap(),
+            "https://openai.mpp.tempo.xyz/v1"
+        );
+        assert_eq!(
+            normalize_api_base_url("http://127.0.0.1:8080/v1").unwrap(),
+            "http://127.0.0.1:8080/v1"
         );
     }
 
     #[test]
-    fn derives_payment_bootstrap_url() {
-        let url = payment_http_url("wss://openai.mpp.tempo.xyz/v1/responses").unwrap();
-        assert_eq!(url.as_str(), "https://openai.mpp.tempo.xyz/v1/responses");
-    }
-
-    #[test]
-    fn derives_openai_api_base_url() {
-        let url = openai_api_base_url("wss://openai.mpp.tempo.xyz/v1/responses").unwrap();
-        assert_eq!(url, "https://openai.mpp.tempo.xyz/v1");
-    }
-
-    #[test]
-    fn rejects_non_responses_mpp_endpoint() {
-        let error =
-            openai_api_base_url("wss://openai.mpp.tempo.xyz/v1/chat/completions").unwrap_err();
-        assert!(error.to_string().contains("must end in /responses"));
-    }
-
-    #[test]
-    fn preserves_mppx_websocket_namespace() {
-        let namespace = websocket_origin("wss://openai.mpp.tempo.xyz/v1/responses").unwrap();
-        assert_eq!(namespace, "wss://openai.mpp.tempo.xyz");
-    }
-
-    #[test]
-    fn deterministic_mpp_failures_become_terminal_api_errors() {
-        let error = MppWsError::Payment(MppError::InvalidConfig(
-            "insufficient balance for session top-up".to_owned(),
-        ));
-
-        assert!(is_terminal_mpp_error(&error));
-        let event: serde_json::Value =
-            serde_json::from_str(&terminal_mpp_error_event(&error)).unwrap();
-        assert_eq!(event["type"], "error");
-        assert_eq!(event["error"]["code"], "mpp_payment_failed");
-        assert_eq!(
-            event["error"]["message"],
-            "MPP payment failed: Invalid configuration: insufficient balance for session top-up"
+    fn rejects_websocket_api_base() {
+        let error = normalize_api_base_url("wss://openai.mpp.tempo.xyz/v1/responses").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Tempo MPP API URL scheme")
         );
     }
 
     #[test]
-    fn transport_closures_remain_retryable() {
-        assert!(!is_terminal_mpp_error(&MppWsError::Closed));
+    fn rejects_plaintext_remote_api_base() {
+        let error = normalize_api_base_url("http://openai.mpp.tempo.xyz/v1").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must use HTTPS unless it is loopback")
+        );
     }
 }

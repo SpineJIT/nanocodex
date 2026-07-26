@@ -161,19 +161,21 @@ impl AgentArgs {
         let responses_transport = self.responses_transport();
         let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
         let mpp_enabled = self.mpp.is_enabled();
+        if mpp_enabled && !matches!(responses_transport, ResponsesTransport::Https) {
+            return Err(eyre!(
+                "the Tempo provider currently supports HTTPS Responses with Charge only"
+            ));
+        }
         let auth = if mpp_enabled {
             OpenAiAuth::api_key("tempo-proxy")
         } else {
             select_auth(self.api_key, self.auth_file, environment_api_key()?)?
         };
         let direct_websocket_url = direct_websocket_url(self.websocket_url, auth.mode());
-        let (websocket_url, mpp_adapter) = self
-            .mpp
-            .start(direct_websocket_url, responses_transport)
-            .await?;
+        let mpp_adapter = self.mpp.start().await?;
         let mut responses = Responses::builder()
             .transport(responses_transport)
-            .websocket_url(websocket_url);
+            .websocket_url(direct_websocket_url);
         if let Some(history) = self.responses_history {
             responses = responses.history(history);
         }
