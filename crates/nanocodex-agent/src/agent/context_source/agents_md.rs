@@ -7,11 +7,14 @@ use std::{
 
 use tracing::warn;
 
-use crate::NanocodexError;
-
 const MAX_PROJECT_INSTRUCTIONS_BYTES: usize = 32 * 1024;
 const CANDIDATE_FILENAMES: [&str; 2] = ["AGENTS.override.md", "AGENTS.md"];
 const PROJECT_DOC_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
+
+struct ProjectInstructionsError {
+    path: PathBuf,
+    source: io::Error,
+}
 
 pub(crate) fn load_global_instructions(codex_home: Option<&Path>) -> Option<Arc<str>> {
     let codex_home = codex_home?;
@@ -54,16 +57,26 @@ pub(crate) fn load_global_instructions(codex_home: Option<&Path>) -> Option<Arc<
 pub(super) fn load_instructions(
     workspace: &Path,
     global_instructions: Option<&str>,
-) -> Result<Option<String>, NanocodexError> {
-    let project_instructions = load_project_instructions(workspace)?;
-    Ok(match (global_instructions, project_instructions) {
+) -> Option<String> {
+    let project_instructions = match load_project_instructions(workspace) {
+        Ok(instructions) => instructions,
+        Err(error) => {
+            warn!(
+                path = %error.path.display(),
+                error = %error.source,
+                "failed to read project AGENTS.md instructions"
+            );
+            None
+        }
+    };
+    match (global_instructions, project_instructions) {
         (Some(global), Some(project)) => Some(format!("{global}{PROJECT_DOC_SEPARATOR}{project}")),
         (Some(global), None) => Some(global.to_owned()),
         (None, project) => project,
-    })
+    }
 }
 
-fn load_project_instructions(workspace: &Path) -> Result<Option<String>, NanocodexError> {
+fn load_project_instructions(workspace: &Path) -> Result<Option<String>, ProjectInstructionsError> {
     let root = find_project_root(workspace)?;
     let mut directories = workspace
         .ancestors()
@@ -82,15 +95,21 @@ fn load_project_instructions(workspace: &Path) -> Result<Option<String>, Nanocod
         let Some(path) = instruction_file(&directory)? else {
             continue;
         };
-        let data = read_bounded(&path, remaining).map_err(|source| {
-            NanocodexError::ReadProjectInstructions {
+        let (data, truncated) =
+            read_bounded(&path, remaining).map_err(|source| ProjectInstructionsError {
                 path: path.clone(),
                 source,
-            }
-        })?;
-        remaining -= data.len();
+            })?;
+        if truncated {
+            warn!(
+                path = %path.display(),
+                remaining_bytes = remaining,
+                "project doc exceeds remaining budget; truncating"
+            );
+        }
         let text = String::from_utf8_lossy(&data).into_owned();
         if !text.trim().is_empty() {
+            remaining -= data.len();
             documents.push(text);
         }
     }
@@ -98,14 +117,14 @@ fn load_project_instructions(workspace: &Path) -> Result<Option<String>, Nanocod
     Ok((!documents.is_empty()).then(|| documents.join("\n\n")))
 }
 
-fn find_project_root(workspace: &Path) -> Result<PathBuf, NanocodexError> {
+fn find_project_root(workspace: &Path) -> Result<PathBuf, ProjectInstructionsError> {
     for directory in workspace.ancestors() {
         let marker = directory.join(".git");
         match fs::metadata(&marker) {
             Ok(_) => return Ok(directory.to_path_buf()),
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
             Err(source) => {
-                return Err(NanocodexError::ReadProjectInstructions {
+                return Err(ProjectInstructionsError {
                     path: marker,
                     source,
                 });
@@ -115,7 +134,7 @@ fn find_project_root(workspace: &Path) -> Result<PathBuf, NanocodexError> {
     Ok(workspace.to_path_buf())
 }
 
-fn instruction_file(directory: &Path) -> Result<Option<PathBuf>, NanocodexError> {
+fn instruction_file(directory: &Path) -> Result<Option<PathBuf>, ProjectInstructionsError> {
     for filename in CANDIDATE_FILENAMES {
         let path = directory.join(filename);
         match fs::metadata(&path) {
@@ -123,18 +142,21 @@ fn instruction_file(directory: &Path) -> Result<Option<PathBuf>, NanocodexError>
             Ok(_) => {}
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
             Err(source) => {
-                return Err(NanocodexError::ReadProjectInstructions { path, source });
+                return Err(ProjectInstructionsError { path, source });
             }
         }
     }
     Ok(None)
 }
 
-fn read_bounded(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+fn read_bounded(path: &Path, limit: usize) -> io::Result<(Vec<u8>, bool)> {
     let file = File::open(path)?;
-    let mut data = Vec::with_capacity(limit.min(8 * 1024));
-    file.take(limit as u64).read_to_end(&mut data)?;
-    Ok(data)
+    let mut data = Vec::with_capacity(limit.saturating_add(1).min(8 * 1024));
+    file.take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut data)?;
+    let truncated = data.len() > limit;
+    data.truncate(limit);
+    Ok((data, truncated))
 }
 
 #[cfg(test)]
@@ -225,8 +247,42 @@ mod tests {
         fs::write(workspace.join("AGENTS.override.md"), "local").unwrap();
 
         assert_eq!(
-            load_instructions(&workspace, Some("global")).unwrap(),
+            load_instructions(&workspace, Some("global")),
             Some("global\n\n--- project-doc ---\n\nroot\n\ncrate\n\nlocal".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_project_docs_do_not_consume_the_shared_budget() {
+        let repo = tempdir().unwrap();
+        fs::create_dir(repo.path().join(".git")).unwrap();
+        fs::write(
+            repo.path().join("AGENTS.md"),
+            " ".repeat(MAX_PROJECT_INSTRUCTIONS_BYTES),
+        )
+        .unwrap();
+        let workspace = repo.path().join("crate");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("AGENTS.md"), "use the crate instructions").unwrap();
+
+        assert_eq!(
+            load_instructions(&workspace, None),
+            Some("use the crate instructions".to_owned())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_read_errors_preserve_global_instructions() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempdir().unwrap();
+        fs::create_dir(repo.path().join(".git")).unwrap();
+        symlink("AGENTS.md", repo.path().join("AGENTS.md")).unwrap();
+
+        assert_eq!(
+            load_instructions(repo.path(), Some("global")),
+            Some("global".to_owned())
         );
     }
 }

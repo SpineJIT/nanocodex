@@ -90,14 +90,14 @@ async fn per_agent_tool_factory_binds_recursive_forks_to_the_invoking_driver() -
 }
 
 #[tokio::test]
-async fn clean_spawn_reuses_an_explicit_cache_key_without_history_or_lineage() -> Result<()> {
+async fn clean_spawn_reuses_the_root_cache_key_without_history() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
         let mut root = accept_async(stream).await?;
         let root_warmup = next_json(&mut root).await?;
-        assert_eq!(root_warmup["prompt_cache_key"], "shared-private-prefix");
+        assert_eq!(root_warmup["prompt_cache_key"], TEST_SESSION_ID);
         assert!(
             root_warmup
                 .to_string()
@@ -117,7 +117,7 @@ async fn clean_spawn_reuses_an_explicit_cache_key_without_history_or_lineage() -
             .as_str()
             .ok_or_else(|| eyre!("clean child warmup omitted its session id"))?;
         assert_ne!(child_session, TEST_SESSION_ID);
-        assert_eq!(child_warmup["prompt_cache_key"], "shared-private-prefix");
+        assert_eq!(child_warmup["prompt_cache_key"], TEST_SESSION_ID);
         assert!(child_warmup.get("previous_response_id").is_none());
         assert!(
             child_warmup
@@ -141,7 +141,6 @@ async fn clean_spawn_reuses_an_explicit_cache_key_without_history_or_lineage() -
         .instructions("shared private configuration")
         .thinking(Thinking::Low)
         .session_id(test_session_id())
-        .prompt_cache_key("shared-private-prefix")
         .workspace(&workspace)
         .tools_factory(move |handle| {
             drop(handles.send(handle));

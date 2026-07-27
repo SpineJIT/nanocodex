@@ -102,10 +102,10 @@ impl<F> NanocodexBuilder<F> {
 
     /// Sets a stable cache identity for the immutable request prefix.
     ///
-    /// Independent agents may share this key without sharing their session,
-    /// conversation, response chain, tools, or workspace. When omitted, each
-    /// clean agent uses its own session lineage as before; forks inherit their
-    /// parent's cache identity.
+    /// Independent root agents may share this key without sharing their
+    /// session, conversation, response chain, tools, or workspace. When
+    /// omitted, each independently built root uses its own session lineage.
+    /// Clean children and forks inherit their root's cache identity.
     #[must_use]
     pub fn prompt_cache_key(mut self, prompt_cache_key: impl Into<String>) -> Self {
         self.prompt_cache.key = Some(prompt_cache_key.into());

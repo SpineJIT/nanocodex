@@ -52,7 +52,7 @@ impl ContextSource {
             })
     }
 
-    pub(crate) fn project_instructions(&self, workspace: &str) -> Result<Option<String>> {
+    pub(crate) fn project_instructions(&self, workspace: &str) -> Option<String> {
         load_instructions(Path::new(workspace), self.global_instructions.as_deref())
     }
 

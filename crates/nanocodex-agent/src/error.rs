@@ -43,16 +43,6 @@ pub enum NanocodexError {
         requested: String,
     },
 
-    /// Project instructions could not be loaded from disk.
-    #[error("failed to read project instructions from {path}: {source}")]
-    ReadProjectInstructions {
-        /// Instruction file that could not be read.
-        path: PathBuf,
-        /// Underlying filesystem failure.
-        #[source]
-        source: io::Error,
-    },
-
     /// A completed provider response violated an agent-loop invariant.
     #[error("malformed Responses API event: {detail}")]
     MalformedResponse {

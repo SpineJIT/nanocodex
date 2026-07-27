@@ -19,8 +19,8 @@ impl ContextSource {
         Ok(requested.unwrap_or(".").to_owned())
     }
 
-    pub(crate) fn project_instructions(&self, _workspace: &str) -> Result<Option<String>> {
-        Ok(None)
+    pub(crate) fn project_instructions(&self, _workspace: &str) -> Option<String> {
+        None
     }
 
     pub(crate) fn global_instructions(&self) -> Option<Arc<str>> {

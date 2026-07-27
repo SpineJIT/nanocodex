@@ -652,11 +652,15 @@ where
         let mut config = (*self.config).clone();
         config.thinking = thinking;
         config.fast_mode = fast_mode;
+        let prompt_cache_key = self
+            .prompt_cache_key
+            .as_ref()
+            .map_or_else(|| Arc::clone(&self.lineage_id), Arc::clone);
         let spawner = Self {
             config: Arc::new(config),
             tools: self.tools.clone(),
             lineage_id: Arc::from(session_id_text.as_str()),
-            prompt_cache_key: self.prompt_cache_key.as_ref().map(Arc::clone),
+            prompt_cache_key: Some(prompt_cache_key),
             shared_prompt_cache: self.shared_prompt_cache.clone(),
             context_config: self.context_config.clone(),
             context_source: self.context_config.build(),

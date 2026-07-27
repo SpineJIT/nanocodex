@@ -91,6 +91,7 @@ pub(crate) struct PreparedCheckpoint {
     pub(crate) checkpoint: ModelCheckpoint,
     pub(crate) runtime: ToolRuntime,
     pub(crate) context_source: ContextSource,
+    project_instructions: Option<Arc<str>>,
 }
 
 pub(crate) struct HistoryCheckpoint {
@@ -154,6 +155,7 @@ struct ModelSessionState {
     tools: ToolRuntime,
     factory: ResponsesAttemptFactory,
     conversation: ConversationState,
+    project_instructions: Option<Arc<str>>,
     preserve_inherited_delta: bool,
 }
 
@@ -317,9 +319,9 @@ enum CompactionPhase {
 }
 
 struct CompactionContext<'a> {
-    project_workspace: &'a str,
     working_directory: &'a str,
     shell: &'a str,
+    project_instructions: Option<&'a str>,
     phase: CompactionPhase,
 }
 
@@ -518,6 +520,7 @@ impl<S> ModelRun<S> {
             checkpoint,
             runtime,
             context_source,
+            project_instructions,
         } = prepared;
         let active_tools = runtime.control();
         let factory = ResponsesAttemptFactory::new(
@@ -548,6 +551,7 @@ impl<S> ModelRun<S> {
                 tools: runtime,
                 factory,
                 conversation: checkpoint.conversation,
+                project_instructions,
                 preserve_inherited_delta: checkpoint.preserve_inherited_delta,
             }),
             active_tools: Some(active_tools),
@@ -590,10 +594,6 @@ impl<S> ModelRun<S> {
             ResponsesTransport::Https => &self.config.api_base_url,
         }
     }
-
-    fn load_agent_instructions(&self, workspace: &str) -> Result<Option<String>> {
-        self.context_source.project_instructions(workspace)
-    }
 }
 
 pub(crate) fn prepare_checkpoint(
@@ -603,10 +603,14 @@ pub(crate) fn prepare_checkpoint(
     context_source: ContextSource,
 ) -> PreparedCheckpoint {
     let runtime = tool_runtime(checkpoint.workspace(), config, tools);
+    let project_instructions = context_source
+        .project_instructions(checkpoint.workspace())
+        .map(Arc::from);
     PreparedCheckpoint {
         checkpoint,
         runtime,
         context_source,
+        project_instructions,
     }
 }
 
@@ -663,6 +667,9 @@ pub(crate) fn prepare_history_checkpoint(
         history,
         prompt_cache_key,
     } = resume;
+    let project_instructions = context_source
+        .project_instructions(&workspace)
+        .map(Arc::from);
     let runtime = tool_runtime(&workspace, config, tools);
     let tool_specs = runtime.model_specs(session_id);
     let request_prefix = request_profile(
@@ -685,6 +692,7 @@ pub(crate) fn prepare_history_checkpoint(
         checkpoint,
         runtime,
         context_source,
+        project_instructions,
     })
 }
 
@@ -888,9 +896,9 @@ where
                 &mut session.conversation,
                 &session.factory,
                 CompactionContext {
-                    project_workspace: &session.workspace,
                     working_directory: session.tools.working_directory(),
                     shell: session.tools.default_shell_name(),
+                    project_instructions: session.project_instructions.as_deref(),
                     phase: CompactionPhase::PreTurn,
                 },
             );
@@ -957,7 +965,10 @@ where
             let workspace = self
                 .context_source
                 .resolve_workspace(requested_workspace.as_deref())?;
-            let project_instructions = self.load_agent_instructions(&workspace)?;
+            let project_instructions = self
+                .context_source
+                .project_instructions(&workspace)
+                .map(Arc::<str>::from);
             let tools = tool_runtime(&workspace, &self.config, &self.tools);
             self.active_tools = Some(tools.control());
             let factory = self.attempt_factory(&tools);
@@ -974,6 +985,7 @@ where
                 tools,
                 factory,
                 conversation,
+                project_instructions,
                 preserve_inherited_delta: false,
             };
             session
@@ -1161,9 +1173,9 @@ where
                             &mut session.conversation,
                             &session.factory,
                             CompactionContext {
-                                project_workspace: &session.workspace,
                                 working_directory: session.tools.working_directory(),
                                 shell: session.tools.default_shell_name(),
+                                project_instructions: session.project_instructions.as_deref(),
                                 phase: CompactionPhase::MidTurn,
                             },
                         )
@@ -1182,9 +1194,9 @@ where
                         &mut session.conversation,
                         &session.factory,
                         CompactionContext {
-                            project_workspace: &session.workspace,
                             working_directory: session.tools.working_directory(),
                             shell: session.tools.default_shell_name(),
+                            project_instructions: session.project_instructions.as_deref(),
                             phase: CompactionPhase::MidTurn,
                         },
                     )
@@ -1218,9 +1230,9 @@ where
                     &mut session.conversation,
                     &session.factory,
                     CompactionContext {
-                        project_workspace: &session.workspace,
                         working_directory: session.tools.working_directory(),
                         shell: session.tools.default_shell_name(),
+                        project_instructions: session.project_instructions.as_deref(),
                         phase: CompactionPhase::MidTurn,
                     },
                 )
@@ -1388,9 +1400,9 @@ where
         context: CompactionContext<'_>,
     ) -> Result<bool> {
         let CompactionContext {
-            project_workspace,
             working_directory,
             shell,
+            project_instructions,
             phase,
         } = context;
         let Some(auto_compact_token_limit) = compaction::auto_compact_token_limit(MODEL) else {
@@ -1413,9 +1425,7 @@ where
             )
             .await?;
         conversation.observe_server_reasoning(server_reasoning_included);
-        let project_instructions = self.load_agent_instructions(project_workspace)?;
-        let canonical_context =
-            task_context(working_directory, shell, project_instructions.as_deref());
+        let canonical_context = task_context(working_directory, shell, project_instructions);
         conversation.install_compaction(
             item,
             developer_context(),

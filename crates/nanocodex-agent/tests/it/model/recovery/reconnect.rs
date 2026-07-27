@@ -147,7 +147,12 @@ async fn receive_reset_reconnects_without_replaying_completed_tools() -> Result<
 }
 
 #[tokio::test]
-async fn sol_compacts_with_a_trigger_and_installs_the_returned_context() -> Result<()> {
+async fn sol_compacts_with_the_session_agents_md_and_installs_the_returned_context() -> Result<()> {
+    let workspace = temporary_workspace("compaction")?;
+    std::fs::write(
+        workspace.join("AGENTS.md"),
+        "original session instructions\n",
+    )?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
     let server = tokio::spawn(async move {
@@ -167,7 +172,7 @@ async fn sol_compacts_with_a_trigger_and_installs_the_returned_context() -> Resu
                     "type": "custom_tool_call",
                     "call_id": "call-exec",
                     "name": "exec",
-                    "input": "await tools.apply_patch(\"*** Begin Patch\\n*** Add File: AGENTS.md\\n+fresh compacted instructions\\n*** End Patch\"); text(\"tool completed\")"
+                    "input": "await tools.apply_patch(\"*** Begin Patch\\n*** Update File: AGENTS.md\\n@@\\n-original session instructions\\n+fresh compacted instructions\\n*** End Patch\"); text(\"tool completed\")"
                 })],
                 372_001,
             ),
@@ -220,13 +225,17 @@ async fn sol_compacts_with_a_trigger_and_installs_the_returned_context() -> Resu
         assert!(
             continuation
                 .to_string()
+                .contains("original session instructions")
+        );
+        assert!(
+            !continuation
+                .to_string()
                 .contains("fresh compacted instructions")
         );
         assert!(!continuation.to_string().contains("tool completed"));
         send_final(&mut socket, "resp-final").await
     });
 
-    let workspace = temporary_workspace("compaction")?;
     let output = run_model(&endpoint, &workspace, "exercise compaction").await?;
     timeout(std::time::Duration::from_secs(5), server)
         .await
