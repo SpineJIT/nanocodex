@@ -15,9 +15,10 @@ use tokio::{
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
 use crate::{
-    AgentHandle, Nanocodex, NanocodexError, OpenAiAuth, Prompt, ResponseItem, ResponseItemId,
-    Responses, ResponsesError, ResponsesHistory, ResponsesTransport, RolloutConfig, SessionId,
-    SessionSnapshot, Thinking, Tools,
+    AgentEventData, AgentHandle, CostStatus, Nanocodex, NanocodexError, OpenAiAuth,
+    PricingSnapshot, Prompt, ResponseItem, ResponseItemId, Responses, ResponsesError,
+    ResponsesHistory, ResponsesTransport, RolloutConfig, RunEvent, SessionId, SessionSnapshot,
+    Thinking, TokenRates, Tools,
 };
 
 const TEST_SESSION_ID: &str = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
@@ -26,6 +27,21 @@ fn test_session_id() -> SessionId {
     TEST_SESSION_ID
         .parse()
         .expect("the test session ID is UUIDv7")
+}
+
+fn test_pricing() -> PricingSnapshot {
+    PricingSnapshot::new(
+        "test-contract",
+        "test-fixture",
+        "2026-07-01",
+        TokenRates {
+            input: "1".parse().unwrap(),
+            cached_input: "0.1".parse().unwrap(),
+            cache_write_input: "1".parse().unwrap(),
+            output: "10".parse().unwrap(),
+        },
+    )
+    .unwrap()
 }
 
 #[derive(Clone)]
@@ -100,6 +116,7 @@ async fn a_turn_stream_mirrors_one_turn_and_await_retains_its_result() -> Result
     let responses = Responses::builder().websocket_url(endpoint).build();
     let (agent, mut session_events) = Nanocodex::builder("test-key")
         .thinking(Thinking::Low)
+        .pricing(test_pricing())
         .workspace(&workspace)
         .responses(responses)
         .session_id(test_session_id())
@@ -118,6 +135,13 @@ async fn a_turn_stream_mirrors_one_turn_and_await_retains_its_result() -> Result
     assert_eq!(result.usage().output_tokens(), 2);
     assert_eq!(result.usage().reasoning_output_tokens(), 1);
     assert_eq!(result.usage().total_tokens(), 12);
+    let estimated_cost = result
+        .usage()
+        .estimated_cost()
+        .expect("configured pricing should produce an estimate");
+    assert_eq!(estimated_cost.amount().decimal(), "0.0000255");
+    assert_eq!(estimated_cost.pricing().id(), "test-contract");
+    assert_eq!(result.usage().cost_status(), CostStatus::EstimatedFromUsage);
 
     drop(agent);
     let mut session = Vec::new();
@@ -137,6 +161,36 @@ async fn a_turn_stream_mirrors_one_turn_and_await_retains_its_result() -> Result
     assert_eq!(
         streamed.last().map(|event| event.kind),
         Some(nanocodex_oai_api::AgentEventKind::RunCompleted)
+    );
+    let terminal = streamed
+        .last()
+        .expect("the turn should have a terminal event");
+    let AgentEventData::Run(RunEvent::Completed(typed_terminal)) = terminal.data()? else {
+        return Err(eyre!(
+            "terminal event should have a typed completed projection"
+        ));
+    };
+    assert_eq!(
+        typed_terminal
+            .estimated_cost
+            .as_ref()
+            .expect("terminal should retain the configured estimate")
+            .amount()
+            .decimal(),
+        "0.0000255"
+    );
+    let terminal_payload = terminal.decode_payload::<Value>()?;
+    assert_eq!(
+        terminal_payload["estimated_cost"]["usd"],
+        json!("0.0000255")
+    );
+    assert_eq!(
+        terminal_payload["estimated_cost"]["pricing"]["effective_date"],
+        json!("2026-07-01")
+    );
+    assert_eq!(
+        terminal_payload["cost_status"],
+        json!("estimated_from_usage")
     );
 
     timeout(std::time::Duration::from_secs(5), server)
@@ -1803,13 +1857,42 @@ async fn completed_response_accepts_null_usage() -> Result<()> {
     });
 
     let workspace = temporary_workspace("null-usage")?;
-    let output = run_model(&endpoint, &workspace, "accept missing usage").await?;
+    let task = Prompt::new("accept missing usage");
+    let responses = Responses::builder().websocket_url(endpoint).build();
+    let (agent, events) = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .pricing(test_pricing())
+        .workspace(&workspace)
+        .responses(responses)
+        .session_id(test_session_id())
+        .build()?;
+    let turn = agent.prompt(task).await?;
+    drop(agent);
+    let mut encoded_events = Vec::new();
+    let (event_result, turn_result) =
+        tokio::join!(events.write_jsonl(&mut encoded_events), turn.result());
+    event_result?;
+    let result = turn_result?;
+    let output = String::from_utf8(encoded_events)?;
     timeout(std::time::Duration::from_secs(5), server)
         .await
         .map_err(|_| eyre!("mock Responses server did not finish"))???;
     assert!(output.contains("\"model.call.completed\""));
     assert!(output.contains("\"usage\":null"));
     assert!(output.contains("\"run.completed\""));
+    assert!(result.usage().estimated_cost().is_none());
+    assert_eq!(result.usage().cost_status(), CostStatus::UsageNotReported);
+    let terminal: Value = serde_json::from_str(
+        output
+            .lines()
+            .find(|line| line.contains("\"type\":\"run.completed\""))
+            .ok_or_else(|| eyre!("missing terminal event"))?,
+    )?;
+    assert_eq!(
+        terminal["payload"]["cost_status"],
+        json!("usage_not_reported")
+    );
+    assert!(terminal["payload"]["estimated_cost"].is_null());
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }

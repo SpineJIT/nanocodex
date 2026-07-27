@@ -102,12 +102,14 @@ mod error;
 #[allow(missing_docs)]
 #[path = "error_wasm.rs"]
 mod error;
+mod event_data;
 #[allow(missing_docs)]
 mod events;
 #[cfg(not(target_family = "wasm"))]
 mod http;
 mod middleware;
 mod openai;
+mod pricing;
 pub mod responses;
 mod service;
 mod service_error;
@@ -135,6 +137,14 @@ pub use auth::{
 };
 pub use client::ResponsesClient;
 pub use error::{ResponsesError, RetryAdvice};
+pub use event_data::{
+    AgentEventData, AssistantDelta, AssistantEvent, AssistantMessage, CompactionCompleted,
+    CompactionFailed, CompactionStarted, ContextEvent, EventUsage, ModelCallCompleted,
+    ModelCallFailed, ModelCallStarted, ModelEvent, ModelWarmupCompleted, ModelWarmupFailed,
+    ModelWarmupStarted, OpenAiEvent, ReasoningEvent, ReasoningSummaryDelta, RunError, RunEvent,
+    RunMetrics, RunStarted, RunStatus, RunSteered, RunTerminal, ToolCall, ToolEvent,
+    ToolResultEvent, ToolStatus, TransportEvent,
+};
 #[doc(hidden)]
 pub use events::{
     AgentEvent, AgentEventKind, AgentEventTiming, AgentEvents, EventError, EventSink,
@@ -144,6 +154,10 @@ pub use middleware::{DefaultResponsesService, ResponsesRetryPolicy};
 pub use openai::{
     CallerServiceFactory, LayeredServiceFactory, MakeResponsesService, OpenAi, OpenAiBuilder,
     OpenAiError, StandardServiceFactory,
+};
+pub use pricing::{
+    CostStatus, EstimatedUsdCost, PricingError, PricingSnapshot, TokenRates, UsdAmount,
+    UsdParseError, UsdPerMillionTokens,
 };
 pub use responses::{
     AgentMessageContent, ContentItem, CustomToolFormat, FunctionOutputBody, FunctionOutputContent,
@@ -374,6 +388,8 @@ pub struct ModelConfig {
     pub api_base_url: String,
     /// Immutable harness system prompt serialized before session instructions.
     pub system_prompt: Arc<str>,
+    /// Optional application-supplied pricing used only for cost projection.
+    pub pricing: Option<Arc<PricingSnapshot>>,
 }
 
 impl ModelConfig {
@@ -409,6 +425,7 @@ impl Default for ModelConfig {
             websocket_url: "wss://api.openai.com/v1/responses".to_owned(),
             api_base_url: "https://api.openai.com/v1".to_owned(),
             system_prompt: SYSTEM_PROMPT.into(),
+            pricing: None,
         }
     }
 }

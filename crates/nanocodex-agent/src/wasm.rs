@@ -9,7 +9,8 @@ use nanocodex_oai_api::{
     DefaultResponsesService, ResponsesClient, ResponsesService, TransportStats,
 };
 use nanocodex_oai_api::{
-    EventSink, ModelConfig, Prompt, ReasoningMode, ResponseItem, Thinking, UserInput,
+    EventSink, ModelConfig, PricingSnapshot, Prompt, ReasoningMode, ResponseItem, Thinking,
+    UserInput,
 };
 use nanocodex_tools::Tools;
 use serde::Deserialize;
@@ -57,6 +58,8 @@ struct WasmConfig {
     workspace: Option<String>,
     #[serde(default)]
     resume: Option<SessionSnapshot>,
+    #[serde(default)]
+    pricing: Option<PricingSnapshot>,
 }
 
 #[derive(Clone)]
@@ -179,6 +182,7 @@ impl WasmNanocodex {
             system_prompt: config
                 .instructions
                 .map_or_else(|| ModelConfig::default().system_prompt, Arc::from),
+            pricing: config.pricing.map(Arc::new),
         });
         let configured_workspace = config.workspace.map(Arc::<str>::from);
         let (lineage_id, prompt_cache_key, initial_resume, workspace) =

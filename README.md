@@ -124,6 +124,54 @@ The agent owns policy: its tool loop, `AGENTS.md` discovery, compaction timing,
 workspace behavior, cancellation, and branching. It does not expose response
 IDs, socket tasks, queue capacities, or mutable conversation internals.
 
+### Usage, cost, and events
+
+Every completed turn reports exact aggregate token counts. USD is estimated
+only when the application supplies an immutable pricing snapshot; Nanocodex
+does not guess an account's rates:
+
+```rust,ignore
+use nanocodex::{
+    Nanocodex, OpenAi, PricingSnapshot, TokenRates, UsdPerMillionTokens,
+};
+
+let pricing = PricingSnapshot::new(
+    "team-contract-2026-q3",
+    "https://billing.example.com/openai/2026-q3",
+    "2026-07-01",
+    TokenRates {
+        input: "1.25".parse::<UsdPerMillionTokens>()?,
+        cached_input: "0.125".parse::<UsdPerMillionTokens>()?,
+        cache_write_input: "1.25".parse::<UsdPerMillionTokens>()?,
+        output: "10.00".parse::<UsdPerMillionTokens>()?,
+    },
+)?;
+let openai = OpenAi::new(std::env::var("OPENAI_API_KEY")?)?;
+let (agent, _events) = Nanocodex::builder(openai)
+    .instructions("Answer concisely and preserve exact identifiers.")
+    .pricing(pricing)
+    .build()?;
+
+let result = agent.prompt("Explain the identifier req_7f3.").await?.await?;
+println!("{} tokens", result.usage().total_tokens());
+if let Some(cost) = result.usage().estimated_cost() {
+    println!("estimated {} using {}", cost.amount(), cost.pricing().id());
+} else {
+    println!("cost unavailable: {}", result.usage().cost_status().as_str());
+}
+```
+
+The exact estimate and its source/effective date also appear in the terminal
+typed event, JSONL adapter, tracing spans, CLI, and language bindings.
+`CostStatus` distinguishes unconfigured pricing from provider responses that
+omit usage, so missing accounting data is never reported as a zero-dollar turn.
+`AgentEvent::data()` exposes normalized run, assistant, reasoning, tool, model,
+and compaction events. The original raw payload remains available for a
+lossless OpenAI and transport firehose.
+
+The CLI accepts the same serialized snapshot with
+`--pricing-file pricing.json` or `NANOCODEX_PRICING_FILE`.
+
 ## The Responses API without the agent
 
 `nanocodex-oai-api` is the lower-level, Tower-native OpenAI client. Its managed
@@ -240,7 +288,8 @@ Hard contracts include:
   history;
 - retry reuses replayable owned state and cannot duplicate a partial side
   effect;
-- event and stream buffers are bounded;
+- event fanout shares raw payloads, preserves lossless monotonic order, and
+  skips serialization as soon as every receiver is dropped;
 - VM images are prepared once and attempts start from cheap immutable
   snapshots or reflinks;
 - browser and eval hot paths never rebuild unchanged images; and

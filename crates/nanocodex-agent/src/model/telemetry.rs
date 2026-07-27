@@ -3,7 +3,7 @@ use std::time::Duration;
 #[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
 
-use nanocodex_oai_api::{ModelConfig, Thinking, Usage};
+use nanocodex_oai_api::{ModelConfig, PricingSnapshot, Thinking, Usage};
 use serde::Serialize;
 use serde_json::value::RawValue;
 use web_time::Instant;
@@ -13,8 +13,6 @@ use crate::NanocodexError;
 use crate::Result;
 use nanocodex_oai_api::TransportStatsDelta;
 use nanocodex_tools::ToolOutputBody;
-
-const COST_STATUS: &str = "not_reported_by_responses_api";
 
 #[derive(Serialize)]
 pub(super) struct ModelCallStarted<'a> {
@@ -139,10 +137,13 @@ pub(super) struct UsageTotals {
     pub(super) output_tokens: u64,
     pub(super) reasoning_output_tokens: u64,
     pub(super) total_tokens: u64,
+    #[serde(skip)]
+    pub(super) reported: bool,
 }
 
 impl UsageTotals {
     pub(super) fn add(&mut self, usage: &Usage) {
+        self.reported = true;
         self.input_tokens += usage.input_tokens;
         self.cached_input_tokens += usage
             .input_tokens_details
@@ -192,14 +193,21 @@ impl RunStats {
         self.retry_backoff_duration_ns = delta.retry_backoff_duration_ns;
     }
 
-    pub(super) fn turn_usage(&self) -> crate::TurnUsage {
+    pub(super) fn turn_usage(&self, pricing: Option<&PricingSnapshot>) -> crate::TurnUsage {
         crate::TurnUsage::from_counts(
-            self.usage.input_tokens + self.warmup_usage.input_tokens,
-            self.usage.cached_input_tokens + self.warmup_usage.cached_input_tokens,
-            self.usage.cache_write_input_tokens + self.warmup_usage.cache_write_input_tokens,
-            self.usage.output_tokens + self.warmup_usage.output_tokens,
-            self.usage.reasoning_output_tokens + self.warmup_usage.reasoning_output_tokens,
-            self.usage.total_tokens + self.warmup_usage.total_tokens,
+            crate::usage::TurnUsageCounts {
+                input_tokens: self.usage.input_tokens + self.warmup_usage.input_tokens,
+                cached_input_tokens: self.usage.cached_input_tokens
+                    + self.warmup_usage.cached_input_tokens,
+                cache_write_input_tokens: self.usage.cache_write_input_tokens
+                    + self.warmup_usage.cache_write_input_tokens,
+                output_tokens: self.usage.output_tokens + self.warmup_usage.output_tokens,
+                reasoning_output_tokens: self.usage.reasoning_output_tokens
+                    + self.warmup_usage.reasoning_output_tokens,
+                total_tokens: self.usage.total_tokens + self.warmup_usage.total_tokens,
+                reported: self.usage.reported || self.warmup_usage.reported,
+            },
+            pricing,
         )
     }
 }
@@ -238,6 +246,7 @@ pub(super) fn terminal_payload<'a>(
     config: &'a ModelConfig,
     thinking: Thinking,
     stats: &'a RunStats,
+    usage: &'a crate::TurnUsage,
 ) -> TerminalPayload<'a> {
     TerminalPayload {
         status: terminal_status,
@@ -249,8 +258,9 @@ pub(super) fn terminal_payload<'a>(
         duration_ms: duration_ms(elapsed),
         duration_ns: duration_ns(elapsed),
         stats,
-        cost_usd: None,
-        cost_status: COST_STATUS,
+        estimated_cost: usage.estimated_cost(),
+        cost_usd: usage.estimated_cost().map(|cost| cost.amount().as_f64()),
+        cost_status: usage.cost_status(),
     }
 }
 
@@ -290,8 +300,10 @@ pub(super) struct TerminalPayload<'a> {
     duration_ns: u64,
     #[serde(flatten)]
     stats: &'a RunStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    estimated_cost: Option<&'a nanocodex_oai_api::EstimatedUsdCost>,
     cost_usd: Option<f64>,
-    cost_status: &'static str,
+    cost_status: nanocodex_oai_api::CostStatus,
 }
 
 fn duration_ms(duration: Duration) -> u64 {

@@ -431,6 +431,7 @@ where
             next_logical_turn: 1,
             thinking: config.thinking,
             fast_mode: config.fast_mode,
+            pricing: config.pricing,
             transport_stats: Arc::new(TransportStats::default()),
         })
     }
@@ -460,6 +461,7 @@ pub struct Session<S> {
     next_logical_turn: u64,
     thinking: Thinking,
     fast_mode: bool,
+    pricing: Option<Arc<crate::PricingSnapshot>>,
     transport_stats: Arc<TransportStats>,
 }
 
@@ -651,6 +653,8 @@ pub struct CompletedResponse {
     output: Arc<[ResponseItem]>,
     output_text: Arc<str>,
     usage: Option<Usage>,
+    estimated_cost: Option<crate::EstimatedUsdCost>,
+    cost_status: crate::CostStatus,
     end_turn: Option<bool>,
     checkpoint: ResponseCheckpoint,
 }
@@ -685,6 +689,21 @@ impl CompletedResponse {
     #[must_use]
     pub const fn usage(&self) -> Option<&Usage> {
         self.usage.as_ref()
+    }
+
+    /// Returns the local USD estimate when the client configured pricing.
+    ///
+    /// The estimate retains the exact rates, source, and effective date used.
+    /// `None` means pricing was not configured or the provider omitted usage.
+    #[must_use]
+    pub const fn estimated_cost(&self) -> Option<&crate::EstimatedUsdCost> {
+        self.estimated_cost.as_ref()
+    }
+
+    /// Returns why an estimate is present or unavailable.
+    #[must_use]
+    pub const fn cost_status(&self) -> crate::CostStatus {
+        self.cost_status
     }
 
     /// Returns whether the model affirmatively ended its logical turn.
@@ -732,6 +751,8 @@ impl fmt::Debug for ResponseCheckpoint {
 #[derive(Clone)]
 pub struct CompletedCompaction {
     usage: Option<Usage>,
+    estimated_cost: Option<crate::EstimatedUsdCost>,
+    cost_status: crate::CostStatus,
     checkpoint: ResponseCheckpoint,
 }
 
@@ -740,6 +761,18 @@ impl CompletedCompaction {
     #[must_use]
     pub const fn usage(&self) -> Option<&Usage> {
         self.usage.as_ref()
+    }
+
+    /// Returns the local USD estimate when pricing and usage were available.
+    #[must_use]
+    pub const fn estimated_cost(&self) -> Option<&crate::EstimatedUsdCost> {
+        self.estimated_cost.as_ref()
+    }
+
+    /// Returns why an estimate is present or unavailable.
+    #[must_use]
+    pub const fn cost_status(&self) -> crate::CostStatus {
+        self.cost_status
     }
 
     /// Returns the opaque completed client-owned checkpoint.
@@ -1045,10 +1078,14 @@ where
         .final_message
         .unwrap_or_else(|| output_text(&output))
         .into();
+    let (estimated_cost, cost_status) =
+        estimate_cost(session.pricing.as_deref(), response.usage.as_ref());
     Ok(CompletedResponse {
         output,
         output_text,
         usage: response.usage,
+        estimated_cost,
+        cost_status,
         end_turn: response.end_turn,
         checkpoint: session.checkpoint(),
     })
@@ -1097,10 +1134,28 @@ where
     candidate.install_compaction(response.item, [], session.profile.prefix());
     session.state = candidate;
 
+    let (estimated_cost, cost_status) =
+        estimate_cost(session.pricing.as_deref(), response.usage.as_ref());
     Ok(CompletedCompaction {
         usage: response.usage,
+        estimated_cost,
+        cost_status,
         checkpoint: session.checkpoint(),
     })
+}
+
+fn estimate_cost(
+    pricing: Option<&crate::PricingSnapshot>,
+    usage: Option<&Usage>,
+) -> (Option<crate::EstimatedUsdCost>, crate::CostStatus) {
+    match (pricing, usage) {
+        (Some(pricing), Some(usage)) => (
+            Some(pricing.estimate(usage)),
+            crate::CostStatus::EstimatedFromUsage,
+        ),
+        (Some(_), None) => (None, crate::CostStatus::UsageNotReported),
+        (None, _) => (None, crate::CostStatus::PricingNotConfigured),
+    }
 }
 
 impl<S> Session<S> {
@@ -1170,7 +1225,7 @@ mod tests {
 
     use crate::{
         CompactionOutput, ContentItem, GenerationOutput, MessageRole, ResponsePipelineStats,
-        ResponsesAttemptKind, ResponsesOutput, ResponsesServiceResponse, SessionId,
+        ResponsesAttemptKind, ResponsesOutput, ResponsesServiceResponse, SessionId, TokenRates,
     };
 
     use super::{OpenAi, ResponseError, ResponseEvent};
@@ -1236,6 +1291,20 @@ mod tests {
         let calls = Arc::new(AtomicU32::new(0));
         let factory_calls = Arc::clone(&calls);
         let openai = OpenAi::builder("test-key")
+            .pricing(
+                crate::PricingSnapshot::new(
+                    "test-contract",
+                    "test-fixture",
+                    "2026-07-01",
+                    TokenRates {
+                        input: "1".parse().unwrap(),
+                        cached_input: "0.1".parse().unwrap(),
+                        cache_write_input: "1".parse().unwrap(),
+                        output: "10".parse().unwrap(),
+                    },
+                )
+                .unwrap(),
+            )
             .service(move || Scripted {
                 calls: Arc::clone(&factory_calls),
             })
@@ -1258,9 +1327,42 @@ mod tests {
         };
 
         assert_eq!(completed.output_text(), "answer-1");
+        let estimated_cost = completed
+            .estimated_cost()
+            .expect("configured pricing and usage should produce an estimate");
+        assert_eq!(estimated_cost.amount().decimal(), "0.000062");
+        assert_eq!(estimated_cost.pricing().id(), "test-contract");
+        assert_eq!(
+            completed.cost_status(),
+            crate::CostStatus::EstimatedFromUsage
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(session.history_len(), 2);
         assert_eq!(session.active_context_tokens(), 17);
+    }
+
+    #[test]
+    fn missing_usage_never_becomes_a_zero_cost_estimate() {
+        let pricing = crate::PricingSnapshot::new(
+            "test-contract",
+            "test-fixture",
+            "2026-07-01",
+            TokenRates {
+                input: "1".parse().unwrap(),
+                cached_input: "0.1".parse().unwrap(),
+                cache_write_input: "1".parse().unwrap(),
+                output: "10".parse().unwrap(),
+            },
+        )
+        .unwrap();
+
+        let (estimate, status) = super::estimate_cost(Some(&pricing), None);
+        assert!(estimate.is_none());
+        assert_eq!(status, crate::CostStatus::UsageNotReported);
+
+        let (estimate, status) = super::estimate_cost(None, None);
+        assert!(estimate.is_none());
+        assert_eq!(status, crate::CostStatus::PricingNotConfigured);
     }
 
     #[derive(Debug)]

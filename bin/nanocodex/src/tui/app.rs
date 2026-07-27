@@ -5,7 +5,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nanocodex::{AgentEvent, AgentEventKind, Prompt, RolloutTranscriptItem, Thinking, UserInput};
+use nanocodex::{
+    AgentEvent, AgentEventData, AgentEventKind, AssistantEvent, Prompt, ReasoningEvent,
+    RolloutTranscriptItem, RunEvent, RunStatus, Thinking, UserInput,
+};
 use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
@@ -209,6 +212,7 @@ pub(super) struct Conversation {
     pub(super) pending_turns: usize,
     pub(super) running: bool,
     pub(super) status: String,
+    pub(super) last_cost_usd: Option<String>,
     pub(super) scroll_from_bottom: usize,
     pub(super) has_unseen_output: bool,
     smooth_scroll_from_bottom: usize,
@@ -241,6 +245,7 @@ impl Conversation {
             pending_turns: 0,
             running: false,
             status: status.into(),
+            last_cost_usd: None,
             scroll_from_bottom: 0,
             has_unseen_output: false,
             smooth_scroll_from_bottom: 0,
@@ -363,6 +368,7 @@ impl Conversation {
                     self.transcript.push_editable_user(prompt, prompt_id);
                 }
                 self.running = true;
+                self.last_cost_usd = None;
                 self.run_generation = self.run_generation.saturating_add(1);
                 self.streamed_this_turn = false;
                 self.pending_run_error = None;
@@ -380,12 +386,15 @@ impl Conversation {
                 "Steer applied".clone_into(&mut self.status);
             }
             AgentEventKind::AssistantDelta => {
-                if let Ok(payload) = event.decode_payload::<TextPayload>() {
+                if let Ok(AgentEventData::Assistant(AssistantEvent::Delta(payload))) = event.data()
+                {
                     self.push_assistant_delta(&payload.text);
                 }
             }
             AgentEventKind::AssistantMessage => {
-                if let Ok(payload) = event.decode_payload::<TextPayload>() {
+                if let Ok(AgentEventData::Assistant(AssistantEvent::Message(payload))) =
+                    event.data()
+                {
                     if self.streamed_this_turn {
                         self.note_tail_will_change();
                     } else {
@@ -395,7 +404,9 @@ impl Conversation {
                 }
             }
             AgentEventKind::ReasoningSummaryDelta => {
-                if let Ok(payload) = event.decode_payload::<TextPayload>() {
+                if let Ok(AgentEventData::Reasoning(ReasoningEvent::SummaryDelta(payload))) =
+                    event.data()
+                {
                     self.push_reasoning_delta(&payload.text);
                     "Thinking...".clone_into(&mut self.status);
                 }
@@ -407,11 +418,12 @@ impl Conversation {
                 return self.on_tool_result(event);
             }
             AgentEventKind::RunError => {
-                if let Ok(payload) = event.decode_payload::<ErrorPayload>() {
+                if let Ok(AgentEventData::Run(RunEvent::Error(payload))) = event.data() {
                     self.pending_run_error = Some(payload.message);
                 }
             }
             AgentEventKind::RunCompleted => {
+                self.capture_terminal_cost(event);
                 if let Some(error) = self.pending_run_error.take() {
                     self.push_output(TranscriptItem::Error(error));
                 }
@@ -664,13 +676,21 @@ impl Conversation {
     }
 
     fn run_failed(&mut self, event: &AgentEvent) {
+        self.capture_terminal_cost(event);
         self.running = false;
         self.run_started_at = None;
         self.pending_code_execs.clear();
         self.reconcile_applied_steers();
-        let cancelled = event
-            .decode_payload::<TerminalPayload>()
-            .is_ok_and(|payload| payload.status == "cancelled");
+        let cancelled = event.data().map_or_else(
+            |_| {
+                event
+                    .decode_payload::<TerminalStatusPayload>()
+                    .is_ok_and(|payload| payload.status == RunStatus::Cancelled)
+            },
+            |data| {
+                matches!(data, AgentEventData::Run(RunEvent::Failed(payload)) if payload.status == RunStatus::Cancelled)
+            },
+        );
         if cancelled {
             self.pending_run_error = None;
             "Cancelled".clone_into(&mut self.status);
@@ -680,6 +700,15 @@ impl Conversation {
             }
             "Turn failed".clone_into(&mut self.status);
         }
+    }
+
+    fn capture_terminal_cost(&mut self, event: &AgentEvent) {
+        self.last_cost_usd = event.data().ok().and_then(|data| match data {
+            AgentEventData::Run(RunEvent::Completed(payload) | RunEvent::Failed(payload)) => {
+                payload.estimated_cost.map(|cost| cost.amount().decimal())
+            }
+            _ => None,
+        });
     }
 
     fn reconcile_applied_steers(&mut self) -> usize {
@@ -2754,18 +2783,8 @@ fn normalize_pasted_path(pasted: &str) -> Option<PathBuf> {
 }
 
 #[derive(Deserialize)]
-struct TextPayload {
-    text: String,
-}
-
-#[derive(Deserialize)]
-struct ErrorPayload {
-    message: String,
-}
-
-#[derive(Deserialize)]
-struct TerminalPayload {
-    status: String,
+struct TerminalStatusPayload {
+    status: RunStatus,
 }
 
 #[derive(Deserialize)]

@@ -663,6 +663,8 @@ where
         let message = error.to_string();
         self.events
             .emit(AgentEventKind::RunError, RunError { message: &message })?;
+        let usage = self.stats.turn_usage(self.config.pricing.as_deref());
+        record_turn_usage(&tracing::Span::current(), &usage);
         self.events.emit(
             AgentEventKind::RunFailed,
             terminal_payload(
@@ -671,6 +673,7 @@ where
                 &self.config,
                 self.thinking,
                 &self.stats,
+                &usage,
             ),
         )?;
         Ok(())
@@ -715,6 +718,8 @@ where
             Ok(ModelTaskOutcome::Completed(message)) => {
                 self.stats
                     .apply_transport(self.transport_stats.since(transport_before));
+                let usage = self.stats.turn_usage(self.config.pricing.as_deref());
+                record_turn_usage(&tracing::Span::current(), &usage);
                 self.events.emit(
                     AgentEventKind::RunCompleted,
                     terminal_payload(
@@ -723,12 +728,13 @@ where
                         &self.config,
                         self.thinking,
                         &self.stats,
+                        &usage,
                     ),
                 )?;
                 let checkpoint = self.commit_checkpoint()?;
                 Ok(ModelTurnOutcome::Completed(CompletedModelTurn {
                     final_message: message,
-                    usage: self.stats.turn_usage(),
+                    usage,
                     checkpoint,
                 }))
             }
@@ -744,6 +750,8 @@ where
                     .emit(AgentEventKind::RunError, RunError { message: &message })?;
                 self.stats
                     .apply_transport(self.transport_stats.since(transport_before));
+                let usage = self.stats.turn_usage(self.config.pricing.as_deref());
+                record_turn_usage(&tracing::Span::current(), &usage);
                 self.events.emit(
                     AgentEventKind::RunFailed,
                     terminal_payload(
@@ -752,6 +760,7 @@ where
                         &self.config,
                         self.thinking,
                         &self.stats,
+                        &usage,
                     ),
                 )?;
                 Ok(ModelTurnOutcome::Cancelled(checkpoint))
@@ -762,9 +771,18 @@ where
                     .emit(AgentEventKind::RunError, RunError { message: &message })?;
                 self.stats
                     .apply_transport(self.transport_stats.since(transport_before));
+                let usage = self.stats.turn_usage(self.config.pricing.as_deref());
+                record_turn_usage(&tracing::Span::current(), &usage);
                 self.events.emit(
                     AgentEventKind::RunFailed,
-                    terminal_payload("failed", elapsed, &self.config, self.thinking, &self.stats),
+                    terminal_payload(
+                        "failed",
+                        elapsed,
+                        &self.config,
+                        self.thinking,
+                        &self.stats,
+                        &usage,
+                    ),
                 )?;
                 Err(error)
             }
@@ -1291,17 +1309,7 @@ where
                 prompt_cache_key: factory.profile().prompt_cache_key(),
             },
         )?;
-        let span = info_span!(
-            target: "nanocodex",
-            "model.warmup",
-            otel.kind = "internal",
-            otel.status_code = tracing::field::Empty,
-            model = MODEL,
-            system_prompt.bytes = self.config.system_prompt().len(),
-            warmup.source = tracing::field::Empty,
-            status = tracing::field::Empty,
-            duration_ns = tracing::field::Empty,
-        );
+        let span = warmup_span(&self.config);
         if let Some(content) = serialize_trace_content(factory.profile().prefix()) {
             record_span_content(&span, "model.input", &content);
         }
@@ -1351,6 +1359,9 @@ where
                 (None, "shared_prefix", None, None, None, false)
             };
         span.record("warmup.source", source);
+        if let Some(usage) = &usage {
+            record_usage(&span, usage, self.config.pricing.as_deref());
+        }
         span.record("status", "completed");
         span.record("otel.status_code", "OK");
         span.record("duration_ns", duration_ns);
@@ -1482,15 +1493,7 @@ where
         span.record("otel.status_code", "OK");
         span.record("duration_ns", duration_ns);
         if let Some(usage) = &response.usage {
-            span.record("input_tokens", usage.input_tokens);
-            span.record(
-                "cached_input_tokens",
-                usage
-                    .input_tokens_details
-                    .as_ref()
-                    .map_or(0, |details| details.cached_tokens),
-            );
-            span.record("output_tokens", usage.output_tokens);
+            record_usage(&span, usage, self.config.pricing.as_deref());
         }
         self.stats.model_duration_ns += duration_ns;
         if let Some(usage) = &response.usage {
@@ -1555,18 +1558,7 @@ where
             self.fast_mode,
         );
         let (input_item_count, input_bytes, input_content) = trace_model_input(&request);
-        let span = info_span!(
-            target: "nanocodex",
-            "model.compaction",
-            otel.kind = "internal",
-            otel.status_code = tracing::field::Empty,
-            after_model_call_index,
-            model.input.item_count = input_item_count,
-            model.input.bytes = input_bytes,
-            model.response.id = tracing::field::Empty,
-            status = tracing::field::Empty,
-            duration_ns = tracing::field::Empty,
-        );
+        let span = compaction_span(after_model_call_index, input_item_count, input_bytes);
         if let Some(input_content) = &input_content {
             record_span_content(&span, "model.input", input_content);
         }
@@ -1599,6 +1591,7 @@ where
         span.record("duration_ns", duration_ns);
         self.stats.model_duration_ns += duration_ns;
         if let Some(usage) = &response.usage {
+            record_usage(&span, usage, self.config.pricing.as_deref());
             self.stats.usage.add(usage);
         }
         self.stats.last_response_id = Some(response.id.clone());
@@ -1787,7 +1780,13 @@ fn model_call_span(
         duration_ns = tracing::field::Empty,
         input_tokens = tracing::field::Empty,
         cached_input_tokens = tracing::field::Empty,
+        cache_write_input_tokens = tracing::field::Empty,
         output_tokens = tracing::field::Empty,
+        reasoning_output_tokens = tracing::field::Empty,
+        total_tokens = tracing::field::Empty,
+        cost.usd = tracing::field::Empty,
+        pricing.id = tracing::field::Empty,
+        pricing.effective_date = tracing::field::Empty,
         reasoning.summary_count = tracing::field::Empty,
         time_to_first_event_ns = tracing::field::Empty,
         time_to_first_output_ns = tracing::field::Empty,
@@ -1796,6 +1795,112 @@ fn model_call_span(
         stream.inter_delta_gap.max_ns = tracing::field::Empty,
         stream.inter_delta_stall_100ms.count = tracing::field::Empty,
     )
+}
+
+fn warmup_span(config: &ModelConfig) -> tracing::Span {
+    info_span!(
+        target: "nanocodex",
+        "model.warmup",
+        otel.kind = "internal",
+        otel.status_code = tracing::field::Empty,
+        model = MODEL,
+        system_prompt.bytes = config.system_prompt().len(),
+        warmup.source = tracing::field::Empty,
+        status = tracing::field::Empty,
+        duration_ns = tracing::field::Empty,
+        input_tokens = tracing::field::Empty,
+        cached_input_tokens = tracing::field::Empty,
+        cache_write_input_tokens = tracing::field::Empty,
+        output_tokens = tracing::field::Empty,
+        reasoning_output_tokens = tracing::field::Empty,
+        total_tokens = tracing::field::Empty,
+        cost.usd = tracing::field::Empty,
+        pricing.id = tracing::field::Empty,
+        pricing.effective_date = tracing::field::Empty,
+    )
+}
+
+fn compaction_span(
+    after_model_call_index: u32,
+    input_item_count: usize,
+    input_bytes: usize,
+) -> tracing::Span {
+    info_span!(
+        target: "nanocodex",
+        "model.compaction",
+        otel.kind = "internal",
+        otel.status_code = tracing::field::Empty,
+        after_model_call_index,
+        model.input.item_count = input_item_count,
+        model.input.bytes = input_bytes,
+        model.response.id = tracing::field::Empty,
+        status = tracing::field::Empty,
+        duration_ns = tracing::field::Empty,
+        input_tokens = tracing::field::Empty,
+        cached_input_tokens = tracing::field::Empty,
+        cache_write_input_tokens = tracing::field::Empty,
+        output_tokens = tracing::field::Empty,
+        reasoning_output_tokens = tracing::field::Empty,
+        total_tokens = tracing::field::Empty,
+        cost.usd = tracing::field::Empty,
+        pricing.id = tracing::field::Empty,
+        pricing.effective_date = tracing::field::Empty,
+    )
+}
+
+fn record_usage(
+    span: &tracing::Span,
+    usage: &Usage,
+    pricing: Option<&nanocodex_oai_api::PricingSnapshot>,
+) {
+    let cached_input_tokens = usage
+        .input_tokens_details
+        .as_ref()
+        .map_or(0, |details| details.cached_tokens);
+    let cache_write_input_tokens = usage
+        .input_tokens_details
+        .as_ref()
+        .map_or(0, |details| details.cache_write_tokens);
+    let reasoning_output_tokens = usage
+        .output_tokens_details
+        .as_ref()
+        .map_or(0, |details| details.reasoning_tokens);
+    span.record("input_tokens", usage.input_tokens);
+    span.record("cached_input_tokens", cached_input_tokens);
+    span.record("cache_write_input_tokens", cache_write_input_tokens);
+    span.record("output_tokens", usage.output_tokens);
+    span.record("reasoning_output_tokens", reasoning_output_tokens);
+    span.record("total_tokens", usage.total_tokens);
+    if let Some(pricing) = pricing {
+        let estimate = pricing.estimate(usage);
+        let amount = estimate.amount().decimal();
+        span.record("cost.usd", amount.as_str());
+        span.record("pricing.id", pricing.id());
+        span.record("pricing.effective_date", pricing.effective_date());
+    }
+}
+
+fn record_turn_usage(span: &tracing::Span, usage: &crate::TurnUsage) {
+    span.record("usage.input_tokens", usage.input_tokens());
+    span.record("usage.cached_input_tokens", usage.cached_input_tokens());
+    span.record(
+        "usage.cache_write_input_tokens",
+        usage.cache_write_input_tokens(),
+    );
+    span.record("usage.output_tokens", usage.output_tokens());
+    span.record(
+        "usage.reasoning_output_tokens",
+        usage.reasoning_output_tokens(),
+    );
+    span.record("usage.total_tokens", usage.total_tokens());
+    span.record("cost.status", usage.cost_status().as_str());
+    if let Some(cost) = usage.estimated_cost() {
+        let amount = cost.amount().decimal();
+        span.record("cost.usd", amount.as_str());
+        span.record("pricing.id", cost.pricing().id());
+        span.record("pricing.source", cost.pricing().source());
+        span.record("pricing.effective_date", cost.pricing().effective_date());
+    }
 }
 
 fn record_model_response(span: &tracing::Span, response: &TurnResult) {

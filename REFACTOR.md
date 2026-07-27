@@ -221,7 +221,8 @@ It exposes the exact input, cache-read, cache-write, output, and reasoning
 token counts plus a typed estimated USD cost when a versioned pricing snapshot
 is configured. The estimate's source and effective date remain attached through
 terminal events and eval results; unavailable pricing is explicit rather than
-serialized as a misleading zero.
+serialized as a misleading zero. `CostStatus` distinguishes
+`pricing_not_configured` from `usage_not_reported`.
 
 - `agent.clone()` targets the same driver, session, and command queue.
 - `AgentHandle::spawn()` creates a clean sibling from the same recipe.
@@ -599,7 +600,7 @@ rewrite old results under new crate names.
 | Healthy continuation | Work and wire history proportional to the new delta |
 | Reconnect | One explicit O(history) replay, no deep copy per retry |
 | Response aggregation | Bounded streaming buffers; one final materialization |
-| Event delivery | Bounded queues and monotonic ordering |
+| Event delivery | Lossless monotonic ordering, shared payloads, and no serialization after receiver drop |
 | Tool output | Bounded while produced, not after unbounded capture |
 | Process cancellation | Terminates process group and descendants |
 | VM attempt | Cheap snapshot/reflink; no unchanged image rebuild |
@@ -702,6 +703,15 @@ and all native and WASM consumers compile against the new owner.
 - Establish numeric baselines and budgets for the newly owning crates.
 - Add allocation/work-count checks for asymptotic contracts.
 - Publish one reproducible performance report for the refactored stack.
+
+Evidence: [`benchmarks/refactor_observability_baseline_2026-07-26.md`](benchmarks/refactor_observability_baseline_2026-07-26.md)
+records the retained 358-event projection and fixed-point pricing baselines.
+Retained raw `AgentEvent` records round-trip byte-for-byte, and generated JSONL
+preserves the master envelope and terminal fields while adding exact cost
+provenance. `AgentEvent::data()` adds a lazy typed domain view. One explicitly
+supplied `PricingSnapshot` produces the same exact `EstimatedUsdCost` through
+standalone OAI sessions, owned agent results, terminal events, root/model
+tracing spans, the CLI/TUI, PyO3, and Node/browser WASM.
 
 ### 6. VM and images
 

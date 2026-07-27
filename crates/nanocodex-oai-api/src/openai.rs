@@ -4,8 +4,8 @@ use tower::Layer;
 
 use crate::{
     DefaultResponsesService, ModelConfig, OpenAiAuth, OpenAiAuthError, OpenAiAuthMode,
-    ReasoningMode, ResponsesHistory, ResponsesRetryPolicy, ResponsesService, ResponsesTransport,
-    Thinking, session::SessionBuilder,
+    PricingSnapshot, ReasoningMode, ResponsesHistory, ResponsesRetryPolicy, ResponsesService,
+    ResponsesTransport, Thinking, session::SessionBuilder,
 };
 
 /// Configured, cloneable `OpenAI` client recipe.
@@ -129,6 +129,16 @@ impl<F> OpenAiBuilder<F> {
     #[must_use]
     pub const fn fast_mode(mut self, enabled: bool) -> Self {
         self.config.fast_mode = enabled;
+        self
+    }
+
+    /// Attaches an immutable pricing snapshot to usage returned by sessions.
+    ///
+    /// The snapshot affects only local cost estimates. It never changes a
+    /// provider request or claims that the Responses API reported a charge.
+    #[must_use]
+    pub fn pricing(mut self, pricing: PricingSnapshot) -> Self {
+        self.config.pricing = Some(Arc::new(pricing));
         self
     }
 

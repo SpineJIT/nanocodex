@@ -14,8 +14,36 @@ py/bindings/.venv/bin/python examples/python/follow_on.py
 `prompt()` only accepts the turn and returns a `Turn`; `Turn.result()` does the
 blocking wait while releasing Python's GIL. Once it completes, `Turn.usage()`
 returns exact aggregate input, cache-read, cache-write, output, reasoning, and
-total token counts as a dictionary. `AgentEvents.recv_json()` likewise
-releases the GIL, so applications can consume it from a normal Python thread.
+total token counts as a dictionary. Pass explicit immutable rates when that
+dictionary should also contain an exact USD estimate:
+
+```python
+import os
+
+from nanocodex import Nanocodex, PricingSnapshot
+
+pricing = PricingSnapshot(
+    "team-contract-2026-q3",
+    "https://billing.example.com/openai/2026-q3",
+    "2026-07-01",
+    input_usd_per_million="1.25",
+    cached_input_usd_per_million="0.125",
+    cache_write_input_usd_per_million="1.25",
+    output_usd_per_million="10.00",
+)
+agent, events = Nanocodex(os.environ["OPENAI_API_KEY"], pricing=pricing)
+turn = agent.prompt("Explain the identifier req_7f3.")
+turn.result()
+print(turn.usage()["estimated_cost"]["usd"])
+print(turn.usage()["cost_status"])
+```
+
+`cost_status` is `estimated_from_usage`, `pricing_not_configured`, or
+`usage_not_reported`; a missing provider usage record is never presented as
+zero cost.
+
+`AgentEvents.recv_json()` likewise releases the GIL, so applications can
+consume it from a normal Python thread.
 `agent.set_thinking("high")` changes the effort for subsequently accepted turns
 without replacing the session. `agent.set_fast_mode(True)` similarly enables
 priority service for subsequently accepted turns.

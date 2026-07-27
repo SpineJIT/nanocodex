@@ -22,6 +22,7 @@ export function create(options = {}) {
     reasoningMode,
     fastMode,
     instructions,
+    pricing,
     sessionId,
     resume,
     apiKey,
@@ -66,6 +67,7 @@ export function create(options = {}) {
     reasoningMode,
     fastMode,
     instructions,
+    pricing,
     sessionId,
     resume,
   });

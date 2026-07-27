@@ -60,8 +60,10 @@ pub mod observability {
 /// Common imports for the golden owned-agent path.
 pub mod prelude {
     pub use nanocodex_agent::{
-        AgentEvents, NanocodexError, OpenAi, OpenAiAuth, Prompt, ReasoningMode, SessionId,
-        SessionSnapshot, Thinking, TurnUsage,
+        AgentEventData, AgentEvents, AssistantEvent, ContextEvent, EstimatedUsdCost, ModelEvent,
+        NanocodexError, OpenAi, OpenAiAuth, PricingSnapshot, Prompt, ReasoningEvent, ReasoningMode,
+        RunEvent, SessionId, SessionSnapshot, Thinking, TokenRates, ToolEvent, TurnUsage,
+        UsdAmount, UsdPerMillionTokens,
     };
     #[cfg(not(target_family = "wasm"))]
     pub use nanocodex_agent::{Nanocodex, NanocodexBuilder, Turn, TurnControl, TurnResult};

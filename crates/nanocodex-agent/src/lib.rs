@@ -30,6 +30,38 @@
 //! tool, and process state. Cloning [`Nanocodex`] only clones its command
 //! capability; [`Nanocodex::spawn`] creates a clean sibling and
 //! [`Nanocodex::fork`] creates an independent branch from committed history.
+//!
+//! # Typed events
+//!
+//! [`AgentEvents`] is optional and independent from turn results. Its raw
+//! JSONL-compatible envelope remains lossless, while [`AgentEvent::data`]
+//! provides a normalized domain view:
+//!
+//! ```no_run
+//! use futures_util::StreamExt;
+//! use nanocodex_agent::{
+//!     AgentEventData, AssistantEvent, Nanocodex, OpenAi,
+//! };
+//!
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let openai = OpenAi::new(std::env::var("OPENAI_API_KEY")?)?;
+//! let (agent, mut events) = Nanocodex::builder(openai)
+//!     .instructions("Answer concisely and preserve exact identifiers.")
+//!     .build()?;
+//! let turn = agent.prompt("Explain the identifier req_7f3.").await?;
+//!
+//! while let Some(event) = events.next().await {
+//!     if let AgentEventData::Assistant(AssistantEvent::Delta(delta)) = event.data()? {
+//!         print!("{}", delta.text);
+//!     }
+//!     if event.kind.is_terminal() {
+//!         break;
+//!     }
+//! }
+//! let _result = turn.await?;
+//! # Ok(())
+//! # }
+//! ```
 
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 
@@ -64,17 +96,23 @@ pub use error::{NanocodexError, ResponsesError, Result};
 pub use nanocodex_oai_api::OpenAi;
 pub use nanocodex_oai_api::responses::RequestProfile;
 pub use nanocodex_oai_api::{
-    AgentEvent, AgentEventKind, AgentEventTiming, AgentEvents, AgentMessageContent, ContentItem,
-    CustomToolFormat, DefaultResponsesService, FunctionOutputBody, FunctionOutputContent,
-    ImageDetail, InternalMessageMetadata, ItemStatus, JsonSchema, JsonValue, LocalShellAction,
-    LocalShellExecAction, LocalShellStatus, MODEL, MessagePhase, MessageRole, OpenAiAuth,
-    OpenAiAuthError, OpenAiAuthMode, OpenAiError, OutputTextAnnotation, OutputTextLogprob,
-    OutputTextTopLogprob, Prompt, PromptInput, ReasoningContent, ReasoningMode, ReasoningSummary,
-    ResponseItem, ResponseItemId, ResponsesAttempt, ResponsesAttemptKind, ResponsesClient,
-    ResponsesHistory, ResponsesRetryPolicy, ResponsesService, ResponsesServiceError,
-    ResponsesServiceResponse, ResponsesTransport, SessionId, SessionIdError, Thinking,
-    TimedAgentEvent, ToolCaller, ToolDefinition, Usage, UserInput, WebSearchAction,
-    monotonic_now_ns,
+    AgentEvent, AgentEventData, AgentEventKind, AgentEventTiming, AgentEvents, AgentMessageContent,
+    AssistantDelta, AssistantEvent, AssistantMessage, CompactionCompleted, CompactionFailed,
+    CompactionStarted, ContentItem, ContextEvent, CostStatus, CustomToolFormat,
+    DefaultResponsesService, EstimatedUsdCost, EventUsage, FunctionOutputBody,
+    FunctionOutputContent, ImageDetail, InternalMessageMetadata, ItemStatus, JsonSchema, JsonValue,
+    LocalShellAction, LocalShellExecAction, LocalShellStatus, MODEL, MessagePhase, MessageRole,
+    ModelCallCompleted, ModelCallFailed, ModelCallStarted, ModelEvent, ModelWarmupCompleted,
+    ModelWarmupFailed, ModelWarmupStarted, OpenAiAuth, OpenAiAuthError, OpenAiAuthMode,
+    OpenAiError, OpenAiEvent, OutputTextAnnotation, OutputTextLogprob, OutputTextTopLogprob,
+    PricingError, PricingSnapshot, Prompt, PromptInput, ReasoningContent, ReasoningEvent,
+    ReasoningMode, ReasoningSummary, ReasoningSummaryDelta, ResponseItem, ResponseItemId,
+    ResponsesAttempt, ResponsesAttemptKind, ResponsesClient, ResponsesHistory,
+    ResponsesRetryPolicy, ResponsesService, ResponsesServiceError, ResponsesServiceResponse,
+    ResponsesTransport, RunError, RunEvent, RunMetrics, RunStarted, RunStatus, RunSteered,
+    RunTerminal, SessionId, SessionIdError, Thinking, TimedAgentEvent, TokenRates, ToolCall,
+    ToolCaller, ToolDefinition, ToolEvent, ToolResultEvent, ToolStatus, TransportEvent, Usage,
+    UsdAmount, UsdParseError, UsdPerMillionTokens, UserInput, WebSearchAction, monotonic_now_ns,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use nanocodex_tools::tool;

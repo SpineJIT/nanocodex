@@ -18,12 +18,41 @@ export type AgentEvent = {
 
 export type AgentOptions = {
   instructions?: string | undefined;
+  pricing?: PricingSnapshot | undefined;
   reasoningMode?: ReasoningMode | undefined;
   fastMode?: boolean | undefined;
   sessionId?: string | undefined;
   thinking?: Thinking | undefined;
   resume?: SessionSnapshot | undefined;
 };
+
+export type PricingSnapshot = Readonly<{
+  id: string;
+  source: string;
+  effective_date: string;
+  model: "gpt-5.6-sol";
+  rates: Readonly<{
+    input_usd_per_million: string;
+    cached_input_usd_per_million: string;
+    cache_write_input_usd_per_million: string;
+    output_usd_per_million: string;
+  }>;
+}>;
+
+export type EstimatedUsdCost = Readonly<{
+  usd: string;
+  input_usd: string;
+  cached_input_usd: string;
+  cache_write_input_usd: string;
+  output_usd: string;
+  pricing: PricingSnapshot;
+}>;
+
+export type CostStatus =
+  | "estimated_from_usage"
+  | "pricing_not_configured"
+  | "usage_not_reported"
+  | "other";
 
 export type SessionSnapshot = Readonly<{
   version: number;
@@ -43,6 +72,8 @@ export type TurnUsage = Readonly<{
   output_tokens: number;
   reasoning_output_tokens: number;
   total_tokens: number;
+  estimated_cost: EstimatedUsdCost | null;
+  cost_status: CostStatus;
 }>;
 
 export type ForkOptions = { at?: Turn | undefined };

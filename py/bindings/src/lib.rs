@@ -1,17 +1,16 @@
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use nanocodex::{
-    AgentEvents as RustAgentEvents, Nanocodex as RustNanocodex, OpenAiAuth, ReasoningMode,
-    Thinking, TurnControl as RustTurnControl, TurnResult as RustTurnResult, load_chatgpt_auth,
+    AgentEvents as RustAgentEvents, Nanocodex as RustNanocodex, OpenAiAuth,
+    PricingSnapshot as RustPricingSnapshot, ReasoningMode, Thinking, TokenRates,
+    TurnControl as RustTurnControl, TurnResult as RustTurnResult, UsdPerMillionTokens,
+    load_chatgpt_auth,
 };
 use pyo3::{
     Bound, PyResult, Python,
     exceptions::{PyRuntimeError, PyValueError},
-    prelude::{PyModule, pyclass, pymethods, pymodule},
-    types::PyModuleMethods,
+    prelude::{Py, PyModule, PyRef, pyclass, pymethods, pymodule},
+    types::{PyDict, PyDictMethods, PyModuleMethods},
 };
 use tokio::runtime::Runtime;
 
@@ -24,7 +23,11 @@ struct Nanocodex {
 #[pymethods]
 impl Nanocodex {
     #[new]
-    #[pyo3(signature = (api_key = None, *, auth_file = None, thinking = "high", reasoning_mode = "standard", fast_mode = false, workspace = None, instructions = None))]
+    #[pyo3(signature = (api_key = None, *, auth_file = None, thinking = "high", reasoning_mode = "standard", fast_mode = false, workspace = None, instructions = None, pricing = None))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "PyO3 exposes one flat keyword-only options surface"
+    )]
     fn new(
         api_key: Option<String>,
         auth_file: Option<String>,
@@ -33,6 +36,7 @@ impl Nanocodex {
         fast_mode: bool,
         workspace: Option<String>,
         instructions: Option<String>,
+        pricing: Option<PyRef<'_, PricingSnapshot>>,
     ) -> PyResult<(Self, AgentEvents)> {
         let auth = match (api_key, auth_file) {
             (Some(api_key), None) => OpenAiAuth::api_key(api_key),
@@ -48,6 +52,7 @@ impl Nanocodex {
         };
         let thinking = parse_thinking(thinking)?;
         let reasoning_mode = parse_reasoning_mode(reasoning_mode)?;
+        let pricing = pricing.map(|pricing| pricing.inner.clone());
         let runtime = build_runtime()?;
         let (agent, events) = runtime
             .block_on(async move {
@@ -60,6 +65,9 @@ impl Nanocodex {
                 }
                 if let Some(instructions) = instructions {
                     builder = builder.instructions(instructions);
+                }
+                if let Some(pricing) = pricing {
+                    builder = builder.pricing(pricing);
                 }
                 builder.build()
             })
@@ -222,7 +230,7 @@ impl Turn {
     }
 
     /// Return exact aggregate token usage for this completed logical turn.
-    fn usage(&self) -> PyResult<BTreeMap<&'static str, u64>> {
+    fn usage(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let state = self.state.lock().map_err(lock_error)?;
         let result = match &*state {
             TurnState::Completed(result) => result,
@@ -238,14 +246,59 @@ impl Turn {
             }
         };
         let usage = result.usage();
-        Ok(BTreeMap::from([
-            ("input_tokens", usage.input_tokens()),
-            ("cached_input_tokens", usage.cached_input_tokens()),
-            ("cache_write_input_tokens", usage.cache_write_input_tokens()),
-            ("output_tokens", usage.output_tokens()),
-            ("reasoning_output_tokens", usage.reasoning_output_tokens()),
-            ("total_tokens", usage.total_tokens()),
-        ]))
+        let output = PyDict::new(py);
+        output.set_item("input_tokens", usage.input_tokens())?;
+        output.set_item("cached_input_tokens", usage.cached_input_tokens())?;
+        output.set_item("cache_write_input_tokens", usage.cache_write_input_tokens())?;
+        output.set_item("output_tokens", usage.output_tokens())?;
+        output.set_item("reasoning_output_tokens", usage.reasoning_output_tokens())?;
+        output.set_item("total_tokens", usage.total_tokens())?;
+        if let Some(cost) = usage.estimated_cost() {
+            output.set_item("estimated_cost", estimated_cost_dict(py, cost)?)?;
+        } else {
+            output.set_item("estimated_cost", py.None())?;
+        }
+        output.set_item("cost_status", usage.cost_status().as_str())?;
+        Ok(output.unbind())
+    }
+}
+
+#[pyclass(frozen, module = "nanocodex._native")]
+struct PricingSnapshot {
+    inner: RustPricingSnapshot,
+}
+
+#[pymethods]
+impl PricingSnapshot {
+    #[new]
+    #[pyo3(signature = (id, source, effective_date, *, input_usd_per_million, cached_input_usd_per_million, cache_write_input_usd_per_million, output_usd_per_million))]
+    fn new(
+        id: String,
+        source: String,
+        effective_date: String,
+        input_usd_per_million: &str,
+        cached_input_usd_per_million: &str,
+        cache_write_input_usd_per_million: &str,
+        output_usd_per_million: &str,
+    ) -> PyResult<Self> {
+        let rates = TokenRates {
+            input: parse_rate(input_usd_per_million)?,
+            cached_input: parse_rate(cached_input_usd_per_million)?,
+            cache_write_input: parse_rate(cache_write_input_usd_per_million)?,
+            output: parse_rate(output_usd_per_million)?,
+        };
+        RustPricingSnapshot::new(id, source, effective_date, rates)
+            .map(|inner| Self { inner })
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PricingSnapshot(id={:?}, effective_date={:?}, model={:?})",
+            self.inner.id(),
+            self.inner.effective_date(),
+            self.inner.model()
+        )
     }
 }
 
@@ -302,6 +355,43 @@ fn parse_reasoning_mode(value: &str) -> PyResult<ReasoningMode> {
     value.parse().map_err(PyValueError::new_err)
 }
 
+fn parse_rate(value: &str) -> PyResult<UsdPerMillionTokens> {
+    value
+        .parse()
+        .map_err(|error: nanocodex::UsdParseError| PyValueError::new_err(error.to_string()))
+}
+
+fn estimated_cost_dict<'py>(
+    py: Python<'py>,
+    cost: &nanocodex::EstimatedUsdCost,
+) -> PyResult<Bound<'py, PyDict>> {
+    let pricing = cost.pricing();
+    let rates = pricing.rates();
+    let rate_dict = PyDict::new(py);
+    rate_dict.set_item("input_usd_per_million", rates.input.decimal())?;
+    rate_dict.set_item("cached_input_usd_per_million", rates.cached_input.decimal())?;
+    rate_dict.set_item(
+        "cache_write_input_usd_per_million",
+        rates.cache_write_input.decimal(),
+    )?;
+    rate_dict.set_item("output_usd_per_million", rates.output.decimal())?;
+    let pricing_dict = PyDict::new(py);
+    pricing_dict.set_item("id", pricing.id())?;
+    pricing_dict.set_item("source", pricing.source())?;
+    pricing_dict.set_item("effective_date", pricing.effective_date())?;
+    pricing_dict.set_item("model", pricing.model())?;
+    pricing_dict.set_item("rates", rate_dict)?;
+
+    let output = PyDict::new(py);
+    output.set_item("usd", cost.amount().decimal())?;
+    output.set_item("input_usd", cost.input().decimal())?;
+    output.set_item("cached_input_usd", cost.cached_input().decimal())?;
+    output.set_item("cache_write_input_usd", cost.cache_write_input().decimal())?;
+    output.set_item("output_usd", cost.output().decimal())?;
+    output.set_item("pricing", pricing_dict)?;
+    Ok(output)
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn runtime_error(error: impl ToString) -> pyo3::PyErr {
     PyRuntimeError::new_err(error.to_string())
@@ -315,6 +405,7 @@ fn lock_error<T>(error: std::sync::PoisonError<T>) -> pyo3::PyErr {
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Nanocodex>()?;
+    module.add_class::<PricingSnapshot>()?;
     module.add_class::<Turn>()?;
     module.add_class::<AgentEvents>()?;
     Ok(())

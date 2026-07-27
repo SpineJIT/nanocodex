@@ -205,6 +205,92 @@ impl AgentEventKind {
 }
 
 impl AgentEvent {
+    /// Returns a stable typed projection of this event.
+    ///
+    /// Raw `OpenAI` frames and lower-level transport diagnostics remain
+    /// lossless; application-facing run, assistant, reasoning, tool, model,
+    /// and context events decode into named types.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a payload does not satisfy the contract declared
+    /// by its event kind.
+    pub fn data(&self) -> Result<crate::AgentEventData, serde_json::Error> {
+        use crate::{
+            AgentEventData, AssistantEvent, ContextEvent, ModelEvent, ReasoningEvent, RunEvent,
+            ToolEvent, TransportEvent,
+        };
+
+        Ok(match self.kind {
+            AgentEventKind::ApiEvent => AgentEventData::OpenAi(self.decode_payload()?),
+            AgentEventKind::AssistantDelta => {
+                AgentEventData::Assistant(AssistantEvent::Delta(self.decode_payload()?))
+            }
+            AgentEventKind::AssistantMessage => {
+                AgentEventData::Assistant(AssistantEvent::Message(self.decode_payload()?))
+            }
+            AgentEventKind::ReasoningSummaryDelta => {
+                AgentEventData::Reasoning(ReasoningEvent::SummaryDelta(self.decode_payload()?))
+            }
+            AgentEventKind::RunStarted => {
+                AgentEventData::Run(RunEvent::Started(self.decode_payload()?))
+            }
+            AgentEventKind::RunSteered => {
+                AgentEventData::Run(RunEvent::Steered(self.decode_payload()?))
+            }
+            AgentEventKind::RunError => {
+                AgentEventData::Run(RunEvent::Error(self.decode_payload()?))
+            }
+            AgentEventKind::RunCompleted => {
+                AgentEventData::Run(RunEvent::Completed(Box::new(self.decode_payload()?)))
+            }
+            AgentEventKind::RunFailed => {
+                AgentEventData::Run(RunEvent::Failed(Box::new(self.decode_payload()?)))
+            }
+            AgentEventKind::ToolCall => {
+                AgentEventData::Tool(ToolEvent::Call(self.decode_payload()?))
+            }
+            AgentEventKind::ToolResult => {
+                AgentEventData::Tool(ToolEvent::Result(self.decode_payload()?))
+            }
+            AgentEventKind::ModelWarmupStarted => {
+                AgentEventData::Model(ModelEvent::WarmupStarted(self.decode_payload()?))
+            }
+            AgentEventKind::ModelWarmupCompleted => {
+                AgentEventData::Model(ModelEvent::WarmupCompleted(self.decode_payload()?))
+            }
+            AgentEventKind::ModelWarmupFailed => {
+                AgentEventData::Model(ModelEvent::WarmupFailed(self.decode_payload()?))
+            }
+            AgentEventKind::ModelCallStarted => {
+                AgentEventData::Model(ModelEvent::CallStarted(self.decode_payload()?))
+            }
+            AgentEventKind::ModelCallCompleted => {
+                AgentEventData::Model(ModelEvent::CallCompleted(self.decode_payload()?))
+            }
+            AgentEventKind::ModelCallFailed => {
+                AgentEventData::Model(ModelEvent::CallFailed(self.decode_payload()?))
+            }
+            AgentEventKind::ModelCompactionStarted => {
+                AgentEventData::Context(ContextEvent::CompactionStarted(self.decode_payload()?))
+            }
+            AgentEventKind::ModelCompactionCompleted => {
+                AgentEventData::Context(ContextEvent::CompactionCompleted(self.decode_payload()?))
+            }
+            AgentEventKind::ModelCompactionFailed => {
+                AgentEventData::Context(ContextEvent::CompactionFailed(self.decode_payload()?))
+            }
+            AgentEventKind::ModelAttemptStarted
+            | AgentEventKind::ModelAttemptFailed
+            | AgentEventKind::ModelAttemptRetrying
+            | AgentEventKind::ModelConnectionStarted
+            | AgentEventKind::ModelConnectionCompleted
+            | AgentEventKind::ModelConnectionFailed => {
+                AgentEventData::Transport(TransportEvent::new(self.kind, Arc::clone(&self.payload)))
+            }
+        })
+    }
+
     /// Decodes the event payload into a caller-selected typed shape.
     ///
     /// # Errors
@@ -351,6 +437,7 @@ mod tests {
     use serde_json::json;
 
     use super::{AgentEventKind, EventSink};
+    use crate::{AgentEventData, AssistantEvent, ToolEvent, TransportEvent};
 
     #[test]
     fn events_are_ordered_and_receiver_drop_is_not_an_error() {
@@ -465,6 +552,70 @@ mod tests {
         assert_eq!(
             session.receiver.try_recv().unwrap().event.seq,
             session_second.seq + 1
+        );
+    }
+
+    #[test]
+    fn typed_projection_preserves_domain_values_and_raw_diagnostics() {
+        let (events, mut receiver) = EventSink::channel("request-1".to_owned());
+        events
+            .emit(
+                AgentEventKind::AssistantDelta,
+                json!({
+                    "model_call_index": 2,
+                    "item_id": "item-1",
+                    "phase": "final_answer",
+                    "text": "hello"
+                }),
+            )
+            .unwrap();
+        events
+            .emit(
+                AgentEventKind::ToolCall,
+                json!({
+                    "call_id": "call-1",
+                    "tool": "deployment_region",
+                    "arguments": {"service": "api"},
+                    "model_call_index": 2
+                }),
+            )
+            .unwrap();
+        events
+            .emit(
+                AgentEventKind::ModelAttemptRetrying,
+                json!({"attempt": 1, "next_attempt": 2}),
+            )
+            .unwrap();
+
+        let assistant = receiver.receiver.try_recv().unwrap().event;
+        let AgentEventData::Assistant(AssistantEvent::Delta(delta)) = assistant.data().unwrap()
+        else {
+            panic!("assistant delta should use the typed assistant projection");
+        };
+        assert_eq!(delta.text, "hello");
+        assert_eq!(delta.model_call_index, 2);
+
+        let tool = receiver.receiver.try_recv().unwrap().event;
+        let AgentEventData::Tool(ToolEvent::Call(call)) = tool.data().unwrap() else {
+            panic!("tool call should use the typed tool projection");
+        };
+        assert_eq!(call.tool, "deployment_region");
+        assert_eq!(
+            call.decode_arguments::<serde_json::Value>().unwrap()["service"],
+            "api"
+        );
+
+        let diagnostic = receiver.receiver.try_recv().unwrap().event;
+        let AgentEventData::Transport(transport) = diagnostic.data().unwrap() else {
+            panic!("retry should remain a lossless transport diagnostic");
+        };
+        assert_eq!(
+            TransportEvent::kind(&transport),
+            AgentEventKind::ModelAttemptRetrying
+        );
+        assert_eq!(
+            transport.decode_payload::<serde_json::Value>().unwrap()["next_attempt"],
+            2
         );
     }
 }

@@ -14,8 +14,8 @@ use std::{
 use futures_util::Stream;
 use nanocodex_oai_api::{
     AgentEvent, AgentEvents, EventSink, MakeResponsesService, ModelConfig, OpenAi, OpenAiAuth,
-    OpenAiAuthMode, Prompt, ReasoningMode, ResponsesHistory, ResponsesTransport, SessionId,
-    Thinking,
+    OpenAiAuthMode, PricingSnapshot, Prompt, ReasoningMode, ResponsesHistory, ResponsesTransport,
+    SessionId, Thinking,
 };
 use nanocodex_oai_api::{
     DefaultResponsesService, ResponsesAttempt, ResponsesClient, ResponsesService,
@@ -711,6 +711,16 @@ impl<S> NanocodexBuilder<S> {
     #[must_use]
     pub const fn reasoning_mode(mut self, reasoning_mode: ReasoningMode) -> Self {
         self.config.reasoning_mode = reasoning_mode;
+        self
+    }
+
+    /// Attaches immutable rates used to estimate USD cost from provider usage.
+    ///
+    /// Pricing affects only result, event, and trace projections. It is
+    /// inherited by spawned and forked agents and never changes API requests.
+    #[must_use]
+    pub fn pricing(mut self, pricing: PricingSnapshot) -> Self {
+        self.config.pricing = Some(Arc::new(pricing));
         self
     }
 
@@ -1513,6 +1523,17 @@ fn agent_turn_span(
         thinking = reasoning.effort.as_str(),
         turn.index = turn_index,
         prompt.bytes = prompt_bytes,
+        usage.input_tokens = tracing::field::Empty,
+        usage.cached_input_tokens = tracing::field::Empty,
+        usage.cache_write_input_tokens = tracing::field::Empty,
+        usage.output_tokens = tracing::field::Empty,
+        usage.reasoning_output_tokens = tracing::field::Empty,
+        usage.total_tokens = tracing::field::Empty,
+        cost.usd = tracing::field::Empty,
+        cost.status = tracing::field::Empty,
+        pricing.id = tracing::field::Empty,
+        pricing.source = tracing::field::Empty,
+        pricing.effective_date = tracing::field::Empty,
         status = tracing::field::Empty,
     );
     if let Some(parent_session_id) = &origin.parent_session_id {

@@ -11,7 +11,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use nanocodex_oai_api::EncodedRequest;
 use nanocodex_oai_api::{
     AgentEvent, AgentEventKind, ContentItem, EventSink, FunctionOutputBody, FunctionOutputContent,
-    MessageRole, ResponseItem, monotonic_now_ns, responses::ServerEvent,
+    MessageRole, PricingSnapshot, ResponseItem, TokenRates, UsdPerMillionTokens, monotonic_now_ns,
+    responses::ServerEvent,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, value::RawValue};
@@ -368,6 +369,35 @@ fn agent_event_encoding(criterion: &mut Criterion) {
     group.finish();
 }
 
+fn pricing_estimation(criterion: &mut Criterion) {
+    let pricing = PricingSnapshot::new(
+        "benchmark-contract",
+        "retained-benchmark-fixture",
+        "2026-07-01",
+        TokenRates {
+            input: "1.25".parse::<UsdPerMillionTokens>().unwrap(),
+            cached_input: "0.125".parse::<UsdPerMillionTokens>().unwrap(),
+            cache_write_input: "1.25".parse::<UsdPerMillionTokens>().unwrap(),
+            output: "10".parse::<UsdPerMillionTokens>().unwrap(),
+        },
+    )
+    .unwrap();
+    let mut group = criterion.benchmark_group("pricing_estimation");
+    group.sample_size(100);
+    group.measurement_time(Duration::from_secs(3));
+    group.bench_function("aggregate_turn_usage", |bencher| {
+        bencher.iter(|| {
+            black_box(pricing.estimate_tokens(
+                black_box(128_000),
+                black_box(96_000),
+                black_box(8_000),
+                black_box(16_000),
+            ))
+        });
+    });
+    group.finish();
+}
+
 fn timed_agent_event_delivery(criterion: &mut Criterion) {
     const EVENTS_PER_BATCH: u64 = 1_024;
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -490,6 +520,14 @@ fn retained_agent_event_trace(criterion: &mut Criterion) {
     let value_events = decode_jsonl::<ValueDecodedAgentEvent>(&encoded);
     assert_eq!(raw_events.len(), value_events.len());
     assert_eq!(encode_jsonl(&raw_events), encoded);
+    for event in &raw_events {
+        event.data().unwrap_or_else(|error| {
+            panic!(
+                "retained event {} ({:?}) violated its typed projection: {error}",
+                event.seq, event.kind
+            )
+        });
+    }
     black_box(value_events.iter().fold(0_u64, |checksum, event| {
         checksum
             ^ u64::from(event.protocol_version)
@@ -520,6 +558,15 @@ fn retained_agent_event_trace(criterion: &mut Criterion) {
     });
     group.bench_function("encode_value_payload", |bencher| {
         bencher.iter(|| encode_jsonl(black_box(&value_events)));
+    });
+    group.bench_function("project_typed_domain_events", |bencher| {
+        bencher.iter(|| {
+            let projected = raw_events
+                .iter()
+                .filter_map(|event| event.data().ok())
+                .count();
+            black_box(projected)
+        });
     });
     group.finish();
 }
@@ -820,6 +867,7 @@ criterion_group!(
     request_encoding,
     event_decoding,
     agent_event_encoding,
+    pricing_estimation,
     timed_agent_event_delivery,
     retained_agent_event_trace,
     retained_response_event_pipeline,

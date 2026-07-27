@@ -504,17 +504,11 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .pending_turns
         .saturating_sub(usize::from(conversation.running));
     let steers = conversation.pending_steers.len();
-    let queue = if queued == 0 && steers == 0 {
-        String::new()
-    } else {
-        match (steers, queued) {
-            (0, queued) => format!(" · {queued} queued"),
-            (1, 0) => " · 1 steer".to_owned(),
-            (steers, 0) => format!(" · {steers} steers"),
-            (1, queued) => format!(" · 1 steer · {queued} queued"),
-            (steers, queued) => format!(" · {steers} steers · {queued} queued"),
-        }
-    };
+    let queue = footer_queue(steers, queued);
+    let cost = conversation
+        .last_cost_usd
+        .as_deref()
+        .map_or_else(String::new, |usd| format!(" · ${usd}"));
     let escape_help = if steers == 0 {
         "Esc Esc stop"
     } else {
@@ -541,7 +535,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                format!(" {state}{queue}"),
+                format!(" {state}{cost}{queue}"),
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(help, Style::default().fg(Color::DarkGray)),
@@ -572,6 +566,17 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Paragraph::new(Line::from(model)).alignment(Alignment::Right),
         right,
     );
+}
+
+fn footer_queue(steers: usize, queued: usize) -> String {
+    match (steers, queued) {
+        (0, 0) => String::new(),
+        (0, queued) => format!(" · {queued} queued"),
+        (1, 0) => " · 1 steer".to_owned(),
+        (steers, 0) => format!(" · {steers} steers"),
+        (1, queued) => format!(" · 1 steer · {queued} queued"),
+        (steers, queued) => format!(" · {steers} steers · {queued} queued"),
+    }
 }
 
 fn format_elapsed(elapsed: std::time::Duration) -> String {
@@ -781,6 +786,21 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(footer.ends_with("gpt-5.6-sol · high · fast "));
+    }
+
+    #[test]
+    fn completed_turn_cost_is_visible_without_displacing_model_identity() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        let mut app = App::new("/workspace".into());
+        app.main.last_cost_usd = Some("0.012345".to_owned());
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let footer = terminal.backend().buffer().content[15 * 80..16 * 80]
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(footer.contains("Ready · $0.012345"));
+        assert!(footer.ends_with("gpt-5.6-sol · high "));
     }
 
     #[test]
