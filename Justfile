@@ -293,6 +293,26 @@ eval-leaderboard-hosted: check-hosted-auth download-agent-hosted
             --quiet \
             --yes
 
+# Run the canonical 89-task, k=5 leaderboard job from an exact PR-head binary.
+# This is a single-agent result; it is not comparable to OpenAI's Ultra mode.
+eval-leaderboard-hosted-pr pr effort="max": check-hosted-auth (download-agent-hosted-pr pr)
+    @test -x "{{harbor}}" || { echo "run 'just bootstrap' first" >&2; exit 2; }
+    @pr_sha=$(jq -er '.sha' "{{hosted_agent_pr_provenance}}"); \
+        job_name="$(date +%Y-%m-%d__%H-%M-%S)-terminal-bench-2-1-pr{{pr}}-${pr_sha:0:10}-{{effort}}-k5-$BASHPID"; \
+        HARBOR_TELEMETRY=off "{{harbor}}" run \
+            --config "evals/terminal-bench-2-1-leaderboard-high.yaml" \
+            --env daytona \
+            --verifier "{{canonical_verifier}}" \
+            --agent-kwarg "binary_path={{hosted_agent_artifact}}" \
+            --agent-kwarg "install_node=true" \
+            --agent-kwarg "effort={{effort}}" \
+            --job-name "$job_name" \
+            --n-attempts 5 \
+            --timeout-multiplier 1 \
+            --n-concurrent "{{hosted_eval_concurrency}}" \
+            --quiet \
+            --yes
+
 # Open all locally retained Harbor jobs unless another jobs directory is supplied.
 view jobs=default_jobs:
     @test -x "{{harbor}}" || { echo "run 'just bootstrap' first" >&2; exit 2; }
