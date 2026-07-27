@@ -137,19 +137,23 @@ async fn follow_on_prompts_can_change_turn_policy_without_restarting_the_session
         send_final(&mut socket, "resp-first").await?;
 
         let follow_on = next_json(&mut socket).await?;
-        assert_eq!(follow_on["previous_response_id"], "resp-first");
+        assert!(follow_on.get("previous_response_id").is_none());
         assert_eq!(follow_on["reasoning"]["effort"], "high");
         assert_eq!(follow_on["service_tier"], "priority");
         assert_eq!(follow_on["prompt_cache_key"], prompt_cache_key);
-        assert_eq!(follow_on["input"].as_array().map(Vec::len), Some(1));
-        assert_eq!(follow_on["input"][0]["role"], "user");
-        assert_eq!(follow_on["input"][0]["content"][0]["text"], "second prompt");
+        let replay = follow_on.to_string();
+        assert!(replay.contains("first prompt"));
+        assert!(replay.contains("second prompt"));
         send_final(&mut socket, "resp-second").await?;
 
         let standard = next_json(&mut socket).await?;
-        assert_eq!(standard["previous_response_id"], "resp-second");
+        assert!(standard.get("previous_response_id").is_none());
         assert_eq!(standard["reasoning"]["effort"], "high");
         assert!(standard.get("service_tier").is_none());
+        let replay = standard.to_string();
+        assert!(replay.contains("first prompt"));
+        assert!(replay.contains("second prompt"));
+        assert!(replay.contains("third prompt"));
         send_final(&mut socket, "resp-third").await
     });
 
@@ -246,9 +250,13 @@ async fn queued_prompts_retain_the_thinking_captured_when_accepted() -> Result<(
         send_final(&mut socket, "resp-queued").await?;
 
         let updated = next_json(&mut socket).await?;
-        assert_eq!(updated["previous_response_id"], "resp-queued");
+        assert!(updated.get("previous_response_id").is_none());
         assert_eq!(updated["reasoning"]["effort"], "high");
         assert_eq!(updated["service_tier"], "priority");
+        let replay = updated.to_string();
+        assert!(replay.contains("first prompt"));
+        assert!(replay.contains("queued prompt"));
+        assert!(replay.contains("updated prompt"));
         send_final(&mut socket, "resp-updated").await
     });
 

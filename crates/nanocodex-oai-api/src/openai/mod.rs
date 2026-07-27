@@ -2,10 +2,12 @@ use std::{num::NonZeroU32, sync::Arc};
 
 use ::tower::Layer;
 
+mod platform;
+
 use crate::{
     DefaultResponsesService, ModelConfig, OpenAiAuth, OpenAiAuthError, OpenAiAuthMode,
-    ReasoningMode, ResponsesHistory, ResponsesRetryPolicy, ResponsesService, ResponsesTransport,
-    Thinking, session::SessionBuilder,
+    ReasoningMode, ResponsesHistory, ResponsesRetryPolicy, ResponsesTransport, Thinking,
+    session::SessionBuilder,
 };
 
 /// Configured, cloneable `OpenAI` client recipe.
@@ -102,11 +104,25 @@ impl<F> OpenAiBuilder<F> {
     }
 
     /// Controls whether the provider retains Responses checkpoints.
+    ///
+    /// Storage is disabled by default for both API-key and ChatGPT
+    /// authentication. API-key callers can opt into durable checkpoints with
+    /// `store(true)`; ChatGPT subscription authentication does not support
+    /// stored responses.
+    ///
+    /// On HTTPS, this also selects the compatible default history policy:
+    /// incremental checkpoints when enabled and full client-history replay
+    /// when disabled. Call [`Self::history`] afterwards to override that
+    /// default.
     #[must_use]
     pub const fn store(mut self, store: bool) -> Self {
         self.config.store_responses = store;
-        if !store && matches!(self.config.responses_transport, ResponsesTransport::Https) {
-            self.config.responses_history = ResponsesHistory::FullReplay;
+        if matches!(self.config.responses_transport, ResponsesTransport::Https) {
+            self.config.responses_history = if store {
+                ResponsesHistory::Incremental
+            } else {
+                ResponsesHistory::FullReplay
+            };
         }
         self
     }
@@ -143,6 +159,19 @@ impl<F> OpenAiBuilder<F> {
     #[must_use]
     pub fn api_base_url(mut self, url: impl Into<String>) -> Self {
         self.config.api_base_url = url.into();
+        self
+    }
+
+    /// Installs the environment-owned socket and timer implementation.
+    ///
+    /// The host only moves text frames and waits for retry deadlines. Request
+    /// encoding, response decoding, continuation state, and retry decisions
+    /// remain owned by this crate.
+    #[cfg(any(target_family = "wasm", docsrs))]
+    #[cfg_attr(docsrs, doc(cfg(target_family = "wasm")))]
+    #[must_use]
+    pub fn host_transport(mut self, transport: impl crate::transport::host::HostTransport) -> Self {
+        self.config.host_transport = Some(Arc::new(transport));
         self
     }
 
@@ -262,7 +291,7 @@ impl OpenAiBuilder<StandardServiceFactory> {
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     #[must_use]
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
-        self.factory.http_client = Some(client);
+        self.factory.platform.set_http_client(client);
         self
     }
 }
@@ -279,6 +308,7 @@ where
     /// transport, storage, and replay configuration.
     pub fn build(self) -> Result<OpenAi<F>, OpenAiError> {
         validate(&self.config)?;
+        self.factory.validate_config(&self.config)?;
         Ok(OpenAi {
             config: self.config,
             factory: self.factory,
@@ -291,16 +321,14 @@ where
 #[derive(Clone)]
 pub struct StandardServiceFactory {
     max_attempts: NonZeroU32,
-    #[cfg(not(target_family = "wasm"))]
-    http_client: Option<reqwest::Client>,
+    platform: platform::FactoryPlatform,
 }
 
 impl Default for StandardServiceFactory {
     fn default() -> Self {
         Self {
             max_attempts: ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS,
-            #[cfg(not(target_family = "wasm"))]
-            http_client: None,
+            platform: platform::FactoryPlatform::new(),
         }
     }
 }
@@ -333,6 +361,11 @@ pub trait MakeResponsesService: Clone {
     /// Concrete service owned by each managed session.
     type Service;
 
+    /// Validates service-specific client configuration.
+    fn validate_config(&self, _config: &ModelConfig) -> Result<(), OpenAiError> {
+        Ok(())
+    }
+
     /// Creates one independent service stack.
     fn make(&self, config: Arc<ModelConfig>) -> Self::Service;
 }
@@ -340,29 +373,12 @@ pub trait MakeResponsesService: Clone {
 impl MakeResponsesService for StandardServiceFactory {
     type Service = DefaultResponsesService;
 
+    fn validate_config(&self, config: &ModelConfig) -> Result<(), OpenAiError> {
+        self.platform.validate_config(config)
+    }
+
     fn make(&self, config: Arc<ModelConfig>) -> Self::Service {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            self.http_client.as_ref().map_or_else(
-                || {
-                    ResponsesService::standard_with_max_attempts(
-                        Arc::clone(&config),
-                        self.max_attempts,
-                    )
-                },
-                |client| {
-                    ResponsesService::standard_with_http_client_and_max_attempts(
-                        Arc::clone(&config),
-                        client.clone(),
-                        self.max_attempts,
-                    )
-                },
-            )
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            ResponsesService::standard_with_max_attempts(config, self.max_attempts)
-        }
+        self.platform.make(config, self.max_attempts)
     }
 }
 
@@ -384,6 +400,10 @@ where
 {
     type Service = L::Service;
 
+    fn validate_config(&self, config: &ModelConfig) -> Result<(), OpenAiError> {
+        self.inner.validate_config(config)
+    }
+
     fn make(&self, config: Arc<ModelConfig>) -> Self::Service {
         self.layer.layer(self.inner.make(config))
     }
@@ -404,7 +424,7 @@ pub enum OpenAiError {
 }
 
 fn apply_mode_defaults(config: &mut ModelConfig, mode: OpenAiAuthMode) {
-    config.store_responses = mode.supports_stored_responses();
+    config.store_responses = false;
     config.responses_history = ResponsesHistory::Incremental;
     mode.default_websocket_url()
         .clone_into(&mut config.websocket_url);
@@ -451,9 +471,12 @@ mod tests {
 
     use ::tower::{Service, service_fn, timeout::TimeoutLayer};
 
-    use crate::{ResponseError, ResponsesAttempt, ResponsesServiceResponse};
+    use crate::{
+        ModelConfig, OpenAiAuthMode, ResponseError, ResponsesAttempt, ResponsesHistory,
+        ResponsesServiceResponse, ResponsesTransport,
+    };
 
-    use super::OpenAi;
+    use super::{OpenAi, apply_mode_defaults};
 
     #[derive(Clone)]
     struct NeverCalled;
@@ -487,6 +510,33 @@ mod tests {
         let second = session.build().unwrap();
 
         assert_ne!(first.id(), second.id());
+    }
+
+    #[test]
+    fn response_storage_is_opt_in_for_both_auth_modes() {
+        for mode in [OpenAiAuthMode::ApiKey, OpenAiAuthMode::ChatGpt] {
+            let mut config = ModelConfig {
+                store_responses: true,
+                ..ModelConfig::default()
+            };
+            apply_mode_defaults(&mut config, mode);
+            assert!(!config.store_responses);
+        }
+    }
+
+    #[test]
+    fn api_key_can_opt_into_https_checkpoints() {
+        let client = OpenAi::builder("test-key")
+            .transport(ResponsesTransport::Https)
+            .store(true)
+            .build()
+            .unwrap();
+
+        assert!(client.config.store_responses);
+        assert_eq!(
+            client.config.responses_history,
+            ResponsesHistory::Incremental
+        );
     }
 
     #[tokio::test]

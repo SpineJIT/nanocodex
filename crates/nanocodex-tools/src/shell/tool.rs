@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use nanocodex_oai_api::tools::ToolDefinition;
 use serde::Deserialize;
 
-use crate::{StandardTool, Tool, ToolContext, ToolExecution, ToolInput, ToolResult};
+use crate::{StandardTool, Tool, ToolContext, ToolInput, ToolOutput, ToolResult};
 
 use super::{ExecCommand, ShellSessions, WriteStdin};
 
@@ -72,8 +72,8 @@ impl Tool for WriteStdinHandler {
     }
 }
 
-fn shell_execution(result: &super::ExecCommandResult) -> ToolExecution {
-    ToolExecution::json(&result).with_process_trace(
+fn shell_execution(result: &super::ExecCommandResult) -> ToolOutput {
+    ToolOutput::json(&result).with_process_trace(
         result.exit_code,
         result.session_id,
         result.original_token_count,

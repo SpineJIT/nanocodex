@@ -3,7 +3,7 @@ use super::*;
 mod environment;
 
 #[tokio::test]
-async fn stored_response_local_code_mode_round_trip() -> Result<()> {
+async fn connection_local_response_code_mode_round_trip() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
     let server = tokio::spawn(async move {
@@ -23,7 +23,7 @@ async fn stored_response_local_code_mode_round_trip() -> Result<()> {
 
         let generation = next_json(&mut socket).await?;
         assert_eq!(generation["previous_response_id"], "resp-warmup");
-        assert_eq!(generation["store"], true);
+        assert_eq!(generation["store"], false);
         assert!(generation.get("generate").is_none());
         assert_eq!(generation["input"].as_array().map(Vec::len), Some(3));
         assert_eq!(generation["input"][0]["role"], "developer");

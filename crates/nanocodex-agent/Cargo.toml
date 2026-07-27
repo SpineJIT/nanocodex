@@ -18,7 +18,9 @@ all-features = true
 rustdoc-args = ["-D", "warnings"]
 
 [dependencies]
+chrono.workspace = true
 futures-util.workspace = true
+iana-time-zone.workspace = true
 nanocodex-oai-api.workspace = true
 nanocodex-tools.workspace = true
 serde.workspace = true
@@ -31,14 +33,10 @@ tracing.workspace = true
 web-time.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-chrono.workspace = true
-iana-time-zone.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 uuid.workspace = true
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
-js-sys.workspace = true
-wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 
 [dev-dependencies]

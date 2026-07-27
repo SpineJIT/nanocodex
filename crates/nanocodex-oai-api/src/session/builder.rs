@@ -259,23 +259,17 @@ where
 
 fn assign_request_prefix_ids(prefix: &mut [ResponseItem]) {
     for item in prefix {
-        if matches!(item, ResponseItem::AdditionalTools { .. }) {
+        if matches!(
+            item,
+            ResponseItem::AdditionalTools { .. }
+                | ResponseItem::Message {
+                    role: MessageRole::Developer,
+                    ..
+                }
+        ) {
             item.strip_id();
             continue;
         }
-        if matches!(
-            item,
-            ResponseItem::Message {
-                role: MessageRole::Developer,
-                ..
-            }
-        ) {
-            item.set_id(Some(crate::ResponseItemId::with_suffix(
-                "msg",
-                "nanocodex-instructions",
-            )));
-        } else {
-            assign_missing_response_item_id(item);
-        }
+        assign_missing_response_item_id(item);
     }
 }

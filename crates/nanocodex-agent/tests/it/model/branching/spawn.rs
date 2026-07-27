@@ -8,6 +8,7 @@ async fn per_agent_tool_factory_binds_recursive_forks_to_the_invoking_driver() -
         let (stream, _) = listener.accept().await?;
         let mut root = accept_async(stream).await?;
         let warmup = next_json(&mut root).await?;
+        assert_eq!(warmup["store"], true);
         let lineage = warmup["prompt_cache_key"].clone();
         let root_session = warmup["client_metadata"]["session_id"].clone();
         send_warmup(&mut root, "resp-warmup").await?;
@@ -40,6 +41,7 @@ async fn per_agent_tool_factory_binds_recursive_forks_to_the_invoking_driver() -
     let workspace = temporary_workspace("recursive-fork-tools")?;
     let openai = OpenAi::builder("test-key")
         .websocket_url(endpoint)
+        .store(true)
         .build()?;
     let (root, root_events) = Nanocodex::builder(openai)
         .thinking(Thinking::Low)

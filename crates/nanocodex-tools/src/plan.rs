@@ -3,7 +3,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use super::{StandardTool, Tool, ToolContext, ToolExecution, ToolInput, ToolResult};
+use super::{StandardTool, Tool, ToolContext, ToolInput, ToolOutput, ToolResult};
 
 /// Host-owned standard plan tool for runtimes that replace workspace effects.
 pub struct UpdatePlanTool {
@@ -48,7 +48,7 @@ impl Tool for UpdatePlanTool {
             );
         }
         *self.current.lock().await = Some(plan);
-        Ok(ToolExecution::text("Plan updated").with_code_mode_value(json!({})))
+        Ok(ToolOutput::text("Plan updated").with_code_mode_value(json!({})))
     }
 }
 

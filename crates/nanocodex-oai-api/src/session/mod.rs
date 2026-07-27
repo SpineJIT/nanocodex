@@ -4,6 +4,8 @@ pub mod compaction;
 pub mod context;
 
 mod builder;
+#[cfg(not(target_family = "wasm"))]
+mod image_dimensions;
 mod response;
 mod state;
 

@@ -23,29 +23,47 @@ export function createNodeHost(options = {}) {
   const maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
   let nextHandle = 1;
 
-  function connect(endpoint, apiKey, sessionId) {
+  function connect(endpoint, apiKey, sessionId, metadata = {}) {
     if (options.mpp) return connectMpp(endpoint);
     return new Promise((resolve, reject) => {
       let settled = false;
       let upgradeResponse;
+      const headers = {
+        Authorization: `Bearer ${apiKey}`,
+        "OpenAI-Beta": RESPONSES_WEBSOCKETS_BETA,
+        "x-openai-internal-codex-responses-lite": "true",
+        "session-id": sessionId,
+        "thread-id": sessionId,
+        "x-client-request-id": sessionId,
+        "x-responsesapi-include-timing-metrics": "true",
+        "User-Agent": "nanocodex-wasm/0.1.0",
+      };
+      if (metadata.accountId) headers["ChatGPT-Account-ID"] = metadata.accountId;
+      if (metadata.fedramp) headers["X-OpenAI-Fedramp"] = "true";
+      if (metadata.turnState) headers["x-codex-turn-state"] = metadata.turnState;
       const socket = new WebSocket(endpoint, {
         handshakeTimeout: connectTimeoutMs,
         maxPayload: maxFrameBytes,
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "OpenAI-Beta": RESPONSES_WEBSOCKETS_BETA,
-          "x-openai-internal-codex-responses-lite": "true",
-          "session-id": sessionId,
-          "thread-id": sessionId,
-          "x-client-request-id": sessionId,
-          "x-responsesapi-include-timing-metrics": "true",
-          "User-Agent": "nanocodex-wasm/0.1.0",
-        },
+        headers,
       });
       const handle = nextHandle++;
       const connection = queueState(socket);
 
       socket.on("upgrade", (response) => { upgradeResponse = response; });
+      socket.on("unexpected-response", (_request, response) => {
+        if (settled) return;
+        settled = true;
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        response.on("end", () => {
+          const error = new Error(`WebSocket handshake was rejected with HTTP ${response.statusCode}`);
+          error.status = response.statusCode;
+          error.body = chunks.length ? Buffer.concat(chunks).toString("utf8") : "empty response body";
+          const retryAfter = Number(header(response.headers, "retry-after"));
+          if (Number.isFinite(retryAfter) && retryAfter >= 0) error.retryAfter = retryAfter;
+          reject(error);
+        });
+      });
       socket.on("open", () => {
         settled = true;
         connections.set(handle, connection);

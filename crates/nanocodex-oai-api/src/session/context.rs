@@ -15,6 +15,11 @@ const TOOL_OUTPUT_TOKEN_LIMIT: usize = 12_000;
 pub struct ContextManager {
     items: ResponseHistory,
     last_token_usage: Option<Usage>,
+    calls: CallIds,
+}
+
+#[derive(Clone, Default)]
+struct CallIds {
     function_calls: HashSet<Box<str>>,
     function_outputs: HashSet<Box<str>>,
     custom_calls: HashSet<Box<str>>,
@@ -29,12 +34,7 @@ impl ContextManager {
         let mut context = Self {
             items: ResponseHistory::default(),
             last_token_usage: None,
-            function_calls: HashSet::new(),
-            function_outputs: HashSet::new(),
-            custom_calls: HashSet::new(),
-            custom_outputs: HashSet::new(),
-            tool_search_calls: HashSet::new(),
-            tool_search_outputs: HashSet::new(),
+            calls: CallIds::default(),
         };
         context.record_items(items);
         context
@@ -72,23 +72,15 @@ impl ContextManager {
             .map(truncate_tool_output)
         {
             assign_missing_response_item_id(&mut item);
-            self.track_call_id(&item);
+            self.calls.track(&item);
             self.items.push(item);
         }
     }
 
     pub fn commit_tail(&mut self) {
         self.items.commit_tail();
-        if self.function_calls == self.function_outputs
-            && self.custom_calls == self.custom_outputs
-            && self.tool_search_calls == self.tool_search_outputs
-        {
-            self.function_calls.clear();
-            self.function_outputs.clear();
-            self.custom_calls.clear();
-            self.custom_outputs.clear();
-            self.tool_search_calls.clear();
-            self.tool_search_outputs.clear();
+        if self.calls.is_balanced() {
+            self.calls.clear();
         }
     }
 
@@ -104,15 +96,9 @@ impl ContextManager {
             total_tokens,
             ..Usage::default()
         });
-        self.function_calls.clear();
-        self.function_outputs.clear();
-        self.custom_calls.clear();
-        self.custom_outputs.clear();
-        self.tool_search_calls.clear();
-        self.tool_search_outputs.clear();
-        let tracked: Vec<_> = self.items.iter().cloned().collect();
-        for item in &tracked {
-            self.track_call_id(item);
+        self.calls.clear();
+        for item in self.items.iter() {
+            self.calls.track(item);
         }
     }
 
@@ -142,9 +128,7 @@ impl ContextManager {
     /// missing call outputs or orphan outputs.
     #[must_use]
     pub fn prompt_items(&self) -> ResponseHistory {
-        let needs_repair = self.function_calls != self.function_outputs
-            || self.custom_calls != self.custom_outputs
-            || self.tool_search_calls != self.tool_search_outputs;
+        let needs_repair = !self.calls.is_balanced();
         if !needs_repair {
             return self.items.clone();
         }
@@ -158,7 +142,7 @@ impl ContextManager {
                     ..
                 } => {
                     repaired.push(item.clone());
-                    if !self.function_outputs.contains(call_id.as_ref()) {
+                    if !self.calls.function_outputs.contains(call_id.as_ref()) {
                         repaired.push(ResponseItem::function_call_output(
                             call_id.to_string(),
                             FunctionOutputBody::Text("aborted".into()),
@@ -167,7 +151,7 @@ impl ContextManager {
                 }
                 ResponseItem::CustomToolCall { call_id, .. } => {
                     repaired.push(item.clone());
-                    if !self.custom_outputs.contains(call_id.as_ref()) {
+                    if !self.calls.custom_outputs.contains(call_id.as_ref()) {
                         repaired.push(ResponseItem::custom_tool_output(
                             call_id.to_string(),
                             None,
@@ -176,15 +160,15 @@ impl ContextManager {
                     }
                 }
                 ResponseItem::FunctionCallOutput { call_id, .. }
-                    if !self.function_calls.contains(call_id.as_ref()) => {}
+                    if !self.calls.function_calls.contains(call_id.as_ref()) => {}
                 ResponseItem::CustomToolCallOutput { call_id, .. }
-                    if !self.custom_calls.contains(call_id.as_ref()) => {}
+                    if !self.calls.custom_calls.contains(call_id.as_ref()) => {}
                 ResponseItem::ToolSearchCall {
                     call_id: Some(call_id),
                     ..
                 } => {
                     repaired.push(item.clone());
-                    if !self.tool_search_outputs.contains(call_id.as_ref()) {
+                    if !self.calls.tool_search_outputs.contains(call_id.as_ref()) {
                         repaired.push(ResponseItem::ToolSearchOutput {
                             id: None,
                             call_id: Some(call_id.clone()),
@@ -200,7 +184,7 @@ impl ContextManager {
                     execution,
                     ..
                 } if execution.as_ref() != "server"
-                    && !self.tool_search_calls.contains(call_id.as_ref()) => {}
+                    && !self.calls.tool_search_calls.contains(call_id.as_ref()) => {}
                 _ => repaired.push(item.clone()),
             }
         }
@@ -238,8 +222,25 @@ impl ContextManager {
         }
         before_last_user.unwrap_or_default()
     }
+}
 
-    fn track_call_id(&mut self, item: &ResponseItem) {
+impl CallIds {
+    fn is_balanced(&self) -> bool {
+        self.function_calls == self.function_outputs
+            && self.custom_calls == self.custom_outputs
+            && self.tool_search_calls == self.tool_search_outputs
+    }
+
+    fn clear(&mut self) {
+        self.function_calls.clear();
+        self.function_outputs.clear();
+        self.custom_calls.clear();
+        self.custom_outputs.clear();
+        self.tool_search_calls.clear();
+        self.tool_search_outputs.clear();
+    }
+
+    fn track(&mut self, item: &ResponseItem) {
         match item {
             ResponseItem::FunctionCall { call_id, .. }
             | ResponseItem::LocalShellCall {
@@ -290,19 +291,8 @@ pub fn assign_missing_response_item_id(item: &mut ResponseItem) {
     item.set_id(Some(new_response_item_id(prefix)));
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn new_response_item_id(prefix: &str) -> ResponseItemId {
     ResponseItemId::with_suffix(prefix, uuid::Uuid::now_v7())
-}
-
-#[cfg(target_family = "wasm")]
-fn new_response_item_id(prefix: &str) -> ResponseItemId {
-    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let nonce = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    ResponseItemId::with_suffix(
-        prefix,
-        format_args!("nanocodex-wasm-{:x}-{nonce}", js_sys::Date::now().to_bits()),
-    )
 }
 
 #[must_use]

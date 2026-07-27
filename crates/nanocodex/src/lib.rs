@@ -3,18 +3,14 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub use nanocodex_agent::{
-    AgentEvents, CostStatus, EstimatedUsdCost, NanocodexError, ServiceTier, TurnUsage, UsdAmount,
+    AgentEvents, CostStatus, EstimatedUsdCost, Nanocodex, NanocodexBuilder, NanocodexError,
+    ServiceTier, Turn, TurnControl, TurnResult, TurnUsage, UsdAmount,
 };
-#[cfg(not(target_family = "wasm"))]
-#[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
-pub use nanocodex_agent::{Nanocodex, NanocodexBuilder, Turn, TurnControl, TurnResult};
-#[cfg(target_family = "wasm")]
-#[cfg_attr(docsrs, doc(cfg(target_family = "wasm")))]
-pub use nanocodex_agent::{WasmNanocodex, WasmTurn};
 pub use nanocodex_oai_api::{OpenAi, ReasoningMode, Thinking};
 #[cfg(not(target_family = "wasm"))]
 #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
-pub use nanocodex_tools::{Tool, Tools, tool};
+pub use nanocodex_tools::tool;
+pub use nanocodex_tools::{Tool, Tools};
 
 /// Owned agent lifecycle, builders, turns, branching, and snapshots.
 ///
@@ -46,8 +42,11 @@ pub use nanocodex_oai_api as oai;
 pub use nanocodex_tools as tools;
 
 /// Application-owned tracing and OpenTelemetry setup.
-#[cfg(not(target_family = "wasm"))]
-#[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+#[cfg(all(not(target_family = "wasm"), feature = "observability"))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(all(not(target_family = "wasm"), feature = "observability")))
+)]
 #[doc(inline)]
 pub use nanocodex_observability as observability;
 
@@ -55,10 +54,8 @@ pub use nanocodex_observability as observability;
 pub mod prelude {
     #[cfg(not(target_family = "wasm"))]
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
-    pub use crate::{Nanocodex, NanocodexBuilder, OpenAi, Tool, Tools, tool};
-    #[cfg(target_family = "wasm")]
-    #[cfg_attr(docsrs, doc(cfg(target_family = "wasm")))]
-    pub use crate::{OpenAi, WasmNanocodex, WasmTurn};
+    pub use crate::tool;
+    pub use crate::{Nanocodex, NanocodexBuilder, OpenAi, Tool, Tools};
 }
 
 #[cfg(not(target_family = "wasm"))]

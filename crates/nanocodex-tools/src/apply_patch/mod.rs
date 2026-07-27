@@ -6,7 +6,7 @@ use std::{
 use nanocodex_oai_api::tools::ToolDefinition;
 use serde_json::json;
 
-use super::{StandardTool, Tool, ToolContext, ToolExecution, ToolInput, ToolResult};
+use super::{StandardTool, Tool, ToolContext, ToolInput, ToolOutput, ToolResult};
 
 mod parser;
 mod seek_sequence;
@@ -35,11 +35,11 @@ impl Tool for ApplyPatchHandler {
         let workspace = self.workspace.clone();
         Ok(
             match tokio::task::spawn_blocking(move || apply(&input, &workspace)).await {
-                Ok(Ok(output)) => ToolExecution::text(output).with_code_mode_value(json!({})),
+                Ok(Ok(output)) => ToolOutput::text(output).with_code_mode_value(json!({})),
                 Ok(Err(error)) => {
-                    ToolExecution::error(format!("apply_patch verification failed: {error}"))
+                    ToolOutput::error(format!("apply_patch verification failed: {error}"))
                 }
-                Err(error) => ToolExecution::error(format!("apply_patch task failed: {error}")),
+                Err(error) => ToolOutput::error(format!("apply_patch task failed: {error}")),
             },
         )
     }

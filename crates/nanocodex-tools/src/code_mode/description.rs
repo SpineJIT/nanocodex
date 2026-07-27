@@ -113,11 +113,13 @@ pub(super) fn exec_description(definitions: &[ToolDefinition], has_deferred_tool
     if has_deferred_tools {
         let _ = write!(description, "\n\n{DEFERRED_NESTED_TOOLS_GUIDANCE}");
     }
-    if definitions.iter().any(|spec| {
-        spec.output_schema()
-            .and_then(|schema| mcp_structured_content_schema(schema.as_value()))
-            .is_some()
-    }) {
+    if has_deferred_tools
+        || definitions.iter().any(|spec| {
+            spec.output_schema()
+                .and_then(|schema| mcp_structured_content_schema(schema.as_value()))
+                .is_some()
+        })
+    {
         let _ = write!(
             description,
             "\n\nShared MCP Types:\n```ts\n{MCP_TYPESCRIPT_PREAMBLE}\n```"

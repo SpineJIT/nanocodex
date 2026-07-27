@@ -18,10 +18,11 @@ history, code-mode runtime, shell sessions, and prompt-cache identity across
 follow-on turns. A WebSocket policy also reuses its connection. The caller does
 not replay earlier results.
 
-The standard policy is WebSocket plus incremental history. API-key
-authentication defaults to `store: true`; ChatGPT subscription authentication
-defaults to `store: false`. Selecting HTTPS with ChatGPT automatically selects
-full replay. WebSocket is the interactive default because its reused
+The standard policy is WebSocket plus incremental history and `store: false`
+for both API-key and ChatGPT subscription authentication. API-key callers can
+opt into durable provider checkpoints with `.store(true)`; ChatGPT
+subscription authentication cannot. Selecting HTTPS with storage disabled
+automatically selects full replay. WebSocket is the interactive default because its reused
 connection has the lowest measured warm first-event latency. Native callers
 can select HTTPS when cold start or fresh-fork startup matters more, but a
 session and every fork retain the one policy selected at build time. See

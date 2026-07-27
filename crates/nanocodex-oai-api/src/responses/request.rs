@@ -430,10 +430,7 @@ impl Serialize for ResponsesInput<'_> {
     {
         let mut sequence = serializer.serialize_seq(Some(self.len()))?;
         for item in self.iter() {
-            sequence.serialize_element(&RequestResponseItem {
-                item,
-                retain_ids: true,
-            })?;
+            sequence.serialize_element(&RequestResponseItem { item })?;
         }
         sequence.end()
     }
@@ -442,7 +439,6 @@ impl Serialize for ResponsesInput<'_> {
 #[derive(Clone, Copy)]
 struct RequestInput<'a> {
     input: ResponsesInput<'a>,
-    retain_ids: bool,
 }
 
 impl Serialize for RequestInput<'_> {
@@ -452,10 +448,7 @@ impl Serialize for RequestInput<'_> {
     {
         let mut sequence = serializer.serialize_seq(Some(self.input.len()))?;
         for item in self.input.iter() {
-            sequence.serialize_element(&RequestResponseItem {
-                item,
-                retain_ids: self.retain_ids,
-            })?;
+            sequence.serialize_element(&RequestResponseItem { item })?;
         }
         sequence.end()
     }
@@ -463,7 +456,6 @@ impl Serialize for RequestInput<'_> {
 
 struct RequestResponseItem<'a> {
     item: &'a ResponseItem,
-    retain_ids: bool,
 }
 
 impl Serialize for RequestResponseItem<'_> {
@@ -471,11 +463,7 @@ impl Serialize for RequestResponseItem<'_> {
     where
         S: serde::Serializer,
     {
-        if self
-            .item
-            .id()
-            .is_some_and(|id| !id.is_prefixed() || !self.retain_ids)
-        {
+        if self.item.id().is_some_and(|id| !id.is_prefixed()) {
             let mut item = self.item.clone();
             item.set_id(None);
             item.serialize(serializer)
@@ -575,10 +563,7 @@ impl<'a> ResponseCreate<'a> {
             kind: websocket.then_some("response.create"),
             model: crate::MODEL,
             previous_response_id,
-            input: RequestInput {
-                input,
-                retain_ids: config.store_responses,
-            },
+            input: RequestInput { input },
             tool_choice: "auto",
             parallel_tool_calls: false,
             reasoning: ReasoningControls {
@@ -663,7 +648,7 @@ mod tests {
         assert_eq!(request["prompt_cache_key"], json!("lineage-a"));
         assert_eq!(request["client_metadata"]["session_id"], json!("branch-a"));
         assert_eq!(request["client_metadata"]["thread_id"], json!("branch-a"));
-        assert_eq!(request["store"], true);
+        assert_eq!(request["store"], false);
         assert_eq!(request["generate"], false);
         assert!(request.get("tools").is_none());
         assert!(request.get("instructions").is_none());
@@ -695,7 +680,10 @@ mod tests {
             "server-item-id",
         )));
         let history = ResponseHistory::new(vec![client_item, server_item]);
-        let stored_config = ModelConfig::default();
+        let stored_config = ModelConfig {
+            store_responses: true,
+            ..ModelConfig::default()
+        };
         let profile = RequestProfile::new("agent", "lineage", Arc::from([]));
 
         let stored_request = serde_json::to_value(ResponseCreate::generation(
@@ -727,7 +715,7 @@ mod tests {
         ))
         .expect("request should serialize");
 
-        assert!(ephemeral_request["input"][0].get("id").is_none());
+        assert_eq!(ephemeral_request["input"][0]["id"], "msg_stable");
         assert!(ephemeral_request["input"][1].get("id").is_none());
         assert_eq!(
             history

@@ -1,7 +1,5 @@
 use std::{
-    future::Future,
     num::NonZeroU32,
-    pin::Pin,
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
@@ -11,21 +9,20 @@ use ::tower::retry::{Policy, Retry};
 use web_time::Instant;
 
 use crate::{
+    ModelConfig,
     attempt::{ResponsesAttempt, ResponsesServiceResponse},
     service::ResponsesService,
     service_error::{FailurePhase, ResponsesServiceError},
     telemetry::{AttemptRetrying, duration_ns, elapsed_ns},
 };
 
-#[cfg(not(target_family = "wasm"))]
-type RetryFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
-#[cfg(target_family = "wasm")]
-type RetryFuture = Pin<Box<dyn Future<Output = ()>>>;
+use super::delay::{RetryDelay, RetryFuture};
 
 /// Retry policy for the SDK-owned Responses transport stack.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ResponsesRetryPolicy {
     max_attempts: NonZeroU32,
+    delay: RetryDelay,
 }
 
 impl ResponsesRetryPolicy {
@@ -35,7 +32,21 @@ impl ResponsesRetryPolicy {
     /// Creates a retry policy with a fixed total-attempt limit.
     #[must_use]
     pub const fn new(max_attempts: NonZeroU32) -> Self {
-        Self { max_attempts }
+        Self {
+            max_attempts,
+            delay: RetryDelay::unconfigured(),
+        }
+    }
+
+    // Hosted targets retain an `Arc` to the selected host, so this cannot be
+    // const across every supported target even though the native adapter is
+    // zero-sized.
+    #[allow(clippy::missing_const_for_fn)]
+    pub(crate) fn for_config(max_attempts: NonZeroU32, config: &ModelConfig) -> Self {
+        Self {
+            max_attempts,
+            delay: RetryDelay::from_config(config),
+        }
     }
 }
 
@@ -124,9 +135,11 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
             return None;
         }
         let stats = Arc::clone(&request.observer.stats);
+        let delay_runtime = self.delay.clone_for_retry();
+        let session_id = request.profile.session_id().to_owned();
         Some(Box::pin(async move {
             let started_at = Instant::now();
-            sleep(delay).await;
+            delay_runtime.wait(session_id, delay).await;
             stats
                 .retry_backoff_duration_ns
                 .fetch_add(elapsed_ns(started_at), Ordering::Relaxed);
@@ -138,26 +151,6 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
         request.limit_attempts(self.max_attempts);
         Some(request)
     }
-}
-
-#[cfg(not(target_family = "wasm"))]
-async fn sleep(delay: Duration) {
-    tokio::time::sleep(delay).await;
-}
-
-#[cfg(target_family = "wasm")]
-async fn sleep(delay: Duration) {
-    use wasm_bindgen::prelude::*;
-    use wasm_bindgen_futures::JsFuture;
-
-    #[wasm_bindgen]
-    extern "C" {
-        #[wasm_bindgen(js_namespace = ["globalThis", "nanocodexHost"], js_name = sleep)]
-        fn host_sleep(milliseconds: u32) -> js_sys::Promise;
-    }
-
-    let milliseconds = u32::try_from(delay.as_millis()).unwrap_or(u32::MAX);
-    drop(JsFuture::from(host_sleep(milliseconds)).await);
 }
 
 /// Standard stateful Responses transport wrapped in the SDK-owned retry policy.

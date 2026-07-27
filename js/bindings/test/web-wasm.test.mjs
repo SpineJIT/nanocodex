@@ -21,7 +21,7 @@ test("web-target WASM runs the shared model loop through the browser host", asyn
     module: wasm,
     websocketUrl: endpoint,
     thinking: "low",
-    sessionId: "web-session",
+    sessionId: "018f1f9a-7b3c-7a07-8000-000000000007",
   });
   const watch = agent.events.watch({ includeAllSessions: true });
   watch.onEvent((event) => events.push(event));

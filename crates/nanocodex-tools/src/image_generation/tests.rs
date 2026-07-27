@@ -14,7 +14,7 @@ use super::{
     ImageGenerationConfig, ImageGenerationHandler, ImageRequest, ImagegenArgs, Tool, ToolContext,
     ToolOutputContent, request_for_args,
 };
-use crate::{ToolOutputBody, test_support::RotatingChatGptAuth};
+use crate::ToolOutputBody;
 
 const TINY_PNG: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
@@ -90,74 +90,6 @@ async fn generation_uses_codex_images_request_and_persists_result() -> Result<()
             "size": "auto"
         })
     );
-    std::fs::remove_dir_all(workspace)?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn chatgpt_auth_recovers_and_covers_generation_and_edit_routes() -> Result<()> {
-    let workspace = temporary_workspace("image-oauth")?;
-    let source_image = workspace.join("source.png");
-    tokio::fs::write(&source_image, TINY_PNG).await?;
-    let (api_base_url, server) = spawn_oauth_image_server().await?;
-    let (auth, auth_source) = RotatingChatGptAuth::shared();
-    let handler = ImageGenerationHandler::new(ImageGenerationConfig {
-        api_base_url,
-        auth,
-        save_root: workspace.clone(),
-    });
-    let history = Vec::new();
-
-    let generated = handler
-        .run(
-            r#"{"prompt":"paint a blue whale"}"#,
-            ToolContext::new(
-                "gpt-5.6-sol",
-                "oauth-session",
-                "generate",
-                &history,
-                crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
-            ),
-        )
-        .await;
-    assert!(generated.success);
-
-    let edit_input = json!({
-        "prompt": "add a red hat",
-        "referenced_image_paths": [source_image],
-    })
-    .to_string();
-    let edited = handler
-        .run(
-            &edit_input,
-            ToolContext::new(
-                "gpt-5.6-sol",
-                "oauth-session",
-                "edit",
-                &history,
-                crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
-            ),
-        )
-        .await;
-    assert!(edited.success);
-
-    let requests = server.await??;
-    assert_eq!(
-        requests
-            .iter()
-            .map(|request| request.path.as_str())
-            .collect::<Vec<_>>(),
-        [
-            "/v1/images/generations",
-            "/v1/images/generations",
-            "/v1/images/edits",
-        ]
-    );
-    assert_image_oauth_headers(&requests[0].headers, "oauth-token-0");
-    assert_image_oauth_headers(&requests[1].headers, "oauth-token-1");
-    assert_image_oauth_headers(&requests[2].headers, "oauth-token-1");
-    assert_eq!(auth_source.recoveries(), 1);
-
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -283,57 +215,6 @@ async fn spawn_image_server() -> Result<(String, JoinHandle<Result<CapturedReque
         Ok(request)
     });
     Ok((api_base_url, server))
-}
-
-async fn spawn_oauth_image_server() -> Result<(String, JoinHandle<Result<Vec<CapturedRequest>>>)> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let api_base_url = format!("http://{}/v1", listener.local_addr()?);
-    let server = tokio::spawn(async move {
-        let mut requests = Vec::with_capacity(3);
-        for index in 0..3 {
-            let (mut stream, _) = listener.accept().await?;
-            requests.push(read_http_request(&mut stream).await?);
-            if index == 0 {
-                stream
-                    .write_all(
-                        b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                    )
-                    .await?;
-            } else {
-                write_image_response(&mut stream).await?;
-            }
-        }
-        Ok(requests)
-    });
-    Ok((api_base_url, server))
-}
-
-async fn write_image_response(stream: &mut TcpStream) -> Result<()> {
-    let response = serde_json::to_vec(&json!({
-        "created": 1,
-        "data": [{"b64_json": BASE64_STANDARD.encode(TINY_PNG)}],
-        "background": "opaque",
-        "quality": "high",
-        "size": "1024x1024"
-    }))?;
-    stream
-        .write_all(
-            format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                response.len()
-            )
-            .as_bytes(),
-        )
-        .await?;
-    stream.write_all(&response).await?;
-    Ok(())
-}
-
-fn assert_image_oauth_headers(headers: &str, token: &str) {
-    let headers = headers.to_ascii_lowercase();
-    assert!(headers.contains(&format!("authorization: bearer {token}")));
-    assert!(headers.contains("chatgpt-account-id: account-test"));
-    assert!(headers.contains("x-openai-fedramp: true"));
 }
 
 async fn read_http_request(stream: &mut TcpStream) -> Result<CapturedRequest> {

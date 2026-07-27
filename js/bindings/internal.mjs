@@ -154,9 +154,18 @@ export function releaseHostSession(host, sessionId) {
 }
 
 const hostBridge = Object.freeze({
-  async connect(endpoint, apiKey, sessionId) {
+  async connect(endpoint, apiKey, accountId, fedramp, sessionId, turnState) {
     const host = requiredSessionHost(sessionId);
-    const result = JSON.parse(await host.connect(endpoint, apiKey, sessionId));
+    let result;
+    try {
+      result = JSON.parse(await host.connect(endpoint, apiKey, sessionId, {
+        accountId: accountId ?? undefined,
+        fedramp,
+        turnState: turnState ?? undefined,
+      }));
+    } catch (error) {
+      throw JSON.stringify(connectFailure(error));
+    }
     const handle = nextHostConnection++;
     hostConnections.set(handle, { host, handle: result.handle });
     hostSessions.set(sessionId, host);
@@ -180,8 +189,12 @@ const hostBridge = Object.freeze({
     hostConnections.delete(handle);
     connection.host.close(connection.handle);
   },
-  sleep(milliseconds) {
-    return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  sleep(sessionId, milliseconds) {
+    const host = requiredSessionHost(sessionId);
+    if (typeof host.sleep !== "function") {
+      throw new TypeError("the selected Nanocodex host must define sleep(milliseconds)");
+    }
+    return host.sleep(milliseconds);
   },
   executeCode(source, sessionId, callId) {
     return requiredSessionHost(sessionId).executeCode(source, sessionId, callId);
@@ -258,6 +271,36 @@ function requiredSessionHost(sessionId) {
 function requiredActiveHost() {
   if (!activeHost) throw new Error("no Nanocodex host is active");
   return activeHost;
+}
+
+function connectFailure(error) {
+  if (typeof error === "string") {
+    try {
+      const encoded = JSON.parse(error);
+      if (encoded?.kind === "handshake_rejected" || encoded?.kind === "transport") {
+        return encoded;
+      }
+    } catch {}
+  }
+  const status = Number(error?.status);
+  if (Number.isInteger(status) && status >= 100 && status <= 599) {
+    const retryAfter = Number(error?.retryAfter);
+    return {
+      kind: "handshake_rejected",
+      status,
+      body: typeof error?.body === "string" ? error.body : errorDetail(error),
+      ...(Number.isFinite(retryAfter) && retryAfter >= 0 ? { retry_after: retryAfter } : {}),
+    };
+  }
+  return {
+    kind: "transport",
+    detail: errorDetail(error),
+    reconnectable: true,
+  };
+}
+
+function errorDetail(error) {
+  return error && (error.stack || error.message) || String(error);
 }
 
 function createTurn(raw, agent) {

@@ -1,12 +1,12 @@
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
-use serde::Deserialize;
+use super::api_error::{api_error_has_code, retryable_api_error};
 
-use tokio_tungstenite::tungstenite::{
-    Error as WebSocketError, error::ProtocolError, http::header::InvalidHeaderValue,
-};
-
-/// Errors produced by the `OpenAI` Responses WebSocket transport.
+/// Errors produced by the standard `OpenAI` Responses transports.
+///
+/// The API is identical across native and hosted targets. Platform adapters
+/// retain their complete error detail while reducing retry behavior to explicit
+/// typed fields before the error reaches the shared state machine.
 #[derive(Debug, thiserror::Error)]
 pub enum ResponsesError {
     /// Authorization could not be resolved.
@@ -15,15 +15,27 @@ pub enum ResponsesError {
         /// Credential-resolution detail without the credential value.
         detail: String,
     },
+    /// The embedding did not install the transport required by this target.
+    #[error("the Responses host transport is not configured")]
+    HostUnavailable,
     /// The configured WebSocket URL was invalid.
-    #[error("invalid Responses WebSocket URL")]
-    InvalidUrl(#[source] WebSocketError),
-    /// The authorization value could not be encoded as an HTTP header.
-    #[error("invalid OpenAI authorization header")]
-    InvalidAuthorization(#[source] InvalidHeaderValue),
-    /// The session identity could not be encoded as an HTTP header.
-    #[error("invalid Responses session identifier header")]
-    InvalidSessionId(#[source] InvalidHeaderValue),
+    #[error("invalid Responses WebSocket URL: {detail}")]
+    InvalidUrl {
+        /// Complete parser failure detail.
+        detail: String,
+    },
+    /// An authorization value could not be encoded for the handshake.
+    #[error("invalid OpenAI authorization header: {detail}")]
+    InvalidAuthorization {
+        /// Complete header encoding failure detail.
+        detail: String,
+    },
+    /// A session identity could not be encoded for the handshake.
+    #[error("invalid Responses session identifier header: {detail}")]
+    InvalidSessionId {
+        /// Complete header encoding failure detail.
+        detail: String,
+    },
     /// The WebSocket handshake exceeded its deadline.
     #[error("Responses WebSocket handshake exceeded {seconds} seconds")]
     HandshakeTimeout {
@@ -31,8 +43,13 @@ pub enum ResponsesError {
         seconds: u64,
     },
     /// The WebSocket handshake failed at the transport layer.
-    #[error("Responses WebSocket handshake failed")]
-    Handshake(#[source] WebSocketError),
+    #[error("Responses WebSocket handshake failed: {detail}")]
+    Handshake {
+        /// Complete platform failure detail.
+        detail: String,
+        /// Whether opening a replacement socket may safely recover.
+        reconnectable: bool,
+    },
     /// The server rejected the WebSocket handshake.
     #[error("Responses WebSocket handshake was rejected with HTTP {status}: {body}")]
     HandshakeRejected {
@@ -44,8 +61,13 @@ pub enum ResponsesError {
         retry_after: Option<Duration>,
     },
     /// Sending a WebSocket frame failed.
-    #[error("failed to send a Responses WebSocket frame")]
-    Send(#[source] WebSocketError),
+    #[error("failed to send a Responses WebSocket frame: {detail}")]
+    Send {
+        /// Complete platform failure detail.
+        detail: String,
+        /// Whether opening a replacement socket may safely recover.
+        reconnectable: bool,
+    },
     /// Sending a WebSocket frame exceeded its deadline.
     #[error("sending a Responses WebSocket frame exceeded {seconds} seconds")]
     SendTimeout {
@@ -62,8 +84,13 @@ pub enum ResponsesError {
     #[error("Responses WebSocket closed without a close frame")]
     UnexpectedEnd,
     /// Receiving a WebSocket frame failed.
-    #[error("failed to receive a Responses WebSocket frame")]
-    Receive(#[source] WebSocketError),
+    #[error("failed to receive a Responses WebSocket frame: {detail}")]
+    Receive {
+        /// Complete platform failure detail.
+        detail: String,
+        /// Whether opening a replacement socket may safely recover.
+        reconnectable: bool,
+    },
     /// A received WebSocket event was not valid JSON.
     #[error("Responses WebSocket event was not valid JSON")]
     InvalidJson(#[source] serde_json::Error),
@@ -107,8 +134,15 @@ pub enum ResponsesError {
         event: String,
     },
     /// Sending or reading an HTTPS request failed.
-    #[error("Responses HTTPS request failed")]
-    HttpRequest(#[source] reqwest::Error),
+    #[error("Responses HTTPS request failed: {detail}")]
+    HttpRequest {
+        /// Complete platform failure detail.
+        detail: String,
+        /// Whether replaying the request may recover.
+        retryable: bool,
+        /// Whether the request exceeded a configured deadline.
+        timeout: bool,
+    },
     /// The server rejected an HTTPS request.
     #[error("Responses HTTPS request was rejected with HTTP {status}: {body}")]
     HttpRejected {
@@ -120,8 +154,11 @@ pub enum ResponsesError {
         retry_after: Option<Duration>,
     },
     /// An SSE response body contained invalid UTF-8.
-    #[error("Responses HTTPS stream contained invalid UTF-8")]
-    InvalidSseUtf8(#[source] std::str::Utf8Error),
+    #[error("Responses HTTPS stream contained invalid UTF-8: {detail}")]
+    InvalidSseUtf8 {
+        /// Complete UTF-8 failure detail.
+        detail: String,
+    },
 }
 
 impl ResponsesError {
@@ -129,10 +166,11 @@ impl ResponsesError {
     #[must_use]
     pub fn retry_advice(&self) -> Option<RetryAdvice> {
         let (class, server_delay) = match self {
+            Self::Handshake {
+                reconnectable: true,
+                ..
+            } => ("handshake_transport", None),
             Self::HandshakeTimeout { .. } => ("handshake_timeout", None),
-            Self::Handshake(error) if is_transient_websocket(error) => {
-                ("handshake_transport", None)
-            }
             Self::HandshakeRejected {
                 status,
                 retry_after,
@@ -144,15 +182,21 @@ impl ResponsesError {
                 ..
             } if (500..=599).contains(status) => ("handshake_server", *retry_after),
             Self::SendTimeout { .. } => ("send_timeout", None),
-            Self::Send(error) if is_transient_websocket(error) => ("send_transport", None),
+            Self::Send {
+                reconnectable: true,
+                ..
+            } => ("send_transport", None),
             Self::IdleTimeout { .. } => ("event_idle_timeout", None),
             Self::UnexpectedEnd | Self::Closed { .. } => ("premature_close", None),
-            Self::Receive(error) if is_transient_websocket(error) => ("receive_transport", None),
+            Self::Receive {
+                reconnectable: true,
+                ..
+            } => ("receive_transport", None),
             Self::Api { event } => retryable_api_error(event)?,
-            Self::HttpRequest(error) if error.is_timeout() => ("https_timeout", None),
-            Self::HttpRequest(error) if error.is_connect() || error.is_body() => {
-                ("https_transport", None)
-            }
+            Self::HttpRequest { timeout: true, .. } => ("https_timeout", None),
+            Self::HttpRequest {
+                retryable: true, ..
+            } => ("https_transport", None),
             Self::HttpRejected {
                 status,
                 retry_after,
@@ -176,17 +220,18 @@ impl ResponsesError {
     pub fn class(&self) -> &'static str {
         match self {
             Self::Authorization { .. } => "authorization",
-            Self::InvalidUrl(_) => "invalid_url",
-            Self::InvalidAuthorization(_) => "invalid_authorization",
-            Self::InvalidSessionId(_) => "invalid_session_id",
+            Self::HostUnavailable => "host_unavailable",
+            Self::InvalidUrl { .. } => "invalid_url",
+            Self::InvalidAuthorization { .. } => "invalid_authorization",
+            Self::InvalidSessionId { .. } => "invalid_session_id",
             Self::HandshakeTimeout { .. } => "handshake_timeout",
-            Self::Handshake(_) => "handshake",
+            Self::Handshake { .. } => "handshake",
             Self::HandshakeRejected { .. } => "handshake_rejected",
-            Self::Send(_) => "send",
+            Self::Send { .. } => "send",
             Self::SendTimeout { .. } => "send_timeout",
             Self::IdleTimeout { .. } => "event_idle_timeout",
             Self::UnexpectedEnd => "premature_close",
-            Self::Receive(_) => "receive",
+            Self::Receive { .. } => "receive",
             Self::InvalidJson(_) => "invalid_json",
             Self::UnexpectedBinary => "unexpected_binary",
             Self::EncodeRequest(_) => "encode_request",
@@ -198,12 +243,12 @@ impl ResponsesError {
             Self::Api { .. } => "api",
             Self::ContextWindowExceeded { .. } => "context_window_exceeded",
             Self::InvalidImageRequest { .. } => "invalid_image_request",
-            Self::HttpRequest(error) if error.is_timeout() => "https_timeout",
-            Self::HttpRequest(_) => "https_transport",
+            Self::HttpRequest { timeout: true, .. } => "https_timeout",
+            Self::HttpRequest { .. } => "https_transport",
             Self::HttpRejected { status: 429, .. } => "https_rate_limit",
             Self::HttpRejected { status, .. } if (500..=599).contains(status) => "https_server",
             Self::HttpRejected { .. } => "https_rejected",
-            Self::InvalidSseUtf8(_) => "invalid_sse_utf8",
+            Self::InvalidSseUtf8 { .. } => "invalid_sse_utf8",
         }
     }
 
@@ -237,113 +282,46 @@ pub struct RetryAdvice {
     pub server_delay: Option<Duration>,
 }
 
-const fn is_transient_websocket(error: &WebSocketError) -> bool {
-    matches!(
-        error,
-        WebSocketError::ConnectionClosed
-            | WebSocketError::AlreadyClosed
-            | WebSocketError::Io(_)
-            | WebSocketError::Protocol(
-                ProtocolError::HandshakeIncomplete
-                    | ProtocolError::ResetWithoutClosingHandshake
-                    | ProtocolError::SendAfterClosing
-            )
-    )
-}
-
-fn retryable_api_error(event: &str) -> Option<(&'static str, Option<Duration>)> {
-    let event: ApiErrorEnvelope = serde_json::from_str(event).ok()?;
-    let error = event
-        .error
-        .as_ref()
-        .or_else(|| event.response.as_ref()?.error.as_ref())?;
-    let class = match error.code.as_deref().or(error.kind.as_deref()) {
-        Some(
-            "server_is_overloaded"
-            | "slow_down"
-            | "server_error"
-            | "websocket_connection_limit_reached",
-        ) => "api_server",
-        Some("rate_limit_exceeded") => "api_rate_limit",
-        _ => return None,
-    };
-    let server_delay = error
-        .retry_after
-        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
-        .or_else(|| retry_after_header(&event.headers));
-    Some((class, server_delay))
-}
-
-fn api_error_has_code(event: &str, expected: &str) -> bool {
-    let Ok(event) = serde_json::from_str::<ApiErrorEnvelope>(event) else {
-        return false;
-    };
-    let code = event
-        .error
-        .as_ref()
-        .or_else(|| {
-            event
-                .response
-                .as_ref()
-                .and_then(|response| response.error.as_ref())
-        })
-        .and_then(|error| error.code.as_deref());
-    code == Some(expected)
-}
-
-fn retry_after_header(headers: &HashMap<String, RetryAfterValue>) -> Option<Duration> {
-    headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
-        .and_then(|(_, value)| value.seconds())
-        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
-}
-
-#[derive(Deserialize)]
-struct ApiErrorEnvelope {
-    #[serde(default)]
-    error: Option<ApiErrorDetail>,
-    #[serde(default)]
-    response: Option<ApiErrorResponse>,
-    #[serde(default)]
-    headers: HashMap<String, RetryAfterValue>,
-}
-
-#[derive(Deserialize)]
-struct ApiErrorResponse {
-    #[serde(default)]
-    error: Option<ApiErrorDetail>,
-}
-
-#[derive(Deserialize)]
-struct ApiErrorDetail {
-    #[serde(default, rename = "type")]
-    kind: Option<Box<str>>,
-    #[serde(default)]
-    code: Option<Box<str>>,
-    #[serde(default)]
-    retry_after: Option<f64>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RetryAfterValue {
-    Number(f64),
-    String(Box<str>),
-}
-
-impl RetryAfterValue {
-    fn seconds(&self) -> Option<f64> {
-        match self {
-            Self::Number(seconds) => Some(*seconds),
-            Self::String(seconds) => seconds.parse().ok(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ResponsesError, retryable_api_error};
+    use std::time::Duration;
+
+    use super::ResponsesError;
+    use crate::transport::api_error::retryable_api_error;
+
+    #[test]
+    fn handshake_rejection_retains_provider_retry_delay() {
+        let delay = Duration::from_secs(3);
+        let error = ResponsesError::HandshakeRejected {
+            status: 429,
+            body: r#"{"error":"slow down"}"#.to_owned(),
+            retry_after: Some(delay),
+        };
+
+        let advice = error
+            .retry_advice()
+            .expect("HTTP 429 handshake rejection must remain retryable");
+        assert_eq!(advice.class, "handshake_rate_limit");
+        assert_eq!(advice.server_delay, Some(delay));
+    }
+
+    #[test]
+    fn transport_retryability_is_explicit() {
+        let retryable = ResponsesError::Send {
+            detail: "socket was replaced".to_owned(),
+            reconnectable: true,
+        };
+        let terminal = ResponsesError::Send {
+            detail: "host rejected the request".to_owned(),
+            reconnectable: false,
+        };
+
+        assert_eq!(
+            retryable.retry_advice().map(|advice| advice.class),
+            Some("send_transport")
+        );
+        assert!(terminal.retry_advice().is_none());
+    }
 
     #[test]
     fn retries_server_error_reported_as_error_type() {

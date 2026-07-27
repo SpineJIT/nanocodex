@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(not(target_family = "wasm"))]
+use crate::rollout::RolloutConfig;
+
 /// Builder for one owned agent lifecycle.
 #[derive(Clone)]
 pub struct NanocodexBuilder<F = StandardServiceFactory> {
@@ -21,8 +24,8 @@ pub(super) struct PromptCacheConfig {
 
 #[derive(Clone, Default)]
 pub(super) struct CodexCompatibility {
-    pub(super) home: Option<PathBuf>,
-    pub(super) rollout: Option<RolloutConfig>,
+    pub(super) context: ContextSourceConfig,
+    pub(super) durability: DurabilityConfig,
 }
 
 impl<F> NanocodexBuilder<F> {
@@ -68,6 +71,8 @@ impl<F> NanocodexBuilder<F> {
     /// runtime is being built. Use this for agent-relative tools such as Code
     /// Mode child-agent tools; stateless tools may continue using
     /// [`Self::tools`].
+    #[cfg(not(target_family = "wasm"))]
+    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     #[must_use]
     pub fn tools_factory<T>(mut self, factory: T) -> Self
     where
@@ -123,19 +128,25 @@ impl<F> NanocodexBuilder<F> {
 
     /// Loads global user instructions from `AGENTS.override.md` or `AGENTS.md`
     /// in the supplied Codex state directory.
+    #[cfg(not(target_family = "wasm"))]
+    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     #[must_use]
     pub fn codex_home(mut self, codex_home: impl Into<PathBuf>) -> Self {
-        self.codex.home = Some(codex_home.into());
+        self.codex.context.set_codex_home(codex_home.into());
         self
     }
 
     /// Records committed history in Codex's resumable JSONL rollout layout.
+    #[cfg(not(target_family = "wasm"))]
+    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     #[must_use]
     pub fn rollout(mut self, rollout: RolloutConfig) -> Self {
-        if self.codex.home.is_none() {
-            self.codex.home = Some(rollout.codex_home().to_path_buf());
+        if self.codex.context.codex_home().is_none() {
+            self.codex
+                .context
+                .set_codex_home(rollout.codex_home().to_path_buf());
         }
-        self.codex.rollout = Some(rollout);
+        self.codex.durability.set_rollout(rollout);
         self
     }
 
@@ -153,6 +164,7 @@ impl<F> NanocodexBuilder<F> {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl<F> NanocodexBuilder<F>
 where
     F: MakeResponsesService + Send + Sync + 'static,
@@ -167,25 +179,56 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid agent policy or when no Tokio runtime is
-    /// active.
+    /// Returns an error for invalid agent policy or, on native targets, when
+    /// no Tokio runtime is active.
     pub fn build(self) -> Result<(Nanocodex, AgentEvents)> {
-        validate(&self.config, self.prompt_cache.key.as_deref())?;
-        let config = Arc::new(self.config);
-        let factory = self.factory;
-        let service_factory: ServiceFactory<F::Service> = Arc::new({
-            let service_config = Arc::clone(&config);
-            move || factory.make(Arc::clone(&service_config))
-        });
-        build_agent(
-            config,
-            self.tools,
-            self.workspace,
-            self.session_id,
-            self.prompt_cache,
-            self.codex,
-            self.resume,
-            service_factory,
-        )
+        build(self)
     }
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+impl<F> NanocodexBuilder<F>
+where
+    F: MakeResponsesService + 'static,
+    F::Service: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + 'static,
+    <F::Service as Service<ResponsesAttempt>>::Error: Into<NanocodexError> + 'static,
+{
+    /// Builds an agent from the configured [`OpenAi`] client recipe.
+    ///
+    /// Each root, spawned sibling, and fork receives a fresh concrete Tower
+    /// service, tool runtime, event stream, and mutable conversation state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid agent policy.
+    pub fn build(self) -> Result<(Nanocodex, AgentEvents)> {
+        build(self)
+    }
+}
+
+fn build<F>(builder: NanocodexBuilder<F>) -> Result<(Nanocodex, AgentEvents)>
+where
+    F: MakeResponsesService + AgentFactory + 'static,
+    F::Service:
+        Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
+    <F::Service as Service<ResponsesAttempt>>::Error: Into<NanocodexError> + AgentSend + 'static,
+    <F::Service as Service<ResponsesAttempt>>::Future: AgentSend,
+{
+    validate(&builder.config, builder.prompt_cache.key.as_deref())?;
+    let config = Arc::new(builder.config);
+    let factory = builder.factory;
+    let service_factory: ServiceFactory<F::Service> = Arc::new({
+        let service_config = Arc::clone(&config);
+        move || factory.make(Arc::clone(&service_config))
+    });
+    build_agent(
+        config,
+        builder.tools,
+        builder.workspace,
+        builder.session_id,
+        builder.prompt_cache,
+        builder.codex,
+        builder.resume,
+        service_factory,
+    )
 }

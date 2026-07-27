@@ -1,27 +1,27 @@
 //! Responses transport policy, errors, and connection statistics.
 
+mod api_error;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod connector;
-#[cfg(not(target_family = "wasm"))]
 pub(crate) mod error;
+/// Portable embedding-host interfaces for persistent Responses connections.
+pub mod host;
 #[cfg(target_family = "wasm")]
-#[path = "error_wasm.rs"]
-pub(crate) mod error;
+pub(crate) use host::socket;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod http;
+pub(crate) mod platform;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod socket;
-#[cfg(target_family = "wasm")]
-#[path = "socket_wasm.rs"]
-pub(crate) mod socket;
 pub(crate) mod telemetry;
+mod wire;
 
 use std::{fmt, str::FromStr};
 
 pub use crate::tower::attempt::{TransportStats, TransportStatsDelta, TransportStatsSnapshot};
 pub use error::{ResponsesError, RetryAdvice};
-pub use socket::EncodedRequest;
 pub use telemetry::TRANSPORT;
+pub use wire::EncodedRequest;
 
 /// Responses transport selected once when a managed session is built.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

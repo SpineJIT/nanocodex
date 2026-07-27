@@ -16,9 +16,7 @@ use nanocodex_agent::{
     session::SessionId,
     transport::{ResponsesAttempt, ResponsesServiceResponse},
 };
-use nanocodex_tools::{
-    ToolContext, ToolDefinition, contract::ToolExecution, runtime::DynamicToolProvider,
-};
+use nanocodex_tools::{ToolContext, ToolDefinition, ToolOutput, runtime::DynamicToolProvider};
 use serde_json::Value;
 use tempfile::tempdir;
 use tokio::sync::mpsc;
@@ -116,7 +114,7 @@ impl DynamicToolProvider for StartProbe {
         _name: &str,
         _input: Value,
         _context: ToolContext<'_>,
-    ) -> Option<ToolExecution> {
+    ) -> Option<ToolOutput> {
         None
     }
 }

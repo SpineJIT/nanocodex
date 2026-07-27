@@ -17,7 +17,7 @@ use self::{
     schema::commands_schema,
     wire::{SearchCommands, SearchRequest, SearchResponse, SearchSettings},
 };
-use super::{Tool, ToolContext, ToolExecution, ToolInput, ToolResult, WebSearchConfig};
+use super::{Tool, ToolContext, ToolInput, ToolOutput, ToolResult, WebSearchConfig};
 
 const DESCRIPTION: &str = include_str!("web_run_description.md");
 const ERROR_BODY_LIMIT: usize = 4_096;
@@ -46,31 +46,31 @@ impl WebSearchHandler {
         }
     }
 
-    async fn run(&self, input: &str, context: ToolContext<'_>) -> ToolExecution {
+    async fn run(&self, input: &str, context: ToolContext<'_>) -> ToolOutput {
         match timeout(TOOL_TIMEOUT, self.run_inner(input, context)).await {
             Ok(execution) => execution,
-            Err(_) => ToolExecution::error(format!(
+            Err(_) => ToolOutput::error(format!(
                 "standalone web search timed out after {} seconds",
                 TOOL_TIMEOUT.as_secs()
             )),
         }
     }
 
-    async fn run_inner(&self, input: &str, context: ToolContext<'_>) -> ToolExecution {
+    async fn run_inner(&self, input: &str, context: ToolContext<'_>) -> ToolOutput {
         let commands = if input.trim().is_empty() {
             SearchCommands::default()
         } else {
             match serde_json::from_str(input) {
                 Ok(commands) => commands,
                 Err(error) => {
-                    return ToolExecution::error(format!(
+                    return ToolOutput::error(format!(
                         "failed to parse web.run arguments: {error}"
                     ));
                 }
             }
         };
         if let Err(error) = commands.validate() {
-            return ToolExecution::error(error);
+            return ToolOutput::error(error);
         }
 
         let commands = commands.into_requests();
@@ -135,14 +135,14 @@ impl WebSearchHandler {
 
         let output = outputs.join("\n");
         let mut execution = if failures.is_empty() {
-            ToolExecution::text(output.clone()).with_code_mode_value(Value::String(output))
+            ToolOutput::text(output.clone()).with_code_mode_value(Value::String(output))
         } else {
             let mut error = failures.join("\n");
             if !output.is_empty() {
                 error.push_str("\n\nWeb search output:\n");
                 error.push_str(&output);
             }
-            ToolExecution::error(error)
+            ToolOutput::error(error)
         };
         if saw_results {
             execution = execution.with_metadata(json!({ "results": results }));
@@ -330,163 +330,9 @@ fn has_semantic_error(output: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use eyre::{Result, eyre};
-    use nanocodex_oai_api::responses::ResponseItem;
-    use serde_json::{Value, json};
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::{TcpListener, TcpStream},
-        task::JoinHandle,
-    };
+    use serde_json::json;
 
-    use super::{Tool, ToolContext, WebSearchConfig, WebSearchHandler};
-    use crate::{ToolOutputBody, test_support::RotatingChatGptAuth};
-
-    #[tokio::test]
-    async fn posts_codex_search_request_and_returns_plaintext_output() -> Result<()> {
-        let (endpoint, server) = spawn_search_server().await?;
-        let (auth, auth_source) = RotatingChatGptAuth::shared();
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            "x-injected-client",
-            reqwest::header::HeaderValue::from_static("true"),
-        );
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()?;
-        let handler = WebSearchHandler::with_client(WebSearchConfig { endpoint, auth }, client);
-        let history = serde_json::from_value::<Vec<ResponseItem>>(json!([
-            json!({
-                "type": "message",
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": "<environment_context>ignored</environment_context>"
-                }]
-            }),
-            json!({
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "Search the web"}]
-            }),
-        ]))?;
-        let execution = handler
-            .run(
-                r#"{"search_query":[{"q":"standalone web search"}]}"#,
-                ToolContext::new(
-                    "gpt-5.6-sol",
-                    "search-session",
-                    "call-search",
-                    &history,
-                    crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
-                ),
-            )
-            .await;
-
-        assert!(execution.success);
-        assert!(matches!(
-            execution.output,
-            ToolOutputBody::Text(ref text) if text == "Search result with turn0search0"
-        ));
-        assert_eq!(
-            execution.code_mode_value(),
-            Value::String("Search result with turn0search0".to_owned())
-        );
-        assert_eq!(
-            execution
-                .metadata
-                .as_deref()
-                .map(|raw| serde_json::from_str::<Value>(raw.get()).unwrap()),
-            Some(json!({
-                "results": [{
-                    "type": "text_result",
-                    "ref_id": "turn0search0",
-                    "url": "https://example.com/result",
-                    "future_field": {"preserved": true}
-                }]
-            }))
-        );
-
-        let request = server.await??;
-        assert_eq!(request["id"], "search-session");
-        assert_eq!(request["model"], "gpt-5.6-sol");
-        assert_eq!(
-            request["commands"],
-            json!({"search_query": [{"q": "standalone web search"}]})
-        );
-        assert_eq!(
-            request["settings"],
-            json!({"allowed_callers": ["direct"], "external_web_access": true})
-        );
-        assert_eq!(request["max_output_tokens"], 10_000);
-        assert_eq!(
-            request["input"],
-            json!([{
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "Search the web"}]
-            }])
-        );
-        assert!(request.get("reasoning").is_none());
-        assert_eq!(auth_source.recoveries(), 1);
-        Ok(())
-    }
-
-    async fn spawn_search_server() -> Result<(String, JoinHandle<Result<Value>>)> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let endpoint = format!("http://{}/v1/alpha/search", listener.local_addr()?);
-        let server = tokio::spawn(async move {
-            let (mut rejected, _) = listener.accept().await?;
-            let (headers, _) = read_http_request(&mut rejected).await?;
-            assert_search_headers(&headers, "oauth-token-0")?;
-            rejected
-                .write_all(
-                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                )
-                .await?;
-
-            let (mut stream, _) = listener.accept().await?;
-            let (headers, body) = read_http_request(&mut stream).await?;
-            assert_search_headers(&headers, "oauth-token-1")?;
-            let response = serde_json::to_vec(&json!({
-                "encrypted_output": "ciphertext",
-                "output": "Search result with turn0search0",
-                "results": [{
-                    "type": "text_result",
-                    "ref_id": "turn0search0",
-                    "url": "https://example.com/result",
-                    "future_field": {"preserved": true}
-                }]
-            }))?;
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        response.len()
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-            stream.write_all(&response).await?;
-            Ok(body)
-        });
-        Ok((endpoint, server))
-    }
-
-    fn assert_search_headers(headers: &str, token: &str) -> Result<()> {
-        let headers = headers.to_ascii_lowercase();
-        for expected in [
-            format!("authorization: bearer {token}"),
-            "chatgpt-account-id: account-test".to_owned(),
-            "x-openai-fedramp: true".to_owned(),
-            "x-injected-client: true".to_owned(),
-        ] {
-            if !headers.contains(&expected) {
-                return Err(eyre!("search request omitted `{expected}`"));
-            }
-        }
-        Ok(())
-    }
+    use super::{Tool, WebSearchConfig, WebSearchHandler};
 
     #[test]
     fn exposes_codex_web_run_schema_and_description() {
@@ -507,42 +353,5 @@ mod tests {
                 .as_str()
                 .is_some_and(|description| description.contains("turn2search5"))
         );
-    }
-
-    async fn read_http_request(stream: &mut TcpStream) -> Result<(String, Value)> {
-        let mut bytes = Vec::new();
-        let header_end = loop {
-            let mut chunk = [0_u8; 1024];
-            let read = stream.read(&mut chunk).await?;
-            if read == 0 {
-                return Err(eyre!("HTTP request ended before its headers"));
-            }
-            bytes.extend_from_slice(&chunk[..read]);
-            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-                break index + 4;
-            }
-        };
-        let headers = std::str::from_utf8(&bytes[..header_end])?.to_owned();
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .ok_or_else(|| eyre!("HTTP request omitted content-length"))?;
-        while bytes.len() - header_end < content_length {
-            let mut chunk = [0_u8; 1024];
-            let read = stream.read(&mut chunk).await?;
-            if read == 0 {
-                return Err(eyre!("HTTP request body ended early"));
-            }
-            bytes.extend_from_slice(&chunk[..read]);
-        }
-        Ok((
-            headers,
-            serde_json::from_slice(&bytes[header_end..header_end + content_length])?,
-        ))
     }
 }

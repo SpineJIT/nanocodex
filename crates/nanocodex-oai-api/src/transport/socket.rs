@@ -1,8 +1,6 @@
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::value::{RawValue, to_raw_value};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -11,12 +9,15 @@ use tokio_tungstenite::{
     tungstenite::{
         Error as WebSocketError, Message, Utf8Bytes,
         client::IntoClientRequest,
+        error::ProtocolError,
         http::{HeaderValue, header},
     },
 };
 
-use crate::{OpenAiAuthSnapshot, monotonic_now_ns};
-use crate::{ResponsesError, connector::connect_async};
+use crate::{EncodedRequest, OpenAiAuthSnapshot, ResponsesError, connector::connect_async};
+use crate::{monotonic_now_ns, transport::wire::turn_state_from_event};
+
+pub(crate) use crate::transport::wire::{decode_event, parse_raw_json};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -50,9 +51,6 @@ pub(crate) struct ReceivedText {
     pub received_ns: u64,
 }
 
-/// A request serialized once at the API boundary and ready for transport.
-pub struct EncodedRequest(Box<RawValue>);
-
 struct SocketPump {
     commands: mpsc::Sender<SocketCommand>,
     messages: mpsc::UnboundedReceiver<PumpMessage>,
@@ -71,31 +69,6 @@ enum SocketCommand {
     },
 }
 
-impl EncodedRequest {
-    /// Serializes a request once into compact raw JSON.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the request cannot be serialized.
-    pub fn new<T: Serialize + ?Sized>(request: &T) -> Result<Self, ResponsesError> {
-        to_raw_value(request)
-            .map(Self)
-            .map_err(ResponsesError::EncodeRequest)
-    }
-
-    /// Borrows the compact serialized JSON request.
-    #[must_use]
-    pub fn raw(&self) -> &RawValue {
-        &self.0
-    }
-
-    /// Returns the encoded request text without copying its allocation.
-    #[must_use]
-    pub fn into_string(self) -> String {
-        String::from(Box::<str>::from(self.0))
-    }
-}
-
 impl ResponsesSocket {
     /// Opens a Responses WebSocket with stable session and cache headers.
     ///
@@ -108,18 +81,29 @@ impl ResponsesSocket {
         session_id: &str,
         turn_state: Option<&str>,
     ) -> Result<(Self, ConnectionMetadata), ResponsesError> {
-        let mut request = endpoint
-            .into_client_request()
-            .map_err(ResponsesError::InvalidUrl)?;
-        let authorization = HeaderValue::from_str(&format!("Bearer {}", auth.bearer()))
-            .map_err(ResponsesError::InvalidAuthorization)?;
+        let mut request =
+            endpoint
+                .into_client_request()
+                .map_err(|error| ResponsesError::InvalidUrl {
+                    detail: error.to_string(),
+                })?;
+        let authorization =
+            HeaderValue::from_str(&format!("Bearer {}", auth.bearer())).map_err(|error| {
+                ResponsesError::InvalidAuthorization {
+                    detail: error.to_string(),
+                }
+            })?;
         request
             .headers_mut()
             .insert(header::AUTHORIZATION, authorization);
         if let Some(account_id) = auth.account_id() {
             request.headers_mut().insert(
                 "ChatGPT-Account-ID",
-                HeaderValue::from_str(account_id).map_err(ResponsesError::InvalidAuthorization)?,
+                HeaderValue::from_str(account_id).map_err(|error| {
+                    ResponsesError::InvalidAuthorization {
+                        detail: error.to_string(),
+                    }
+                })?,
             );
         }
         if auth.is_fedramp() {
@@ -137,7 +121,11 @@ impl ResponsesSocket {
         for name in ["session-id", "thread-id", "x-client-request-id"] {
             request.headers_mut().insert(
                 name,
-                HeaderValue::from_str(session_id).map_err(ResponsesError::InvalidSessionId)?,
+                HeaderValue::from_str(session_id).map_err(|error| {
+                    ResponsesError::InvalidSessionId {
+                        detail: error.to_string(),
+                    }
+                })?,
             );
         }
         if let Some(turn_state) = turn_state.and_then(|state| HeaderValue::from_str(state).ok()) {
@@ -186,7 +174,7 @@ impl ResponsesSocket {
             .map_err(|_| ResponsesError::SendTimeout {
                 seconds: SEND_TIMEOUT.as_secs(),
             })?
-            .map_err(ResponsesError::Send)?;
+            .map_err(map_send_error)?;
         Ok(())
     }
 
@@ -217,7 +205,7 @@ impl ResponsesSocket {
                 .next()
                 .await
                 .ok_or(ResponsesError::UnexpectedEnd)?;
-            let message = received.message.map_err(ResponsesError::Receive)?;
+            let message = received.message.map_err(map_receive_error)?;
 
             match message {
                 Message::Text(text) => {
@@ -255,52 +243,6 @@ impl ResponsesSocket {
         }
         self.turn_state = turn_state_from_event(text);
     }
-}
-
-fn turn_state_from_event(text: &str) -> Option<String> {
-    if text.starts_with(r#"{"type":""#) && !text.starts_with(r#"{"type":"response.metadata""#) {
-        return None;
-    }
-    let Ok(MetadataEvent::Metadata { headers }) = serde_json::from_str(text) else {
-        return None;
-    };
-    headers.into_iter().find_map(|(name, value)| {
-        name.eq_ignore_ascii_case(TURN_STATE_HEADER)
-            .then_some(value)
-    })
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type")]
-enum MetadataEvent {
-    #[serde(rename = "response.metadata")]
-    Metadata {
-        #[serde(default)]
-        headers: HashMap<String, String>,
-    },
-    #[serde(other)]
-    Other,
-}
-
-/// Validates an inbound event while preserving its raw JSON representation.
-///
-/// # Errors
-///
-/// Returns an error when `text` is not valid JSON.
-pub(crate) fn parse_raw_json(text: &str) -> Result<&RawValue, ResponsesError> {
-    serde_json::from_str(text).map_err(ResponsesError::InvalidJson)
-}
-
-/// Decodes a previously validated raw event into a wire type.
-///
-/// # Errors
-///
-/// Returns an error when the event does not match the target type.
-pub(crate) fn decode_event<T: DeserializeOwned>(event: &RawValue) -> Result<T, ResponsesError> {
-    serde_json::from_str(event.get()).map_err(|source| ResponsesError::InvalidPayload {
-        source,
-        event: event.get().to_owned(),
-    })
 }
 
 impl SocketPump {
@@ -392,7 +334,10 @@ impl Drop for SocketPump {
 
 fn map_handshake_error(error: WebSocketError) -> ResponsesError {
     let WebSocketError::Http(response) = error else {
-        return ResponsesError::Handshake(error);
+        return ResponsesError::Handshake {
+            reconnectable: is_transient_websocket(&error),
+            detail: error.to_string(),
+        };
     };
     let status = response.status().as_u16();
     let retry_after = response
@@ -410,6 +355,34 @@ fn map_handshake_error(error: WebSocketError) -> ResponsesError {
         body,
         retry_after,
     }
+}
+
+fn map_send_error(error: WebSocketError) -> ResponsesError {
+    ResponsesError::Send {
+        reconnectable: is_transient_websocket(&error),
+        detail: error.to_string(),
+    }
+}
+
+fn map_receive_error(error: WebSocketError) -> ResponsesError {
+    ResponsesError::Receive {
+        reconnectable: is_transient_websocket(&error),
+        detail: error.to_string(),
+    }
+}
+
+const fn is_transient_websocket(error: &WebSocketError) -> bool {
+    matches!(
+        error,
+        WebSocketError::ConnectionClosed
+            | WebSocketError::AlreadyClosed
+            | WebSocketError::Io(_)
+            | WebSocketError::Protocol(
+                ProtocolError::HandshakeIncomplete
+                    | ProtocolError::ResetWithoutClosingHandshake
+                    | ProtocolError::SendAfterClosing
+            )
+    )
 }
 
 fn header_string(

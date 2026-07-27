@@ -285,3 +285,103 @@ async fn steering_during_a_tool_call_joins_after_the_tool_result() -> Result<()>
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
+
+#[tokio::test]
+async fn compaction_resumes_tool_continuation_before_queued_steering() -> Result<()> {
+    let workspace = temporary_workspace("steer-after-compaction")?;
+    let server_workspace = workspace.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut socket).await?);
+        send_warmup(&mut socket, "resp-warmup").await?;
+
+        drop(next_json(&mut socket).await?);
+        send_json(
+            &mut socket,
+            completed_response_with_usage(
+                "resp-tool",
+                &[json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call-exec",
+                    "name": "exec",
+                    "input": "const result = await tools.exec_command({cmd: \"printf started > tool-started; while [ ! -f release-tool ]; do sleep 0.01; done; printf tool-output\"}); text(result.output);"
+                })],
+                372_001,
+            ),
+        )
+        .await?;
+
+        let compact = next_json(&mut socket).await?;
+        assert_eq!(compact["previous_response_id"], "resp-tool");
+        assert!(compact.to_string().contains("tool-output"));
+        assert!(!compact.to_string().contains("queued steer"));
+        assert_eq!(
+            compact["input"].as_array().and_then(|input| input.last()),
+            Some(&json!({ "type": "compaction_trigger" }))
+        );
+        send_json(
+            &mut socket,
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "id": "cmp-server-id",
+                    "type": "compaction",
+                    "encrypted_content": "opaque-summary"
+                }
+            }),
+        )
+        .await?;
+        send_json(
+            &mut socket,
+            completed_response_with_usage("resp-compact", &[], 120),
+        )
+        .await?;
+
+        let continuation = next_json(&mut socket).await?;
+        assert!(continuation.get("previous_response_id").is_none());
+        assert!(continuation.to_string().contains("opaque-summary"));
+        assert!(!continuation.to_string().contains("queued steer"));
+        send_final(&mut socket, "resp-continuation").await?;
+
+        let steered = next_json(&mut socket).await?;
+        assert_eq!(steered["previous_response_id"], json!("resp-continuation"));
+        assert!(steered.to_string().contains("queued steer"));
+        send_final(&mut socket, "resp-steered").await?;
+
+        if !server_workspace.join("release-tool").exists() {
+            return Err(eyre!("tool release marker disappeared"));
+        }
+        Ok(())
+    });
+
+    let openai = OpenAi::builder("test-key")
+        .websocket_url(endpoint)
+        .build()?;
+    let (agent, events) = Nanocodex::builder(openai)
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .session_id(test_session_id())
+        .build()?;
+    let turn = agent.prompt("run a tool and continue").await?;
+    timeout(std::time::Duration::from_secs(5), async {
+        while !workspace.join("tool-started").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| eyre!("tool process did not start"))?;
+    turn.steer("queued steer").await?;
+    std::fs::write(workspace.join("release-tool"), [])?;
+
+    assert_eq!(turn.result().await?.final_message(), "done");
+    drop(agent);
+    drop(events);
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}

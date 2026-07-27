@@ -4,10 +4,7 @@ use nanocodex_oai_api::{
     MODEL, ModelConfig, Prompt, Thinking,
     events::{AgentEventKind, EventSink},
     pricing::{ServiceTier, estimate},
-    responses::{
-        ContentItem, MessageRole, RequestProfile, ResponseItem, ResponseItemId, ToolDefinition,
-        Usage,
-    },
+    responses::{ContentItem, MessageRole, RequestProfile, ResponseItem, ToolDefinition, Usage},
     session::ManagedSessionState,
     tower::{
         CodeCall, CodeCallKind, GenerationOutput as TurnResult, ResponsesAttempt,
@@ -26,16 +23,19 @@ use web_time::Instant;
 use super::{
     CompactionCompleted, CompactionFailed, CompactionStarted, ModelCallCompleted, ModelCallFailed,
     ModelCallStarted, RunError, RunStarted, RunStats, RunSteered, ToolCallArguments, ToolCallEvent,
-    ToolResultEvent, WarmupCompleted, WarmupFailed, WarmupStarted,
-    agents_md::load_instructions,
-    display_endpoint, elapsed_ns,
+    ToolResultEvent, WarmupCompleted, WarmupFailed, WarmupStarted, display_endpoint, elapsed_ns,
     input::{
         custom_tool_notification, custom_tool_output, developer_context, function_tool_output,
         task_context, task_input, turn_aborted,
     },
-    resolve_workspace, terminal_payload,
+    terminal_payload,
 };
-use crate::{NanocodexError, Result, prompt_cache::ModelPromptCache, usage::TurnUsage};
+use crate::{
+    NanocodexError, Result,
+    agent::{AgentSend, ContextSource},
+    prompt_cache::ModelPromptCache,
+    usage::TurnUsage,
+};
 use nanocodex_tools::{
     ToolContext, Tools,
     code_mode::{CodeModeExecution, CodeModeObserver, CodeModeUpdate},
@@ -61,6 +61,7 @@ pub(crate) struct ModelRun<S> {
     tool_call_indices: HashMap<Box<str>, u32>,
     tools: Tools,
     prompt_cache: ModelPromptCache,
+    context_source: ContextSource,
     global_instructions: Option<Arc<str>>,
     force_compaction: bool,
 }
@@ -89,18 +90,25 @@ pub(crate) struct ModelCheckpoint {
 pub(crate) struct PreparedCheckpoint {
     pub(crate) checkpoint: ModelCheckpoint,
     pub(crate) runtime: ToolRuntime,
+    pub(crate) context_source: ContextSource,
+}
+
+pub(crate) struct HistoryCheckpoint {
+    pub(crate) workspace: String,
+    pub(crate) canonical_context: ResponseItem,
+    pub(crate) history: Vec<ResponseItem>,
+    pub(crate) prompt_cache_key: Arc<str>,
 }
 
 impl ModelCheckpoint {
     pub(crate) fn workspace(&self) -> &str {
         &self.workspace
     }
-    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn history(&self) -> nanocodex_oai_api::responses::ResponseHistory {
         self.conversation.shared_history()
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    #[allow(dead_code, reason = "consumed by the native durability boundary only")]
     pub(crate) const fn history_revision(&self) -> u64 {
         self.conversation.history_revision()
     }
@@ -127,6 +135,7 @@ impl ModelCheckpoint {
         prompt_cache_key: Arc<str>,
         canonical_context: ResponseItem,
         history: Vec<ResponseItem>,
+        global_instructions: Option<Arc<str>>,
     ) -> Result<Self> {
         assign_request_prefix_ids(&mut request_prefix);
         Ok(Self {
@@ -135,20 +144,10 @@ impl ModelCheckpoint {
             request_prefix: Arc::from(request_prefix),
             prompt_cache_key,
             preserve_inherited_delta: false,
-            global_instructions: None,
+            global_instructions,
         })
     }
 }
-
-#[cfg(not(target_family = "wasm"))]
-pub(crate) trait AgentSend: Send {}
-#[cfg(not(target_family = "wasm"))]
-impl<T: Send> AgentSend for T {}
-
-#[cfg(target_family = "wasm")]
-pub(crate) trait AgentSend {}
-#[cfg(target_family = "wasm")]
-impl<T> AgentSend for T {}
 
 struct ModelSessionState {
     workspace: String,
@@ -159,11 +158,15 @@ struct ModelSessionState {
 }
 
 impl ModelSessionState {
-    fn validate_workspace(&self, requested: Option<&str>) -> Result<()> {
+    fn validate_workspace(
+        &self,
+        context_source: &ContextSource,
+        requested: Option<&str>,
+    ) -> Result<()> {
         let Some(requested) = requested else {
             return Ok(());
         };
-        let requested = resolve_workspace(Some(requested))?;
+        let requested = context_source.resolve_workspace(Some(requested))?;
         if requested != self.workspace {
             return Err(NanocodexError::WorkspaceChanged {
                 current: self.workspace.clone(),
@@ -307,10 +310,30 @@ enum ModelTaskOutcome {
     Cancelled,
 }
 
+#[derive(Clone, Copy)]
+enum CompactionPhase {
+    PreTurn,
+    MidTurn,
+}
+
+struct CompactionContext<'a> {
+    project_workspace: &'a str,
+    working_directory: &'a str,
+    shell: &'a str,
+    phase: CompactionPhase,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ContinuationPolicy {
+    thinking: Thinking,
+    fast_mode: bool,
+}
+
 #[derive(Clone)]
 struct ConversationState {
     canonical_context: Arc<ResponseItem>,
     managed: ManagedSessionState,
+    continuation_policy: Option<ContinuationPolicy>,
 }
 
 impl ConversationState {
@@ -325,6 +348,7 @@ impl ConversationState {
         Ok(Self {
             canonical_context: Arc::new(canonical_context),
             managed: ManagedSessionState::new(history),
+            continuation_policy: None,
         })
     }
 
@@ -340,6 +364,7 @@ impl ConversationState {
         Ok(Self {
             canonical_context: Arc::new(canonical_context),
             managed,
+            continuation_policy: None,
         })
     }
 
@@ -387,7 +412,7 @@ impl ConversationState {
         self.managed.set_previous_response_id(response_id);
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    #[allow(dead_code, reason = "consumed by the native durability boundary only")]
     const fn history_revision(&self) -> u64 {
         self.managed.history_revision()
     }
@@ -398,15 +423,35 @@ impl ConversationState {
         canonical_developer_context: ResponseItem,
         canonical_context: ResponseItem,
         request_prefix: &[ResponseItem],
+        phase: CompactionPhase,
     ) {
-        let initial_context = [canonical_developer_context, canonical_context.clone()];
-        self.canonical_context = Arc::new(canonical_context);
-        self.managed
-            .install_compaction(item, initial_context, request_prefix);
+        self.canonical_context = Arc::new(canonical_context.clone());
+        match phase {
+            CompactionPhase::PreTurn => {
+                self.managed.install_compaction(item, [], request_prefix);
+                self.managed
+                    .append([canonical_developer_context, canonical_context]);
+            }
+            CompactionPhase::MidTurn => {
+                let initial_context = [canonical_developer_context, canonical_context];
+                self.managed
+                    .install_compaction(item, initial_context, request_prefix);
+            }
+        }
     }
 
     fn reset_for_full_request(&mut self) {
         self.managed.reset_for_full_request();
+    }
+
+    fn prepare_request_policy(&mut self, policy: ContinuationPolicy) {
+        if self
+            .continuation_policy
+            .is_some_and(|previous| previous != policy)
+        {
+            self.reset_for_full_request();
+        }
+        self.continuation_policy = Some(policy);
     }
 
     fn commit(&mut self) -> Result<()> {
@@ -434,10 +479,11 @@ impl<S> ModelRun<S> {
         transport_stats: Arc<TransportStats>,
         tools: Tools,
         prompt_cache: ModelPromptCache,
-        global_instructions: Option<Arc<str>>,
+        context_source: ContextSource,
     ) -> Self {
         let thinking = config.thinking;
         let fast_mode = config.fast_mode;
+        let global_instructions = context_source.global_instructions();
         Self {
             events,
             config,
@@ -453,6 +499,7 @@ impl<S> ModelRun<S> {
             tool_call_indices: HashMap::new(),
             tools,
             prompt_cache,
+            context_source,
             global_instructions,
             force_compaction: false,
         }
@@ -470,6 +517,7 @@ impl<S> ModelRun<S> {
         let PreparedCheckpoint {
             checkpoint,
             runtime,
+            context_source,
         } = prepared;
         let active_tools = runtime.control();
         let factory = ResponsesAttemptFactory::new(
@@ -483,6 +531,9 @@ impl<S> ModelRun<S> {
         );
         let thinking = config.thinking;
         let fast_mode = config.fast_mode;
+        let context_source =
+            context_source.with_fallback_global(checkpoint.global_instructions.clone());
+        let global_instructions = context_source.global_instructions();
         Self {
             events,
             config,
@@ -504,12 +555,12 @@ impl<S> ModelRun<S> {
             tool_call_indices: HashMap::new(),
             tools,
             prompt_cache,
-            global_instructions: checkpoint.global_instructions,
+            context_source,
+            global_instructions,
             force_compaction: false,
         }
     }
 
-    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn set_events(&mut self, events: EventSink) {
         if let Some(session) = &mut self.session {
             session.factory.set_events(events.clone());
@@ -541,7 +592,7 @@ impl<S> ModelRun<S> {
     }
 
     fn load_agent_instructions(&self, workspace: &str) -> Result<Option<String>> {
-        load_instructions(Path::new(workspace), self.global_instructions.as_deref())
+        self.context_source.project_instructions(workspace)
     }
 }
 
@@ -549,27 +600,27 @@ pub(crate) fn prepare_checkpoint(
     checkpoint: ModelCheckpoint,
     config: &ModelConfig,
     tools: &Tools,
+    context_source: ContextSource,
 ) -> PreparedCheckpoint {
     let runtime = tool_runtime(checkpoint.workspace(), config, tools);
     PreparedCheckpoint {
         checkpoint,
         runtime,
+        context_source,
     }
 }
 
 pub(crate) fn prepare_resumed_checkpoint(
-    checkpoint: ModelCheckpoint,
+    mut checkpoint: ModelCheckpoint,
     config: &ModelConfig,
     tools: &Tools,
     session_id: &str,
+    context_source: ContextSource,
 ) -> Result<PreparedCheckpoint> {
-    let prepared = prepare_checkpoint(checkpoint, config, tools);
-    #[cfg(not(target_family = "wasm"))]
-    let tool_specs = {
-        let _ = session_id;
-        prepared.runtime.model_specs()
-    };
-    #[cfg(target_family = "wasm")]
+    checkpoint.global_instructions = context_source
+        .global_instructions()
+        .or(checkpoint.global_instructions);
+    let prepared = prepare_checkpoint(checkpoint, config, tools, context_source);
     let tool_specs = prepared.runtime.model_specs(session_id);
     let expected = request_profile(
         "resume-validation",
@@ -599,26 +650,24 @@ pub(crate) fn prepare_resumed_checkpoint(
     Ok(prepared)
 }
 
-pub(crate) fn prepare_rollout_checkpoint(
-    workspace: String,
-    canonical_context: ResponseItem,
-    history: Vec<ResponseItem>,
-    prompt_cache_key: Arc<str>,
+pub(crate) fn prepare_history_checkpoint(
+    resume: HistoryCheckpoint,
     config: &ModelConfig,
     tools: &Tools,
     session_id: &str,
+    context_source: ContextSource,
 ) -> Result<PreparedCheckpoint> {
+    let HistoryCheckpoint {
+        workspace,
+        canonical_context,
+        history,
+        prompt_cache_key,
+    } = resume;
     let runtime = tool_runtime(&workspace, config, tools);
-    #[cfg(not(target_family = "wasm"))]
-    let tool_specs = {
-        let _ = session_id;
-        runtime.model_specs()
-    };
-    #[cfg(target_family = "wasm")]
     let tool_specs = runtime.model_specs(session_id);
     let request_prefix = request_profile(
-        "rollout-resume",
-        "rollout-resume",
+        "history-resume",
+        "history-resume",
         tool_specs,
         config.system_prompt(),
     )
@@ -630,10 +679,12 @@ pub(crate) fn prepare_rollout_checkpoint(
         prompt_cache_key,
         canonical_context,
         history,
+        context_source.global_instructions(),
     )?;
     Ok(PreparedCheckpoint {
         checkpoint,
         runtime,
+        context_source,
     })
 }
 
@@ -836,16 +887,26 @@ where
                 self.stats.model_calls,
                 &mut session.conversation,
                 &session.factory,
-                &session.workspace,
-                session.tools.working_directory(),
-                session.tools.default_shell_name(),
+                CompactionContext {
+                    project_workspace: &session.workspace,
+                    working_directory: session.tools.working_directory(),
+                    shell: session.tools.default_shell_name(),
+                    phase: CompactionPhase::PreTurn,
+                },
             );
             tokio::pin!(compaction);
             tokio::select! {
                 biased;
-                _ = &mut *cancel => return Ok(false),
-                outcome = &mut compaction => outcome?,
+                _ = &mut *cancel => None,
+                outcome = &mut compaction => Some(outcome?),
             }
+        };
+        let Some(compacted) = compacted else {
+            let user_content = prepare_user_input(&task.instruction).await;
+            session
+                .conversation
+                .append([ResponseItem::message(MessageRole::User, user_content)]);
+            return Ok(false);
         };
         if compacted || session.preserve_inherited_delta {
             session.preserve_inherited_delta = false;
@@ -868,10 +929,15 @@ where
         fork_snapshots: &watch::Sender<Option<ModelCheckpoint>>,
     ) -> Result<ModelTaskOutcome> {
         let mut session = if let Some(mut session) = self.session.take() {
-            if let Err(error) = session.validate_workspace(requested_workspace.as_deref()) {
+            if let Err(error) =
+                session.validate_workspace(&self.context_source, requested_workspace.as_deref())
+            {
                 self.session = Some(session);
                 return Err(error);
             }
+            session
+                .conversation
+                .prepare_request_policy(self.continuation_policy());
             match self
                 .prepare_follow_on_turn(&mut session, &task, cancel)
                 .await
@@ -888,7 +954,9 @@ where
             }
             session
         } else {
-            let workspace = resolve_workspace(requested_workspace.as_deref())?;
+            let workspace = self
+                .context_source
+                .resolve_workspace(requested_workspace.as_deref())?;
             let project_instructions = self.load_agent_instructions(&workspace)?;
             let tools = tool_runtime(&workspace, &self.config, &self.tools);
             self.active_tools = Some(tools.control());
@@ -908,6 +976,9 @@ where
                 conversation,
                 preserve_inherited_delta: false,
             };
+            session
+                .conversation
+                .prepare_request_policy(self.continuation_policy());
             Self::publish_fork_snapshot(
                 &mut session,
                 fork_snapshots,
@@ -960,6 +1031,13 @@ where
         match outcome {
             Some(outcome) => outcome.map(ModelTaskOutcome::Completed),
             None => Ok(ModelTaskOutcome::Cancelled),
+        }
+    }
+
+    const fn continuation_policy(&self) -> ContinuationPolicy {
+        ContinuationPolicy {
+            thinking: self.thinking,
+            fast_mode: self.fast_mode,
         }
     }
 
@@ -1077,15 +1155,22 @@ where
             if code_calls.is_empty() {
                 if end_turn == Some(false) {
                     session.conversation.clear_delta();
-                    self.maybe_compact(
-                        call_index,
-                        &mut session.conversation,
-                        &session.factory,
-                        &session.workspace,
-                        session.tools.working_directory(),
-                        session.tools.default_shell_name(),
-                    )
-                    .await?;
+                    let compacted = self
+                        .maybe_compact(
+                            call_index,
+                            &mut session.conversation,
+                            &session.factory,
+                            CompactionContext {
+                                project_workspace: &session.workspace,
+                                working_directory: session.tools.working_directory(),
+                                shell: session.tools.default_shell_name(),
+                                phase: CompactionPhase::MidTurn,
+                            },
+                        )
+                        .await?;
+                    // After a mid-turn compaction, resume the model-requested
+                    // continuation before injecting newer steering input.
+                    can_drain_steers = !compacted;
                     continue;
                 }
                 if !steers.is_empty() {
@@ -1096,9 +1181,12 @@ where
                         call_index,
                         &mut session.conversation,
                         &session.factory,
-                        &session.workspace,
-                        session.tools.working_directory(),
-                        session.tools.default_shell_name(),
+                        CompactionContext {
+                            project_workspace: &session.workspace,
+                            working_directory: session.tools.working_directory(),
+                            shell: session.tools.default_shell_name(),
+                            phase: CompactionPhase::MidTurn,
+                        },
                     )
                     .await?;
                     continue;
@@ -1124,15 +1212,22 @@ where
                     .await?;
                 session.conversation.append(output);
             }
-            self.maybe_compact(
-                call_index,
-                &mut session.conversation,
-                &session.factory,
-                &session.workspace,
-                session.tools.working_directory(),
-                session.tools.default_shell_name(),
-            )
-            .await?;
+            let compacted = self
+                .maybe_compact(
+                    call_index,
+                    &mut session.conversation,
+                    &session.factory,
+                    CompactionContext {
+                        project_workspace: &session.workspace,
+                        working_directory: session.tools.working_directory(),
+                        shell: session.tools.default_shell_name(),
+                        phase: CompactionPhase::MidTurn,
+                    },
+                )
+                .await?;
+            // Codex resumes a model/tool continuation immediately after
+            // compaction, then drains steering at the following boundary.
+            can_drain_steers = !compacted;
         }
     }
 
@@ -1290,10 +1385,14 @@ where
         after_model_call_index: u32,
         conversation: &mut ConversationState,
         factory: &ResponsesAttemptFactory,
-        project_workspace: &str,
-        working_directory: &str,
-        shell: &str,
+        context: CompactionContext<'_>,
     ) -> Result<bool> {
+        let CompactionContext {
+            project_workspace,
+            working_directory,
+            shell,
+            phase,
+        } = context;
         let Some(auto_compact_token_limit) = compaction::auto_compact_token_limit(MODEL) else {
             return Ok(false);
         };
@@ -1322,6 +1421,7 @@ where
             developer_context(),
             canonical_context,
             factory.profile().prefix(),
+            phase,
         );
         self.force_compaction = false;
         Ok(true)
@@ -2006,26 +2106,23 @@ fn request_profile(
 
 fn assign_request_prefix_ids(prefix: &mut [ResponseItem]) {
     for item in prefix {
-        // Responses Lite rejects client-defined IDs on `additional_tools` even
-        // though ordinary client-authored messages retain stable IDs.
-        if matches!(item, ResponseItem::AdditionalTools { .. }) {
+        // Responses Lite request-prefix items are transport configuration, not
+        // retained conversation. Codex sends both without client-defined IDs.
+        if matches!(
+            item,
+            ResponseItem::AdditionalTools { .. }
+                | ResponseItem::Message {
+                    role: MessageRole::Developer,
+                    ..
+                }
+        ) {
             item.strip_id();
             continue;
         }
         if item.id().is_some_and(|id| !id.is_empty()) {
             continue;
         }
-        let Some((item_prefix, suffix)) = (match item {
-            ResponseItem::Message {
-                role: MessageRole::Developer,
-                ..
-            } => Some(("msg", "nanocodex-instructions")),
-            _ => None,
-        }) else {
-            assign_missing_response_item_id(item);
-            continue;
-        };
-        item.set_id(Some(ResponseItemId::with_suffix(item_prefix, suffix)));
+        assign_missing_response_item_id(item);
     }
 }
 
@@ -2036,9 +2133,6 @@ fn attempt_factory(
     tools: &ToolRuntime,
     system_prompt: &str,
 ) -> ResponsesAttemptFactory {
-    #[cfg(not(target_family = "wasm"))]
-    let tool_specs = tools.model_specs();
-    #[cfg(target_family = "wasm")]
     let tool_specs = tools.model_specs(events.request_id());
     ResponsesAttemptFactory::new(
         request_profile(

@@ -9,17 +9,15 @@ use std::{
 };
 
 use async_trait::async_trait;
-use nanocodex_oai_api::{
-    auth::OpenAiAuth,
-    responses::ResponseItem,
-    tools::{Tool, ToolContext, ToolDefinition, ToolExecution, ToolInput},
-};
+use nanocodex_oai_api::tools::{Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput};
 use schemars::{JsonSchema, r#gen::SchemaSettings};
 use serde_json::value::to_raw_value;
 use serde_json::{Map, Value, json};
 use tracing::{Instrument, info, info_span};
 
 use crate::code_mode::{self, CodeModeExecution, CodeModeObserver};
+pub use crate::hosted::OwnedToolContext;
+pub use crate::runtime_config::{ImageGenerationConfig, WebSearchConfig};
 use crate::{
     apply_patch, plan,
     shell::{self, ShellSessions},
@@ -27,60 +25,7 @@ use crate::{
 };
 use crate::{image_generation, web_search};
 
-/// Owned context used when a Code Mode cell may outlive the model tool call
-/// that started it.
-#[doc(hidden)]
-pub struct OwnedToolContext {
-    pub(crate) model: String,
-    pub(crate) session_id: String,
-    pub(crate) call_id: String,
-    pub(crate) history: Arc<Vec<ResponseItem>>,
-    pub(crate) output_token_budget: usize,
-}
-
-impl OwnedToolContext {
-    #[must_use]
-    pub fn new(
-        model: impl Into<String>,
-        session_id: impl Into<String>,
-        call_id: impl Into<String>,
-        history: Arc<Vec<ResponseItem>>,
-        output_token_budget: usize,
-    ) -> Self {
-        Self {
-            model: model.into(),
-            session_id: session_id.into(),
-            call_id: call_id.into(),
-            history,
-            output_token_budget,
-        }
-    }
-
-    pub(crate) fn from_borrowed(context: ToolContext<'_>) -> Self {
-        Self::new(
-            context.model(),
-            context.session_id(),
-            context.call_id(),
-            Arc::new(context.history().to_vec()),
-            context.output_token_budget(),
-        )
-    }
-
-    pub(crate) fn borrowed(&self) -> ToolContext<'_> {
-        ToolContext::new(
-            &self.model,
-            &self.session_id,
-            &self.call_id,
-            self.history.as_slice(),
-            self.output_token_budget,
-        )
-    }
-
-    pub(crate) const fn with_output_token_budget(mut self, output_token_budget: usize) -> Self {
-        self.output_token_budget = output_token_budget;
-        self
-    }
-}
+const CODEX_THREAD_ID_ENV_VAR: &str = "CODEX_THREAD_ID";
 
 /// A lazily populated family of Code Mode tools.
 ///
@@ -104,25 +49,7 @@ pub trait DynamicToolProvider: Send + Sync {
         name: &str,
         input: Value,
         context: ToolContext<'_>,
-    ) -> Option<ToolExecution>;
-}
-
-/// Connection inputs for the built-in `OpenAI` web-search tool.
-pub struct WebSearchConfig {
-    /// Complete search endpoint URL.
-    pub endpoint: String,
-    /// Authentication source shared with the `OpenAI` API.
-    pub auth: OpenAiAuth,
-}
-
-/// Connection and persistence inputs for the built-in image-generation tool.
-pub struct ImageGenerationConfig {
-    /// Base `OpenAI` API URL; image endpoint paths are appended internally.
-    pub api_base_url: String,
-    /// Authentication source shared with the `OpenAI` API.
-    pub auth: OpenAiAuth,
-    /// Root under which generated images are retained by session and call.
-    pub save_root: PathBuf,
+    ) -> Option<ToolOutput>;
 }
 
 /// Declarative selection of the built-in tools installed for an agent.
@@ -215,8 +142,25 @@ impl Tools {
         self.image_generation
     }
 
+    /// Returns this tool selection bound to one agent session.
+    ///
+    /// Native workspace commands receive the session ID through
+    /// `CODEX_THREAD_ID`. This binding replaces a caller-provided value without
+    /// mutating other clones of the tool selection.
+    #[must_use]
+    pub fn for_session(mut self, session_id: &str) -> Self {
+        self.insert_process_environment(CODEX_THREAD_ID_ENV_VAR.into(), session_id.into());
+        self
+    }
+
     fn process_environment(&self) -> Arc<Vec<(OsString, OsString)>> {
         Arc::clone(&self.process_environment)
+    }
+
+    fn insert_process_environment(&mut self, name: OsString, value: OsString) {
+        let environment = Arc::make_mut(&mut self.process_environment);
+        environment.retain(|(candidate, _)| candidate != &name);
+        environment.push((name, value));
     }
 
     fn remote_http_client(&self) -> Option<reqwest::Client> {
@@ -317,11 +261,9 @@ impl ToolsBuilder {
         K: Into<OsString>,
         V: Into<OsString>,
     {
-        let environment = Arc::make_mut(&mut self.tools.process_environment);
         for (name, value) in variables {
-            let name = name.into();
-            environment.retain(|(candidate, _)| candidate != &name);
-            environment.push((name, value.into()));
+            self.tools
+                .insert_process_environment(name.into(), value.into());
         }
         self
     }
@@ -544,13 +486,16 @@ impl ToolRuntime {
     }
 
     /// Returns the direct model-visible Code Mode tool definitions.
+    ///
+    /// Native definitions are session-independent. The session ID keeps this
+    /// method aligned with hosted runtimes whose available tools may vary by
+    /// session.
     #[must_use]
-    pub fn model_specs(&self) -> Vec<ToolDefinition> {
+    pub fn model_specs(&self, _session_id: &str) -> Vec<ToolDefinition> {
+        let mut definitions = self.registry.definitions().to_vec();
+        definitions.sort_by(|left, right| left.name().cmp(right.name()));
         vec![
-            code_mode::exec_spec(
-                self.registry.definitions(),
-                !self.registry.providers.is_empty(),
-            ),
+            code_mode::exec_spec(&definitions, !self.registry.providers.is_empty()),
             code_mode::wait_spec(),
         ]
     }
@@ -561,7 +506,7 @@ impl ToolRuntime {
             .execute(
                 source,
                 Arc::clone(&self.registry),
-                OwnedToolContext::from_borrowed(context),
+                OwnedToolContext::from_context(context),
             )
             .await
     }
@@ -577,7 +522,7 @@ impl ToolRuntime {
             .execute_with_updates(
                 source,
                 Arc::clone(&self.registry),
-                OwnedToolContext::from_borrowed(context),
+                OwnedToolContext::from_context(context),
                 observer,
             )
             .await
@@ -631,7 +576,7 @@ impl ToolRuntime {
         name: &str,
         input: ToolInput,
         context: ToolContext<'_>,
-    ) -> ToolExecution {
+    ) -> ToolOutput {
         self.registry.execute_direct(name, input, context).await
     }
 }
@@ -660,7 +605,7 @@ impl ToolRegistry {
         name: &str,
         input: ToolInput,
         context: ToolContext<'_>,
-    ) -> ToolExecution {
+    ) -> ToolOutput {
         let trace_content = tracing::enabled!(
             target: "nanocodex_tools",
             tracing::Level::INFO
@@ -677,11 +622,11 @@ impl ToolRegistry {
         let started_at = std::time::Instant::now();
         let execution = async {
             let Some((handler, _definition)) = self.get(name) else {
-                return ToolExecution::error(format!("unsupported tool call: {name}"));
+                return ToolOutput::error(format!("unsupported tool call: {name}"));
             };
             match handler.execute(input, context).await {
                 Ok(execution) => execution,
-                Err(error) => ToolExecution::error(error.to_string()),
+                Err(error) => ToolOutput::error(error.to_string()),
             }
         }
         .instrument(span.clone())
@@ -698,7 +643,7 @@ impl ToolRegistry {
         name: &str,
         input: Value,
         context: ToolContext<'_>,
-    ) -> ToolExecution {
+    ) -> ToolOutput {
         let trace_content = tracing::enabled!(
             target: "nanocodex_tools",
             tracing::Level::INFO
@@ -759,31 +704,31 @@ impl ToolRegistry {
         name: &str,
         input: Value,
         context: ToolContext<'_>,
-    ) -> ToolExecution {
+    ) -> ToolOutput {
         let Some((handler, definition)) = self.get(name) else {
             for provider in &self.providers {
                 if let Some(execution) = provider.execute(name, input.clone(), context).await {
                     return execution;
                 }
             }
-            return ToolExecution::error(format!("unsupported nested tool call: {name}"));
+            return ToolOutput::error(format!("unsupported nested tool call: {name}"));
         };
         let input = match definition {
             ToolDefinition::Function { .. } if !input.is_object() => {
-                return ToolExecution::error(format!(
+                return ToolOutput::error(format!(
                     "nested function tool {name} requires an object argument"
                 ));
             }
             ToolDefinition::Function { .. } => match to_raw_value(&input) {
                 Ok(input) => ToolInput::Function(input),
                 Err(error) => {
-                    return ToolExecution::error(format!("failed to encode {name} input: {error}"));
+                    return ToolOutput::error(format!("failed to encode {name} input: {error}"));
                 }
             },
             ToolDefinition::Custom { .. } => match input.as_str() {
                 Some(input) => ToolInput::Freeform(input.to_owned()),
                 None => {
-                    return ToolExecution::error(format!(
+                    return ToolOutput::error(format!(
                         "nested freeform tool {name} requires a string argument"
                     ));
                 }
@@ -791,7 +736,7 @@ impl ToolRegistry {
         };
         match handler.execute(input, context).await {
             Ok(execution) => execution,
-            Err(error) => ToolExecution::error(error.to_string()),
+            Err(error) => ToolOutput::error(error.to_string()),
         }
     }
 
@@ -896,7 +841,7 @@ fn tool_execution_span(
 fn finish_tool_execution_span(
     span: &tracing::Span,
     started_at: std::time::Instant,
-    execution: &ToolExecution,
+    execution: &ToolOutput,
     output_content: Option<&str>,
 ) {
     if let Some(output_content) = output_content {
@@ -988,9 +933,12 @@ pub fn schema_for<T: JsonSchema>() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+    use std::{
+        ffi::OsString,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
     };
 
     use nanocodex_oai_api::{auth::OpenAiAuth, tools::ToolDefinition};
@@ -1000,7 +948,7 @@ mod tests {
     use crate::{ToolOutputBody, ToolResult, contract::DEFAULT_TOOL_OUTPUT_TOKENS};
 
     use super::{
-        DynamicToolProvider, ImageGenerationConfig, Tool, ToolContext, ToolExecution, ToolInput,
+        DynamicToolProvider, ImageGenerationConfig, Tool, ToolContext, ToolInput, ToolOutput,
         ToolRuntime, Tools, WebSearchConfig,
     };
 
@@ -1041,7 +989,7 @@ mod tests {
 
         async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
             let input = input.decode_json::<DoubleInput>()?;
-            Ok(ToolExecution::text((input.value * 2).to_string()))
+            Ok(ToolOutput::text((input.value * 2).to_string()))
         }
     }
 
@@ -1076,7 +1024,7 @@ mod tests {
         }
 
         async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
-            Ok(ToolExecution::text("replacement"))
+            Ok(ToolOutput::text("replacement"))
         }
     }
 
@@ -1097,7 +1045,7 @@ mod tests {
 
         async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
             self.activated.store(true, Ordering::Release);
-            Ok(ToolExecution::from_json(
+            Ok(ToolOutput::from_json(
                 json!({ "name": "deferred_echo" }),
                 true,
             ))
@@ -1135,9 +1083,9 @@ mod tests {
             name: &str,
             input: serde_json::Value,
             _context: ToolContext<'_>,
-        ) -> Option<ToolExecution> {
+        ) -> Option<ToolOutput> {
             (name == "deferred_echo" && self.activated.load(Ordering::Acquire))
-                .then(|| ToolExecution::from_json(input, true))
+                .then(|| ToolOutput::from_json(input, true))
         }
     }
 
@@ -1165,7 +1113,7 @@ mod tests {
                 .entries()
                 .any(|(_, definition)| definition.name() == "web__run")
         );
-        let enabled_specs = serde_json::to_value(enabled.model_specs()).unwrap();
+        let enabled_specs = serde_json::to_value(enabled.model_specs("test-session")).unwrap();
         assert!(
             enabled_specs[0]["description"]
                 .as_str()
@@ -1179,7 +1127,7 @@ mod tests {
                 .entries()
                 .all(|(_, definition)| definition.name() != "web__run")
         );
-        let disabled_specs = serde_json::to_value(disabled.model_specs()).unwrap();
+        let disabled_specs = serde_json::to_value(disabled.model_specs("test-session")).unwrap();
         assert!(
             disabled_specs[0]["description"]
                 .as_str()
@@ -1207,6 +1155,33 @@ mod tests {
     }
 
     #[test]
+    fn model_description_is_stable_across_registration_order() {
+        let first = Tools::builder()
+            .without_defaults()
+            .tool(Fails)
+            .tool(Double)
+            .build()
+            .unwrap();
+        let second = Tools::builder()
+            .without_defaults()
+            .tool(Double)
+            .tool(Fails)
+            .build()
+            .unwrap();
+
+        let first = serde_json::to_vec(
+            &ToolRuntime::new_with_tools(".", None, None, &first).model_specs("test-session"),
+        )
+        .unwrap();
+        let second = serde_json::to_vec(
+            &ToolRuntime::new_with_tools(".", None, None, &second).model_specs("test-session"),
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
     fn tool_recipe_overrides_model_visible_environment_context() {
         let tools = Tools::builder()
             .without_defaults()
@@ -1218,6 +1193,45 @@ mod tests {
 
         assert_eq!(runtime.working_directory(), "/workspace");
         assert_eq!(runtime.default_shell_name(), "sh");
+    }
+
+    #[test]
+    fn session_binding_overrides_only_its_process_environment_clone() {
+        let tools = Tools::builder()
+            .process_environment([
+                ("OTHER_VARIABLE", "preserved"),
+                ("CODEX_THREAD_ID", "caller-spoof"),
+            ])
+            .build()
+            .unwrap();
+        let bound = tools.clone().for_session("session-1");
+
+        assert_eq!(
+            tools.process_environment().as_slice(),
+            [
+                (
+                    OsString::from("OTHER_VARIABLE"),
+                    OsString::from("preserved")
+                ),
+                (
+                    OsString::from("CODEX_THREAD_ID"),
+                    OsString::from("caller-spoof")
+                ),
+            ]
+        );
+        assert_eq!(
+            bound.process_environment().as_slice(),
+            [
+                (
+                    OsString::from("OTHER_VARIABLE"),
+                    OsString::from("preserved")
+                ),
+                (
+                    OsString::from("CODEX_THREAD_ID"),
+                    OsString::from("session-1")
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -1240,7 +1254,7 @@ mod tests {
             .build()
             .unwrap();
         let runtime = ToolRuntime::new(".", None, None).with_tools(&tools);
-        let description = serde_json::to_value(runtime.model_specs()).unwrap();
+        let description = serde_json::to_value(runtime.model_specs("test-session")).unwrap();
         assert!(
             description[0]["description"]
                 .as_str()
@@ -1323,7 +1337,14 @@ text(result);
             .unwrap();
         tools.start_providers();
         let runtime = ToolRuntime::new(".", None, None).with_tools(&tools);
-        let model_specs_before = serde_json::to_vec(&runtime.model_specs()).unwrap();
+        let model_specs_before = serde_json::to_vec(&runtime.model_specs("test-session")).unwrap();
+        let model_specs_value = serde_json::to_value(runtime.model_specs("test-session")).unwrap();
+        assert!(
+            model_specs_value[0]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("Shared MCP Types:")),
+            "deferred MCP results need their stable shared type preamble before discovery"
+        );
         let execution = runtime
             .execute_code(
                 r#"
@@ -1343,7 +1364,7 @@ text(result.value);
 
         assert!(execution.success);
         assert_eq!(
-            serde_json::to_vec(&runtime.model_specs()).unwrap(),
+            serde_json::to_vec(&runtime.model_specs("test-session")).unwrap(),
             model_specs_before,
             "activating deferred tools must not change the model request prefix"
         );

@@ -1,15 +1,29 @@
 use super::*;
 
+#[cfg(not(target_family = "wasm"))]
+use crate::rollout::RolloutInfo;
+
 /// Cheap, cloneable command handle for an owned agent driver.
-#[derive(Clone)]
 pub struct Nanocodex {
     pub(super) commands: mpsc::Sender<Command>,
     pub(super) events: EventSink,
     pub(super) next_turn: Arc<AtomicU64>,
     pub(super) lineage_id: Arc<str>,
     pub(super) session_id: SessionId,
-    pub(super) rollout: Option<RolloutInfo>,
-    pub(super) rollout_recorder: Option<RolloutRecorder>,
+    pub(super) durability: Durability,
+}
+
+impl Clone for Nanocodex {
+    fn clone(&self) -> Self {
+        Self {
+            commands: self.commands.clone(),
+            events: self.events.clone(),
+            next_turn: Arc::clone(&self.next_turn),
+            lineage_id: Arc::clone(&self.lineage_id),
+            session_id: self.session_id,
+            durability: self.durability.clone(),
+        }
+    }
 }
 
 /// Weak child-agent capability for the driver that owns one tool runtime.
@@ -79,9 +93,11 @@ impl Nanocodex {
     }
 
     /// Returns the Codex-compatible rollout identity and path when recording is enabled.
+    #[cfg(not(target_family = "wasm"))]
+    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     #[must_use]
     pub const fn rollout(&self) -> Option<&RolloutInfo> {
-        self.rollout.as_ref()
+        self.durability.info()
     }
 
     /// Retries any pending rollout write and waits for a durable file flush.
@@ -92,17 +108,10 @@ impl Nanocodex {
     /// # Errors
     ///
     /// Returns an error when the configured rollout cannot be written.
+    #[cfg(not(target_family = "wasm"))]
+    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     pub async fn flush_rollout(&self) -> Result<()> {
-        let Some(recorder) = &self.rollout_recorder else {
-            return Ok(());
-        };
-        recorder
-            .flush()
-            .await
-            .map_err(|source| NanocodexError::PersistRollout {
-                path: recorder.info().path().to_path_buf(),
-                source,
-            })
+        self.durability.flush().await
     }
 
     /// Accepts the agent's prompt and immediately returns its turn handle.

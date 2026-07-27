@@ -153,16 +153,19 @@ impl From<ResponsesError> for ResponsesServiceError {
             ResponsesError::IdleTimeout { .. } => FailurePhase::Idle,
             ResponsesError::UnexpectedEnd
             | ResponsesError::Closed { .. }
-            | ResponsesError::Receive(_) => FailurePhase::Receive,
-            #[cfg(not(target_family = "wasm"))]
-            ResponsesError::HttpRequest(_) | ResponsesError::InvalidSseUtf8(_) => {
+            | ResponsesError::Receive { .. } => FailurePhase::Receive,
+            ResponsesError::HttpRequest { .. } | ResponsesError::InvalidSseUtf8 { .. } => {
                 FailurePhase::Receive
             }
             ResponsesError::Api { .. } | ResponsesError::ContextWindowExceeded { .. } => {
                 FailurePhase::Api
             }
-            #[cfg(not(target_family = "wasm"))]
             ResponsesError::HttpRejected { .. } => FailurePhase::Api,
+            ResponsesError::HostUnavailable
+            | ResponsesError::HandshakeTimeout { .. }
+            | ResponsesError::Handshake { .. }
+            | ResponsesError::HandshakeRejected { .. } => FailurePhase::Connect,
+            ResponsesError::Send { .. } | ResponsesError::SendTimeout { .. } => FailurePhase::Send,
             _ => FailurePhase::Protocol,
         };
         Self::responses(error, phase, 0)

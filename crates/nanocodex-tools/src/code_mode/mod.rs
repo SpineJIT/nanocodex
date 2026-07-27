@@ -8,7 +8,10 @@ mod spec;
 use std::{
     collections::{BTreeSet, HashMap},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Instant,
 };
 
@@ -16,15 +19,16 @@ use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnord
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
-    sync::{Mutex, Semaphore, mpsc, oneshot},
+    sync::{Mutex, OwnedMutexGuard, Semaphore, mpsc, oneshot},
     task::JoinHandle,
     time::Duration,
 };
 use tracing::{Instrument, info_span};
 
-use serde_json::value::RawValue;
-
 use super::{ToolContext, ToolOutputBody, ToolOutputContent};
+pub use crate::hosted::{
+    CodeModeExecution, CodeModeNotification, CodeModeObserver, CodeModeUpdate, NestedToolCall,
+};
 use crate::runtime::{OwnedToolContext, ToolRegistry};
 use embedded::EmbeddedHost;
 pub(crate) use spec::{exec_spec, wait_spec};
@@ -41,6 +45,11 @@ const NESTED_YIELD_GRACE: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT_NESTED_CALLS: usize = 128;
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const EXEC_PRAGMA_PREFIX: &str = "// @exec:";
+const CELL_RUNNING: u8 = 0;
+const CELL_TERMINATING: u8 = 1;
+const CELL_COMPLETION_CLAIMED: u8 = 2;
+const CELL_CLOSED: u8 = 3;
+
 pub(crate) struct CodeModeRuntime {
     cells: Arc<Mutex<CellRegistry>>,
     stored: Arc<Mutex<HashMap<String, Value>>>,
@@ -106,15 +115,42 @@ fn spawn_host() -> Result<EmbeddedHost, String> {
 
 struct CellRegistry {
     next_cell_id: u64,
-    live_cells: HashMap<u64, LiveCell>,
+    live_cells: HashMap<u64, Arc<LiveCell>>,
 }
 
 struct LiveCell {
     id: u64,
     output_token_budget: usize,
+    observation: Arc<Mutex<CellObservationState>>,
+    lifecycle: Arc<CellLifecycle>,
+    terminate: StdMutex<Option<oneshot::Sender<()>>>,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+// The session owns this state for the cell's full lifetime. An observation
+// holds the mutex as an exclusive lease, so dropping its future releases the
+// lease while preserving both unread updates and already-consumed output.
+struct CellObservationState {
     updates: mpsc::UnboundedReceiver<CellUpdate>,
-    terminate: Option<oneshot::Sender<()>>,
-    task: Option<JoinHandle<()>>,
+    buffered: ObservationBuffer,
+}
+
+#[derive(Default)]
+struct ObservationBuffer {
+    content: Vec<ToolOutputContent>,
+    nested_calls: Vec<(u64, NestedToolCall)>,
+    notifications: Vec<CodeModeNotification>,
+}
+
+// One compare-exchange decides whether termination or completion owns the
+// terminal transition. Stored values are committed only after completion wins.
+struct CellLifecycle {
+    phase: AtomicU8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CellError {
+    Busy,
 }
 
 enum CellUpdate {
@@ -139,70 +175,10 @@ enum CellUpdate {
     HostFailed(String),
 }
 
-/// Complete result of one Code Mode cell observation.
-pub struct CodeModeExecution {
-    /// Ordered model-visible output emitted by the cell.
-    pub output: ToolOutputBody,
-    /// Whether the JavaScript cell reached a successful terminal state.
-    pub success: bool,
-    /// Nested tool calls in their original invocation order.
-    pub nested_calls: Vec<NestedToolCall>,
-    /// Application notifications emitted with `notify(...)`.
-    pub notifications: Vec<CodeModeNotification>,
-}
-
-/// One notification emitted by a Code Mode cell.
-pub struct CodeModeNotification {
-    /// Code Mode call that emitted the notification.
-    pub call_id: String,
-    /// Complete notification text.
-    pub text: String,
-}
-
-/// Incremental nested-tool update observed while a Code Mode cell runs.
-pub enum CodeModeUpdate<'a> {
-    /// A nested call was accepted and may now run concurrently.
-    NestedCallStarted {
-        /// Stable nested call identity.
-        call_id: &'a str,
-        /// Registered tool name.
-        name: &'a str,
-        /// Complete JSON input value.
-        input: &'a Value,
-    },
-    /// A nested call reached a terminal result.
-    NestedCallCompleted(&'a NestedToolCall),
-}
-
-#[doc(hidden)]
-pub trait CodeModeObserver: Send {
-    fn update(&mut self, update: CodeModeUpdate<'_>);
-}
-
 struct IgnoreCodeModeUpdates;
 
 impl CodeModeObserver for IgnoreCodeModeUpdates {
     fn update(&mut self, _update: CodeModeUpdate<'_>) {}
-}
-
-/// Recorded nested tool call made by one Code Mode cell.
-pub struct NestedToolCall {
-    /// Stable call identity derived from the parent Code Mode invocation.
-    pub call_id: String,
-    /// Registered tool name.
-    pub name: String,
-    /// Complete JSON input value.
-    pub input: Value,
-    /// Complete model-visible output.
-    pub output: ToolOutputBody,
-    /// Whether the nested operation succeeded.
-    pub success: bool,
-    /// Nanoseconds from cell start until this call started.
-    pub started_after_ns: u64,
-    /// Nanoseconds spent executing this call.
-    pub duration_ns: u64,
-    /// Optional opaque metadata retained for events and adapters.
-    pub metadata: Option<Box<RawValue>>,
 }
 
 enum RuntimeEvent {
@@ -362,25 +338,32 @@ impl CodeModeRuntime {
         let extend_for_nested_calls = source.yield_time_ms.is_none();
         tracing::Span::current().record("output.max_tokens", output_token_budget);
         let context = context.with_output_token_budget(output_token_budget);
-        let cell_id = self.cells.lock().await.allocate_cell_id();
-        tracing::Span::current().record("cell.id", cell_id);
         let stored = self.stored.lock().await.clone();
-        let mut cell = LiveCell::spawn(
-            cell_id,
-            source.code,
-            tools,
-            context,
-            stored,
-            Arc::clone(&self.stored),
-            Arc::clone(&self.host),
-            output_token_budget,
-        );
+        let (cell, observation) = {
+            let mut registry = self.cells.lock().await;
+            let cell_id = registry.allocate_cell_id();
+            tracing::Span::current().record("cell.id", cell_id);
+            let cell = Arc::new(LiveCell::spawn(
+                cell_id,
+                source.code,
+                tools,
+                context,
+                stored,
+                Arc::clone(&self.stored),
+                Arc::clone(&self.host),
+                output_token_budget,
+            ));
+            let observation = Arc::clone(&cell.observation).lock_owned().await;
+            registry.live_cells.insert(cell_id, Arc::clone(&cell));
+            (cell, observation)
+        };
         let yield_after = source
             .yield_time_ms
             .map_or(INITIAL_YIELD, Duration::from_millis);
         let yield_after = observer_yield_timeout(yield_after);
         let (execution, running) = observe_cell(
-            &mut cell,
+            &cell,
+            observation,
             started_at,
             ObservationMode::YieldAfter(yield_after),
             Some(output_token_budget),
@@ -389,10 +372,8 @@ impl CodeModeRuntime {
         )
         .await;
         tracing::Span::current().record("running", running);
-        if running {
-            self.cells.lock().await.live_cells.insert(cell_id, cell);
-        } else {
-            cell.join().await;
+        if !running {
+            self.remove_and_join(&cell).await;
         }
         execution
     }
@@ -428,18 +409,29 @@ impl CodeModeRuntime {
                 );
             }
         };
-        let Some(mut live_cell) = self.cells.lock().await.live_cells.remove(&cell_id) else {
+        let Some(cell) = self.cells.lock().await.live_cells.get(&cell_id).cloned() else {
             return failed_execution(
                 started_at,
                 &format!("exec cell {cell_id} not found"),
                 Vec::new(),
             );
         };
-        let continued_output_token_budget = live_cell.output_token_budget;
+        let observation = match cell.begin_observation() {
+            Ok(observation) => observation,
+            Err(CellError::Busy) => {
+                return failed_execution(
+                    started_at,
+                    &format!("exec cell {cell_id} already has an active observer"),
+                    Vec::new(),
+                );
+            }
+        };
+        let continued_output_token_budget = cell.output_token_budget;
         if arguments.terminate {
-            live_cell.request_terminate();
-            let (execution, _) = observe_cell(
-                &mut live_cell,
+            cell.request_terminate();
+            let (execution, running) = observe_cell(
+                &cell,
+                observation,
                 started_at,
                 ObservationMode::Terminate,
                 Some(continued_output_token_budget),
@@ -447,7 +439,9 @@ impl CodeModeRuntime {
                 observer,
             )
             .await;
-            live_cell.join().await;
+            if !running {
+                self.remove_and_join(&cell).await;
+            }
             return execution;
         }
         let yield_time = Duration::from_millis(
@@ -461,7 +455,8 @@ impl CodeModeRuntime {
             .unwrap_or(continued_output_token_budget)
             .max(1);
         let (execution, running) = observe_cell(
-            &mut live_cell,
+            &cell,
+            observation,
             started_at,
             ObservationMode::YieldAfter(yield_time),
             Some(output_token_budget),
@@ -469,17 +464,24 @@ impl CodeModeRuntime {
             observer,
         )
         .await;
-        if running {
-            live_cell.output_token_budget = continued_output_token_budget;
-            self.cells
-                .lock()
-                .await
-                .live_cells
-                .insert(cell_id, live_cell);
-        } else {
-            live_cell.join().await;
+        if !running {
+            self.remove_and_join(&cell).await;
         }
         execution
+    }
+
+    async fn remove_and_join(&self, cell: &Arc<LiveCell>) {
+        {
+            let mut registry = self.cells.lock().await;
+            if registry
+                .live_cells
+                .get(&cell.id)
+                .is_some_and(|registered| Arc::ptr_eq(registered, cell))
+            {
+                registry.live_cells.remove(&cell.id);
+            }
+        }
+        cell.join().await;
     }
 }
 
@@ -499,8 +501,11 @@ impl CodeModeControl {
                 .into_values()
                 .collect::<Vec<_>>()
         };
-        for mut cell in cells {
-            cell.terminate().await;
+        for cell in &cells {
+            cell.request_terminate();
+        }
+        for cell in cells {
+            cell.join().await;
         }
 
         let mut shared_host = self.host.lock().await;
@@ -634,6 +639,7 @@ impl LiveCell {
     ) -> Self {
         let (updates_tx, updates) = mpsc::unbounded_channel();
         let (terminate, terminate_rx) = oneshot::channel();
+        let lifecycle = Arc::new(CellLifecycle::new());
         let actor_span = info_span!(
             target: "nanocodex_tools",
             "code_mode.cell_actor",
@@ -659,32 +665,45 @@ impl LiveCell {
                 shared_stored,
                 updates_tx,
                 terminate_rx,
+                Arc::clone(&lifecycle),
             )
             .instrument(actor_span),
         );
         Self {
             id,
             output_token_budget,
-            updates,
-            terminate: Some(terminate),
-            task: Some(task),
+            observation: Arc::new(Mutex::new(CellObservationState {
+                updates,
+                buffered: ObservationBuffer::default(),
+            })),
+            lifecycle,
+            terminate: StdMutex::new(Some(terminate)),
+            task: Mutex::new(Some(task)),
         }
     }
 
-    async fn terminate(&mut self) {
-        self.request_terminate();
-        self.join().await;
+    fn begin_observation(&self) -> Result<OwnedMutexGuard<CellObservationState>, CellError> {
+        Arc::clone(&self.observation)
+            .try_lock_owned()
+            .map_err(|_| CellError::Busy)
     }
 
-    fn request_terminate(&mut self) {
-        if let Some(terminate) = self.terminate.take() {
-            let _ = terminate.send(());
+    fn request_terminate(&self) {
+        if self.lifecycle.request_termination() {
+            let terminate = self
+                .terminate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(terminate) = terminate {
+                let _ = terminate.send(());
+            }
         }
     }
 
-    async fn join(&mut self) {
-        self.terminate = None;
-        if let Some(task) = self.task.take() {
+    async fn join(&self) {
+        let mut task = self.task.lock().await;
+        if let Some(task) = task.take() {
             let _ = task.await;
         }
     }
@@ -692,15 +711,41 @@ impl LiveCell {
 
 impl Drop for LiveCell {
     fn drop(&mut self) {
-        if let Some(terminate) = self.terminate.take() {
-            let _ = terminate.send(());
+        self.request_terminate();
+    }
+}
+
+impl CellLifecycle {
+    const fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(CELL_RUNNING),
         }
-        if let Some(task) = self.task.take() {
-            // The detached actor observes `terminate` and shuts down the shared
-            // host. Aborting here could leave JavaScript running in an isolate
-            // that a later cell is about to reuse.
-            drop(task);
-        }
+    }
+
+    fn request_termination(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                CELL_RUNNING,
+                CELL_TERMINATING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn claim_completion(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                CELL_RUNNING,
+                CELL_COMPLETION_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn close(&self) {
+        self.phase.store(CELL_CLOSED, Ordering::Release);
     }
 }
 
@@ -712,7 +757,8 @@ enum ObservationMode {
 // Keep every lifecycle update in one exhaustive, order-preserving observation loop.
 #[allow(clippy::too_many_lines)]
 async fn observe_cell(
-    cell: &mut LiveCell,
+    cell: &LiveCell,
+    mut observation: OwnedMutexGuard<CellObservationState>,
     started_at: Instant,
     mode: ObservationMode,
     max_output_tokens: Option<usize>,
@@ -723,28 +769,30 @@ async fn observe_cell(
         ObservationMode::YieldAfter(yield_after) => (Some(yield_after), false),
         ObservationMode::Terminate => (None, true),
     };
-    let mut content = Vec::new();
-    let mut nested_calls = Vec::new();
-    let mut notifications = Vec::new();
     let mut yield_timer = yield_after.map(|yield_after| Box::pin(tokio::time::sleep(yield_after)));
     loop {
+        let yield_deadline_elapsed = yield_timer
+            .as_ref()
+            .is_some_and(|yield_timer| yield_timer.deadline() <= tokio::time::Instant::now());
         let update = tokio::select! {
+            biased;
             () = async {
                 match yield_timer.as_mut() {
                     Some(timer) => timer.as_mut().await,
                     None => std::future::pending().await,
                 }
             } => {
+                let buffered = std::mem::take(&mut observation.buffered);
                 return running_observation(
                     cell.id,
                     started_at,
-                    content,
+                    buffered.content,
                     max_output_tokens,
-                    nested_calls,
-                    notifications,
+                    buffered.nested_calls,
+                    buffered.notifications,
                 );
             }
-            update = cell.updates.recv() => update,
+            update = observation.updates.recv(), if !yield_deadline_elapsed => update,
         };
         match update {
             Some(CellUpdate::NestedCallStarted {
@@ -771,92 +819,111 @@ async fn observe_cell(
             }
             Some(CellUpdate::NestedCall { id, call }) => {
                 observer.update(CodeModeUpdate::NestedCallCompleted(&call));
-                nested_calls.push((id, call));
+                observation.buffered.nested_calls.push((id, call));
             }
-            Some(CellUpdate::Notification(notification)) => notifications.push(notification),
-            Some(CellUpdate::Content(item)) => content.push(item),
+            Some(CellUpdate::Notification(notification)) => {
+                observation.buffered.notifications.push(notification);
+            }
+            Some(CellUpdate::Content(item)) => observation.buffered.content.push(item),
             Some(CellUpdate::Yielded) if terminating => {}
             Some(CellUpdate::Yielded) => {
+                let buffered = std::mem::take(&mut observation.buffered);
                 return running_observation(
                     cell.id,
                     started_at,
-                    content,
+                    buffered.content,
                     max_output_tokens,
-                    nested_calls,
-                    notifications,
+                    buffered.nested_calls,
+                    buffered.notifications,
                 );
             }
             Some(CellUpdate::Completed) => {
+                let buffered = std::mem::take(&mut observation.buffered);
                 return (
                     observed_execution(
                         "Script completed",
                         true,
                         started_at,
-                        content,
+                        buffered.content,
                         max_output_tokens,
-                        nested_calls,
-                        notifications,
+                        buffered.nested_calls,
+                        buffered.notifications,
                     ),
                     false,
                 );
             }
             Some(CellUpdate::Terminated) => {
+                let buffered = std::mem::take(&mut observation.buffered);
                 return (
                     observed_execution(
                         "Script terminated",
                         true,
                         started_at,
-                        content,
+                        buffered.content,
                         max_output_tokens,
-                        nested_calls,
-                        notifications,
+                        buffered.nested_calls,
+                        buffered.notifications,
                     ),
                     false,
                 );
             }
             Some(CellUpdate::ScriptFailed { message }) => {
-                content.push(ToolOutputContent::InputText {
-                    text: format!("Script error:\n{message}"),
-                });
+                observation
+                    .buffered
+                    .content
+                    .push(ToolOutputContent::InputText {
+                        text: format!("Script error:\n{message}"),
+                    });
+                let buffered = std::mem::take(&mut observation.buffered);
                 return (
                     observed_execution(
                         "Script failed",
                         false,
                         started_at,
-                        content,
+                        buffered.content,
                         max_output_tokens,
-                        nested_calls,
-                        notifications,
+                        buffered.nested_calls,
+                        buffered.notifications,
                     ),
                     false,
                 );
             }
             Some(CellUpdate::HostFailed(message)) => {
+                observation
+                    .buffered
+                    .content
+                    .push(ToolOutputContent::InputText { text: message });
+                let buffered = std::mem::take(&mut observation.buffered);
                 return (
                     observed_execution(
                         "Script failed",
                         false,
                         started_at,
-                        vec![ToolOutputContent::InputText { text: message }],
+                        buffered.content,
                         max_output_tokens,
-                        nested_calls,
-                        notifications,
+                        buffered.nested_calls,
+                        buffered.notifications,
                     ),
                     false,
                 );
             }
             None => {
+                observation
+                    .buffered
+                    .content
+                    .push(ToolOutputContent::InputText {
+                        text: "local code-mode cell ended before a result".to_owned(),
+                    });
+                let buffered = std::mem::take(&mut observation.buffered);
                 return (
                     observed_execution(
                         "Script failed",
                         false,
                         started_at,
-                        vec![ToolOutputContent::InputText {
-                            text: "local code-mode cell ended before a result".to_owned(),
-                        }],
+                        buffered.content,
                         max_output_tokens,
-                        nested_calls,
-                        notifications,
+                        buffered.nested_calls,
+                        buffered.notifications,
                     ),
                     false,
                 );
@@ -1136,6 +1203,7 @@ async fn run_cell_actor(
     shared_stored: Arc<Mutex<HashMap<String, Value>>>,
     updates: mpsc::UnboundedSender<CellUpdate>,
     mut terminate: oneshot::Receiver<()>,
+    lifecycle: Arc<CellLifecycle>,
 ) {
     let started_at = Instant::now();
     let host_wait_started_at = Instant::now();
@@ -1150,7 +1218,13 @@ async fn run_cell_actor(
                     tracing::Span::current().record("status", "failed");
                     tracing::Span::current().record("otel.status_code", "ERROR");
                     record_elapsed("duration_ns", started_at);
-                    let _ = updates.send(CellUpdate::HostFailed(message));
+                    let update = if lifecycle.claim_completion() {
+                        CellUpdate::HostFailed(message)
+                    } else {
+                        CellUpdate::Terminated
+                    };
+                    let _ = updates.send(update);
+                    lifecycle.close();
                     return;
                 }
             },
@@ -1172,10 +1246,16 @@ async fn run_cell_actor(
         )
         .await
     };
-    let terminal = tokio::select! {
+    let selected = tokio::select! {
         biased;
-        terminal = run => terminal,
         _ = &mut terminate => {
+            None
+        }
+        terminal = run => Some(terminal),
+    };
+    let terminal = match selected {
+        Some(terminal) if lifecycle.claim_completion() => terminal,
+        Some(_) | None => {
             let termination_started_at = Instant::now();
             host.terminate().await;
             record_elapsed("host.termination_ns", termination_started_at);
@@ -1223,6 +1303,7 @@ async fn run_cell_actor(
         host.terminate().await;
         record_elapsed("host.termination_ns", termination_started_at);
     }
+    lifecycle.close();
     record_elapsed("duration_ns", started_at);
 }
 
@@ -1231,15 +1312,6 @@ fn record_elapsed(field: &'static str, started_at: Instant) {
         field,
         u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
     );
-}
-
-impl CodeModeNotification {
-    fn new(call_id: &str, text: String) -> Self {
-        Self {
-            call_id: call_id.to_owned(),
-            text,
-        }
-    }
 }
 
 impl HostFailure {
@@ -1265,7 +1337,7 @@ async fn execute_nested_call(
     let started_after_ns =
         u64::try_from(started_at.duration_since(cell_started_at).as_nanos()).unwrap_or(u64::MAX);
     let call_id = format!("{}/code-{id}", context.call_id);
-    let context = context.borrowed();
+    let context = context.as_context();
     let context = ToolContext::new(
         context.model(),
         context.session_id(),

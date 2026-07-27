@@ -23,7 +23,7 @@ async fn latest_fork_during_streaming_inherits_the_active_prompt_delta() -> Resu
         let (stream, _) = listener.accept().await?;
         let mut branch = accept_async(stream).await?;
         let fork = next_json(&mut branch).await?;
-        assert_eq!(fork["previous_response_id"], "resp-warmup");
+        assert!(fork.get("previous_response_id").is_none());
         assert_eq!(fork["reasoning"]["effort"], "high");
         let fork_text = fork.to_string();
         assert!(fork_text.contains("active root prompt"));
@@ -78,7 +78,7 @@ async fn active_boundary_fork_sends_tool_and_steer_delta_then_replays_on_checkpo
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
         let mut root = accept_async(stream).await?;
-        assert_warmup(&next_json(&mut root).await?);
+        assert_warmup_with_store(&next_json(&mut root).await?, true);
         send_warmup(&mut root, "resp-warmup").await?;
 
         let initial = next_json(&mut root).await?;
@@ -169,6 +169,7 @@ async fn active_boundary_fork_sends_tool_and_steer_delta_then_replays_on_checkpo
 
     let openai = OpenAi::builder("test-key")
         .websocket_url(endpoint)
+        .store(true)
         .build()?;
     let (agent, root_events) = Nanocodex::builder(openai)
         .thinking(Thinking::Low)
@@ -222,7 +223,7 @@ async fn latest_and_historical_forks_keep_distinct_boundaries_during_an_active_t
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
         let mut root = accept_async(stream).await?;
-        assert_warmup(&next_json(&mut root).await?);
+        assert_warmup_with_store(&next_json(&mut root).await?, true);
         send_warmup(&mut root, "resp-warmup").await?;
         let first = next_json(&mut root).await?;
         assert!(first.to_string().contains("completed root prompt"));
@@ -278,6 +279,7 @@ async fn latest_and_historical_forks_keep_distinct_boundaries_during_an_active_t
     let workspace = temporary_workspace("latest-vs-historical-fork")?;
     let openai = OpenAi::builder("test-key")
         .websocket_url(endpoint)
+        .store(true)
         .build()?;
     let (agent, root_events) = Nanocodex::builder(openai)
         .thinking(Thinking::Low)
@@ -344,7 +346,7 @@ async fn historical_fork_runs_while_the_mainline_turn_is_in_flight() -> Result<(
         let (stream, _) = listener.accept().await?;
         let mut root = accept_async(stream).await?;
         let warmup = next_json(&mut root).await?;
-        assert_warmup(&warmup);
+        assert_warmup_with_store(&warmup, true);
         let lineage = warmup["prompt_cache_key"].clone();
         let root_session = warmup["client_metadata"]["session_id"].clone();
         send_warmup(&mut root, "resp-warmup").await?;
@@ -387,6 +389,7 @@ async fn historical_fork_runs_while_the_mainline_turn_is_in_flight() -> Result<(
     let workspace = temporary_workspace("historical-fork")?;
     let openai = OpenAi::builder("test-key")
         .websocket_url(endpoint)
+        .store(true)
         .build()?;
     let (agent, root_events) = Nanocodex::builder(openai)
         .thinking(Thinking::Low)

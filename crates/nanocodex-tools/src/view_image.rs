@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{
-    ImageDetail, StandardTool, Tool, ToolContext, ToolExecution, ToolInput, ToolOutputContent,
+    ImageDetail, StandardTool, Tool, ToolContext, ToolInput, ToolOutput, ToolOutputContent,
     ToolResult,
 };
 
@@ -32,7 +32,7 @@ impl Tool for ViewImageHandler {
             None | Some("high") => ImageDetail::High,
             Some("original") => ImageDetail::Original,
             Some(detail) => {
-                return Ok(ToolExecution::error(format!(
+                return Ok(ToolOutput::error(format!(
                     "view_image.detail only supports `high` or `original`; omit `detail` for default high resized behavior, got `{detail}`"
                 )));
             }
@@ -41,13 +41,13 @@ impl Tool for ViewImageHandler {
         match tokio::fs::metadata(&path).await {
             Ok(metadata) if metadata.is_file() => {}
             Ok(_) => {
-                return Ok(ToolExecution::error(format!(
+                return Ok(ToolOutput::error(format!(
                     "image path `{}` is not a file",
                     path.display()
                 )));
             }
             Err(error) => {
-                return Ok(ToolExecution::error(format!(
+                return Ok(ToolOutput::error(format!(
                     "unable to locate image at `{}`: {error}",
                     path.display()
                 )));
@@ -56,7 +56,7 @@ impl Tool for ViewImageHandler {
         let bytes = match tokio::fs::read(&path).await {
             Ok(bytes) => bytes,
             Err(error) => {
-                return Ok(ToolExecution::error(format!(
+                return Ok(ToolOutput::error(format!(
                     "unable to read image at `{}`: {error}",
                     path.display()
                 )));
@@ -67,7 +67,7 @@ impl Tool for ViewImageHandler {
             "data:application/octet-stream;base64,{}",
             STANDARD.encode(bytes)
         );
-        Ok(ToolExecution::content(vec![ToolOutputContent::InputImage {
+        Ok(ToolOutput::content(vec![ToolOutputContent::InputImage {
             image_url: image_url.clone(),
             detail,
         }])

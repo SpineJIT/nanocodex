@@ -17,12 +17,12 @@ export function createBrowserHost(options = {}) {
   const encoder = new TextEncoder();
   let nextHandle = 1;
 
-  function connect(endpoint, _apiKey, sessionId) {
+  function connect(endpoint, _apiKey, sessionId, metadata = {}) {
     if (options.mpp) return connectMpp(endpoint);
     return new Promise((resolve, reject) => {
       let settled = false;
       const handle = nextHandle++;
-      const socket = createWebSocket(endpoint, sessionId);
+      const socket = createWebSocket(endpoint, sessionId, metadata);
       const connection = {
         socket,
         queue: [],

@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{DynamicToolProvider, Tool, ToolContext, ToolExecution, ToolInput, ToolResult};
+use crate::{DynamicToolProvider, Tool, ToolContext, ToolInput, ToolOutput, ToolResult};
 use async_trait::async_trait;
 use catalog::{ProviderState, ToolEntry};
 use nanocodex_oai_api::tools::ToolDefinition;
@@ -497,10 +497,10 @@ impl DynamicToolProvider for Mcp {
         name: &str,
         input: Value,
         _context: ToolContext<'_>,
-    ) -> Option<ToolExecution> {
+    ) -> Option<ToolOutput> {
         let entry = self.state.active_entry(name)?;
         let Value::Object(arguments) = input else {
-            return Some(ToolExecution::error(format!(
+            return Some(ToolOutput::error(format!(
                 "MCP tool {name} requires an object argument"
             )));
         };
@@ -535,7 +535,7 @@ impl DynamicToolProvider for Mcp {
             Ok(Err(error)) => {
                 span.record("status", "failed");
                 span.record("otel.status_code", "ERROR");
-                return Some(ToolExecution::error(format!(
+                return Some(ToolOutput::error(format!(
                     "MCP tool {}/{} failed: {error}",
                     entry.server_name, entry.remote_name
                 )));
@@ -543,7 +543,7 @@ impl DynamicToolProvider for Mcp {
             Err(_) => {
                 span.record("status", "timeout");
                 span.record("otel.status_code", "ERROR");
-                return Some(ToolExecution::error(format!(
+                return Some(ToolOutput::error(format!(
                     "MCP tool {}/{} exceeded {:.1} seconds",
                     entry.server_name,
                     entry.remote_name,
@@ -559,17 +559,15 @@ impl DynamicToolProvider for Mcp {
             Err(error) => {
                 span.record("status", "failed");
                 span.record("otel.status_code", "ERROR");
-                return Some(ToolExecution::error(format!(
+                return Some(ToolOutput::error(format!(
                     "failed to encode MCP tool result: {error}"
                 )));
             }
         };
-        Some(
-            ToolExecution::from_json(value, success).with_metadata(json!({
-                "mcp_server": entry.server_name,
-                "mcp_tool": entry.remote_name,
-            })),
-        )
+        Some(ToolOutput::from_json(value, success).with_metadata(json!({
+            "mcp_server": entry.server_name,
+            "mcp_tool": entry.remote_name,
+        })))
     }
 }
 
@@ -653,8 +651,8 @@ impl Tool for McpSearch {
             span.record("pending_servers", result.pending_server_count());
         }
         Ok(match result {
-            Ok(result) => ToolExecution::json(&result),
-            Err(error) => ToolExecution::error(error),
+            Ok(result) => ToolOutput::json(&result),
+            Err(error) => ToolOutput::error(error),
         })
     }
 }

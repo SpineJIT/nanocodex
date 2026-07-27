@@ -3,7 +3,7 @@
 Tool building blocks for `OpenAI` agents.
 
 `nanocodex-tools` is useful without the Nanocodex agent loop. It provides the
-caller-defined [`Tool`] contract, [`tool`] macro, heterogeneous [`Tools`]
+caller-defined [`Tool`] contract, `tool` macro, heterogeneous [`Tools`]
 registry, Code Mode runtime, standard workspace tools, and native MCP clients.
 The dependency-light contract types are defined by `nanocodex-oai-api` and
 re-exported here so a tool implementation has one import surface.
@@ -77,6 +77,14 @@ impl Tool for DeploymentRegion {
 }
 ```
 
+## Embed Code Mode in another host
+
+[`hosted`] is the portable boundary for environments that own JavaScript
+execution outside Rust. Implement [`hosted::CodeModeHost`] and pass it to
+[`hosted::HostedTools`]; the adapter reuses the same execution, nested-call,
+notification, observer, and owned-context types as native Code Mode. The
+[`hosted`] module documentation includes a complete host implementation.
+
 ## MCP is native and always available
 
 MCP is not a feature flag. Native consumers configure stdio or Streamable HTTP
@@ -101,23 +109,24 @@ let tools = Tools::builder().provider(mcp).build()?;
 # }
 ```
 
-Handshakes and discovery start with the owning runtime. [`mcp::Mcp`] exposes
+Handshakes and discovery start with the owning runtime. `mcp::Mcp` exposes
 only `tool_search` directly and activates matching remote definitions for Code
 Mode, keeping large catalogs out of the model's initial tool list.
 
 ## Going lower level
 
 The crate root intentionally contains only the normal registry path:
-[`Tools`], [`ToolsBuilder`], [`ToolsBuildError`], [`Tool`], [`tool`], and the
+[`Tools`], `ToolsBuilder`, `ToolsBuildError`, [`Tool`], `tool`, and the
 types required by the `Tool` methods.
 
 - [`contract`] contains complete model-visible inputs, outputs, errors, and
   retained wire forms.
+- [`hosted`] contains the portable application-owned Code Mode boundary.
 - [`runtime`] contains the stateful per-agent executor, built-in connection
   configuration, and dynamic-provider contract.
 - [`code_mode`] contains cell results, notifications, and nested-tool updates.
-- [`mcp`] contains transport configuration, authentication, discovery, login,
+- `mcp` contains transport configuration, authentication, discovery, login,
   and runtime control.
-- [`standard`] contains reusable standard-tool identities and the host-owned
+- `standard` contains reusable standard-tool identities and the host-owned
   plan implementation.
 - [`image`] contains prompt-image preparation and tool-output normalization.

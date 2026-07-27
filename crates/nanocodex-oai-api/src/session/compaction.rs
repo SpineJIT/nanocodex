@@ -9,11 +9,11 @@ use crate::{
     ResponseItem, responses::ResponseHistory,
 };
 #[cfg(not(target_family = "wasm"))]
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-#[cfg(not(target_family = "wasm"))]
-use sha1::{Digest as _, Sha1};
+use sha2::{Digest as _, Sha256};
 
 use crate::context::is_contextual_user_message;
+#[cfg(not(target_family = "wasm"))]
+use crate::session::image_dimensions::dimensions_from_base64;
 
 const RETAINED_MESSAGE_TOKEN_BUDGET: usize = 64_000;
 const APPROX_BYTES_PER_TOKEN: usize = 4;
@@ -30,15 +30,15 @@ const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
 #[cfg(not(target_family = "wasm"))]
 #[derive(Default)]
 struct OriginalImageEstimateCache {
-    entries: HashMap<[u8; 20], Option<usize>>,
-    order: VecDeque<[u8; 20]>,
+    entries: HashMap<[u8; 32], Option<usize>>,
+    order: VecDeque<[u8; 32]>,
 }
 
 #[cfg(not(target_family = "wasm"))]
 impl OriginalImageEstimateCache {
     fn get_or_insert_with(
         &mut self,
-        key: [u8; 20],
+        key: [u8; 32],
         estimate: impl FnOnce() -> Option<usize>,
     ) -> Option<usize> {
         if let Some(value) = self.entries.get(&key).copied() {
@@ -383,13 +383,12 @@ fn base64_image_payload(image_url: &str) -> Option<&str> {
 
 #[cfg(not(target_family = "wasm"))]
 fn original_image_bytes_estimate(image_url: &str) -> Option<usize> {
-    let key = Sha1::digest(image_url.as_bytes()).into();
+    let key = Sha256::digest(image_url.as_bytes()).into();
     let estimate = || {
         let payload = base64_image_payload(image_url)?;
-        let bytes = BASE64_STANDARD.decode(payload).ok()?;
-        let image = image::load_from_memory(&bytes).ok()?;
-        let patches_wide = image.width().div_ceil(ORIGINAL_IMAGE_PATCH_SIZE);
-        let patches_high = image.height().div_ceil(ORIGINAL_IMAGE_PATCH_SIZE);
+        let (width, height) = dimensions_from_base64(payload)?;
+        let patches_wide = width.div_ceil(ORIGINAL_IMAGE_PATCH_SIZE);
+        let patches_high = height.div_ceil(ORIGINAL_IMAGE_PATCH_SIZE);
         let patches = usize::try_from(u64::from(patches_wide) * u64::from(patches_high))
             .unwrap_or(usize::MAX)
             .min(ORIGINAL_IMAGE_MAX_PATCHES);
@@ -403,8 +402,8 @@ fn original_image_bytes_estimate(image_url: &str) -> Option<usize> {
 
 #[cfg(target_family = "wasm")]
 const fn original_image_bytes_estimate(_image_url: &str) -> Option<usize> {
-    // Image decoding is a large native-only dependency. The portable runtime uses the same
-    // conservative resized-image estimate when dimensions are unavailable.
+    // The portable runtime uses the same conservative resized-image estimate when dimensions
+    // are unavailable.
     None
 }
 
@@ -439,6 +438,22 @@ const fn approx_tokens(bytes: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn original_image_estimate_uses_header_dimensions() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&65_u32.to_be_bytes());
+        png.extend_from_slice(&33_u32.to_be_bytes());
+        let image_url = format!("data:image/png;base64,{}", STANDARD.encode(png));
+
+        assert_eq!(
+            original_image_bytes_estimate(&image_url),
+            Some(6 * APPROX_BYTES_PER_TOKEN)
+        );
+    }
 
     #[test]
     fn sol_compacts_at_ninety_percent_of_its_context_window() {

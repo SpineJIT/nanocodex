@@ -8,8 +8,6 @@ use crate::{
 use serde::Serialize;
 use web_time::Instant;
 
-#[cfg(not(target_family = "wasm"))]
-use crate::http::ResponsesHttpStream;
 use crate::{
     ResponsesError,
     attempt::ResponsesObserver,
@@ -219,31 +217,30 @@ struct ReceivedServerEvent {
     api_event_seq: u64,
 }
 
-pub(crate) enum ResponseEventSource<'a> {
-    WebSocket(&'a mut ResponsesSocket),
-    #[cfg(not(target_family = "wasm"))]
-    Https(&'a mut ResponsesHttpStream),
+pub(crate) trait ResponseEventSource {
+    async fn next_text_or_idle_timeout(
+        &mut self,
+    ) -> Result<crate::socket::ReceivedText, ResponsesError>;
 }
 
-impl ResponseEventSource<'_> {
+impl ResponseEventSource for ResponsesSocket {
     async fn next_text_or_idle_timeout(
         &mut self,
     ) -> Result<crate::socket::ReceivedText, ResponsesError> {
-        match self {
-            Self::WebSocket(socket) => socket.next_text_or_idle_timeout().await,
-            #[cfg(not(target_family = "wasm"))]
-            Self::Https(stream) => stream.next_text_or_idle_timeout().await,
-        }
+        Self::next_text_or_idle_timeout(self).await
     }
 }
 
-pub(crate) async fn receive(
-    source: &mut ResponseEventSource<'_>,
+pub(crate) async fn receive<S>(
+    source: &mut S,
     transport: &'static str,
     observer: &ResponsesObserver,
     call_index: u32,
     started_at: Instant,
-) -> Result<GenerationOutput, ResponsesServiceError> {
+) -> Result<GenerationOutput, ResponsesServiceError>
+where
+    S: ResponseEventSource,
+{
     let mut done_items = Vec::with_capacity(2);
     let mut assistant_items = HashMap::new();
     let mut timing = StreamTiming::new(started_at);
@@ -391,13 +388,16 @@ fn emit_assistant_message(
     Ok(())
 }
 
-pub(crate) async fn receive_compaction(
-    source: &mut ResponseEventSource<'_>,
+pub(crate) async fn receive_compaction<S>(
+    source: &mut S,
     transport: &'static str,
     observer: &ResponsesObserver,
     call_index: u32,
     started_at: Instant,
-) -> Result<CompactionOutput, ResponsesServiceError> {
+) -> Result<CompactionOutput, ResponsesServiceError>
+where
+    S: ResponseEventSource,
+{
     let mut done_items = Vec::with_capacity(2);
     let mut timing = StreamTiming::new(started_at);
 
@@ -445,14 +445,17 @@ pub(crate) async fn receive_compaction(
     }
 }
 
-async fn next_event(
-    source: &mut ResponseEventSource<'_>,
+async fn next_event<S>(
+    source: &mut S,
     transport: &'static str,
     observer: &ResponsesObserver,
     phase: &'static str,
     call_index: u32,
     timing: &mut StreamTiming,
-) -> Result<ReceivedServerEvent, ResponsesServiceError> {
+) -> Result<ReceivedServerEvent, ResponsesServiceError>
+where
+    S: ResponseEventSource,
+{
     let receive_started_at = Instant::now();
     let received = source.next_text_or_idle_timeout().await?;
     timing.pipeline.receive_wait_duration_ns = timing

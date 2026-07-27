@@ -16,7 +16,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rand::{Rng, rng};
 use serde::Serialize;
 use tokio::{sync::Mutex, task::JoinHandle, time::timeout};
 
@@ -380,8 +379,15 @@ impl Session {
             Err(_) => None,
         };
         let (output, original_token_count) = self.take_output(max_output_tokens).await;
+        let chunk_id = match generate_chunk_id() {
+            Ok(chunk_id) => Some(chunk_id),
+            Err(error) => {
+                tracing::warn!(%error, "failed to generate shell output chunk ID");
+                None
+            }
+        };
         ExecCommandResult {
-            chunk_id: Some(generate_chunk_id()),
+            chunk_id,
             wall_time_seconds: started_at.elapsed().as_secs_f64(),
             exit_code,
             session_id: exit_code.is_none().then_some(self.id),
@@ -544,12 +550,19 @@ fn duration_ms(requested: Option<u64>, default: u64, minimum: u64, maximum: u64)
     Duration::from_millis(requested.clamp(minimum, maximum))
 }
 
-fn generate_chunk_id() -> String {
+fn generate_chunk_id() -> Result<String, getrandom::Error> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut rng = rng();
-    (0..6)
-        .map(|_| char::from(HEX[rng.random_range(0..HEX.len())]))
-        .collect()
+    let mut bytes = [0_u8; 3];
+    getrandom::fill(&mut bytes)?;
+    Ok(bytes
+        .into_iter()
+        .flat_map(|byte| {
+            [
+                char::from(HEX[usize::from(byte >> 4)]),
+                char::from(HEX[usize::from(byte & 0x0f)]),
+            ]
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -567,7 +580,7 @@ mod tests {
 
     #[test]
     fn chunk_ids_match_codex_shape() {
-        let chunk_id = generate_chunk_id();
+        let chunk_id = generate_chunk_id().unwrap();
         assert_eq!(chunk_id.len(), 6);
         assert!(
             chunk_id

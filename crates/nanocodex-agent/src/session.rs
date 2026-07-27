@@ -31,12 +31,12 @@ impl CommittedSession {
         &self.model
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    #[allow(dead_code, reason = "consumed by the native durability boundary only")]
     pub(crate) fn rollout_history(&self) -> nanocodex_oai_api::responses::ResponseHistory {
         self.model.history()
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    #[allow(dead_code, reason = "consumed by the native durability boundary only")]
     pub(crate) const fn history_revision(&self) -> u64 {
         self.model.history_revision()
     }
@@ -48,6 +48,7 @@ impl CommittedSession {
             lineage_id: self.lineage_id.to_string(),
             prompt_cache_key: self.model.prompt_cache_key().to_owned(),
             workspace: self.model.workspace().to_owned(),
+            base_instructions: None,
             request_prefix: Some(self.model.request_prefix().to_vec()),
             canonical_context: self.model.canonical_context().clone(),
             history: self.model.snapshot_history(),
@@ -71,6 +72,8 @@ pub struct SessionSnapshot {
     prompt_cache_key: String,
     workspace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     request_prefix: Option<Vec<ResponseItem>>,
     canonical_context: ResponseItem,
     history: Vec<ResponseItem>,
@@ -92,6 +95,7 @@ impl SessionSnapshot {
     pub(crate) fn from_rollout(
         thread_id: String,
         workspace: String,
+        base_instructions: Option<String>,
         history: Vec<ResponseItem>,
     ) -> Result<Self> {
         let canonical_context = history
@@ -109,6 +113,7 @@ impl SessionSnapshot {
             lineage_id: thread_id.clone(),
             prompt_cache_key: thread_id,
             workspace,
+            base_instructions,
             request_prefix: None,
             canonical_context,
             history,
@@ -185,6 +190,7 @@ impl SessionSnapshot {
                     Arc::clone(&prompt_cache_key),
                     self.canonical_context.clone(),
                     self.history.clone(),
+                    None,
                 )
             })
             .transpose()?;
@@ -192,6 +198,7 @@ impl SessionSnapshot {
             lineage_id,
             prompt_cache_key,
             workspace: self.workspace,
+            base_instructions: self.base_instructions,
             canonical_context: self.canonical_context,
             history: self.history,
             checkpoint,
@@ -203,6 +210,7 @@ pub(crate) struct SessionResume {
     pub(crate) lineage_id: Arc<str>,
     pub(crate) prompt_cache_key: Arc<str>,
     pub(crate) workspace: String,
+    pub(crate) base_instructions: Option<String>,
     pub(crate) canonical_context: ResponseItem,
     pub(crate) history: Vec<ResponseItem>,
     pub(crate) checkpoint: Option<ModelCheckpoint>,

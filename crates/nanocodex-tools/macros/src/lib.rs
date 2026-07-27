@@ -104,7 +104,7 @@ fn expand_tool(
             ) -> #nanocodex::__private::ToolResult {
                 let input = input.decode_json::<#input_ident>()?;
                 match #handler_ident(#(#calls),*).await {
-                    Ok(output) => Ok(#nanocodex::__private::ToolExecution::json(&output)),
+                    Ok(output) => Ok(#nanocodex::__private::ToolOutput::json(&output)),
                     Err(error) => Err(
                         ::std::io::Error::other(error.to_string()).into()
                     ),

@@ -2,6 +2,11 @@
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg(all(target_family = "wasm", not(target_os = "unknown")))]
+compile_error!(
+    "nanocodex-oai-api supports native targets and hosted wasm*-unknown-unknown targets; WASI is not yet supported"
+);
+
 /// Authentication sources and managed credential snapshots.
 pub mod auth;
 /// Complete typed lifecycle events emitted around Responses operations.
@@ -56,7 +61,7 @@ pub(crate) use tower::{
 pub type CompactionResult = CompactionOutput;
 #[doc(hidden)]
 pub type TurnResult = GenerationOutput;
-pub(crate) use transport::socket::EncodedRequest;
+pub(crate) use transport::EncodedRequest;
 pub(crate) use transport::{ResponsesError, ResponsesHistory, ResponsesTransport, RetryAdvice};
 
 pub(crate) use tower::{attempt, middleware, service, service_error, stream};
@@ -259,6 +264,9 @@ pub struct ModelConfig {
     pub websocket_url: String,
     /// Base URL used for HTTPS Responses calls and related endpoints.
     pub api_base_url: String,
+    /// Embedding-host transport used by the standard WebAssembly client.
+    #[cfg(any(target_family = "wasm", docsrs))]
+    pub host_transport: Option<Arc<dyn transport::host::HostTransport>>,
     /// Immutable harness system prompt serialized before session instructions.
     pub system_prompt: Arc<str>,
 }
@@ -292,9 +300,11 @@ impl Default for ModelConfig {
             fast_mode: false,
             responses_transport: ResponsesTransport::default(),
             responses_history: ResponsesHistory::default(),
-            store_responses: true,
+            store_responses: false,
             websocket_url: "wss://api.openai.com/v1/responses".to_owned(),
             api_base_url: "https://api.openai.com/v1".to_owned(),
+            #[cfg(any(target_family = "wasm", docsrs))]
+            host_transport: None,
             system_prompt: SYSTEM_PROMPT.into(),
         }
     }

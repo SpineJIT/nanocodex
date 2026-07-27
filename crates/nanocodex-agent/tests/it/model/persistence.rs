@@ -7,7 +7,7 @@ async fn missing_stored_checkpoint_replays_local_history_once() -> Result<()> {
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
         let mut root = accept_async(stream).await?;
-        assert_warmup(&next_json(&mut root).await?);
+        assert_warmup_with_store(&next_json(&mut root).await?, true);
         send_warmup(&mut root, "resp-warmup").await?;
         let first = next_json(&mut root).await?;
         send_final(&mut root, "resp-first").await?;
@@ -50,6 +50,7 @@ async fn missing_stored_checkpoint_replays_local_history_once() -> Result<()> {
     let workspace = temporary_workspace("checkpoint-miss")?;
     let openai = OpenAi::builder("test-key")
         .websocket_url(endpoint)
+        .store(true)
         .build()?;
     let (agent, root_events) = Nanocodex::builder(openai)
         .thinking(Thinking::Low)
@@ -157,7 +158,7 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
         .ok_or_else(|| eyre!("snapshot request prefix was not an array"))?;
     assert_eq!(request_prefix[0]["type"], "additional_tools");
     assert!(request_prefix[0].get("id").is_none());
-    assert!(request_prefix[1]["id"].is_string());
+    assert!(request_prefix[1].get("id").is_none());
     assert!(
         snapshot_json["history"]
             .as_array()
@@ -178,6 +179,16 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
         Some(&rollout_history),
         "rollout resume must materialize the recorded committed history"
     );
+    let incompatible_rollout = Nanocodex::builder(openai()?)
+        .instructions("changed instructions")
+        .thinking(Thinking::Low)
+        .resume(durable.snapshot().clone())
+        .build();
+    assert!(matches!(
+        incompatible_rollout,
+        Err(NanocodexError::InvalidSessionSnapshot(message))
+            if message.contains("instructions do not match")
+    ));
     let snapshot: SessionSnapshot = serde_json::from_slice(&encoded)?;
     drop((agent, events, first));
 

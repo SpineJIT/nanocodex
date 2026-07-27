@@ -63,7 +63,7 @@ impl ResponsesHttp {
         if auth.is_fedramp() {
             builder = builder.header("X-OpenAI-Fedramp", "true");
         }
-        let response = builder.send().await.map_err(ResponsesError::HttpRequest)?;
+        let response = builder.send().await.map_err(map_http_error)?;
         let status = response.status();
         if !status.is_success() {
             let retry_after = retry_after(response.headers());
@@ -110,12 +110,7 @@ impl ResponsesHttpStream {
             if self.ended {
                 return Err(ResponsesError::UnexpectedEnd);
             }
-            if let Some(chunk) = self
-                .response
-                .chunk()
-                .await
-                .map_err(ResponsesError::HttpRequest)?
-            {
+            if let Some(chunk) = self.response.chunk().await.map_err(map_http_error)? {
                 self.decoder.push(&chunk);
             } else {
                 self.ended = true;
@@ -164,8 +159,11 @@ impl SseDecoder {
             } else {
                 newline
             };
-            let line = std::str::from_utf8(&self.bytes[line_start..line_end])
-                .map_err(ResponsesError::InvalidSseUtf8)?;
+            let line = std::str::from_utf8(&self.bytes[line_start..line_end]).map_err(|error| {
+                ResponsesError::InvalidSseUtf8 {
+                    detail: error.to_string(),
+                }
+            })?;
             if line.is_empty() {
                 if self.data.is_empty() {
                     if self.finished && self.cursor == self.bytes.len() {
@@ -204,6 +202,14 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_secs)
+}
+
+fn map_http_error(error: reqwest::Error) -> ResponsesError {
+    ResponsesError::HttpRequest {
+        retryable: error.is_connect() || error.is_body(),
+        timeout: error.is_timeout(),
+        detail: error.to_string(),
+    }
 }
 
 #[cfg(test)]

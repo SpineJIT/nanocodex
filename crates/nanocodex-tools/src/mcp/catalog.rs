@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use bm25::{Document, Language, SearchEngine, SearchEngineBuilder};
+use bm25::{Document, SearchEngine, SearchEngineBuilder, Tokenizer};
 use nanocodex_oai_api::tools::ToolDefinition;
 use rmcp::model::Tool as RmcpTool;
 use serde::Serialize;
@@ -15,6 +15,11 @@ use super::client::Client;
 
 const DEFAULT_SEARCH_LIMIT: usize = 8;
 const MAX_SEARCH_LIMIT: usize = 32;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ToolSearchTokenizer;
+
+type ToolSearchEngine = SearchEngine<usize, u32, ToolSearchTokenizer>;
 
 pub(crate) struct ToolEntry {
     pub canonical_name: String,
@@ -37,7 +42,7 @@ struct Catalog {
 
 struct SearchIndex {
     entries: Vec<Arc<ToolEntry>>,
-    engine: SearchEngine<usize>,
+    engine: ToolSearchEngine,
 }
 
 pub(crate) struct ProviderState {
@@ -280,7 +285,11 @@ impl SearchIndex {
             .enumerate()
             .map(|(index, entry)| Document::new(index, entry.search_text.clone()));
         let engine =
-            SearchEngineBuilder::<usize>::with_documents(Language::English, documents).build();
+            SearchEngineBuilder::<usize, u32, ToolSearchTokenizer>::with_tokenizer_and_documents(
+                ToolSearchTokenizer,
+                documents,
+            )
+            .build();
         Self { entries, engine }
     }
 
@@ -290,6 +299,41 @@ impl SearchIndex {
             .into_iter()
             .filter_map(|result| self.entries.get(result.document.id).cloned())
             .collect()
+    }
+}
+
+impl Tokenizer for ToolSearchTokenizer {
+    fn tokenize(&self, input_text: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut token = String::new();
+        let mut previous = None;
+        let mut characters = input_text.chars().peekable();
+
+        while let Some(character) = characters.next() {
+            if !character.is_alphanumeric() {
+                push_search_token(&mut tokens, &mut token);
+                previous = None;
+                continue;
+            }
+
+            let starts_word = !token.is_empty()
+                && character.is_uppercase()
+                && (previous.is_some_and(char::is_lowercase)
+                    || characters.peek().is_some_and(|next| next.is_lowercase()));
+            if starts_word {
+                push_search_token(&mut tokens, &mut token);
+            }
+            token.extend(character.to_lowercase());
+            previous = Some(character);
+        }
+        push_search_token(&mut tokens, &mut token);
+        tokens
+    }
+}
+
+fn push_search_token(tokens: &mut Vec<String>, token: &mut String) {
+    if !token.is_empty() {
+        tokens.push(std::mem::take(token));
     }
 }
 
@@ -395,5 +439,32 @@ mod tests {
             canonical_tool_name("Google Drive", "files/search"),
             "mcp__Google_Drive__files_search"
         );
+    }
+
+    #[test]
+    fn search_tokenizer_splits_identifiers_without_language_dependencies() {
+        assert_eq!(
+            ToolSearchTokenizer.tokenize("mcp__GoogleDrive/files-search-v2 HTTPServer"),
+            [
+                "mcp", "google", "drive", "files", "search", "v2", "http", "server"
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_search_ranks_identifier_components() {
+        let documents = [
+            Document::new(0, "mcp__github__listIssues GitHub list repository issues"),
+            Document::new(1, "mcp__slack__sendMessage Slack send channel message"),
+        ];
+        let engine =
+            SearchEngineBuilder::<usize, u32, ToolSearchTokenizer>::with_tokenizer_and_documents(
+                ToolSearchTokenizer,
+                documents,
+            )
+            .build();
+
+        let results = engine.search("github issues", 1);
+        assert_eq!(results.first().map(|result| result.document.id), Some(0));
     }
 }

@@ -8,11 +8,10 @@ pub(super) struct AgentDriver<S> {
     pub(super) transport_stats: Arc<TransportStats>,
     pub(super) tools: Tools,
     pub(super) workspace: Option<Arc<str>>,
-    pub(super) global_instructions: Option<Arc<str>>,
     pub(super) spawner: BranchSpawner<S>,
     pub(super) initial_model: Option<PreparedCheckpoint>,
     pub(super) origin: AgentOrigin,
-    pub(super) rollout: Option<RolloutRecorder>,
+    pub(super) durability: Durability,
 }
 
 pub(super) struct BranchSpawner<S> {
@@ -21,9 +20,10 @@ pub(super) struct BranchSpawner<S> {
     pub(super) lineage_id: Arc<str>,
     pub(super) prompt_cache_key: Option<Arc<str>>,
     pub(super) shared_prompt_cache: Option<SharedPromptCache>,
-    pub(super) codex_home: Option<PathBuf>,
+    pub(super) context_config: ContextSourceConfig,
+    pub(super) context_source: ContextSource,
     pub(super) depth: u32,
-    pub(super) rollout: Option<RolloutConfig>,
+    pub(super) durability: DurabilityConfig,
     pub(super) service_factory: ServiceFactory<S>,
 }
 
@@ -42,9 +42,10 @@ impl<S> Clone for BranchSpawner<S> {
             lineage_id: Arc::clone(&self.lineage_id),
             prompt_cache_key: self.prompt_cache_key.as_ref().map(Arc::clone),
             shared_prompt_cache: self.shared_prompt_cache.clone(),
-            codex_home: self.codex_home.clone(),
+            context_config: self.context_config.clone(),
+            context_source: self.context_source.clone(),
             depth: self.depth,
-            rollout: self.rollout.clone(),
+            durability: self.durability.for_new_thread(),
             service_factory: Arc::clone(&self.service_factory),
         }
     }
@@ -52,9 +53,9 @@ impl<S> Clone for BranchSpawner<S> {
 
 impl<S> AgentDriver<S>
 where
-    S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + Send + 'static,
-    S::Error: Into<NanocodexError> + Send + 'static,
-    S::Future: Send,
+    S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
+    S::Error: Into<NanocodexError> + AgentSend + 'static,
+    S::Future: AgentSend,
 {
     /// Drives queued turns until every command handle is dropped.
     ///
@@ -64,7 +65,6 @@ where
     #[allow(clippy::too_many_lines)]
     pub(super) async fn run(mut self) -> Result<()> {
         let session_id = self.events.request_id().to_owned();
-        let rollout = self.rollout.take();
         let mut default_thinking = self.spawner.config.thinking;
         let mut default_fast_mode = self.spawner.config.fast_mode;
         let inherited_checkpoint = self.initial_model.as_ref().map(|initial| {
@@ -98,7 +98,7 @@ where
                 Arc::clone(&self.transport_stats),
                 self.tools.clone(),
                 prompt_cache.clone(),
-                self.global_instructions.clone(),
+                self.spawner.context_source.clone(),
             )
         };
         let mut turn_index = 0_u64;
@@ -255,7 +255,7 @@ where
                     );
                 });
             }
-            let rollout_turn = rollout.as_ref().map(|_| RolloutTurn::started(&prompt));
+            let durability_turn = self.durability.start_turn(&prompt);
             let (steers, steer_rx) = mpsc::channel(STEER_CAPACITY);
             let (cancel, cancel_rx) = oneshot::channel();
             let (fork_snapshots, mut fork_snapshot_rx) = watch::channel(None);
@@ -405,9 +405,9 @@ where
                         Arc::clone(&self.spawner.lineage_id),
                         checkpoint,
                     ));
-                    let rollout_turn =
-                        rollout_turn.map(|turn| turn.completed(final_message.clone()));
-                    persist_rollout(rollout.as_ref(), &checkpoint, rollout_turn)
+                    let durability_turn = durability_turn.completed(final_message.clone());
+                    self.durability
+                        .persist(&checkpoint, durability_turn)
                         .instrument(turn_span.clone())
                         .await;
                     latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
@@ -425,8 +425,9 @@ where
                         Arc::clone(&self.spawner.lineage_id),
                         checkpoint,
                     ));
-                    let rollout_turn = rollout_turn.map(RolloutTurn::interrupted);
-                    persist_rollout(rollout.as_ref(), &checkpoint, rollout_turn)
+                    let durability_turn = durability_turn.interrupted();
+                    self.durability
+                        .persist(&checkpoint, durability_turn)
                         .instrument(turn_span.clone())
                         .await;
                     latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
@@ -434,6 +435,7 @@ where
                         checkpoint.model().clone(),
                         &self.spawner.config,
                         &self.tools,
+                        self.spawner.context_source.clone(),
                     );
                     model = ModelRun::from_checkpoint(
                         self.events.clone(),
@@ -472,24 +474,6 @@ where
                 drop(cancel_result.send(outcome));
             }
         }
-    }
-}
-
-async fn persist_rollout(
-    rollout: Option<&RolloutRecorder>,
-    checkpoint: &CommittedSession,
-    turn: Option<RolloutTurn>,
-) {
-    let (Some(rollout), Some(turn)) = (rollout, turn) else {
-        return;
-    };
-    if let Err(source) = rollout.persist(checkpoint, turn).await {
-        error!(
-            target: "nanocodex",
-            rollout_path = %rollout.info().path().display(),
-            error = %source,
-            "failed to persist Codex rollout"
-        );
     }
 }
 
@@ -590,9 +574,9 @@ fn handle_idle_command<S>(
     session_id: &str,
     workspace: Option<Arc<str>>,
 ) where
-    S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + Send + 'static,
-    S::Error: Into<NanocodexError> + Send + 'static,
-    S::Future: Send,
+    S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
+    S::Error: Into<NanocodexError> + AgentSend + 'static,
+    S::Future: AgentSend,
 {
     match command {
         Command::Fork { checkpoint, result } => {
@@ -622,9 +606,9 @@ fn handle_idle_command<S>(
 
 impl<S> BranchSpawner<S>
 where
-    S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + Send + 'static,
-    S::Error: Into<NanocodexError> + Send + 'static,
-    S::Future: Send,
+    S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
+    S::Error: Into<NanocodexError> + AgentSend + 'static,
+    S::Future: AgentSend,
 {
     fn spawn_fork(
         &self,
@@ -647,7 +631,6 @@ where
             workspace,
             (self.service_factory)(),
             Some(InitialResume::Exact(Box::new(checkpoint.model().clone()))),
-            None,
             AgentOrigin {
                 kind: "fork",
                 depth: self.depth.saturating_add(1),
@@ -675,20 +658,19 @@ where
             lineage_id: Arc::from(session_id_text.as_str()),
             prompt_cache_key: self.prompt_cache_key.as_ref().map(Arc::clone),
             shared_prompt_cache: self.shared_prompt_cache.clone(),
-            codex_home: self.codex_home.clone(),
+            context_config: self.context_config.clone(),
+            context_source: self.context_config.build(),
             depth,
-            rollout: self.rollout.clone(),
+            durability: self.durability.for_new_thread(),
             service_factory: Arc::clone(&self.service_factory),
         };
         let service = (self.service_factory)();
-        let global_instructions = load_global_instructions(self.codex_home.as_deref());
         spawn_agent_driver(
             spawner,
             session_id,
             workspace,
             service,
             None,
-            global_instructions,
             AgentOrigin {
                 kind: "spawn",
                 depth,

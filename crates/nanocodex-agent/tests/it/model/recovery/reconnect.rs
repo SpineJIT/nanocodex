@@ -33,7 +33,7 @@ async fn reconnect_drops_previous_response_id_and_replays_full_history() -> Resu
         let mut second = accept_async(stream).await?;
         let replay = next_json(&mut second).await?;
         assert!(replay.get("previous_response_id").is_none());
-        assert_eq!(replay["store"], true);
+        assert_eq!(replay["store"], false);
         assert_eq!(replay["input"].as_array().map(Vec::len), Some(7));
         assert_eq!(replay["input"][0]["type"], "additional_tools");
         assert_eq!(replay["input"][1]["role"], "developer");
@@ -292,12 +292,22 @@ async fn sol_compacts_before_sampling_a_follow_on_turn() -> Result<()> {
         let second_input = second["input"]
             .as_array()
             .ok_or_else(|| eyre!("follow-on request input was not an array"))?;
+        let compact_index = second_input.len().saturating_sub(4);
+        assert!(
+            second_input[compact_index.saturating_sub(1)]
+                .to_string()
+                .contains("first prompt")
+        );
+        assert_eq!(second_input[compact_index]["type"], "compaction");
         assert_eq!(
-            second_input.get(second_input.len().saturating_sub(2)),
-            Some(&json!({
-                "type": "compaction",
-                "encrypted_content": "opaque-summary"
-            }))
+            second_input[compact_index]["encrypted_content"],
+            "opaque-summary"
+        );
+        assert_eq!(second_input[compact_index + 1]["role"], "developer");
+        assert!(
+            second_input[compact_index + 2]
+                .to_string()
+                .contains("<environment_context>")
         );
         assert!(
             second_input

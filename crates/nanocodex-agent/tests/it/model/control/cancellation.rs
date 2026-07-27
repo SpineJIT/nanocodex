@@ -135,6 +135,139 @@ fn assert_interrupted_replay(request: &Value) {
 }
 
 #[tokio::test]
+async fn cancellation_during_pre_turn_compaction_retains_the_accepted_prompt() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let (compact_seen, compact_seen_rx) = tokio::sync::oneshot::channel();
+    let (cancelled, cancelled_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut first_socket = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut first_socket).await?);
+        send_warmup(&mut first_socket, "resp-warmup").await?;
+
+        drop(next_json(&mut first_socket).await?);
+        send_json(
+            &mut first_socket,
+            completed_response_with_usage(
+                "resp-first",
+                &[json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "first done" }]
+                })],
+                244_800,
+            ),
+        )
+        .await?;
+
+        let interrupted_compaction = next_json(&mut first_socket).await?;
+        assert_eq!(interrupted_compaction["previous_response_id"], "resp-first");
+        assert!(
+            !interrupted_compaction
+                .to_string()
+                .contains("cancel during compaction")
+        );
+        compact_seen
+            .send(())
+            .map_err(|()| eyre!("compaction signal receiver dropped"))?;
+        cancelled_rx
+            .await
+            .map_err(|_| eyre!("cancellation signal sender dropped"))?;
+        drop(first_socket);
+
+        let (stream, _) = listener.accept().await?;
+        let mut replacement = accept_async(stream).await?;
+        let retried_compaction = next_json(&mut replacement).await?;
+        assert!(retried_compaction.get("previous_response_id").is_none());
+        let encoded = retried_compaction.to_string();
+        let prompt_index = encoded
+            .find("cancel during compaction")
+            .ok_or_else(|| eyre!("cancelled prompt missing from replayed history"))?;
+        let abort_index = encoded
+            .find("<turn_aborted>")
+            .ok_or_else(|| eyre!("abort marker missing from replayed history"))?;
+        assert!(prompt_index < abort_index);
+        assert!(!encoded.contains("continue after cancellation"));
+        send_json(
+            &mut replacement,
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "id": "cmp-server-id",
+                    "type": "compaction",
+                    "encrypted_content": "opaque-summary"
+                }
+            }),
+        )
+        .await?;
+        send_json(
+            &mut replacement,
+            completed_response_with_usage("resp-compact", &[], 120),
+        )
+        .await?;
+
+        let continuation = next_json(&mut replacement).await?;
+        assert!(continuation.get("previous_response_id").is_none());
+        assert!(
+            continuation
+                .to_string()
+                .contains("continue after cancellation")
+        );
+        send_final(&mut replacement, "resp-final").await
+    });
+
+    let workspace = temporary_workspace("cancel-pre-turn-compaction")?;
+    let openai = OpenAi::builder("test-key")
+        .websocket_url(endpoint)
+        .build()?;
+    let (agent, events) = Nanocodex::builder(openai)
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .session_id(test_session_id())
+        .build()?;
+    assert_eq!(
+        agent
+            .prompt("first prompt")
+            .await?
+            .result()
+            .await?
+            .final_message(),
+        "first done"
+    );
+
+    let interrupted = agent.prompt("cancel during compaction").await?;
+    compact_seen_rx
+        .await
+        .map_err(|_| eyre!("pre-turn compaction was not observed"))?;
+    interrupted.cancel().await?;
+    assert!(matches!(
+        interrupted.result().await,
+        Err(NanocodexError::TurnCancelled)
+    ));
+    cancelled
+        .send(())
+        .map_err(|()| eyre!("cancellation signal receiver dropped"))?;
+
+    assert_eq!(
+        agent
+            .prompt("continue after cancellation")
+            .await?
+            .result()
+            .await?
+            .final_message(),
+        "done"
+    );
+    drop(agent);
+    drop(events);
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancellation_pairs_an_active_tool_call_before_resuming() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);

@@ -2,9 +2,14 @@
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg(all(target_family = "wasm", not(target_os = "unknown")))]
+compile_error!(
+    "nanocodex-agent supports browser/JavaScript WebAssembly \
+     (`wasm32-unknown-unknown`), not WASI targets"
+);
+
 extern crate self as nanocodex_agent;
 
-#[cfg(not(target_family = "wasm"))]
 mod agent;
 mod error;
 mod model;
@@ -17,21 +22,15 @@ pub mod rollout;
 pub mod session;
 /// Per-turn token accounting and USD estimates.
 pub mod usage;
-#[cfg(target_family = "wasm")]
-mod wasm;
 
-#[cfg(not(target_family = "wasm"))]
-#[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
 pub use agent::{AgentHandle, Nanocodex, NanocodexBuilder, Turn, TurnControl, TurnResult};
 pub use error::{NanocodexError, Result};
 pub use nanocodex_oai_api::{OpenAi, ReasoningMode, Thinking, events::AgentEvents};
 #[cfg(not(target_family = "wasm"))]
 #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
-pub use nanocodex_tools::{Tool, Tools, tool};
+pub use nanocodex_tools::tool;
+pub use nanocodex_tools::{Tool, Tools};
 pub use usage::{CostStatus, EstimatedUsdCost, ServiceTier, TurnUsage, UsdAmount};
-#[cfg(target_family = "wasm")]
-#[cfg_attr(docsrs, doc(cfg(target_family = "wasm")))]
-pub use wasm::{WasmNanocodex, WasmTurn};
 
 /// Complete typed lifecycle events emitted by an agent.
 pub mod events {

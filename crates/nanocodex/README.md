@@ -71,7 +71,8 @@ embedding needs more control:
 - [`agent`] — lifecycle policy, events, input, sessions, usage, and rollout
 - [`oai`] — managed Responses sessions and the concrete Tower boundary
 - [`tools`] — tool contracts, built-ins, Code Mode, and MCP
-- [`observability`] — native tracing and OTLP setup
+- `observability` — native tracing and OTLP setup when the default-off
+  `observability` feature is enabled
 - [`prelude`] — common imports for the owned-agent path
 
 Each component module carries the same guide as its independently usable crate.

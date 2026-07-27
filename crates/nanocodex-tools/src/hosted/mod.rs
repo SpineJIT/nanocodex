@@ -1,0 +1,126 @@
+//! Portable adapter for Code Mode runtimes owned by an embedding host.
+//!
+//! Hosted runtimes are useful when Rust owns the agent lifecycle but another
+//! environment owns JavaScript execution and application-defined tools. The
+//! adapter is independent of `wasm-bindgen`; a Node or browser binding can
+//! implement [`CodeModeHost`] without leaking JavaScript types into this crate.
+//!
+//! ```
+//! use nanocodex_tools::{
+//!     ToolContext,
+//!     contract::ToolOutputBody,
+//!     hosted::{
+//!         CodeModeExecution, CodeModeHost, CodeModeHostError, HostFuture, HostedTools,
+//!     },
+//! };
+//!
+//! struct ApplicationHost;
+//!
+//! impl CodeModeHost for ApplicationHost {
+//!     fn tool_definitions(
+//!         &self,
+//!         _session_id: &str,
+//!     ) -> Result<Vec<nanocodex_tools::ToolDefinition>, CodeModeHostError> {
+//!         Ok(Vec::new())
+//!     }
+//!
+//!     fn execute<'a>(
+//!         &'a self,
+//!         source: &'a str,
+//!         _context: ToolContext<'a>,
+//!     ) -> HostFuture<'a, Result<CodeModeExecution, CodeModeHostError>> {
+//!         Box::pin(async move {
+//!             Ok(CodeModeExecution {
+//!                 output: ToolOutputBody::Text(format!("evaluated: {source}")),
+//!                 success: true,
+//!                 nested_calls: Vec::new(),
+//!                 notifications: Vec::new(),
+//!             })
+//!         })
+//!     }
+//! }
+//!
+//! let tools = HostedTools::new(ApplicationHost);
+//! assert!(!tools.web_search_enabled());
+//! ```
+
+mod input;
+mod runtime;
+mod types;
+
+use std::{error::Error, fmt, future::Future, pin::Pin};
+
+use crate::{ToolContext, ToolDefinition};
+
+pub use input::{prepare_output_images, prepare_user_input};
+pub use runtime::{HostedToolRuntime, HostedToolRuntimeControl, HostedTools};
+pub use types::{
+    CodeModeExecution, CodeModeNotification, CodeModeObserver, CodeModeUpdate, NestedToolCall,
+    OwnedToolContext,
+};
+
+/// Future returned by a hosted Code Mode operation.
+///
+/// Native host futures must be sendable because a native agent driver may run
+/// on a multithreaded executor.
+#[cfg(not(target_family = "wasm"))]
+pub type HostFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Future returned by a hosted Code Mode operation.
+///
+/// Browser host futures may retain JavaScript values, which are local to the
+/// browser thread.
+#[cfg(target_family = "wasm")]
+pub type HostFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+
+/// Error reported by an embedding host.
+#[derive(Debug)]
+pub struct CodeModeHostError {
+    message: Box<str>,
+}
+
+impl CodeModeHostError {
+    /// Creates an error with a complete host-provided diagnostic.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into().into_boxed_str(),
+        }
+    }
+
+    /// Returns the complete host-provided diagnostic.
+    #[must_use]
+    pub const fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for CodeModeHostError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for CodeModeHostError {}
+
+/// Application-owned Code Mode and nested-tool execution boundary.
+///
+/// The host receives a read-only [`ToolContext`] for every cell and returns the
+/// same typed execution contract used by the native runtime. Implementations
+/// should preserve nested-call order and return a failed
+/// [`CodeModeExecution`] for model-visible script failures. Reserve
+/// [`CodeModeHostError`] for failures in the host bridge itself.
+pub trait CodeModeHost: Send + Sync + 'static {
+    /// Returns the tools available to Code Mode for this session.
+    ///
+    /// The runtime calls this synchronously while building the model-visible
+    /// `exec` definition.
+    fn tool_definitions(&self, session_id: &str) -> Result<Vec<ToolDefinition>, CodeModeHostError>;
+
+    /// Executes one complete Code Mode cell.
+    fn execute<'a>(
+        &'a self,
+        source: &'a str,
+        context: ToolContext<'a>,
+    ) -> HostFuture<'a, Result<CodeModeExecution, CodeModeHostError>>;
+}

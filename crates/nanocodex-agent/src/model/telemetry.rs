@@ -1,8 +1,5 @@
 use std::time::Duration;
 
-#[cfg(not(target_family = "wasm"))]
-use std::path::PathBuf;
-
 use nanocodex_oai_api::{ModelConfig, Thinking, responses::Usage, transport::TransportStatsDelta};
 use serde::Serialize;
 use serde_json::value::RawValue;
@@ -10,9 +7,6 @@ use web_time::Instant;
 
 use crate::usage::TurnUsage;
 
-#[cfg(not(target_family = "wasm"))]
-use crate::NanocodexError;
-use crate::Result;
 use nanocodex_tools::contract::ToolOutputBody;
 
 #[derive(Serialize)]
@@ -211,34 +205,6 @@ impl RunStats {
             fast_mode,
         )
     }
-}
-
-#[cfg(not(target_family = "wasm"))]
-pub(crate) fn resolve_workspace(requested: Option<&str>) -> Result<String> {
-    let requested = PathBuf::from(requested.unwrap_or("."));
-    let resolved =
-        std::fs::canonicalize(&requested).map_err(|source| NanocodexError::ResolveWorkspace {
-            path: requested,
-            source,
-        })?;
-    if !resolved.is_dir() {
-        return Err(NanocodexError::WorkspaceNotDirectory { path: resolved });
-    }
-    resolved
-        .into_os_string()
-        .into_string()
-        .map_err(|path| NanocodexError::WorkspaceNotUtf8 {
-            path: PathBuf::from(path),
-        })
-}
-
-#[cfg(target_family = "wasm")]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "matches the native workspace-resolution contract"
-)]
-pub(crate) fn resolve_workspace(requested: Option<&str>) -> Result<String> {
-    Ok(requested.unwrap_or(".").to_owned())
 }
 
 pub(super) fn terminal_payload<'a>(

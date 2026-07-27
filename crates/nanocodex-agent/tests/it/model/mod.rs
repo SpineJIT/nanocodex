@@ -83,7 +83,11 @@ mod tools;
 mod transport;
 
 fn assert_warmup(warmup: &Value) {
-    assert_eq!(warmup["store"], true);
+    assert_warmup_with_store(warmup, false);
+}
+
+fn assert_warmup_with_store(warmup: &Value, store: bool) {
+    assert_eq!(warmup["store"], store);
     assert_eq!(warmup["generate"], false);
     assert_eq!(warmup["stream"], true);
     assert_eq!(warmup["parallel_tool_calls"], false);

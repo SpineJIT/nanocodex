@@ -1,5 +1,5 @@
 use std::{
-    fs::File,
+    fs::{File, TryLockError},
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
     time::Instant,
@@ -59,10 +59,18 @@ impl RolloutConfig {
         self.resume_path = Some(rollout_path);
         self
     }
+
+    pub(crate) fn for_new_thread(&self) -> Self {
+        Self::new(self.codex_home.clone())
+    }
 }
 
 /// A completed model boundary materialized from a Codex-compatible rollout.
-#[derive(Clone, Debug)]
+///
+/// This value is intentionally single-use: [`Self::into_parts`] transfers the
+/// exclusive rollout continuation into a builder. Forks and spawned agents
+/// always receive fresh rollout files.
+#[derive(Debug)]
 pub struct DurableSession {
     codex_home: PathBuf,
     thread_id: String,
@@ -85,15 +93,20 @@ impl DurableSession {
                 format!("no Codex rollout found for thread {thread_id}"),
             )
         })?;
-        let (workspace, history, transcript) = materialize_rollout(&rollout_path, thread_id)?;
-        let snapshot = SessionSnapshot::from_rollout(thread_id.to_owned(), workspace, history)
-            .map_err(io::Error::other)?;
+        let materialized = materialize_rollout(&rollout_path, thread_id)?;
+        let snapshot = SessionSnapshot::from_rollout(
+            thread_id.to_owned(),
+            materialized.workspace,
+            materialized.base_instructions,
+            materialized.history,
+        )
+        .map_err(io::Error::other)?;
         Ok(Self {
             codex_home: codex_home.to_path_buf(),
             thread_id: thread_id.to_owned(),
             rollout_path,
             snapshot,
-            transcript,
+            transcript: materialized.transcript,
         })
     }
 
@@ -204,11 +217,9 @@ fn find_rollout_path(codex_home: &Path, thread_id: &str) -> io::Result<Option<Pa
     Ok(None)
 }
 
-fn materialize_rollout(
-    path: &Path,
-    thread_id: &str,
-) -> io::Result<(String, Vec<ResponseItem>, Vec<RolloutTranscriptItem>)> {
+fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedRollout> {
     let mut workspace = None;
+    let mut base_instructions = None;
     let mut history = Vec::new();
     let mut transcript = Vec::new();
     for (index, line) in BufReader::new(File::open(path)?).lines().enumerate() {
@@ -226,12 +237,16 @@ fn materialize_rollout(
         match value.get("type").and_then(serde_json::Value::as_str) {
             Some("session_meta") if workspace.is_none() => {
                 let payload = &value["payload"];
+                validate_legacy_history_mode(payload)?;
                 if payload.get("id").and_then(serde_json::Value::as_str) != Some(thread_id) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "Codex rollout thread ID does not match its filename",
                     ));
                 }
+                base_instructions = payload["base_instructions"]["text"]
+                    .as_str()
+                    .map(str::to_owned);
                 workspace = Some(
                     payload
                         .get("cwd")
@@ -298,7 +313,19 @@ fn materialize_rollout(
             ),
         )
     })?;
-    Ok((workspace, history, transcript))
+    Ok(MaterializedRollout {
+        workspace,
+        base_instructions,
+        history,
+        transcript,
+    })
+}
+
+struct MaterializedRollout {
+    workspace: String,
+    base_instructions: Option<String>,
+    history: Vec<ResponseItem>,
+    transcript: Vec<RolloutTranscriptItem>,
 }
 
 fn visible_rollout_event(payload: &serde_json::Value) -> Option<RolloutTranscriptItem> {
@@ -322,6 +349,21 @@ fn visible_rollout_event(payload: &serde_json::Value) -> Option<RolloutTranscrip
             arguments: serde_json::to_string(payload.get("action")?).ok()?,
         }),
         _ => None,
+    }
+}
+
+fn validate_legacy_history_mode(payload: &serde_json::Value) -> io::Result<()> {
+    match payload.get("history_mode") {
+        None => Ok(()),
+        Some(serde_json::Value::String(mode)) if mode == "legacy" => Ok(()),
+        Some(serde_json::Value::String(mode)) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("Codex rollout history mode `{mode}` is not supported"),
+        )),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex rollout history mode must be a string",
+        )),
     }
 }
 
@@ -373,7 +415,7 @@ impl RolloutInfo {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct RolloutRecorder {
     info: RolloutInfo,
     commands: mpsc::Sender<RolloutCommand>,
@@ -529,6 +571,7 @@ impl RolloutRecorder {
             },
         };
         let mut file = File::options().write(true).create_new(true).open(&path)?;
+        lock_rollout(&file, &path)?;
         write_line(
             &mut file,
             &RolloutLine {
@@ -549,6 +592,8 @@ impl RolloutRecorder {
         path: &Path,
         history_len: usize,
     ) -> io::Result<Self> {
+        let file = File::options().read(true).append(true).open(path)?;
+        lock_rollout(&file, path)?;
         let state = read_resume_writer_state(path, thread_id)?;
         if state.written_len > history_len {
             return Err(io::Error::new(
@@ -556,7 +601,6 @@ impl RolloutRecorder {
                 "Codex rollout contains history newer than the durable Nanocodex boundary",
             ));
         }
-        let file = File::options().read(true).append(true).open(path)?;
         let writer = RolloutWriter::resumed(tokio::fs::File::from_std(file), state);
         Ok(Self::spawn(runtime, thread_id, path.to_path_buf(), writer))
     }
@@ -630,6 +674,20 @@ impl RolloutRecorder {
         receiver
             .await
             .map_err(|_| io::Error::other("Codex rollout writer stopped"))?
+    }
+}
+
+fn lock_rollout(file: &File, path: &Path) -> io::Result<()> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "Codex rollout {} already has an active writer",
+                path.display()
+            ),
+        )),
+        Err(TryLockError::Error(error)) => Err(error),
     }
 }
 
@@ -1095,6 +1153,7 @@ fn read_resume_writer_state(path: &Path, thread_id: &str) -> io::Result<ResumeWr
         match value.get("type").and_then(serde_json::Value::as_str) {
             Some("session_meta") if first_window_id.is_none() => {
                 let payload = &value["payload"];
+                validate_legacy_history_mode(payload)?;
                 if payload.get("id").and_then(serde_json::Value::as_str) != Some(thread_id) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -1194,6 +1253,16 @@ mod tests {
 
     fn completed_turn(prompt: &str, final_message: &str) -> RolloutTurn {
         RolloutTurn::started(&Prompt::new(prompt)).completed(final_message.to_owned())
+    }
+
+    #[test]
+    fn child_rollout_policy_does_not_inherit_a_resume_path() {
+        let resumed =
+            RolloutConfig::new("/codex").resumed(PathBuf::from("/codex/sessions/parent.jsonl"));
+        let child = resumed.for_new_thread();
+
+        assert_eq!(child.codex_home(), Path::new("/codex"));
+        assert!(child.resume_path.is_none());
     }
 
     fn recorder(home: &Path) -> RolloutRecorder {
@@ -1315,6 +1384,35 @@ mod tests {
                 RolloutTranscriptItem::Assistant("visible answer".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn rejects_rollouts_with_paginated_history() {
+        let home = tempdir().expect("temporary Codex home");
+        let thread_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+        let directory = home.path().join("sessions/2026/07/24");
+        std::fs::create_dir_all(&directory).expect("create rollout directory");
+        let path = directory.join(format!("rollout-2026-07-24T12-00-00-{thread_id}.jsonl"));
+        write_line(
+            &mut File::create(&path).expect("create Codex rollout"),
+            &serde_json::json!({
+                "timestamp": "2026-07-24T12:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": thread_id,
+                    "cwd": home.path(),
+                    "history_mode": "paginated",
+                    "context_window": {"window_id": "window-1"}
+                }
+            }),
+        )
+        .expect("write session metadata");
+
+        let error = RolloutConfig::new(home.path())
+            .load_session(thread_id)
+            .expect_err("paginated rollout must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("paginated"));
     }
 
     #[test]
@@ -1462,6 +1560,32 @@ mod tests {
         assert_eq!(lines[7]["payload"]["message"], "two");
         assert_eq!(lines[8]["type"], "response_item");
         assert_eq!(lines[9]["payload"]["message"], "second");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_second_writer_for_the_same_rollout() {
+        let home = tempdir().expect("temporary Codex home");
+        let original = recorder(home.path());
+        let path = original.info().path().to_path_buf();
+        let resumed = RolloutConfig::new(home.path()).resumed(path);
+
+        let error = RolloutRecorder::create(
+            &Handle::current(),
+            &resumed,
+            "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+            Path::new("/worktree"),
+            "base instructions",
+            RolloutOrigin {
+                kind: "resume",
+                parent_thread_id: None,
+            },
+            Some(0),
+        )
+        .expect_err("a live rollout writer must own the file exclusively");
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("active writer"));
+        drop(original);
     }
 
     #[tokio::test]

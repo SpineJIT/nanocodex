@@ -694,6 +694,39 @@ fn unix_now() -> i64 {
         })
 }
 
+fn rfc3339_utc(timestamp: i64) -> String {
+    const SECONDS_PER_DAY: i64 = 86_400;
+
+    let days = timestamp.div_euclid(SECONDS_PER_DAY);
+    let seconds = timestamp.rem_euclid(SECONDS_PER_DAY);
+    let hour = seconds / 3_600;
+    let minute = (seconds % 3_600) / 60;
+    let second = seconds % 60;
+
+    // Howard Hinnant's civil-from-days transform, with day zero at 1970-01-01.
+    let shifted_days = days + 719_468;
+    let era = if shifted_days >= 0 {
+        shifted_days
+    } else {
+        shifted_days - 146_096
+    } / 146_097;
+    let day_of_era = shifted_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    year += i64::from(month <= 2);
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 fn read_store(path: &Path) -> Result<StoredCredentials, ChatGptAuthError> {
     let document = read_document(path)?;
     StoredCredentials::from_document(&document, path)
@@ -738,7 +771,7 @@ fn write_store(path: &Path, credentials: &StoredCredentials) -> Result<(), ChatG
         account_id: Some(credentials.account_id.clone()),
         extra: token_extra,
     });
-    document.last_refresh = Some(chrono::Utc::now().to_rfc3339());
+    document.last_refresh = Some(rfc3339_utc(unix_now()));
 
     let temporary = path.with_extension(format!("json.{}.tmp", random_urlsafe()?));
     let bytes =
@@ -916,7 +949,7 @@ mod tests {
 
     use super::{
         ManagedChatGptAuth, ManagedState, StoredCredentials, authorize_url, jwt_expiration,
-        read_store, refresh_error_code, unix_now, write_store,
+        read_store, refresh_error_code, rfc3339_utc, unix_now, write_store,
     };
     use crate::auth::{OpenAiAuth, OpenAiAuthError};
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -949,6 +982,13 @@ mod tests {
             plan: Some("plus".into()),
             fedramp: false,
         }
+    }
+
+    #[test]
+    fn formats_unix_timestamps_as_codex_compatible_utc() {
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(rfc3339_utc(2_147_483_647), "2038-01-19T03:14:07Z");
     }
 
     fn temp_auth_file() -> std::path::PathBuf {

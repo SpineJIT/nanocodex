@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { Actions } from "../index.mjs";
-import { createAgentClient, defineRuntime } from "../internal.mjs";
+import {
+  activateHost,
+  bindHostSession,
+  createAgentClient,
+  defineRuntime,
+  releaseHostSession,
+} from "../internal.mjs";
 
 test("the headless client exposes matching direct and standalone actions", async () => {
   const events = new Set();
@@ -52,6 +58,67 @@ test("the headless client exposes matching direct and standalone actions", async
 
   const extended = agent.extend((client) => ({ inspect: { session: () => client.sessionId } }));
   assert.equal(extended.inspect.session(), "session-1");
+});
+
+test("the host bridge keeps retry timing and handshake detail session-scoped", async () => {
+  const sleeps = [];
+  const left = {
+    connect(_endpoint, _apiKey, sessionId, metadata) {
+      const error = new Error(`rejected ${sessionId}`);
+      error.status = 429;
+      error.body = "slow down";
+      error.retryAfter = 3;
+      assert.deepEqual(metadata, {
+        accountId: "acct-left",
+        fedramp: true,
+        turnState: "turn-left",
+      });
+      throw error;
+    },
+    sleep(milliseconds) {
+      sleeps.push(["left", milliseconds]);
+      return Promise.resolve();
+    },
+  };
+  const right = {
+    connect() {
+      throw new Error("unused");
+    },
+    sleep(milliseconds) {
+      sleeps.push(["right", milliseconds]);
+      return Promise.resolve();
+    },
+  };
+
+  activateHost(left);
+  bindHostSession(left, "session-left");
+  bindHostSession(right, "session-right");
+  await globalThis.nanocodexHost.sleep("session-left", 7);
+  await globalThis.nanocodexHost.sleep("session-right", 11);
+  assert.deepEqual(sleeps, [["left", 7], ["right", 11]]);
+
+  await assert.rejects(
+    globalThis.nanocodexHost.connect(
+      "wss://api.test",
+      "secret",
+      "acct-left",
+      true,
+      "session-left",
+      "turn-left",
+    ),
+    (error) => {
+      assert.deepEqual(JSON.parse(error), {
+        kind: "handshake_rejected",
+        status: 429,
+        body: "slow down",
+        retry_after: 3,
+      });
+      return true;
+    },
+  );
+
+  releaseHostSession(left, "session-left");
+  releaseHostSession(right, "session-right");
 });
 
 function rawAgent(sessionId) {

@@ -996,6 +996,62 @@ def contains_input_type(request: dict[str, Any], item_type: str) -> bool:
     )
 
 
+def previous_response_chain(requests: list[dict[str, Any]]) -> list[str | None]:
+    return [request.get("previous_response_id") for request in requests]
+
+
+def client_item_ids(request: dict[str, Any]) -> set[str]:
+    input_items = request.get("input")
+    if not isinstance(input_items, list):
+        return set()
+    return {
+        item_id
+        for item in input_items
+        if isinstance(item, dict)
+        and isinstance((item_id := item.get("id")), str)
+        and re.fullmatch(r"[a-z]+_[0-9a-f]{8}-[0-9a-f-]{27}", item_id)
+    }
+
+
+def prompt_item_id(request: dict[str, Any], prompt: str) -> str | None:
+    input_items = request.get("input")
+    if not isinstance(input_items, list):
+        return None
+    for item in input_items:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        if prompt in json.dumps(item, separators=(",", ":")):
+            item_id = item.get("id")
+            return item_id if isinstance(item_id, str) else None
+    return None
+
+
+def client_item_identity_valid(
+    scenario: Scenario,
+    capture: dict[str, Any],
+) -> bool:
+    requests = capture["requests"]
+    if scenario.stateful == "cancellation":
+        return True
+    if scenario.stateful == "compaction":
+        if len(requests) != 4:
+            return False
+        initial_prompt_id = prompt_item_id(requests[1], scenario.prompt)
+        return (
+            initial_prompt_id is not None
+            and prompt_item_id(requests[3], scenario.prompt) == initial_prompt_id
+        )
+    if scenario.stateful == "reconnect_replay":
+        if len(requests) != 4:
+            return False
+        initial_ids = client_item_ids(requests[1])
+        return bool(initial_ids) and initial_ids <= client_item_ids(requests[3])
+    if len(requests) != 2:
+        return False
+    initial_ids = client_item_ids(requests[0])
+    return bool(initial_ids) and initial_ids <= client_item_ids(requests[1])
+
+
 def shell_output_metadata_valid(capture: dict[str, Any]) -> bool:
     for request in reversed(capture["requests"]):
         for item in request.get("input", []):
@@ -1026,21 +1082,33 @@ def stateful_behavior_valid(
     nano: dict[str, Any],
 ) -> bool:
     if scenario.stateful is None:
-        return True
+        return all(
+            all(response_id is None for response_id in previous_response_chain(capture["requests"]))
+            for capture in (stock, nano)
+        )
     if scenario.stateful == "cancellation":
         return (
             stock["cancellation"]["cleanup_valid"]
             and nano["cancellation"]["cleanup_valid"]
+            and previous_response_chain(stock["requests"])
+            == [None, "resp-warmup"]
+            and previous_response_chain(nano["requests"])
+            == [None, "resp-warmup"]
         )
     if scenario.stateful == "shell_output_limit":
         return all(
             shell_output_metadata_valid(capture)
+            and all(
+                response_id is None
+                for response_id in previous_response_chain(capture["requests"])
+            )
             for capture in (stock, nano)
         )
     if scenario.stateful == "reconnect_replay":
         return all(
             len(capture["requests"]) == 4
-            and capture["requests"][3].get("previous_response_id") is None
+            and previous_response_chain(capture["requests"])
+            == [None, "resp-warmup", "resp-tool", None]
             and contains_input_type(
                 capture["requests"][3],
                 "custom_tool_call_output",
@@ -1050,8 +1118,9 @@ def stateful_behavior_valid(
     if scenario.stateful == "compaction":
         return all(
             len(capture["requests"]) == 4
+            and previous_response_chain(capture["requests"])
+            == [None, "resp-warmup", "resp-tool", None]
             and contains_input_type(capture["requests"][2], "compaction_trigger")
-            and capture["requests"][3].get("previous_response_id") is None
             and contains_input_type(capture["requests"][3], "compaction")
             for capture in (stock, nano)
         )
@@ -1121,6 +1190,10 @@ def main() -> int:
                 and stock["request_paths"] == nano["request_paths"]
             )
             behavior_valid = stateful_behavior_valid(scenario, stock, nano)
+            item_identity_valid = all(
+                client_item_identity_valid(scenario, capture)
+                for capture in (stock, nano)
+            )
             if scenario.stateful == "cancellation":
                 process_valid = (
                     stock["cancellation"]["cleanup_valid"]
@@ -1146,6 +1219,7 @@ def main() -> int:
                     "transport_paths_equal": transport_paths_equal,
                     "process_valid": process_valid,
                     "stateful_behavior_valid": behavior_valid,
+                    "client_item_identity_valid": item_identity_valid,
                     "normalized_diff": diff,
                 }
             )
@@ -1162,6 +1236,9 @@ def main() -> int:
     all_stateful_behaviors_valid = all(
         report["stateful_behavior_valid"] for report in reports
     )
+    all_client_item_identities_valid = all(
+        report["client_item_identity_valid"] for report in reports
+    )
     report = {
         "schema_version": 2,
         "scenarios": reports,
@@ -1171,6 +1248,7 @@ def main() -> int:
         "all_normalized_requests_equal": all_requests_equal,
         "all_transport_paths_equal": all_transport_paths_equal,
         "all_stateful_behaviors_valid": all_stateful_behaviors_valid,
+        "all_client_item_identities_valid": all_client_item_identities_valid,
         "supported_surface_exclusions": SUPPORTED_SURFACE_EXCLUSIONS,
     }
     if args.output:
@@ -1199,6 +1277,9 @@ def main() -> int:
                         "stateful_behavior_valid": scenario[
                             "stateful_behavior_valid"
                         ],
+                        "client_item_identity_valid": scenario[
+                            "client_item_identity_valid"
+                        ],
                         "stock_cancellation": scenario["stock"]["cancellation"],
                         "nanocodex_cancellation": scenario["nanocodex"][
                             "cancellation"
@@ -1212,6 +1293,9 @@ def main() -> int:
                 "all_normalized_requests_equal": all_requests_equal,
                 "all_transport_paths_equal": all_transport_paths_equal,
                 "all_stateful_behaviors_valid": all_stateful_behaviors_valid,
+                "all_client_item_identities_valid": (
+                    all_client_item_identities_valid
+                ),
             },
             indent=2,
         )
@@ -1221,6 +1305,7 @@ def main() -> int:
         or not all_counts_valid
         or not all_identities_valid
         or not all_stateful_behaviors_valid
+        or not all_client_item_identities_valid
     ):
         return 1
     if args.check and (not all_requests_equal or not all_transport_paths_equal):

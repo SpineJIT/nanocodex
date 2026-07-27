@@ -17,13 +17,17 @@ description = "Alloy-style facade for the Nanocodex agents SDK"
 all-features = true
 rustdoc-args = ["-D", "warnings"]
 
+[features]
+default = []
+observability = ["dep:nanocodex-observability"]
+
 [dependencies]
 nanocodex-agent.workspace = true
 nanocodex-oai-api.workspace = true
 nanocodex-tools.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-nanocodex-observability.workspace = true
+nanocodex-observability = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The facade compiles the component READMEs as its own module doctests.

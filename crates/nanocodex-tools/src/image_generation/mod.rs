@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    ImageDetail, ImageGenerationConfig, Tool, ToolContext, ToolExecution, ToolInput,
+    ImageDetail, ImageGenerationConfig, Tool, ToolContext, ToolInput, ToolOutput,
     ToolOutputContent, ToolResult, image::load_for_prompt_data_url,
 };
 
@@ -49,18 +49,18 @@ impl ImageGenerationHandler {
         }
     }
 
-    async fn run(&self, input: &str, context: ToolContext<'_>) -> ToolExecution {
+    async fn run(&self, input: &str, context: ToolContext<'_>) -> ToolOutput {
         let args = match serde_json::from_str::<ImagegenArgs>(input) {
             Ok(args) => args,
             Err(error) => {
-                return ToolExecution::error(format!(
+                return ToolOutput::error(format!(
                     "failed to parse image_gen.imagegen arguments: {error}"
                 ));
             }
         };
         let request = match request_for_args(&args, context.history()).await {
             Ok(request) => request,
-            Err(error) => return ToolExecution::error(error),
+            Err(error) => return ToolOutput::error(error),
         };
         let response = match request {
             ImageRequest::Generate(request) => {
@@ -76,10 +76,10 @@ impl ImageGenerationHandler {
             Ok(response) => match response.data.into_iter().next() {
                 Some(data) => data.b64_json,
                 None => {
-                    return ToolExecution::error("image generation returned no image data");
+                    return ToolOutput::error("image generation returned no image data");
                 }
             },
-            Err(error) => return ToolExecution::error(format!("image generation failed: {error}")),
+            Err(error) => return ToolOutput::error(format!("image generation failed: {error}")),
         };
         let saved_path = match save_result(
             &self.save_root,
@@ -108,7 +108,7 @@ impl ImageGenerationHandler {
             });
             code_mode_value["output_hint"] = Value::String(output_hint);
         }
-        ToolExecution::content(output_items).with_code_mode_value(code_mode_value)
+        ToolOutput::content(output_items).with_code_mode_value(code_mode_value)
     }
 
     async fn post_image_request<R: Serialize + ?Sized>(

@@ -12,12 +12,13 @@ pub(super) fn build_agent<S>(
     service_factory: ServiceFactory<S>,
 ) -> Result<(Nanocodex, AgentEvents)>
 where
-    S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + Send + 'static,
-    S::Error: Into<NanocodexError> + Send + 'static,
-    S::Future: Send,
+    S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
+    S::Error: Into<NanocodexError> + AgentSend + 'static,
+    S::Future: AgentSend,
 {
     let session_id = session_id.unwrap_or_default();
     let session_id_text = session_id.to_string();
+    let context_source = codex.context.build();
     let PromptCacheConfig { key, shared } = prompt_cache;
     let is_resume = resume.is_some();
     let (lineage_id, prompt_cache_key, initial_resume) = if let Some(snapshot) = resume {
@@ -25,10 +26,19 @@ where
             lineage_id,
             prompt_cache_key: restored_cache_key,
             workspace,
+            base_instructions,
             canonical_context,
             history,
             checkpoint,
         } = snapshot.into_resume()?;
+        if base_instructions
+            .as_deref()
+            .is_some_and(|stored| stored != config.system_prompt())
+        {
+            return Err(NanocodexError::InvalidSessionSnapshot(
+                "instructions do not match the resumed rollout".to_owned(),
+            ));
+        }
         if key
             .as_deref()
             .is_some_and(|key| key != restored_cache_key.as_ref())
@@ -39,7 +49,7 @@ where
         }
         let initial = checkpoint.map_or_else(
             || {
-                InitialResume::Rollout(Box::new(RolloutResume {
+                InitialResume::History(Box::new(HistoryCheckpoint {
                     workspace,
                     canonical_context,
                     history,
@@ -67,14 +77,14 @@ where
         })
         .transpose()?;
     let workspace = if let Some(initial) = initial_resume.as_ref() {
-        let restored = crate::model::resolve_workspace(Some(initial.workspace()))?;
+        let restored = context_source.resolve_workspace(Some(initial.workspace()))?;
         if restored != initial.workspace() {
             return Err(NanocodexError::InvalidSessionSnapshot(
                 "workspace no longer resolves to the stored location".to_owned(),
             ));
         }
         if let Some(configured) = configured_workspace {
-            let requested = crate::model::resolve_workspace(Some(&configured))?;
+            let requested = context_source.resolve_workspace(Some(&configured))?;
             if requested != restored {
                 return Err(NanocodexError::WorkspaceChanged {
                     current: restored,
@@ -84,12 +94,11 @@ where
         }
         Some(Arc::<str>::from(restored))
     } else {
-        Some(Arc::<str>::from(crate::model::resolve_workspace(
-            configured_workspace.as_deref(),
-        )?))
+        Some(Arc::<str>::from(
+            context_source.resolve_workspace(configured_workspace.as_deref())?,
+        ))
     };
     let service = service_factory();
-    let global_instructions = load_global_instructions(codex.home.as_deref());
     spawn_agent_driver(
         BranchSpawner {
             config,
@@ -97,16 +106,16 @@ where
             lineage_id,
             prompt_cache_key,
             shared_prompt_cache: shared,
-            codex_home: codex.home,
+            context_config: codex.context,
+            context_source,
             depth: 0,
-            rollout: codex.rollout,
+            durability: codex.durability,
             service_factory,
         },
         session_id,
         workspace,
         service,
         initial_resume,
-        global_instructions,
         AgentOrigin {
             kind: if is_resume { "resume" } else { "root" },
             depth: 0,
@@ -121,76 +130,46 @@ pub(super) fn spawn_agent_driver<S>(
     workspace: Option<Arc<str>>,
     service: S,
     initial_resume: Option<InitialResume>,
-    global_instructions: Option<Arc<str>>,
     origin: AgentOrigin,
 ) -> Result<(Nanocodex, AgentEvents)>
 where
-    S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + Send + 'static,
-    S::Error: Into<NanocodexError> + Send + 'static,
-    S::Future: Send,
+    S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
+    S::Error: Into<NanocodexError> + AgentSend + 'static,
+    S::Future: AgentSend,
 {
-    let runtime = tokio::runtime::Handle::try_current()
-        .map_err(|_| NanocodexError::TokioRuntimeUnavailable)?;
     let session_id_text = session_id.to_string();
     let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
-    let tools = bind_agent_environment(
-        spawner.tools.materialize(AgentHandle {
+    let tools = spawner
+        .tools
+        .materialize(AgentHandle {
             commands: commands.downgrade(),
-        })?,
+        })?
+        .for_session(&session_id_text);
+    let durability = spawner.durability.start(
         &session_id_text,
+        workspace.as_deref(),
+        spawner.config.system_prompt(),
+        origin.kind,
+        origin.parent_session_id.as_deref(),
+        initial_resume.as_ref().map(InitialResume::history_len),
     )?;
-    let rollout = spawner
-        .rollout
-        .as_ref()
-        .map(|config| {
-            let cwd = rollout_workspace(workspace.as_deref()).map_err(|source| {
-                NanocodexError::InitializeRollout {
-                    codex_home: config.codex_home().to_path_buf(),
-                    source,
-                }
-            })?;
-            RolloutRecorder::create(
-                &runtime,
-                config,
-                &session_id_text,
-                &cwd,
-                spawner.config.system_prompt(),
-                RolloutOrigin {
-                    kind: origin.kind,
-                    parent_thread_id: origin.parent_session_id.as_deref(),
-                },
-                initial_resume.as_ref().map(InitialResume::history_len),
-            )
-            .map_err(|source| NanocodexError::InitializeRollout {
-                codex_home: config.codex_home().to_path_buf(),
-                source,
-            })
-        })
-        .transpose()?;
-    let rollout_info = rollout.as_ref().map(|recorder| recorder.info().clone());
     let (events, event_stream) = EventSink::channel(session_id_text.clone());
     let initial_model = initial_resume
         .map(|initial| match initial {
-            InitialResume::Exact(checkpoint) => {
-                prepare_resumed_checkpoint(*checkpoint, &spawner.config, &tools, &session_id_text)
-            }
-            InitialResume::Rollout(resume) => {
-                let RolloutResume {
-                    workspace,
-                    canonical_context,
-                    history,
-                    prompt_cache_key,
-                } = *resume;
-                prepare_rollout_checkpoint(
-                    workspace,
-                    canonical_context,
-                    history,
-                    prompt_cache_key,
-                    &spawner.config,
-                    &tools,
-                    &session_id_text,
-                )
-            }
+            InitialResume::Exact(checkpoint) => prepare_resumed_checkpoint(
+                *checkpoint,
+                &spawner.config,
+                &tools,
+                &session_id_text,
+                spawner.context_source.clone(),
+            ),
+            InitialResume::History(resume) => prepare_history_checkpoint(
+                *resume,
+                &spawner.config,
+                &tools,
+                &session_id_text,
+                spawner.context_source.clone(),
+            ),
         })
         .transpose()?;
     let transport_stats = Arc::new(TransportStats::default());
@@ -200,8 +179,7 @@ where
         next_turn: Arc::new(AtomicU64::new(1)),
         lineage_id: Arc::clone(&spawner.lineage_id),
         session_id,
-        rollout: rollout_info,
-        rollout_recorder: rollout.clone(),
+        durability: durability.clone(),
     };
     // Start discovery before returning the handle so an idle CLI or TUI immediately
     // contributes its human think time to provider prewarming.
@@ -213,13 +191,12 @@ where
         transport_stats,
         tools,
         workspace,
-        global_instructions,
         spawner,
         initial_model,
         origin,
-        rollout,
+        durability,
     };
-    drop(runtime.spawn(async move {
+    let driver_task = async move {
         if let Err(error) = driver.run().await {
             tracing::error!(
                 target: "nanocodex",
@@ -227,7 +204,8 @@ where
                 "agent driver stopped with an error"
             );
         }
-    }));
+    };
+    spawn_driver(driver_task)?;
     Ok((agent, event_stream))
 }
 
@@ -269,17 +247,4 @@ pub(super) fn validate(config: &ModelConfig, prompt_cache_key: Option<&str>) -> 
         ));
     }
     Ok(())
-}
-
-fn rollout_workspace(workspace: Option<&str>) -> std::io::Result<PathBuf> {
-    let current = std::env::current_dir()?;
-    let Some(workspace) = workspace else {
-        return Ok(current);
-    };
-    let workspace = PathBuf::from(workspace);
-    if workspace.is_absolute() {
-        Ok(workspace)
-    } else {
-        Ok(current.join(workspace))
-    }
 }

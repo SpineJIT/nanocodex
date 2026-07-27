@@ -13,13 +13,12 @@ use serde_json::Value;
 use tokio::sync::Semaphore;
 
 use super::{
-    CellUpdate, CodeModeExecution, CodeModeObserver, CodeModeUpdate, LiveCell, NestedToolCall,
-    ObservationMode, nested_tool_yield_after, observe_cell, observer_yield_timeout,
-    parse_exec_source,
+    CellError, CellLifecycle, CellObservationState, CellUpdate, CodeModeExecution,
+    CodeModeObserver, CodeModeUpdate, LiveCell, NestedToolCall, ObservationBuffer, ObservationMode,
+    nested_tool_yield_after, observe_cell, observer_yield_timeout, parse_exec_source,
 };
 use crate::{
-    Tool, ToolContext, ToolExecution, ToolInput, ToolOutputBody, ToolOutputContent, ToolResult,
-    Tools,
+    Tool, ToolContext, ToolInput, ToolOutput, ToolOutputBody, ToolOutputContent, ToolResult, Tools,
     runtime::{ToolRuntime, WebSearchConfig},
 };
 
@@ -58,7 +57,7 @@ impl Tool for ConcurrencyProbe {
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         permit.forget();
         self.state.active.fetch_sub(1, Ordering::SeqCst);
-        Ok(ToolExecution::text("released"))
+        Ok(ToolOutput::text("released"))
     }
 }
 
@@ -1090,6 +1089,158 @@ await new Promise(() => {});
 }
 
 #[tokio::test]
+async fn cancellation_terminates_a_cell_during_its_initial_observation() -> Result<()> {
+    let workspace = temporary_workspace("cancelled-initial-observation")?;
+    let state = Arc::new(ConcurrencyProbeState {
+        active: AtomicUsize::new(0),
+        maximum: AtomicUsize::new(0),
+        release: Semaphore::new(0),
+    });
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(ConcurrencyProbe {
+            state: Arc::clone(&state),
+        })
+        .build()?;
+    let runtime = Arc::new(ToolRuntime::new_with_tools(&workspace, None, None, &tools));
+    let control = runtime.control();
+    let execution_runtime = Arc::clone(&runtime);
+    let execution = tokio::spawn(async move {
+        let history = Vec::new();
+        execution_runtime
+            .execute_code(
+                r#"// @exec: {"yield_time_ms": 60000}
+await tools.concurrency_probe({});
+"#,
+                test_context(&history),
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.active.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    tokio::time::timeout(Duration::from_secs(2), control.cancel()).await?;
+    state.release.add_permits(1);
+    let terminated = tokio::time::timeout(Duration::from_secs(2), execution).await??;
+
+    assert!(terminated.success, "{}", execution_output(&terminated));
+    assert!(
+        execution_output(&terminated).contains("Script terminated"),
+        "{}",
+        execution_output(&terminated)
+    );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn active_wait_is_busy_and_a_dropped_observer_can_resume() -> Result<()> {
+    struct ObservationSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl CodeModeObserver for ObservationSignal {
+        fn update(&mut self, update: CodeModeUpdate<'_>) {
+            if matches!(update, CodeModeUpdate::NestedCallStarted { .. })
+                && let Some(signal) = self.0.take()
+            {
+                let _ = signal.send(());
+            }
+        }
+    }
+
+    let workspace = temporary_workspace("dropped-code-mode-observer")?;
+    let state = Arc::new(ConcurrencyProbeState {
+        active: AtomicUsize::new(0),
+        maximum: AtomicUsize::new(0),
+        release: Semaphore::new(0),
+    });
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(ConcurrencyProbe {
+            state: Arc::clone(&state),
+        })
+        .build()?;
+    let runtime = Arc::new(ToolRuntime::new_with_tools(&workspace, None, None, &tools));
+    let history = Vec::new();
+    let yielded = runtime
+        .execute_code(
+            r#"
+await yield_control();
+const result = await tools.concurrency_probe({});
+text(result);
+"#,
+            test_context(&history),
+        )
+        .await;
+    assert!(
+        execution_output(&yielded).contains("Script running with cell ID 1"),
+        "{}",
+        execution_output(&yielded)
+    );
+
+    let waiting_runtime = Arc::clone(&runtime);
+    let (observing_tx, observing_rx) = tokio::sync::oneshot::channel();
+    let waiting = tokio::spawn(async move {
+        let history = Vec::new();
+        let mut observer = ObservationSignal(Some(observing_tx));
+        waiting_runtime
+            .wait_for_code_with_updates(
+                r#"{"cell_id":"1","yield_time_ms":60000}"#,
+                test_context(&history),
+                &mut observer,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), observing_rx).await??;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.active.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    let busy = runtime
+        .wait_for_code(
+            r#"{"cell_id":"1","yield_time_ms":0}"#,
+            test_context(&history),
+        )
+        .await;
+    assert!(!busy.success);
+    assert!(
+        execution_output(&busy).contains("exec cell 1 already has an active observer"),
+        "{}",
+        execution_output(&busy)
+    );
+
+    waiting.abort();
+    let cancellation = match waiting.await {
+        Ok(_) => panic!("aborted observer task completed"),
+        Err(cancellation) => cancellation,
+    };
+    assert!(cancellation.is_cancelled());
+    state.release.add_permits(1);
+    let completed = runtime
+        .wait_for_code(
+            r#"{"cell_id":"1","yield_time_ms":5000}"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(completed.success, "{}", execution_output(&completed));
+    assert!(
+        execution_output(&completed).contains("Script completed"),
+        "{}",
+        execution_output(&completed)
+    );
+    assert_eq!(completed.nested_calls.len(), 1);
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancellation_interrupts_busy_javascript_and_recreates_the_host() -> Result<()> {
     let workspace = temporary_workspace("cancelled-busy-cell")?;
     let tools = test_tools(&workspace);
@@ -1392,6 +1543,186 @@ try {
     Ok(())
 }
 
+#[test]
+fn termination_claim_prevents_completion_and_store_commit() {
+    let lifecycle = CellLifecycle::new();
+    assert!(lifecycle.request_termination());
+
+    let mut committed = false;
+    if lifecycle.claim_completion() {
+        committed = true;
+    }
+
+    assert!(!committed);
+}
+
+#[tokio::test]
+async fn active_observation_reports_busy_without_consuming_the_cell() {
+    let (_updates_tx, updates) = tokio::sync::mpsc::unbounded_channel();
+    let (terminate, terminate_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = terminate_rx.await;
+    });
+    let cell = test_live_cell(1, updates, terminate, task);
+    let observation = cell
+        .begin_observation()
+        .expect("first observer should acquire the cell");
+
+    assert!(matches!(cell.begin_observation(), Err(CellError::Busy)));
+
+    drop(observation);
+    let resumed = cell
+        .begin_observation()
+        .expect("dropping an observer should release the cell");
+    drop(resumed);
+    cell.request_terminate();
+    cell.join().await;
+}
+
+#[tokio::test]
+async fn dropped_observer_preserves_consumed_output_for_the_next_observation() -> Result<()> {
+    struct StartSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl CodeModeObserver for StartSignal {
+        fn update(&mut self, update: CodeModeUpdate<'_>) {
+            if matches!(update, CodeModeUpdate::NestedCallStarted { .. })
+                && let Some(signal) = self.0.take()
+            {
+                let _ = signal.send(());
+            }
+        }
+    }
+
+    let (updates_tx, updates) = tokio::sync::mpsc::unbounded_channel();
+    let (terminate, terminate_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = terminate_rx.await;
+    });
+    let cell = test_live_cell(1, updates, terminate, task);
+    let observation = cell
+        .begin_observation()
+        .expect("first observer should acquire the cell");
+    let observed_cell = Arc::clone(&cell);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let observer_task = tokio::spawn(async move {
+        let mut observer = StartSignal(Some(started_tx));
+        observe_cell(
+            &observed_cell,
+            observation,
+            std::time::Instant::now(),
+            ObservationMode::YieldAfter(Duration::from_secs(60)),
+            None,
+            false,
+            &mut observer,
+        )
+        .await
+    });
+    updates_tx
+        .send(CellUpdate::Content(ToolOutputContent::InputText {
+            text: "survives dropped observer".to_owned(),
+        }))
+        .expect("test cell should receive output");
+    updates_tx
+        .send(CellUpdate::NestedCallStarted {
+            call_id: "call/code-1".to_owned(),
+            name: "test".to_owned(),
+            input: Value::Null,
+            yield_after: None,
+        })
+        .expect("test cell should receive the observation barrier");
+    tokio::time::timeout(Duration::from_secs(1), started_rx)
+        .await?
+        .map_err(|error| eyre!(error))?;
+
+    observer_task.abort();
+    let cancellation = match observer_task.await {
+        Ok(_) => panic!("aborted observer task completed"),
+        Err(cancellation) => cancellation,
+    };
+    assert!(cancellation.is_cancelled());
+
+    updates_tx
+        .send(CellUpdate::Completed)
+        .expect("test cell should receive completion");
+    let observation = cell
+        .begin_observation()
+        .expect("dropping an observer should release the cell");
+    let (completed, running) = observe_cell(
+        &cell,
+        observation,
+        std::time::Instant::now(),
+        ObservationMode::YieldAfter(Duration::from_secs(1)),
+        None,
+        false,
+        &mut super::IgnoreCodeModeUpdates,
+    )
+    .await;
+
+    assert!(!running);
+    assert!(
+        execution_output(&completed).contains("survives dropped observer"),
+        "{}",
+        execution_output(&completed)
+    );
+    cell.request_terminate();
+    cell.join().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn yield_deadline_preempts_already_buffered_runtime_output() {
+    let (updates_tx, updates) = tokio::sync::mpsc::unbounded_channel();
+    let (terminate, terminate_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = terminate_rx.await;
+    });
+    let cell = test_live_cell(1, updates, terminate, task);
+    updates_tx
+        .send(CellUpdate::Content(ToolOutputContent::InputText {
+            text: "queued output".to_owned(),
+        }))
+        .expect("test cell should receive output");
+    let observation = cell
+        .begin_observation()
+        .expect("test cell should not already have an observer");
+
+    let (yielded, running) = observe_cell(
+        &cell,
+        observation,
+        std::time::Instant::now(),
+        ObservationMode::YieldAfter(Duration::ZERO),
+        None,
+        false,
+        &mut super::IgnoreCodeModeUpdates,
+    )
+    .await;
+
+    assert!(running);
+    assert!(!execution_output(&yielded).contains("queued output"));
+
+    updates_tx
+        .send(CellUpdate::Completed)
+        .expect("test cell should receive completion");
+    let observation = cell
+        .begin_observation()
+        .expect("yielded observer should release the cell");
+    let (completed, running) = observe_cell(
+        &cell,
+        observation,
+        std::time::Instant::now(),
+        ObservationMode::YieldAfter(Duration::from_secs(1)),
+        None,
+        false,
+        &mut super::IgnoreCodeModeUpdates,
+    )
+    .await;
+
+    assert!(!running);
+    assert!(execution_output(&completed).contains("queued output"));
+    cell.request_terminate();
+    cell.join().await;
+}
+
 #[tokio::test]
 async fn default_cell_yield_extends_for_a_longer_nested_shell_wait() {
     let (updates_tx, updates) = tokio::sync::mpsc::unbounded_channel();
@@ -1410,16 +1741,14 @@ async fn default_cell_yield_extends_for_a_longer_nested_shell_wait() {
             .send(CellUpdate::Completed)
             .expect("observer should receive cell completion");
     });
-    let mut cell = LiveCell {
-        id: 1,
-        output_token_budget: crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
-        updates,
-        terminate: Some(terminate),
-        task: Some(task),
-    };
+    let cell = test_live_cell(1, updates, terminate, task);
+    let observation = cell
+        .begin_observation()
+        .expect("test cell should not already have an observer");
 
     let (execution, running) = observe_cell(
-        &mut cell,
+        &cell,
+        observation,
         std::time::Instant::now(),
         ObservationMode::YieldAfter(Duration::from_millis(5)),
         None,
@@ -1450,16 +1779,14 @@ async fn explicit_cell_yield_is_not_extended_by_a_nested_shell_wait() {
         tokio::time::sleep(Duration::from_millis(15)).await;
         let _ = updates_tx.send(CellUpdate::Completed);
     });
-    let mut cell = LiveCell {
-        id: 1,
-        output_token_budget: crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
-        updates,
-        terminate: Some(terminate),
-        task: Some(task),
-    };
+    let cell = test_live_cell(1, updates, terminate, task);
+    let observation = cell
+        .begin_observation()
+        .expect("test cell should not already have an observer");
 
     let (execution, running) = observe_cell(
-        &mut cell,
+        &cell,
+        observation,
         std::time::Instant::now(),
         ObservationMode::YieldAfter(Duration::from_millis(5)),
         None,
@@ -1480,7 +1807,7 @@ fn model_description_uses_codex_style_declarations() {
         .expect("temporary test workspace should be available");
     let tools = test_tools(&workspace);
     let specs = tools
-        .model_specs()
+        .model_specs("test-session")
         .into_iter()
         .map(|spec| serde_json::to_value(spec).unwrap())
         .collect::<Vec<_>>();
@@ -1529,6 +1856,25 @@ fn execution_output(execution: &CodeModeExecution) -> String {
 
 fn call_ids(calls: &[NestedToolCall]) -> Vec<&str> {
     calls.iter().map(|call| call.call_id.as_str()).collect()
+}
+
+fn test_live_cell(
+    id: u64,
+    updates: tokio::sync::mpsc::UnboundedReceiver<CellUpdate>,
+    terminate: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+) -> Arc<LiveCell> {
+    Arc::new(LiveCell {
+        id,
+        output_token_budget: crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
+        observation: Arc::new(tokio::sync::Mutex::new(CellObservationState {
+            updates,
+            buffered: ObservationBuffer::default(),
+        })),
+        lifecycle: Arc::new(CellLifecycle::new()),
+        terminate: std::sync::Mutex::new(Some(terminate)),
+        task: tokio::sync::Mutex::new(Some(task)),
+    })
 }
 
 fn test_tools(workspace: &std::path::Path) -> ToolRuntime {

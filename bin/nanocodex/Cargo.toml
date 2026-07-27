@@ -59,6 +59,7 @@ vergen = { workspace = true, features = ["build", "git", "gitcl"] }
 axum.workspace = true
 criterion.workspace = true
 nanocodex-tools.workspace = true
+reqwest = { workspace = true, features = ["query"] }
 tokio-tungstenite.workspace = true
 tracing-subscriber.workspace = true
 

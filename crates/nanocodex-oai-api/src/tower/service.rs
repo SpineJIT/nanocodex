@@ -1,13 +1,10 @@
 use std::{
-    future::Future,
     num::NonZeroU32,
     ops::{Deref, DerefMut},
-    pin::Pin,
     sync::{Arc, atomic::Ordering},
     task::{Context, Poll},
 };
 
-#[cfg(not(target_family = "wasm"))]
 use crate::OpenAiAuthMode;
 use crate::{
     AgentEventKind, ModelConfig, OpenAiAuthSnapshot, ResponsesHistory, ResponsesTransport,
@@ -18,8 +15,8 @@ use tokio::sync::Mutex;
 use tracing::{Instrument, info_span};
 use web_time::Instant;
 
-#[cfg(not(target_family = "wasm"))]
-use crate::http::{HttpMetadata, ResponsesHttp, ResponsesHttpStream};
+mod https;
+
 use crate::{
     EncodedRequest, ResponsesError,
     attempt::{ResponsesAttempt, ResponsesAttemptKind, ResponsesOutput, ResponsesServiceResponse},
@@ -31,14 +28,8 @@ use crate::{
         ApiEvent, AttemptFailed, AttemptStarted, ConnectionCompleted, ConnectionFailed,
         ConnectionPurpose, ConnectionStarted, TRANSPORT, display_endpoint, duration_ns, elapsed_ns,
     },
+    transport::platform::{self, ServiceFuture},
 };
-
-#[cfg(not(target_family = "wasm"))]
-type ServiceFuture =
-    Pin<Box<dyn Future<Output = Result<ResponsesServiceResponse, ResponsesServiceError>> + Send>>;
-#[cfg(target_family = "wasm")]
-type ServiceFuture =
-    Pin<Box<dyn Future<Output = Result<ResponsesServiceResponse, ResponsesServiceError>>>>;
 
 struct ConnectionState {
     socket: Option<ResponsesSocket>,
@@ -190,25 +181,19 @@ pub struct ResponsesService {
     config: Arc<ModelConfig>,
     connection: Arc<Mutex<ConnectionState>>,
     max_attempts: NonZeroU32,
-    #[cfg(not(target_family = "wasm"))]
-    http: ResponsesHttp,
+    platform: platform::ServicePlatform,
 }
 
 impl ResponsesService {
     /// Builds a stateful transport service with default retry limits.
     #[must_use]
     pub fn new(config: Arc<ModelConfig>) -> Self {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            Self::new_with_http_client(config, reqwest::Client::new())
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            Self {
-                config,
-                connection: Arc::new(Mutex::new(ConnectionState::new())),
-                max_attempts: ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS,
-            }
+        let platform = platform::ServicePlatform::new(&config);
+        Self {
+            config,
+            connection: Arc::new(Mutex::new(ConnectionState::new())),
+            max_attempts: ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS,
+            platform,
         }
     }
 
@@ -218,11 +203,12 @@ impl ResponsesService {
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     #[must_use]
     pub fn new_with_http_client(config: Arc<ModelConfig>, http_client: reqwest::Client) -> Self {
+        let platform = platform::ServicePlatform::with_http_client(&config, http_client);
         Self {
             config,
             connection: Arc::new(Mutex::new(ConnectionState::new())),
             max_attempts: ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS,
-            http: ResponsesHttp::new(http_client),
+            platform,
         }
     }
 
@@ -244,10 +230,8 @@ impl ResponsesService {
         config: Arc<ModelConfig>,
         max_attempts: NonZeroU32,
     ) -> DefaultResponsesService {
-        Retry::new(
-            ResponsesRetryPolicy::new(max_attempts),
-            Self::new(config).with_max_attempts(max_attempts),
-        )
+        let retry = ResponsesRetryPolicy::for_config(max_attempts, &config);
+        Retry::new(retry, Self::new(config).with_max_attempts(max_attempts))
     }
 
     /// Builds the standard retry stack with a caller-configured HTTPS client.
@@ -275,8 +259,9 @@ impl ResponsesService {
         http_client: reqwest::Client,
         max_attempts: NonZeroU32,
     ) -> DefaultResponsesService {
+        let retry = ResponsesRetryPolicy::for_config(max_attempts, &config);
         Retry::new(
-            ResponsesRetryPolicy::new(max_attempts),
+            retry,
             Self::new_with_http_client(config, http_client).with_max_attempts(max_attempts),
         )
     }
@@ -365,20 +350,7 @@ impl ResponsesService {
             ResponsesTransport::WebSocket => {
                 self.run_websocket(connection, request, started_at).await
             }
-            ResponsesTransport::Https => {
-                #[cfg(not(target_family = "wasm"))]
-                {
-                    self.run_https(request, started_at).await
-                }
-                #[cfg(target_family = "wasm")]
-                {
-                    Err(ResponsesServiceError::invalid_attempt_state(
-                        "HTTPS Responses transport is unavailable in browser WASM",
-                        FailurePhase::Connect,
-                        0,
-                    ))
-                }
-            }
+            ResponsesTransport::Https => https::run(self, request, started_at).await,
         }
     }
 
@@ -439,7 +411,7 @@ impl ResponsesService {
             ),
             ResponsesAttemptKind::Generation => ResponsesOutput::Generation(
                 stream::receive(
-                    &mut stream::ResponseEventSource::WebSocket(socket),
+                    socket,
                     ResponsesTransport::WebSocket.as_str(),
                     &request.observer,
                     required_call_index(request)?,
@@ -450,7 +422,7 @@ impl ResponsesService {
             ),
             ResponsesAttemptKind::Compaction => ResponsesOutput::Compaction(
                 stream::receive_compaction(
-                    &mut stream::ResponseEventSource::WebSocket(socket),
+                    socket,
                     ResponsesTransport::WebSocket.as_str(),
                     &request.observer,
                     required_call_index(request)?,
@@ -479,97 +451,6 @@ impl ResponsesService {
             attempt: request.attempt,
             connection_generation: generation,
             server_reasoning_included: connection.server_reasoning_included,
-        })
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    async fn run_https(
-        &self,
-        request: &ResponsesAttempt,
-        started_at: Instant,
-    ) -> Result<ResponsesServiceResponse, ResponsesServiceError> {
-        if matches!(request.kind, ResponsesAttemptKind::Warmup) {
-            return Err(ResponsesServiceError::invalid_attempt_state(
-                "HTTPS Responses transport does not perform a warmup request",
-                FailurePhase::Protocol,
-                0,
-            ));
-        }
-        let encode_started_at = Instant::now();
-        let encoded = self.encode_request(&ConnectionState::new(), request)?;
-        let encode_duration_ns = elapsed_ns(encode_started_at);
-        let request_bytes = encoded.raw().get().len();
-        let transport = ResponsesTransport::Https.as_str();
-        let span = tracing::Span::current();
-        span.record("request.bytes", request_bytes);
-        span.record("request.encode.duration_ns", encode_duration_ns);
-        tracing::trace!(
-            target: "nanocodex_oai_api",
-            direction = "outbound",
-            transport,
-            phase = request.kind.phase(),
-            model.call_index = request.call_index,
-            api.request = %encoded.raw().get(),
-            "OpenAI Responses API request"
-        );
-        request.observer.emit(
-            AgentEventKind::ApiEvent,
-            ApiEvent {
-                direction: "outbound",
-                transport,
-                phase: request.kind.phase(),
-                model_call_index: request.call_index,
-                event: encoded.raw(),
-            },
-        )?;
-        let send_started_at = Instant::now();
-        let (mut response, metadata) = self
-            .send_https_with_auth_recovery(request.profile.session_id(), &encoded)
-            .await
-            .map_err(|error| ResponsesServiceError::responses(error, FailurePhase::Send, 0))?;
-        let send_duration_ns = elapsed_ns(send_started_at);
-        span.record("request.send.duration_ns", send_duration_ns);
-        let mut source = stream::ResponseEventSource::Https(&mut response);
-        let output = match request.kind {
-            ResponsesAttemptKind::Generation => ResponsesOutput::Generation(
-                stream::receive(
-                    &mut source,
-                    transport,
-                    &request.observer,
-                    required_call_index(request)?,
-                    started_at,
-                )
-                .await?,
-            ),
-            ResponsesAttemptKind::Compaction => ResponsesOutput::Compaction(
-                stream::receive_compaction(
-                    &mut source,
-                    transport,
-                    &request.observer,
-                    required_call_index(request)?,
-                    started_at,
-                )
-                .await?,
-            ),
-            ResponsesAttemptKind::Warmup => unreachable!("warmup rejected above"),
-        };
-        let pipeline_stats = match &output {
-            ResponsesOutput::Generation(result) => result.pipeline_stats,
-            ResponsesOutput::Compaction(result) => result.pipeline_stats,
-            ResponsesOutput::Warmup(_) => unreachable!("warmup rejected above"),
-        };
-        record_pipeline_stats(
-            &span,
-            request_bytes,
-            encode_duration_ns,
-            send_duration_ns,
-            pipeline_stats,
-        );
-        Ok(ResponsesServiceResponse {
-            output,
-            attempt: request.attempt,
-            connection_generation: 0,
-            server_reasoning_included: metadata.reasoning_included,
         })
     }
 
@@ -742,14 +623,13 @@ impl ResponsesService {
         })
     }
 
-    #[cfg(not(target_family = "wasm"))]
     async fn connect_with_auth_recovery(
         &self,
         session_id: &str,
         turn_state: Option<&str>,
     ) -> Result<(ResponsesSocket, ConnectionMetadata), ResponsesError> {
         let auth = self.auth_snapshot().await?;
-        match ResponsesSocket::connect(&self.config.websocket_url, &auth, session_id, turn_state)
+        match platform::connect_socket(&self.platform, &self.config, &auth, session_id, turn_state)
             .await
         {
             Err(ResponsesError::HandshakeRejected { status: 401, .. })
@@ -763,54 +643,14 @@ impl ResponsesService {
                         detail: error.to_string(),
                     })?;
                 let refreshed = self.auth_snapshot().await?;
-                ResponsesSocket::connect(
-                    &self.config.websocket_url,
+                platform::connect_socket(
+                    &self.platform,
+                    &self.config,
                     &refreshed,
                     session_id,
                     turn_state,
                 )
                 .await
-            }
-            result => result,
-        }
-    }
-
-    #[cfg(target_family = "wasm")]
-    async fn connect_with_auth_recovery(
-        &self,
-        session_id: &str,
-        turn_state: Option<&str>,
-    ) -> Result<(ResponsesSocket, ConnectionMetadata), ResponsesError> {
-        let auth = self.auth_snapshot().await?;
-        ResponsesSocket::connect(&self.config.websocket_url, &auth, session_id, turn_state).await
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    async fn send_https_with_auth_recovery(
-        &self,
-        session_id: &str,
-        request: &EncodedRequest,
-    ) -> Result<(ResponsesHttpStream, HttpMetadata), ResponsesError> {
-        let auth = self.auth_snapshot().await?;
-        match self
-            .http
-            .send(&self.config.api_base_url, &auth, session_id, request)
-            .await
-        {
-            Err(ResponsesError::HttpRejected { status: 401, .. })
-                if auth.mode() == OpenAiAuthMode::ChatGpt =>
-            {
-                self.config
-                    .auth
-                    .recover_unauthorized(&auth)
-                    .await
-                    .map_err(|error| ResponsesError::Authorization {
-                        detail: error.to_string(),
-                    })?;
-                let refreshed = self.auth_snapshot().await?;
-                self.http
-                    .send(&self.config.api_base_url, &refreshed, session_id, request)
-                    .await
             }
             result => result,
         }
