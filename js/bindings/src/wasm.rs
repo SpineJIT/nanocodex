@@ -366,6 +366,7 @@ impl WasmTurn {
                 Err(error) => Err(error.to_string()),
             };
             let mut state = task_state.borrow_mut();
+            state.control = None;
             state.completed = Some(completed);
             state.notify();
         });
