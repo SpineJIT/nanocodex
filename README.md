@@ -234,13 +234,20 @@ implementations.
 The core dependency direction is:
 
 ```text
-nanocodex                       thin facade, modules, and prelude
-    └── nanocodex-agent         owned agent lifecycle and policy
-          ├── nanocodex-tools   tool runtime, MCP, tool_search, Code Mode
-          └── nanocodex-oai-api Tower client, sessions, context, Responses
-
-nanocodex-tools/macros          colocated #[tool] implementation package
+nanocodex                         thin facade, modules, and prelude
+├── nanocodex-agent              owned agent lifecycle and policy
+│   ├── nanocodex-tools          tool runtime, MCP, tool_search, Code Mode
+│   │   ├── nanocodex-oai-api    shared tool and Responses contracts
+│   │   └── nanocodex-tools-macros native #[tool] implementation
+│   └── nanocodex-oai-api        Tower client, sessions, context, Responses
+├── nanocodex-oai-api            direct provider-module reexport
+├── nanocodex-tools              direct tools-module reexport
+└── nanocodex-observability      native observability-module reexport
 ```
+
+The facade root is the canonical common path. Detailed APIs live under their
+owning `nanocodex::agent`, `nanocodex::oai`, or `nanocodex::tools` module;
+lower-level consumers can instead depend on the corresponding component crate.
 
 Tempo-specific application code stays under `bin/`:
 
@@ -334,6 +341,7 @@ Run `cargo doc --open` from the repository root to browse the public
 The normal local gates are:
 
 ```sh
+./scripts/check-crate-boundaries.sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features

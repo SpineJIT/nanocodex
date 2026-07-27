@@ -59,6 +59,9 @@
   snapshots, Codex rollouts, and ergonomic agent builders.
 - `nanocodex` is an Alloy-style facade containing reexports, named component
   modules, and a small prelude. It contains no runtime implementation.
+- Keep facade imports canonical: common types may appear at the crate root and
+  detailed APIs under their owning `agent`, `oai`, or `tools` module. Do not add
+  sibling convenience reexports.
 - `nanocodex-tools/macros` contains the `nanocodex-tools-macros` package that
   implements `#[tool]`. Keep the executable under `bin/nanocodex`; do not move
   CLI behavior into the library.
@@ -66,6 +69,8 @@
   `nanocodex-*` library crates must not depend on them.
 - Each lower crate must remain useful without importing the higher orchestration
   crate. Avoid circular concepts and leaky socket/runtime types.
+- `scripts/check-crate-boundaries.sh` is the executable dependency policy.
+  Update its snapshot only for a deliberate architecture change.
 
 ## Runtime invariants
 

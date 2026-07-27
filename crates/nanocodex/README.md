@@ -75,3 +75,32 @@ embedding needs more control:
 - [`prelude`] — common imports for the owned-agent path
 
 Each component module carries the same guide as its independently usable crate.
+
+## Canonical imports
+
+Use the crate root for the common agent path and the module that owns a concept
+when reaching for its detailed API:
+
+```rust
+use nanocodex::{Nanocodex, OpenAi};
+use nanocodex::agent::{events::AgentEvent, session::SessionSnapshot};
+use nanocodex::oai::tower::ResponsesAttempt;
+use nanocodex::tools::mcp::Mcp;
+
+# fn type_check(
+#     _: Option<Nanocodex>,
+#     _: Option<OpenAi>,
+#     _: Option<AgentEvent>,
+#     _: Option<SessionSnapshot>,
+#     _: Option<ResponsesAttempt>,
+#     _: Option<Mcp>,
+# ) {}
+```
+
+The root convenience path and its owning module name the same type; for
+example, [`OpenAi`] and [`oai::OpenAi`] are identical. The [`agent`] module
+intentionally does not repeat sibling convenience exports: provider
+configuration belongs under [`oai`], tool implementation belongs under
+[`tools`], and lifecycle state belongs under [`agent`]. Applications that need
+only one component can depend on its package directly and use
+`nanocodex_oai_api`, `nanocodex_tools`, or `nanocodex_agent`.

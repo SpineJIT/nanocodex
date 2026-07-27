@@ -40,7 +40,8 @@ jobs:
       - name: Validate installers and crate packages
         shell: bash
         run: |
-          bash -n install scripts/changelog.sh scripts/check-docs.sh scripts/publish-crates.sh
+          bash -n install scripts/changelog.sh scripts/check-crate-boundaries.sh scripts/check-docs.sh scripts/publish-crates.sh
+          ./scripts/check-crate-boundaries.sh
           for crate in nanocodex-oai-api nanocodex-tools-macros nanocodex-observability nanocodex-tools nanocodex-agent nanocodex; do
             cargo package --locked --no-verify --config .cargo/release.toml --package "$crate"
           done

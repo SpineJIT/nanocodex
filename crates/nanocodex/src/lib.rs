@@ -17,8 +17,25 @@ pub use nanocodex_oai_api::{OpenAi, ReasoningMode, Thinking};
 pub use nanocodex_tools::{Tool, Tools, tool};
 
 /// Owned agent lifecycle, builders, turns, branching, and snapshots.
-#[doc(inline)]
-pub use nanocodex_agent as agent;
+///
+/// Provider and tool-runtime APIs keep their canonical detailed paths under
+/// [`crate::oai`] and [`crate::tools`].
+pub mod agent {
+    #![doc = include_str!("../../nanocodex-agent/README.md")]
+
+    pub use nanocodex_agent::{
+        AgentEvents, CostStatus, EstimatedUsdCost, NanocodexError, Result, ServiceTier, TurnUsage,
+        UsdAmount, events, input, session, usage,
+    };
+    #[cfg(not(target_family = "wasm"))]
+    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+    pub use nanocodex_agent::{
+        AgentHandle, Nanocodex, NanocodexBuilder, Turn, TurnControl, TurnResult, rollout,
+    };
+    #[cfg(target_family = "wasm")]
+    #[cfg_attr(docsrs, doc(cfg(target_family = "wasm")))]
+    pub use nanocodex_agent::{WasmNanocodex, WasmTurn};
+}
 
 /// Tower-native OpenAI Responses client, sessions, protocol, and transport.
 #[doc(inline)]
