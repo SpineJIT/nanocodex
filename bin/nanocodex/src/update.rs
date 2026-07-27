@@ -92,7 +92,7 @@ impl Update {
         let checksum_manifest = download(&client, checksums).await?;
         let expected = checksum_for(&checksum_manifest, asset_name)?;
         let contents = download(&client, binary).await?;
-        let actual = format!("{:x}", Sha256::digest(&contents));
+        let actual = hex::encode(Sha256::digest(&contents));
         if actual != expected {
             bail!("checksum mismatch for {asset_name}: expected {expected}, downloaded {actual}");
         }

@@ -11,8 +11,7 @@ use nanocodex::{
     AgentEvents, Nanocodex, OpenAi, Thinking, Tool, Tools,
     agent::{AgentHandle, events::AgentEventKind},
     tools::{
-        ToolContext, ToolDefinition, ToolInput, ToolResult,
-        contract::{ToolExecution, async_trait},
+        ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult, contract::async_trait,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -216,7 +215,7 @@ impl Tool for ChildAgent {
 
         let result = child.prompt(self.kind.prompt(task)).await?.result().await?;
         agents.insert(agent_id, child).await;
-        Ok(ToolExecution::json(&WorkerResult {
+        Ok(ToolOutput::json(&WorkerResult {
             agent_id,
             kind: self.kind.result_name(),
             role,
@@ -266,7 +265,7 @@ impl Tool for PromptAgent {
             .await
             .ok_or_else(|| std::io::Error::other(format!("unknown agent_id {agent_id}")))?;
         let result = child.prompt(task).await?.result().await?;
-        Ok(ToolExecution::json(&FollowUpResult {
+        Ok(ToolOutput::json(&FollowUpResult {
             agent_id,
             report: result.into_final_message(),
         }))

@@ -28,9 +28,6 @@ pub mod agent {
     pub use nanocodex_agent::{
         AgentHandle, Nanocodex, NanocodexBuilder, Turn, TurnControl, TurnResult, rollout,
     };
-    #[cfg(target_family = "wasm")]
-    #[cfg_attr(docsrs, doc(cfg(target_family = "wasm")))]
-    pub use nanocodex_agent::{WasmNanocodex, WasmTurn};
 }
 
 /// Tower-native OpenAI Responses client, sessions, protocol, and transport.

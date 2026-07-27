@@ -21,6 +21,7 @@ crossterm.workspace = true
 dotenvy.workspace = true
 eyre.workspace = true
 futures-util.workspace = true
+hex.workspace = true
 http-body-util.workspace = true
 hudsucker.workspace = true
 image.workspace = true

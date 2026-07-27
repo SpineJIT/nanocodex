@@ -3833,6 +3833,7 @@ dependencies = [
  "dotenvy",
  "eyre",
  "futures-util",
+ "hex",
  "http-body-util",
  "hudsucker",
  "image",

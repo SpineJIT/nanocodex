@@ -570,8 +570,7 @@ fn codex_oauth_key(server_name: &str, server_url: &str) -> Result<String, String
         headers: BTreeMap::new(),
     })
     .map_err(|error| format!("failed to encode MCP OAuth credential key: {error}"))?;
-    let digest = Sha256::digest(encoded);
-    let prefix = format!("{digest:x}");
+    let prefix = hex::encode(Sha256::digest(encoded));
     Ok(format!("{server_name}|{}", &prefix[..16]))
 }
 
@@ -806,7 +805,7 @@ enabled = false
         let mcp = args.build(codex_home.path()).unwrap().unwrap();
         let tools = Tools::builder().provider(mcp.provider).build().unwrap();
         let encoded = serde_json::to_string(
-            &ToolRuntime::new_with_tools(".", None, None, &tools).model_specs(),
+            &ToolRuntime::new_with_tools(".", None, None, &tools).model_specs("test-session"),
         )
         .unwrap();
 
@@ -1114,14 +1113,16 @@ tool_timeout_sec = 9.5
     fn defaults_add_only_deferred_search_to_the_initial_tool_context() {
         let baseline_tools = Tools::builder().build().unwrap();
         let baseline = serde_json::to_vec(
-            &ToolRuntime::new_with_tools(".", None, None, &baseline_tools).model_specs(),
+            &ToolRuntime::new_with_tools(".", None, None, &baseline_tools)
+                .model_specs("test-session"),
         )
         .unwrap();
 
         let mcp = args().build(Path::new("/missing")).unwrap().unwrap();
         let default_tools = Tools::builder().provider(mcp.provider).build().unwrap();
         let with_defaults = serde_json::to_vec(
-            &ToolRuntime::new_with_tools(".", None, None, &default_tools).model_specs(),
+            &ToolRuntime::new_with_tools(".", None, None, &default_tools)
+                .model_specs("test-session"),
         )
         .unwrap();
         let encoded = String::from_utf8(with_defaults.clone()).unwrap();

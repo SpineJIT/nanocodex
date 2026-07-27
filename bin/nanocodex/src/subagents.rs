@@ -10,8 +10,8 @@ use nanocodex::{
     AgentEvents, Nanocodex, Tool, Tools,
     agent::{AgentHandle, events::AgentEventKind},
     tools::{
-        ToolContext, ToolDefinition, ToolInput, ToolResult, ToolsBuildError,
-        contract::{ToolExecution, async_trait},
+        ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult, ToolsBuildError,
+        contract::async_trait,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -225,7 +225,7 @@ impl Tool for ChildAgent {
             .result()
             .await?;
         agents.insert(agent_id, child, event_task).await;
-        Ok(ToolExecution::json(&WorkerResult {
+        Ok(ToolOutput::json(&WorkerResult {
             agent_id,
             kind: self.kind.result_name(),
             role,
@@ -274,7 +274,7 @@ impl Tool for PromptAgent {
             .await
             .ok_or_else(|| std::io::Error::other(format!("unknown agent_id {agent_id}")))?;
         let result = child.prompt(task).await?.result().await?;
-        Ok(ToolExecution::json(&FollowUpResult {
+        Ok(ToolOutput::json(&FollowUpResult {
             agent_id,
             report: result.into_final_message(),
         }))

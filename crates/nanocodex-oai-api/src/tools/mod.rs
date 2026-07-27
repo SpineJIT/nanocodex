@@ -63,10 +63,6 @@ pub struct ToolOutput {
     process_trace: Option<ToolProcessTrace>,
 }
 
-/// Compatibility name for the former tool-runtime result.
-#[doc(hidden)]
-pub type ToolExecution = ToolOutput;
-
 /// Lossless process-boundary representation of a tool output.
 #[doc(hidden)]
 #[allow(missing_docs)]
@@ -78,10 +74,6 @@ pub struct ToolOutputWire {
     pub metadata: Option<Box<RawValue>>,
     pub process_trace: Option<ToolProcessTraceWire>,
 }
-
-/// Compatibility name for the former wire result.
-#[doc(hidden)]
-pub type ToolExecutionWire = ToolOutputWire;
 
 /// Process measurements attached by process-backed tool implementations.
 #[doc(hidden)]
@@ -106,10 +98,6 @@ pub struct ToolProcessTraceWire {
     pub output_bytes: usize,
     pub wall_time_seconds: f64,
 }
-
-/// Compatibility name for the former process-trace wire type.
-#[doc(hidden)]
-pub type ProcessTraceWire = ToolProcessTraceWire;
 
 /// Error returned by an application-defined tool handler.
 pub type ToolError = Box<dyn std::error::Error + Send + Sync + 'static>;
