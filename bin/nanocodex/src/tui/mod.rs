@@ -680,6 +680,8 @@ fn apply_main_agent_event_batch(
         let update = ui.update(UiAction::AgentStreamClosed, worker_tx)?;
         return Ok(apply_update(update, scheduler));
     };
+    // Drain only the already-queued burst. Applying one cached Markdown tail
+    // mutation per provider delta becomes quadratic for long unbroken lines.
     let mut events = Vec::with_capacity(MAX_AGENT_EVENTS_PER_BATCH);
     events.push(first);
     for _ in 1..MAX_AGENT_EVENTS_PER_BATCH {
@@ -718,6 +720,8 @@ fn apply_main_agent_events(
             assistant_events.push((received, true));
             continue;
         }
+        // The raw API frame is the lossless mirror of the normalized delta. It
+        // remains individually visible to telemetry but is not a UI barrier.
         if event.kind == AgentEventKind::ApiEvent {
             if assistant_text.is_some() {
                 assistant_events.push((received, false));
