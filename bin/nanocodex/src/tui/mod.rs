@@ -3183,6 +3183,7 @@ mod tests {
         let workspace = temporary_workspace("tui-historical-edit")?;
         let openai = OpenAi::builder("test-key")
             .websocket_url(endpoint)
+            .store(true)
             .build()?;
         let session_id = nanocodex::agent::session::SessionId::new();
         let (agent, mut events) = Nanocodex::builder(openai)
