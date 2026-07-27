@@ -3978,13 +3978,7 @@ dependencies = [
 name = "nanocodex-core"
 version = "0.2.0"
 dependencies = [
- "criterion",
- "serde",
- "serde_json",
- "smallvec",
- "thiserror 2.0.18",
- "tokio",
- "web-time",
+ "nanocodex-oai-api",
 ]
 
 [[package]]
@@ -4037,6 +4031,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanocodex-oai-api"
+version = "0.2.0"
+dependencies = [
+ "base64",
+ "criterion",
+ "eyre",
+ "futures-util",
+ "http",
+ "image",
+ "js-sys",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha1",
+ "simd-json",
+ "smallvec",
+ "sonic-rs",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tower",
+ "tracing",
+ "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-time",
+]
+
+[[package]]
 name = "nanocodex-observability"
 version = "0.2.0"
 dependencies = [
@@ -4068,28 +4092,7 @@ dependencies = [
 name = "nanocodex-service"
 version = "0.2.0"
 dependencies = [
- "base64",
- "criterion",
- "eyre",
- "futures-util",
- "http",
- "js-sys",
- "nanocodex-core",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "simd-json",
- "smallvec",
- "sonic-rs",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite",
- "tower",
- "tracing",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-time",
+ "nanocodex-oai-api",
 ]
 
 [[package]]
@@ -7606,6 +7609,7 @@ checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

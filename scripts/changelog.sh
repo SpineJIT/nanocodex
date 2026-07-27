@@ -41,6 +41,7 @@ if [[ -n "$crate_root" ]]; then
     fi
 else
     for crate_name in \
+        nanocodex-oai-api \
         nanocodex-core \
         nanocodex-macros \
         nanocodex-observability \

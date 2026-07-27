@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use nanocodex_core::AgentEventKind;
+use crate::AgentEventKind;
 use tower::retry::{Policy, Retry};
 use web_time::Instant;
 
@@ -110,7 +110,7 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
             .response_retries
             .fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
-            target: "nanocodex_service",
+            target: "nanocodex_oai_api",
             phase = request.kind.phase(),
             model.call_index = request.call_index,
             attempt = request.attempt,
@@ -160,6 +160,7 @@ async fn sleep(delay: Duration) {
     drop(JsFuture::from(host_sleep(milliseconds)).await);
 }
 
+/// Standard stateful Responses transport wrapped in the SDK-owned retry policy.
 pub type DefaultResponsesService = Retry<ResponsesRetryPolicy, ResponsesService>;
 
 fn retry_delay(attempt: u32, call_index: Option<u32>) -> Duration {

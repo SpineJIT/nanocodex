@@ -1,10 +1,11 @@
 use std::time::Duration;
 
-use nanocodex_core::EventError;
+use crate::EventError;
 use serde::Serialize;
 
 use crate::{ResponsesError, RetryAdvice};
 
+/// Typed failure returned by the standard Responses Tower service.
 #[derive(Debug)]
 pub struct ResponsesServiceError {
     pub(crate) source: ResponsesServiceErrorSource,
@@ -90,27 +91,39 @@ impl ResponsesServiceError {
         self
     }
 
+    /// Returns a stable low-cardinality error class.
     #[must_use]
     pub const fn error_class(&self) -> &'static str {
         self.class
     }
 
+    /// Returns whether the SDK retry policy may safely retry this failure.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         self.retry_advice.is_some()
     }
 
+    /// Returns whether a private continuation checkpoint disappeared.
     #[must_use]
     pub fn is_checkpoint_missing(&self) -> bool {
         self.responses_error()
             .is_some_and(ResponsesError::is_checkpoint_missing)
     }
 
+    /// Returns whether the request exceeded the model context window.
+    #[must_use]
+    pub fn is_context_window_exceeded(&self) -> bool {
+        self.responses_error()
+            .is_some_and(ResponsesError::is_context_window_exceeded)
+    }
+
+    /// Returns the server-requested retry delay, if supplied.
     #[must_use]
     pub fn server_retry_after(&self) -> Option<Duration> {
         self.retry_advice.and_then(|advice| advice.server_delay)
     }
 
+    /// Returns the underlying Responses transport error when applicable.
     #[must_use]
     pub const fn responses_error(&self) -> Option<&ResponsesError> {
         match &self.source {
@@ -145,7 +158,9 @@ impl From<ResponsesError> for ResponsesServiceError {
             ResponsesError::HttpRequest(_) | ResponsesError::InvalidSseUtf8(_) => {
                 FailurePhase::Receive
             }
-            ResponsesError::Api { .. } => FailurePhase::Api,
+            ResponsesError::Api { .. } | ResponsesError::ContextWindowExceeded { .. } => {
+                FailurePhase::Api
+            }
             #[cfg(not(target_family = "wasm"))]
             ResponsesError::HttpRejected { .. } => FailurePhase::Api,
             _ => FailurePhase::Protocol,

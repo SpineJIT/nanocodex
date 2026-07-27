@@ -15,8 +15,8 @@ use tokio_tungstenite::{
     },
 };
 
+use crate::{OpenAiAuthSnapshot, monotonic_now_ns};
 use crate::{ResponsesError, connector::connect_async};
-use nanocodex_core::{OpenAiAuthSnapshot, monotonic_now_ns};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -83,6 +83,7 @@ impl EncodedRequest {
             .map_err(ResponsesError::EncodeRequest)
     }
 
+    /// Borrows the compact serialized JSON request.
     #[must_use]
     pub fn raw(&self) -> &RawValue {
         &self.0
@@ -239,6 +240,10 @@ impl ResponsesSocket {
     #[must_use]
     pub(crate) fn turn_state(&self) -> Option<&str> {
         self.turn_state.as_deref()
+    }
+
+    pub(crate) fn reset_turn_state(&mut self) {
+        self.turn_state = None;
     }
 
     fn capture_turn_state(&mut self, text: &str) {
@@ -598,9 +603,7 @@ mod tests {
             return Ok(());
         }
         let endpoint = env::var("NANOCODEX_HTTP_PROXY_TEST_ENDPOINT")?;
-        let auth = nanocodex_core::OpenAiAuth::api_key("test-key")
-            .snapshot()
-            .await?;
+        let auth = crate::OpenAiAuth::api_key("test-key").snapshot().await?;
         let result = ResponsesSocket::connect(&endpoint, &auth, "session-proxy").await;
         let expected_rejection = env::var("NANOCODEX_HTTP_PROXY_TEST_EXPECT_REJECTION")
             .ok()
@@ -701,8 +704,8 @@ mod tests {
         });
 
         let endpoint = format!("ws://{address}");
-        let auth = nanocodex_core::OpenAiAuthSnapshot::new(
-            nanocodex_core::OpenAiAuthMode::ChatGpt,
+        let auth = crate::OpenAiAuthSnapshot::new(
+            crate::OpenAiAuthMode::ChatGpt,
             "subscription-token",
             Some("account-test"),
             true,

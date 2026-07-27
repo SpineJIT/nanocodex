@@ -1,4 +1,4 @@
-//! Conversation items sent to and received from the Responses protocol.
+//! Complete typed transcript items used by Responses input and output.
 
 use std::{fmt, ops::Deref};
 
@@ -17,26 +17,31 @@ use super::{
 pub struct ResponseItemId(Box<str>);
 
 impl ResponseItemId {
+    /// Builds a deterministic client-owned ID from a type prefix and suffix.
     #[must_use]
     pub fn with_suffix(prefix: &str, suffix: impl fmt::Display) -> Self {
         Self(format!("{prefix}_{suffix}").into_boxed_str())
     }
 
+    /// Retains a provider-supplied item ID.
     #[must_use]
     pub fn from_server(value: impl Into<Box<str>>) -> Self {
         Self(value.into())
     }
 
+    /// Returns the encoded item ID.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
+    /// Returns whether the encoded item ID is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// Returns whether this is a deterministic Nanocodex-owned ID.
     #[must_use]
     pub fn is_prefixed(&self) -> bool {
         self.split_once('_')
@@ -76,7 +81,12 @@ impl From<&str> for ResponseItemId {
     }
 }
 
-/// A strongly typed conversation item sent to or received from the Responses API.
+/// One typed Responses transcript item.
+///
+/// Variants preserve the provider's complete known wire fields. Unknown future
+/// item types are retained by [`ResponseItem::Other`] without converting known
+/// history into an untyped JSON document.
+#[allow(missing_docs)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseItem {
@@ -262,6 +272,7 @@ pub enum ResponseItem {
 }
 
 impl ResponseItem {
+    /// Creates the stable developer item that declares session tools.
     #[must_use]
     pub fn additional_tools(tools: Vec<ToolDefinition>) -> Self {
         Self::AdditionalTools {
@@ -271,6 +282,7 @@ impl ResponseItem {
         }
     }
 
+    /// Creates a message without provider status or internal metadata.
     #[must_use]
     pub fn message(role: MessageRole, content: impl IntoIterator<Item = ContentItem>) -> Self {
         Self::Message {
@@ -283,6 +295,7 @@ impl ResponseItem {
         }
     }
 
+    /// Creates completed output for one custom-tool call.
     #[must_use]
     pub fn custom_tool_output(
         call_id: String,
@@ -301,6 +314,7 @@ impl ResponseItem {
         }
     }
 
+    /// Creates completed output for one function call.
     #[must_use]
     pub fn function_call_output(call_id: String, output: FunctionOutputBody) -> Self {
         Self::FunctionCallOutput {
@@ -314,11 +328,13 @@ impl ResponseItem {
         }
     }
 
+    /// Creates the typed terminal item for a remote compaction request.
     #[must_use]
     pub const fn compaction_trigger() -> Self {
         Self::CompactionTrigger {}
     }
 
+    /// Returns whether this item is a user-role message.
     #[must_use]
     pub fn is_user_message(&self) -> bool {
         matches!(

@@ -204,7 +204,7 @@ class ContextParityContractTests(unittest.TestCase):
             agent = ParityCodexAgent(
                 logs_dir=Path(directory),
                 model_name="openai/test-model",
-                system_prompt_path=repository / "crates/nanocodex-core/prompts/system.md",
+                system_prompt_path=repository / "crates/nanocodex-oai-api/prompts/system.md",
                 agents_md_path=repository / "evals/history-derived/AGENTS.md",
                 reasoning_effort="low",
                 web_search="disabled",

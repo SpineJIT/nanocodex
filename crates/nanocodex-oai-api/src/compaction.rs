@@ -4,18 +4,17 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
+use crate::{
+    CONTEXT_WINDOW_TOKENS, ContentItem, FunctionOutputBody, FunctionOutputContent, ImageDetail,
+    ResponseItem, responses::ResponseHistory,
+};
 #[cfg(not(target_family = "wasm"))]
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use nanocodex_core::{
-    ContentItem, FunctionOutputBody, FunctionOutputContent, ImageDetail, ResponseItem,
-    responses::ResponseHistory,
-};
 #[cfg(not(target_family = "wasm"))]
 use sha1::{Digest as _, Sha1};
 
-use super::context_manager::is_contextual_user_message;
+use crate::context::is_contextual_user_message;
 
-const SOL_CONTEXT_WINDOW: u64 = 272_000;
 const RETAINED_MESSAGE_TOKEN_BUDGET: usize = 64_000;
 const APPROX_BYTES_PER_TOKEN: usize = 4;
 const RESIZED_IMAGE_BYTES_ESTIMATE: usize = 7_373;
@@ -64,15 +63,17 @@ impl OriginalImageEstimateCache {
 static ORIGINAL_IMAGE_ESTIMATE_CACHE: LazyLock<Mutex<OriginalImageEstimateCache>> =
     LazyLock::new(|| Mutex::new(OriginalImageEstimateCache::default()));
 
-pub(super) fn auto_compact_token_limit(model: &str) -> Option<u64> {
-    (model == "gpt-5.6-sol").then_some((SOL_CONTEXT_WINDOW * 9) / 10)
+#[must_use]
+pub fn auto_compact_token_limit(model: &str) -> Option<u64> {
+    (model == "gpt-5.6-sol").then_some((CONTEXT_WINDOW_TOKENS * 9) / 10)
 }
 
-pub(super) const fn trigger() -> ResponseItem {
+#[must_use]
+pub const fn trigger() -> ResponseItem {
     ResponseItem::compaction_trigger()
 }
 
-pub(super) fn trim_tool_outputs_to_fit_context_window(
+pub fn trim_tool_outputs_to_fit_context_window(
     history: &mut ResponseHistory,
     request_prefix: &[ResponseItem],
 ) -> usize {
@@ -83,7 +84,7 @@ pub(super) fn trim_tool_outputs_to_fit_context_window(
         .fold(0_u64, u64::saturating_add);
     let mut rewritten_outputs = Vec::new();
     for item in history.iter_rev() {
-        if estimated_tokens <= SOL_CONTEXT_WINDOW {
+        if estimated_tokens <= CONTEXT_WINDOW_TOKENS {
             break;
         }
         let tokens_before = estimate_item_tokens(item);
@@ -148,7 +149,8 @@ fn rewritten_tool_output(item: &ResponseItem) -> Option<ResponseItem> {
     }
 }
 
-pub(super) fn install_history(
+#[must_use]
+pub fn install_history(
     history: &[ResponseItem],
     initial_context: &[ResponseItem],
     compaction: ResponseItem,
@@ -239,7 +241,8 @@ fn truncate_message_text(mut item: ResponseItem, max_tokens: usize) -> Option<Re
     Some(item)
 }
 
-pub(super) fn truncate_middle_with_token_budget(text: &str, max_tokens: usize) -> String {
+#[must_use]
+pub fn truncate_middle_with_token_budget(text: &str, max_tokens: usize) -> String {
     if text.is_empty() {
         return String::new();
     }
@@ -279,7 +282,8 @@ fn ceil_char_boundary(text: &str, target: usize) -> usize {
     boundary
 }
 
-pub(super) fn estimate_item_tokens(item: &ResponseItem) -> u64 {
+#[must_use]
+pub fn estimate_item_tokens(item: &ResponseItem) -> u64 {
     u64::try_from(approx_tokens(model_visible_len(item))).unwrap_or(u64::MAX)
 }
 
@@ -445,7 +449,7 @@ mod tests {
     #[test]
     fn installed_history_retains_user_inputs_and_reinjects_context() {
         let permissions = ResponseItem::message(
-            nanocodex_core::MessageRole::Developer,
+            crate::MessageRole::Developer,
             [ContentItem::InputText {
                 text: "<permissions instructions>...</permissions instructions>".into(),
             }],
@@ -540,7 +544,7 @@ mod tests {
 
     fn message(text: &str) -> ResponseItem {
         ResponseItem::message(
-            nanocodex_core::MessageRole::User,
+            crate::MessageRole::User,
             [ContentItem::InputText { text: text.into() }],
         )
     }

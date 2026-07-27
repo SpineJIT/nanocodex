@@ -9,65 +9,123 @@ use tokio_tungstenite::tungstenite::{
 /// Errors produced by the `OpenAI` Responses WebSocket transport.
 #[derive(Debug, thiserror::Error)]
 pub enum ResponsesError {
+    /// Authorization could not be resolved.
     #[error("failed to resolve OpenAI authorization: {detail}")]
-    Authorization { detail: String },
+    Authorization {
+        /// Credential-resolution detail without the credential value.
+        detail: String,
+    },
+    /// The configured WebSocket URL was invalid.
     #[error("invalid Responses WebSocket URL")]
     InvalidUrl(#[source] WebSocketError),
+    /// The authorization value could not be encoded as an HTTP header.
     #[error("invalid OpenAI authorization header")]
     InvalidAuthorization(#[source] InvalidHeaderValue),
+    /// The session identity could not be encoded as an HTTP header.
     #[error("invalid Responses session identifier header")]
     InvalidSessionId(#[source] InvalidHeaderValue),
+    /// The WebSocket handshake exceeded its deadline.
     #[error("Responses WebSocket handshake exceeded {seconds} seconds")]
-    HandshakeTimeout { seconds: u64 },
+    HandshakeTimeout {
+        /// Configured timeout in seconds.
+        seconds: u64,
+    },
+    /// The WebSocket handshake failed at the transport layer.
     #[error("Responses WebSocket handshake failed")]
     Handshake(#[source] WebSocketError),
+    /// The server rejected the WebSocket handshake.
     #[error("Responses WebSocket handshake was rejected with HTTP {status}: {body}")]
     HandshakeRejected {
+        /// HTTP response status.
         status: u16,
+        /// Retained response body.
         body: String,
+        /// Server-requested retry delay when present.
         retry_after: Option<Duration>,
     },
+    /// Sending a WebSocket frame failed.
     #[error("failed to send a Responses WebSocket frame")]
     Send(#[source] WebSocketError),
+    /// Sending a WebSocket frame exceeded its deadline.
     #[error("sending a Responses WebSocket frame exceeded {seconds} seconds")]
-    SendTimeout { seconds: u64 },
+    SendTimeout {
+        /// Configured timeout in seconds.
+        seconds: u64,
+    },
+    /// No response event arrived before the idle deadline.
     #[error("Responses WebSocket produced no event for {seconds} seconds")]
-    IdleTimeout { seconds: u64 },
+    IdleTimeout {
+        /// Configured idle timeout in seconds.
+        seconds: u64,
+    },
+    /// The WebSocket stream ended without a close frame.
     #[error("Responses WebSocket closed without a close frame")]
     UnexpectedEnd,
+    /// Receiving a WebSocket frame failed.
     #[error("failed to receive a Responses WebSocket frame")]
     Receive(#[source] WebSocketError),
+    /// A received WebSocket event was not valid JSON.
     #[error("Responses WebSocket event was not valid JSON")]
     InvalidJson(#[source] serde_json::Error),
+    /// The endpoint returned a binary frame where text JSON was required.
     #[error("Responses WebSocket returned a binary data frame; expected JSON text")]
     UnexpectedBinary,
+    /// A typed request could not be serialized.
     #[error("failed to encode a Responses WebSocket request")]
     EncodeRequest(#[source] serde_json::Error),
+    /// An event's payload did not match the shape declared by its type.
     #[error("Responses API event did not match its declared type: {event}")]
     InvalidPayload {
+        /// Typed payload decode failure.
         #[source]
         source: serde_json::Error,
+        /// Complete retained provider event.
         event: String,
     },
+    /// The WebSocket closed with provider-supplied detail.
     #[error("Responses WebSocket closed {detail}")]
-    Closed { detail: String },
+    Closed {
+        /// Close code and reason.
+        detail: String,
+    },
+    /// The Responses API returned a typed error event.
     #[error("Responses API returned an error event: {event}")]
-    Api { event: String },
+    Api {
+        /// Complete retained provider event.
+        event: String,
+    },
+    /// The request exceeded the model context window.
+    #[error("Responses input exceeded the model context window")]
+    ContextWindowExceeded {
+        /// Complete retained provider event.
+        event: String,
+    },
+    /// The provider rejected malformed or unsupported image data.
     #[error("Responses API rejected invalid image data: {event}")]
-    InvalidImageRequest { event: String },
+    InvalidImageRequest {
+        /// Complete retained provider event.
+        event: String,
+    },
+    /// Sending or reading an HTTPS request failed.
     #[error("Responses HTTPS request failed")]
     HttpRequest(#[source] reqwest::Error),
+    /// The server rejected an HTTPS request.
     #[error("Responses HTTPS request was rejected with HTTP {status}: {body}")]
     HttpRejected {
+        /// HTTP response status.
         status: u16,
+        /// Retained response body.
         body: String,
+        /// Server-requested retry delay when present.
         retry_after: Option<Duration>,
     },
+    /// An SSE response body contained invalid UTF-8.
     #[error("Responses HTTPS stream contained invalid UTF-8")]
     InvalidSseUtf8(#[source] std::string::FromUtf8Error),
 }
 
 impl ResponsesError {
+    /// Returns the SDK-owned retry classification, if retrying is safe.
     #[must_use]
     pub fn retry_advice(&self) -> Option<RetryAdvice> {
         let (class, server_delay) = match self {
@@ -113,6 +171,7 @@ impl ResponsesError {
         })
     }
 
+    /// Returns a stable low-cardinality error class for telemetry.
     #[must_use]
     pub fn class(&self) -> &'static str {
         match self {
@@ -137,6 +196,7 @@ impl ResponsesError {
                 "checkpoint_missing"
             }
             Self::Api { .. } => "api",
+            Self::ContextWindowExceeded { .. } => "context_window_exceeded",
             Self::InvalidImageRequest { .. } => "invalid_image_request",
             Self::HttpRequest(error) if error.is_timeout() => "https_timeout",
             Self::HttpRequest(_) => "https_transport",
@@ -147,15 +207,33 @@ impl ResponsesError {
         }
     }
 
+    /// Returns whether the provider no longer recognizes a continuation ID.
     #[must_use]
     pub fn is_checkpoint_missing(&self) -> bool {
         matches!(self, Self::Api { event } if api_error_has_code(event, "previous_response_not_found"))
     }
+
+    /// Returns whether the provider rejected the request for context exhaustion.
+    #[must_use]
+    pub const fn is_context_window_exceeded(&self) -> bool {
+        matches!(self, Self::ContextWindowExceeded { .. })
+    }
+
+    pub(crate) fn api_event(event: String) -> Self {
+        if api_error_has_code(&event, "context_length_exceeded") {
+            Self::ContextWindowExceeded { event }
+        } else {
+            Self::Api { event }
+        }
+    }
 }
 
+/// Retry metadata derived from one typed transport or API error.
 #[derive(Clone, Copy, Debug)]
 pub struct RetryAdvice {
+    /// Stable low-cardinality retry class.
     pub class: &'static str,
+    /// Server-supplied minimum delay, if any.
     pub server_delay: Option<Duration>,
 }
 
@@ -265,7 +343,7 @@ impl RetryAfterValue {
 
 #[cfg(test)]
 mod tests {
-    use super::retryable_api_error;
+    use super::{ResponsesError, retryable_api_error};
 
     #[test]
     fn retries_server_error_reported_as_error_type() {
@@ -282,6 +360,26 @@ mod tests {
             retryable_api_error(event).map(|(class, _)| class),
             Some("api_server")
         );
+    }
+
+    #[test]
+    fn classifies_context_window_failures_from_nested_response_errors() {
+        let error = ResponsesError::api_event(
+            r#"{
+                "type": "response.failed",
+                "response": {
+                    "error": {
+                        "code": "context_length_exceeded",
+                        "message": "maximum context length exceeded"
+                    }
+                }
+            }"#
+            .to_owned(),
+        );
+
+        assert!(error.is_context_window_exceeded());
+        assert_eq!(error.class(), "context_window_exceeded");
+        assert!(error.retry_advice().is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use nanocodex_core::{
+use crate::{
     AgentEventKind, ContentItem, EventSink, MessagePhase, MessageRole, ResponseItem,
     ResponseItemId, monotonic_now_ns,
     responses::{ServerEvent, Usage},
@@ -12,6 +12,7 @@ use web_time::Instant;
 use crate::http::ResponsesHttpStream;
 use crate::{
     ResponsesError,
+    attempt::ResponsesObserver,
     service_error::ResponsesServiceError,
     socket::{ResponsesSocket, decode_event, parse_raw_json},
     telemetry::{ApiEvent, elapsed_ns},
@@ -19,58 +20,101 @@ use crate::{
 
 const INVALID_IMAGE_ERROR: &str = "The image data you provided does not represent a valid image";
 
-pub struct TurnResult {
+/// Complete provider output from one `response.create` operation.
+pub struct GenerationOutput {
+    /// Provider response ID retained privately by a managed session.
     pub id: String,
+    /// Provider terminal status.
     pub status: String,
+    /// Whether the model affirmatively ended the logical turn.
     pub end_turn: Option<bool>,
+    /// Concatenated final assistant message when one was produced.
     pub final_message: Option<String>,
+    /// Complete provider output items in order.
     pub output_items: Vec<ResponseItem>,
+    /// Parsed custom and function calls derived from the output items.
     pub code_calls: Vec<CodeCall>,
+    /// Provider token usage.
     pub usage: Option<Usage>,
+    /// Nanoseconds from attempt start to the first provider event.
     pub time_to_first_event_ns: u64,
+    /// Nanoseconds from attempt start to the first model output.
     pub time_to_first_output_ns: Option<u64>,
+    /// Detailed stream-pipeline counters.
     pub pipeline_stats: ResponsePipelineStats,
 }
 
-pub struct CompactionResult {
+/// Complete provider output from one `response.compact` operation.
+pub struct CompactionOutput {
+    /// Provider response ID retained privately by a managed session.
     pub id: String,
+    /// Provider terminal status.
     pub status: String,
+    /// Exactly one completed compaction item.
     pub item: ResponseItem,
+    /// Provider token usage.
     pub usage: Option<Usage>,
+    /// Nanoseconds from attempt start to the first provider event.
     pub time_to_first_event_ns: u64,
+    /// Nanoseconds from attempt start to the first compaction output.
     pub time_to_first_output_ns: Option<u64>,
+    /// Detailed stream-pipeline counters.
     pub pipeline_stats: ResponsePipelineStats,
 }
 
+/// Work and latency counters for one complete streamed response.
 #[derive(Clone, Copy, Default)]
 pub struct ResponsePipelineStats {
+    /// Provider events received.
     pub event_count: u64,
+    /// Encoded provider event bytes received.
     pub event_bytes: u64,
+    /// Nanoseconds waiting for the transport to yield events.
     pub receive_wait_duration_ns: u64,
+    /// Nanoseconds validating raw JSON.
     pub parse_duration_ns: u64,
+    /// Nanoseconds emitting raw and normalized events.
     pub emit_duration_ns: u64,
+    /// Nanoseconds decoding typed provider events.
     pub decode_duration_ns: u64,
+    /// Nanoseconds events waited in the socket pump queue.
     pub socket_queue_duration_ns: u64,
+    /// Displayable text and reasoning delta count.
     pub display_delta_count: u64,
+    /// Displayable delta bytes.
     pub display_delta_bytes: u64,
+    /// Sum of gaps between displayable deltas.
     pub inter_delta_gap_duration_ns: u64,
+    /// Largest gap between displayable deltas.
     pub inter_delta_gap_max_ns: u64,
+    /// Gaps of at least 50 milliseconds.
     pub inter_delta_stall_50ms_count: u64,
+    /// Gaps of at least 100 milliseconds.
     pub inter_delta_stall_100ms_count: u64,
+    /// Gaps of at least 250 milliseconds.
     pub inter_delta_stall_250ms_count: u64,
 }
 
+/// Completed callable output derived from a response item.
 pub struct CodeCall {
+    /// Provider call identity.
     pub call_id: String,
+    /// Tool name.
     pub name: String,
+    /// Optional tool namespace.
     pub namespace: Option<String>,
+    /// Complete function arguments or custom-tool input.
     pub input: String,
+    /// Wire-level call representation.
     pub kind: CodeCallKind,
 }
 
+/// Wire-level representation used by a completed callable output.
 #[derive(Clone, Copy)]
 pub enum CodeCallKind {
+    /// Custom tool call with free-form input.
     Custom,
+    /// Function call with JSON arguments.
     Function,
 }
 
@@ -196,10 +240,10 @@ impl ResponseEventSource<'_> {
 pub(crate) async fn receive(
     source: &mut ResponseEventSource<'_>,
     transport: &'static str,
-    events: &EventSink,
+    observer: &ResponsesObserver,
     call_index: u32,
     started_at: Instant,
-) -> Result<TurnResult, ResponsesServiceError> {
+) -> Result<GenerationOutput, ResponsesServiceError> {
     let mut done_items = Vec::with_capacity(2);
     let mut assistant_items = HashMap::new();
     let mut timing = StreamTiming::new(started_at);
@@ -208,7 +252,7 @@ pub(crate) async fn receive(
         let received = next_event(
             source,
             transport,
-            events,
+            observer,
             "generation",
             call_index,
             &mut timing,
@@ -236,7 +280,7 @@ pub(crate) async fn receive(
             } => {
                 let item = output_index.and_then(|index| assistant_items.get(&index));
                 emit_display_delta(
-                    events,
+                    &observer.events,
                     &mut timing,
                     AgentEventKind::AssistantDelta,
                     AssistantTextDelta {
@@ -250,10 +294,10 @@ pub(crate) async fn receive(
                     delta.len(),
                 )?;
             }
-            ServerEvent::ReasoningSummaryTextDelta { delta }
-            | ServerEvent::ReasoningSummaryDelta { delta } => {
+            ServerEvent::ReasoningSummaryTextDelta { delta, .. }
+            | ServerEvent::ReasoningSummaryDelta { delta, .. } => {
                 emit_display_delta(
-                    events,
+                    &observer.events,
                     &mut timing,
                     AgentEventKind::ReasoningSummaryDelta,
                     TextDelta {
@@ -266,7 +310,7 @@ pub(crate) async fn receive(
                 )?;
             }
             ServerEvent::OutputItemDone { item } => {
-                emit_assistant_message(events, call_index, &item)?;
+                emit_assistant_message(&observer.events, call_index, &item)?;
                 done_items.push(item);
             }
             ServerEvent::Completed { mut response } => {
@@ -277,7 +321,7 @@ pub(crate) async fn receive(
                 };
                 let code_calls = code_calls(&output_items);
                 let final_message = final_message(&output_items);
-                return Ok(TurnResult {
+                return Ok(GenerationOutput {
                     id: response.id,
                     status: response.status,
                     end_turn: response.end_turn,
@@ -350,10 +394,10 @@ fn emit_assistant_message(
 pub(crate) async fn receive_compaction(
     source: &mut ResponseEventSource<'_>,
     transport: &'static str,
-    events: &EventSink,
+    observer: &ResponsesObserver,
     call_index: u32,
     started_at: Instant,
-) -> Result<CompactionResult, ResponsesServiceError> {
+) -> Result<CompactionOutput, ResponsesServiceError> {
     let mut done_items = Vec::with_capacity(2);
     let mut timing = StreamTiming::new(started_at);
 
@@ -361,7 +405,7 @@ pub(crate) async fn receive_compaction(
         let received = next_event(
             source,
             transport,
-            events,
+            observer,
             "compaction",
             call_index,
             &mut timing,
@@ -386,7 +430,7 @@ pub(crate) async fn receive_compaction(
                 let Some(item) = item else {
                     return Err(ResponsesServiceError::invalid_compaction(0));
                 };
-                return Ok(CompactionResult {
+                return Ok(CompactionOutput {
                     id: response.id,
                     status: response.status,
                     item,
@@ -404,7 +448,7 @@ pub(crate) async fn receive_compaction(
 async fn next_event(
     source: &mut ResponseEventSource<'_>,
     transport: &'static str,
-    events: &EventSink,
+    observer: &ResponsesObserver,
     phase: &'static str,
     call_index: u32,
     timing: &mut StreamTiming,
@@ -434,8 +478,17 @@ async fn next_event(
     let elapsed = elapsed_ns(timing.started_at);
     timing.first_event_ns.get_or_insert(elapsed);
 
+    tracing::trace!(
+        target: "nanocodex_oai_api",
+        direction = "inbound",
+        transport,
+        phase,
+        model.call.index = call_index,
+        api.event = %raw_event.get(),
+        "OpenAI Responses API event"
+    );
     let emit_started_at = Instant::now();
-    let api_event_seq = events.emit_with_source_sequence(
+    let api_event_seq = observer.events.emit_with_source_sequence(
         AgentEventKind::ApiEvent,
         ApiEvent {
             direction: "inbound",
@@ -453,6 +506,9 @@ async fn next_event(
 
     let decode_started_at = Instant::now();
     let event = decode_event::<ServerEvent>(raw_event)?;
+    if let Some(event) = event.normalized() {
+        observer.emit_response(event).await;
+    }
     timing.pipeline.decode_duration_ns = timing
         .pipeline
         .decode_duration_ns
@@ -477,10 +533,7 @@ async fn next_event(
             }
             .into());
         }
-        return Err(ResponsesError::Api {
-            event: raw_event.get().to_owned(),
-        }
-        .into());
+        return Err(ResponsesError::api_event(raw_event.get().to_owned()).into());
     }
     Ok(ReceivedServerEvent {
         event,

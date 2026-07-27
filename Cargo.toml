@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/nanocodex", "bin/nanousd-api", "crates/mpp-egress", "crates/nanocodex", "crates/nanocodex-core", "crates/nanocodex-macros", "crates/nanocodex-mcp", "crates/nanocodex-observability", "crates/nanocodex-service", "crates/nanocodex-tools", "crates/nanousd", "examples", "js/bindings", "py/bindings"]
+members = ["bin/nanocodex", "bin/nanousd-api", "crates/mpp-egress", "crates/nanocodex", "crates/nanocodex-core", "crates/nanocodex-macros", "crates/nanocodex-mcp", "crates/nanocodex-oai-api", "crates/nanocodex-observability", "crates/nanocodex-service", "crates/nanocodex-tools", "crates/nanousd", "examples", "js/bindings", "py/bindings"]
 default-members = ["bin/nanocodex"]
 resolver = "2"
 
@@ -42,6 +42,7 @@ nanocodex = { version = "0.2.0", path = "crates/nanocodex" }
 nanocodex-core = { version = "0.2.0", path = "crates/nanocodex-core" }
 nanocodex-macros = { version = "0.2.0", path = "crates/nanocodex-macros" }
 nanocodex-mcp = { version = "0.2.0", path = "crates/nanocodex-mcp" }
+nanocodex-oai-api = { version = "0.2.0", path = "crates/nanocodex-oai-api" }
 nanocodex-observability = { version = "0.2.0", path = "crates/nanocodex-observability" }
 nanocodex-service = { version = "0.2.0", path = "crates/nanocodex-service" }
 nanocodex-tools = { version = "0.2.0", path = "crates/nanocodex-tools" }
@@ -96,7 +97,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "jso
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
 url = "2.5.7"
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1", features = ["js", "serde", "v7"] }
 vergen = { version = "8", default-features = false }
 wasm-bindgen = "0.2.105"
 wasm-bindgen-futures = "0.4.55"

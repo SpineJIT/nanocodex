@@ -4,6 +4,13 @@ use nanocodex_core::{
     AgentEventKind, EventSink, MODEL, ModelConfig, Prompt, ResponseItem, ResponseItemId,
     ResponsesTransport, Thinking, ToolDefinition, Usage, responses::RequestProfile,
 };
+use nanocodex_core::{
+    compaction,
+    context::{
+        ContextManager, assign_missing_response_item_id, assign_missing_response_item_ids,
+        has_well_formed_tool_calls,
+    },
+};
 use nanocodex_service::{
     CodeCall, CodeCallKind, ResponsesAttempt, ResponsesAttemptFactory, ResponsesClient,
     ResponsesOutput, ResponsesServiceResponse, TransportStats, TurnResult,
@@ -15,16 +22,11 @@ use tower::Service;
 use tracing::{Instrument, info, info_span};
 use web_time::Instant;
 
-use super::context_manager::{
-    assign_missing_response_item_id, assign_missing_response_item_ids, has_well_formed_tool_calls,
-};
 use super::{
     CompactionCompleted, CompactionFailed, CompactionStarted, ModelCallCompleted, ModelCallFailed,
     ModelCallStarted, RunError, RunStarted, RunStats, RunSteered, ToolCallArguments, ToolCallEvent,
     ToolResultEvent, WarmupCompleted, WarmupFailed, WarmupStarted,
     agents_md::load_instructions,
-    compaction,
-    context_manager::ContextManager,
     display_endpoint, elapsed_ns,
     input::{
         custom_tool_notification, custom_tool_output, developer_context, function_tool_output,

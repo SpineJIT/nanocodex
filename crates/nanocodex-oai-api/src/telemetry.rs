@@ -137,7 +137,7 @@ pub(crate) fn display_endpoint(endpoint: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use nanocodex_core::{AgentEventKind, EventSink};
+    use crate::{AgentEventKind, EventSink};
     use serde_json::value::RawValue;
 
     use super::{ApiEvent, TRANSPORT};

@@ -7,7 +7,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
 use crate::ResponsesError;
-use nanocodex_core::monotonic_now_ns;
+use crate::monotonic_now_ns;
 
 const EVENT_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
@@ -98,6 +98,7 @@ impl EncodedRequest {
             .map_err(ResponsesError::EncodeRequest)
     }
 
+    /// Borrows the compact serialized JSON request.
     #[must_use]
     pub fn raw(&self) -> &RawValue {
         &self.0
@@ -107,7 +108,7 @@ impl EncodedRequest {
 impl ResponsesSocket {
     pub(crate) async fn connect(
         endpoint: &str,
-        auth: &nanocodex_core::OpenAiAuthSnapshot,
+        auth: &crate::OpenAiAuthSnapshot,
         session_id: &str,
     ) -> Result<(Self, ConnectionMetadata), ResponsesError> {
         let promise = host_connect(endpoint, auth.bearer(), session_id).map_err(|error| {
@@ -184,6 +185,10 @@ impl ResponsesSocket {
 
     pub(crate) fn turn_state(&self) -> Option<&str> {
         self.turn_state.as_deref()
+    }
+
+    pub(crate) fn reset_turn_state(&mut self) {
+        self.turn_state = None;
     }
 
     fn capture_turn_state(&mut self, text: &str) {

@@ -1,3 +1,5 @@
+//! Byte-stable request profiles, persistent history, and wire serialization.
+
 use std::sync::Arc;
 
 use serde::{Serialize, ser::SerializeSeq};
@@ -14,6 +16,7 @@ pub struct RequestProfile {
 }
 
 impl RequestProfile {
+    /// Creates stable session metadata and an immutable request prefix.
     #[must_use]
     pub fn new(
         session_id: impl Into<String>,
@@ -27,16 +30,19 @@ impl RequestProfile {
         }
     }
 
+    /// Returns the client-owned session identity used in request metadata.
     #[must_use]
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
 
+    /// Returns the stable prompt-cache identity.
     #[must_use]
     pub fn prompt_cache_key(&self) -> &str {
         &self.prompt_cache_key
     }
 
+    /// Returns immutable instructions and tool definitions.
     #[must_use]
     pub fn prefix(&self) -> &[ResponseItem] {
         &self.prefix
@@ -68,6 +74,7 @@ struct HistorySegment {
 }
 
 impl ResponseHistory {
+    /// Creates history with one mutable tail and no committed segments.
     #[must_use]
     pub fn new(items: Vec<ResponseItem>) -> Self {
         Self {
@@ -76,30 +83,36 @@ impl ResponseHistory {
         }
     }
 
+    /// Returns the total item count across committed segments and the tail.
     #[must_use]
     pub fn len(&self) -> usize {
         self.head.as_ref().map_or(0, |segment| segment.len) + self.tail.len()
     }
 
+    /// Returns whether the history contains no items.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Returns the current uncommitted tail.
     #[must_use]
     pub fn tail(&self) -> &[ResponseItem] {
         &self.tail
     }
 
+    /// Shares the current tail allocation.
     #[must_use]
     pub fn shared_tail(&self) -> Arc<Vec<ResponseItem>> {
         Arc::clone(&self.tail)
     }
 
+    /// Appends an item to the copy-on-write tail.
     pub fn push(&mut self, item: ResponseItem) {
         Arc::make_mut(&mut self.tail).push(item);
     }
 
+    /// Returns mutable access to the copy-on-write tail.
     pub fn tail_mut(&mut self) -> &mut Vec<ResponseItem> {
         Arc::make_mut(&mut self.tail)
     }
@@ -118,6 +131,7 @@ impl ResponseHistory {
         }));
     }
 
+    /// Replaces complete history with one new mutable tail.
     pub fn replace(&mut self, items: Vec<ResponseItem>) {
         self.head = None;
         self.tail = Arc::new(items);
@@ -153,16 +167,19 @@ impl ResponseHistory {
         Arc::make_mut(&mut self.tail).extend(replacement);
     }
 
+    /// Iterates over all items from oldest to newest.
     #[must_use]
     pub fn iter(&self) -> ResponseHistoryIter<'_> {
         ResponseHistoryIter::new(self, 0)
     }
 
+    /// Iterates from an absolute item index without flattening history.
     #[must_use]
     pub fn iter_from(&self, start: usize) -> ResponseHistoryIter<'_> {
         ResponseHistoryIter::new(self, start)
     }
 
+    /// Iterates over all items from newest to oldest.
     #[must_use]
     pub fn iter_rev(&self) -> ResponseHistoryRevIter<'_> {
         ResponseHistoryRevIter {
@@ -188,6 +205,7 @@ impl<'a> IntoIterator for &'a ResponseHistory {
     }
 }
 
+/// Forward iterator across persistent history segments.
 pub struct ResponseHistoryIter<'a> {
     segments: Vec<&'a HistorySegment>,
     segment_index: usize,
@@ -260,6 +278,7 @@ impl<'a> Iterator for ResponseHistoryIter<'a> {
 
 impl ExactSizeIterator for ResponseHistoryIter<'_> {}
 
+/// Reverse iterator across persistent history segments.
 pub struct ResponseHistoryRevIter<'a> {
     tail: std::iter::Rev<std::slice::Iter<'a, ResponseItem>>,
     segment: Option<&'a HistorySegment>,
@@ -293,6 +312,7 @@ impl<'a> Iterator for ResponseHistoryRevIter<'a> {
 
 impl ExactSizeIterator for ResponseHistoryRevIter<'_> {}
 
+/// Borrowed, allocation-free composition of request input sources.
 #[derive(Clone, Copy)]
 pub struct ResponsesInput<'a> {
     first: &'a [ResponseItem],
@@ -303,6 +323,7 @@ pub struct ResponsesInput<'a> {
 }
 
 impl<'a> ResponsesInput<'a> {
+    /// Concatenates two slices and an optional terminal item.
     #[must_use]
     pub const fn new(
         first: &'a [ResponseItem],
@@ -318,6 +339,7 @@ impl<'a> ResponsesInput<'a> {
         }
     }
 
+    /// Concatenates a slice, complete persistent history, and a terminal item.
     #[must_use]
     pub const fn history(
         first: &'a [ResponseItem],
@@ -333,6 +355,7 @@ impl<'a> ResponsesInput<'a> {
         }
     }
 
+    /// Concatenates a slice, a persistent-history suffix, and a terminal item.
     #[must_use]
     pub const fn history_suffix(
         first: &'a [ResponseItem],
@@ -349,6 +372,7 @@ impl<'a> ResponsesInput<'a> {
         }
     }
 
+    /// Iterates over the composed input in wire order.
     #[must_use]
     pub fn iter(self) -> ResponsesInputIter<'a> {
         ResponsesInputIter {
@@ -361,6 +385,7 @@ impl<'a> ResponsesInput<'a> {
         }
     }
 
+    /// Returns the exact composed item count.
     #[must_use]
     pub fn len(self) -> usize {
         self.first.len()
@@ -371,12 +396,14 @@ impl<'a> ResponsesInput<'a> {
             + usize::from(self.tail.is_some())
     }
 
+    /// Returns whether the composed input has no items.
     #[must_use]
     pub fn is_empty(self) -> bool {
         self.len() == 0
     }
 }
 
+/// Iterator over a borrowed [`ResponsesInput`].
 pub struct ResponsesInputIter<'a> {
     first: std::slice::Iter<'a, ResponseItem>,
     second: std::slice::Iter<'a, ResponseItem>,
@@ -458,6 +485,7 @@ impl Serialize for RequestResponseItem<'_> {
     }
 }
 
+/// Fully typed wire request for `response.create` or WebSocket warmup.
 #[derive(Serialize)]
 pub struct ResponseCreate<'a> {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
@@ -482,6 +510,7 @@ pub struct ResponseCreate<'a> {
 }
 
 impl<'a> ResponseCreate<'a> {
+    /// Builds a non-generating WebSocket warmup request.
     #[must_use]
     pub fn warmup(
         config: &'a ModelConfig,
@@ -504,6 +533,7 @@ impl<'a> ResponseCreate<'a> {
         )
     }
 
+    /// Builds a generating Responses request.
     #[must_use]
     pub fn generation(
         config: &'a ModelConfig,

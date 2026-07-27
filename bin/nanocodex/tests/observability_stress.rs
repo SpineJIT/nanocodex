@@ -186,7 +186,7 @@ fn subagent_stress_command(
         .arg("--log-filter")
         .arg("warn")
         .arg("--otel-filter")
-        .arg("warn,nanocodex=info,nanocodex_service=info,nanocodex_tools=info")
+        .arg("warn,nanocodex=info,nanocodex_oai_api=info,nanocodex_tools=info")
         .arg("--otel-endpoint")
         .arg(otlp_endpoint)
         .arg("--otel-environment")
@@ -300,7 +300,7 @@ fn stress_command(
         command
             .arg("--otel-filter")
             .arg(
-                "warn,nanocodex=info,nanocodex_service=info,nanocodex_tools=info,nanocodex_mcp=info",
+                "warn,nanocodex=info,nanocodex_oai_api=info,nanocodex_tools=info,nanocodex_mcp=info",
             )
             .arg("--otel-endpoint")
             .arg(endpoint)

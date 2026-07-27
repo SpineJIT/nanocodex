@@ -6,13 +6,14 @@ use std::{
     },
 };
 
-use nanocodex_core::{
-    AgentEventKind, EventError, EventSink, ResponseItem, Thinking,
+use crate::{
+    AgentEventKind, EventError, EventSink, ResponseEvent, ResponseItem, Thinking,
     responses::{RequestProfile, ResponseHistory, ResponsesInput, WarmupResponse},
 };
 use serde::Serialize;
+use tokio::sync::mpsc;
 
-use crate::stream::{CompactionResult, TurnResult};
+use crate::stream::{CompactionOutput, GenerationOutput};
 
 const RESPONSE_MAX_ATTEMPTS: NonZeroU32 = NonZeroU32::new(5).unwrap();
 
@@ -21,8 +22,11 @@ const RESPONSE_MAX_ATTEMPTS: NonZeroU32 = NonZeroU32::new(5).unwrap();
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ResponsesAttemptKind {
+    /// Optional WebSocket connection warmup.
     Warmup,
+    /// A `response.create` operation.
     Generation,
+    /// A `response.compact` operation.
     Compaction,
 }
 
@@ -40,6 +44,7 @@ impl ResponsesAttemptKind {
 pub(crate) struct ResponsesObserver {
     pub(crate) events: EventSink,
     pub(crate) stats: Arc<TransportStats>,
+    response_events: Option<mpsc::Sender<ResponseEvent>>,
 }
 
 impl ResponsesObserver {
@@ -50,8 +55,15 @@ impl ResponsesObserver {
     ) -> Result<(), EventError> {
         self.events.emit(kind, payload)
     }
+
+    pub(crate) async fn emit_response(&self, event: ResponseEvent) {
+        if let Some(events) = &self.response_events {
+            drop(events.send(event).await);
+        }
+    }
 }
 
+/// Shared atomic counters for one transport family.
 #[derive(Default)]
 pub struct TransportStats {
     pub(crate) connection_attempts: AtomicU32,
@@ -62,6 +74,7 @@ pub struct TransportStats {
     pub(crate) retry_backoff_duration_ns: AtomicU64,
 }
 
+/// Point-in-time transport counter values used to calculate a delta.
 #[derive(Clone, Copy, Default)]
 pub struct TransportStatsSnapshot {
     connection_attempts: u32,
@@ -73,6 +86,7 @@ pub struct TransportStatsSnapshot {
 }
 
 impl TransportStats {
+    /// Captures the current counter values.
     #[must_use]
     pub fn snapshot(&self) -> TransportStatsSnapshot {
         TransportStatsSnapshot {
@@ -85,6 +99,7 @@ impl TransportStats {
         }
     }
 
+    /// Calculates counters accumulated since an earlier snapshot.
     #[must_use]
     pub fn since(&self, before: TransportStatsSnapshot) -> TransportStatsDelta {
         let after = self.snapshot();
@@ -114,11 +129,17 @@ impl TransportStats {
 /// Per-run transport counters derived from the process-wide service counters.
 #[derive(Clone, Copy, Default)]
 pub struct TransportStatsDelta {
+    /// Physical connection attempts.
     pub connection_attempts: u32,
+    /// Successful WebSocket replacements after the initial connection.
     pub websocket_reconnects: u32,
+    /// Physical Responses attempts.
     pub response_attempts: u32,
+    /// Responses retries after the first physical attempt.
     pub response_retries: u32,
+    /// Nanoseconds spent establishing connections.
     pub connection_duration_ns: u64,
+    /// Nanoseconds spent waiting for owned retry backoff.
     pub retry_backoff_duration_ns: u64,
 }
 
@@ -139,6 +160,7 @@ pub struct ResponsesAttempt {
     pub(crate) attempt: u32,
     pub(crate) max_attempts: u32,
     full_replay: bool,
+    pub(crate) logical_turn: u64,
 }
 
 impl ResponsesAttempt {
@@ -163,6 +185,7 @@ impl ResponsesAttempt {
             attempt: 1,
             max_attempts: 1,
             full_replay: false,
+            logical_turn: 0,
         }
     }
 
@@ -193,6 +216,7 @@ impl ResponsesAttempt {
             attempt: 1,
             max_attempts: RESPONSE_MAX_ATTEMPTS.get(),
             full_replay: previous_response_id.is_none(),
+            logical_turn: 0,
         }
     }
 
@@ -224,6 +248,7 @@ impl ResponsesAttempt {
             attempt: 1,
             max_attempts: RESPONSE_MAX_ATTEMPTS.get(),
             full_replay: previous_response_id.is_none(),
+            logical_turn: 0,
         }
     }
 
@@ -247,11 +272,13 @@ impl ResponsesAttempt {
         }
     }
 
+    /// Returns the provider operation represented by this attempt.
     #[must_use]
     pub const fn kind(&self) -> ResponsesAttemptKind {
         self.kind
     }
 
+    /// Returns the session-monotonic model call index, if this is not warmup.
     #[must_use]
     pub const fn model_call_index(&self) -> Option<u32> {
         self.call_index
@@ -269,20 +296,36 @@ impl ResponsesAttempt {
         self.fast_mode
     }
 
+    /// Returns the current physical attempt number.
     #[must_use]
     pub const fn attempt(&self) -> u32 {
         self.attempt
     }
 
+    /// Iterates over the exact input items this physical attempt will send.
     pub fn input_items(&self) -> impl Iterator<Item = &ResponseItem> {
         self.input().iter()
     }
 
+    /// Emits one normalized event for callers streaming this attempt.
+    ///
+    /// Custom Tower services installed with [`crate::OpenAiBuilder::service`]
+    /// use this method when they can expose live provider events. A service
+    /// that only returns a completed aggregate may omit it; the managed
+    /// response stream synthesizes its terminal completion event.
+    pub async fn emit(&self, event: ResponseEvent) {
+        self.observer.emit_response(event).await;
+    }
+
+    /// Returns the exact number of input items this physical attempt will send.
     #[must_use]
     pub fn input_item_count(&self) -> usize {
         self.input().len()
     }
 
+    /// Returns the private provider continuation ID used by this attempt.
+    ///
+    /// Full-replay attempts deliberately return `None`.
     #[must_use]
     pub fn previous_response_id(&self) -> Option<&str> {
         (!self.full_replay)
@@ -290,6 +333,7 @@ impl ResponsesAttempt {
             .flatten()
     }
 
+    /// Returns whether this attempt sends complete authoritative history.
     #[must_use]
     pub const fn is_full_replay(&self) -> bool {
         self.full_replay
@@ -321,12 +365,17 @@ impl ResponsesAttempt {
     }
 }
 
+/// Complete output returned by one low-level Responses Tower call.
 pub enum ResponsesOutput {
+    /// WebSocket warmup completed.
     Warmup(WarmupResponse),
-    Generation(TurnResult),
-    Compaction(CompactionResult),
+    /// `response.create` completed.
+    Generation(GenerationOutput),
+    /// `response.compact` completed.
+    Compaction(CompactionOutput),
 }
 
+/// Complete result produced by a Tower service for one Responses attempt.
 pub struct ResponsesServiceResponse {
     pub(crate) output: ResponsesOutput,
     pub(crate) attempt: u32,
@@ -335,56 +384,123 @@ pub struct ResponsesServiceResponse {
 }
 
 impl ResponsesServiceResponse {
+    /// Wraps completed output from a caller-supplied Tower service.
+    #[must_use]
+    pub const fn new(output: ResponsesOutput) -> Self {
+        Self {
+            output,
+            attempt: 1,
+            connection_generation: 0,
+            server_reasoning_included: false,
+        }
+    }
+
+    /// Records the physical attempt that produced this completed output.
+    #[must_use]
+    pub const fn with_attempt(mut self, attempt: u32) -> Self {
+        self.attempt = attempt;
+        self
+    }
+
+    /// Records the transport connection generation that produced this output.
+    #[must_use]
+    pub const fn with_connection_generation(mut self, connection_generation: u32) -> Self {
+        self.connection_generation = connection_generation;
+        self
+    }
+
+    /// Records whether the server already accounted for retained reasoning.
+    #[must_use]
+    pub const fn with_server_reasoning_included(mut self, included: bool) -> Self {
+        self.server_reasoning_included = included;
+        self
+    }
+
+    /// Returns the physical attempt that produced this output.
     #[must_use]
     pub const fn attempt(&self) -> u32 {
         self.attempt
     }
 
+    /// Returns the transport connection generation that produced this output.
     #[must_use]
     pub const fn connection_generation(&self) -> u32 {
         self.connection_generation
     }
 
+    /// Returns whether the server already accounted for retained reasoning.
     #[must_use]
     pub const fn server_reasoning_included(&self) -> bool {
         self.server_reasoning_included
     }
 
+    /// Consumes the transport metadata and returns the completed output.
     #[must_use]
     pub fn into_output(self) -> ResponsesOutput {
         self.output
     }
 }
 
+/// Builds replayable low-level Responses attempts against one stable profile.
 #[must_use]
 pub struct ResponsesAttemptFactory {
     profile: Arc<RequestProfile>,
     observer: ResponsesObserver,
+    logical_turn: u64,
 }
 
 impl ResponsesAttemptFactory {
+    /// Creates a low-level attempt factory with shared events and counters.
     pub fn new(profile: RequestProfile, events: EventSink, stats: Arc<TransportStats>) -> Self {
         Self {
             profile: Arc::new(profile),
-            observer: ResponsesObserver { events, stats },
+            observer: ResponsesObserver {
+                events,
+                stats,
+                response_events: None,
+            },
+            logical_turn: 0,
         }
     }
 
+    pub(crate) fn with_response_events(
+        mut self,
+        response_events: mpsc::Sender<ResponseEvent>,
+    ) -> Self {
+        self.observer.response_events = Some(response_events);
+        self
+    }
+
+    /// Returns an attempt factory scoped to one client-side logical turn.
+    #[doc(hidden)]
+    pub fn for_logical_turn(&self, logical_turn: u64) -> Self {
+        Self {
+            profile: Arc::clone(&self.profile),
+            observer: self.observer.clone(),
+            logical_turn,
+        }
+    }
+
+    /// Returns the immutable request profile shared by generated attempts.
     #[must_use]
     pub fn profile(&self) -> &RequestProfile {
         &self.profile
     }
 
+    /// Builds a WebSocket warmup attempt.
     #[must_use]
     pub fn warmup(&self, thinking: Thinking, fast_mode: bool) -> ResponsesAttempt {
-        ResponsesAttempt::warmup(
+        let mut attempt = ResponsesAttempt::warmup(
             thinking,
             fast_mode,
             Arc::clone(&self.profile),
             self.observer.clone(),
-        )
+        );
+        attempt.logical_turn = self.logical_turn;
+        attempt
     }
 
+    /// Builds a replayable `response.create` attempt.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn generation(
@@ -397,7 +513,7 @@ impl ResponsesAttemptFactory {
         thinking: Thinking,
         fast_mode: bool,
     ) -> ResponsesAttempt {
-        ResponsesAttempt::generation(
+        let mut attempt = ResponsesAttempt::generation(
             call_index,
             full_history,
             incremental_history,
@@ -407,10 +523,13 @@ impl ResponsesAttemptFactory {
             fast_mode,
             Arc::clone(&self.profile),
             self.observer.clone(),
-        )
+        );
+        attempt.logical_turn = self.logical_turn;
+        attempt
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Builds a replayable `response.compact` attempt.
     #[must_use]
     pub fn compaction(
         &self,
@@ -423,7 +542,7 @@ impl ResponsesAttemptFactory {
         thinking: Thinking,
         fast_mode: bool,
     ) -> ResponsesAttempt {
-        ResponsesAttempt::compaction(
+        let mut attempt = ResponsesAttempt::compaction(
             call_index,
             full_history,
             incremental_history,
@@ -434,14 +553,16 @@ impl ResponsesAttemptFactory {
             fast_mode,
             Arc::clone(&self.profile),
             self.observer.clone(),
-        )
+        );
+        attempt.logical_turn = self.logical_turn;
+        attempt
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ResponseHistory, ResponsesAttemptFactory, TransportStats};
-    use nanocodex_core::{
+    use crate::{
         ContentItem, EventSink, MessageRole, ResponseItem, Thinking, responses::RequestProfile,
     };
     use serde_json::json;

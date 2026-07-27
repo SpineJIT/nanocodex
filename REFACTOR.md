@@ -28,6 +28,13 @@ facade is thin, existing behavior is preserved, performance contracts are
 measured, and Nanoeval's supported workflows run from this repository through
 `nanocodex eval ...`.
 
+`master` is the behavioral parity baseline. A slice may deliberately redesign
+an API, but it may not remove a working capability, target, transport, tool,
+consumer, event, or operational workflow without an explicit replacement
+decision. Compatibility surfaces remain only long enough to move real
+consumers; deletion follows a focused parity test or smoke proving the new
+owner.
+
 ## Design rules
 
 ### Building blocks
@@ -74,6 +81,25 @@ measured, and Nanoeval's supported workflows run from this repository through
   environment metadata; they are trend evidence rather than deterministic CI
   tests.
 - No performance claim is made from a synthetic microbenchmark alone.
+- The normal-turn target is model and network latency dominating the critical
+  path. A trace must separate queueing, encoding, transport, first-token wait,
+  parsing, event delivery, tool work, and aggregation before making that claim.
+- Independent MCP discovery, tool calls, VM preparation, browser work, and eval
+  attempts run as bounded sibling branches. Conversation mutation, response
+  commit, and externally visible ordering retain one deterministic owner.
+
+### Tracing
+
+- Follow init4-style topology: one root span is one bounded operation, never a
+  long-lived driver or session.
+- Carry explicit parents with work sent across channels and instrument futures
+  before spawning them. Concurrent work appears as overlapping sibling
+  branches.
+- Put complete ordered prompts, responses, reasoning, tool arguments, and tool
+  results in span events. Span attributes remain structural and searchable.
+- Retained traces are also performance evidence: they must make harness
+  overhead, provider wait, parallel work, backpressure, and cancellation
+  visible without adding a second observation path.
 
 ## Target crate graph
 
@@ -191,6 +217,11 @@ Dropping the event receiver has no lifecycle effect.
 - `snapshot() -> SessionSnapshot`.
 
 `TurnUsage` aggregates all Responses calls in the logical agent turn.
+It exposes the exact input, cache-read, cache-write, output, and reasoning
+token counts plus a typed estimated USD cost when a versioned pricing snapshot
+is configured. The estimate's source and effective date remain attached through
+terminal events and eval results; unavailable pricing is explicit rather than
+serialized as a misleading zero.
 
 - `agent.clone()` targets the same driver, session, and command queue.
 - `AgentHandle::spawn()` creates a clean sibling from the same recipe.
@@ -590,6 +621,12 @@ Local deterministic Criterion suites may become CI comparison gates. Provider,
 network, VM cold-start, and full eval measurements remain scheduled or release
 gates with retained artifacts.
 
+USD cost is derived from the same authoritative per-call usage retained by the
+trace. Pricing is a versioned input with source and effective date because the
+Responses API reports token usage, not billed dollars. Agent terminal results,
+the CLI, and `nanocodex eval` all project the same aggregate instead of
+recomputing it independently.
+
 Each refactor PR that moves a hot path must move its benchmark in the same PR.
 The stack may not defer all performance evidence until after the architecture
 has changed.
@@ -599,6 +636,10 @@ has changed.
 Every slice is based on the branch immediately above it. Each remains
 reviewable, documents migrations, runs its focused gates, and avoids unrelated
 product changes.
+
+Before deleting an old owner, the slice records its `master` capability
+inventory, maps every item to the new owner, and exercises the replacement
+through a real consumer. Unmapped behavior blocks the deletion.
 
 ### 1. Frame and contracts
 
@@ -695,6 +736,8 @@ product changes.
 - warnings-denied Rustdoc with compiled public examples
 - no higher-layer dependency in a lower reusable crate
 - no duplicate authoritative history, VM implementation, or eval runtime
+- every capability present on `master` is mapped to a replacement and retains
+  an executable parity check before its former owner is deleted
 - benchmark result attached for every moved hot path
 - one live native agent smoke after core slices
 - one browser-in-VM smoke after browser composition

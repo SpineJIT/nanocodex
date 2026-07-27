@@ -1,7 +1,7 @@
 use std::{hint::black_box, sync::Arc};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use nanocodex_core::{
+use nanocodex_oai_api::{
     ContentItem, FunctionOutputBody, MessageRole, ResponseItem, responses::ResponseHistory,
 };
 

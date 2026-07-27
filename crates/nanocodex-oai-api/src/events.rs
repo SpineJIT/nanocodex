@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::value::{RawValue, to_raw_value};
 use tokio::sync::mpsc;
@@ -179,6 +180,19 @@ impl AgentEvents {
             }
         }
         Err(EventError::ClosedBeforeTerminal)
+    }
+}
+
+impl Stream for AgentEvents {
+    type Item = AgentEvent;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.receiver
+            .poll_recv(context)
+            .map(|event| event.map(|event| event.event))
     }
 }
 

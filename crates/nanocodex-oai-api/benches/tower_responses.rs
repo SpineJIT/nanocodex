@@ -8,11 +8,11 @@ use std::{
 };
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use nanocodex_core::{
+use nanocodex_oai_api::EncodedRequest;
+use nanocodex_oai_api::{
     AgentEvent, AgentEventKind, ContentItem, EventSink, FunctionOutputBody, FunctionOutputContent,
     MessageRole, ResponseItem, monotonic_now_ns, responses::ServerEvent,
 };
-use nanocodex_service::EncodedRequest;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, value::RawValue};
 use smallvec::SmallVec;

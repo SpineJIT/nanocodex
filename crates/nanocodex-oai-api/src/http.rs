@@ -1,7 +1,7 @@
 use std::time::Duration;
 
+use crate::{OpenAiAuthSnapshot, monotonic_now_ns};
 use http::header;
-use nanocodex_core::{OpenAiAuthSnapshot, monotonic_now_ns};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 

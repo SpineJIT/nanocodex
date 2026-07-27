@@ -7,8 +7,8 @@ use std::{
 };
 
 #[cfg(not(target_family = "wasm"))]
-use nanocodex_core::OpenAiAuthMode;
-use nanocodex_core::{
+use crate::OpenAiAuthMode;
+use crate::{
     AgentEventKind, ModelConfig, OpenAiAuthSnapshot, ResponsesHistory, ResponsesTransport,
     responses::{ResponseCreate, WarmupResponse, WarmupServerEvent},
 };
@@ -45,6 +45,7 @@ struct ConnectionState {
     generation: u32,
     next_purpose: ConnectionPurpose,
     server_reasoning_included: bool,
+    logical_turn: Option<u64>,
 }
 
 struct EstablishedConnection {
@@ -62,6 +63,7 @@ impl ConnectionState {
             generation: 0,
             next_purpose: ConnectionPurpose::Initial,
             server_reasoning_included: false,
+            logical_turn: None,
         }
     }
 
@@ -76,6 +78,17 @@ impl ConnectionState {
         self.socket = None;
         self.next_purpose = purpose;
     }
+
+    fn enter_logical_turn(&mut self, logical_turn: u64) {
+        if self.logical_turn == Some(logical_turn) {
+            return;
+        }
+        self.logical_turn = Some(logical_turn);
+        self.turn_state = None;
+        if let Some(socket) = &mut self.socket {
+            socket.reset_turn_state();
+        }
+    }
 }
 
 /// Stateful transport attempt service at the base of a Responses Tower stack.
@@ -89,6 +102,7 @@ pub struct ResponsesService {
 }
 
 impl ResponsesService {
+    /// Builds a stateful transport service with default retry limits.
     #[must_use]
     pub fn new(config: Arc<ModelConfig>) -> Self {
         #[cfg(not(target_family = "wasm"))]
@@ -279,6 +293,15 @@ impl ResponsesService {
         let span = tracing::Span::current();
         span.record("request.bytes", request_bytes);
         span.record("request.encode.duration_ns", encode_duration_ns);
+        tracing::trace!(
+            target: "nanocodex_oai_api",
+            direction = "outbound",
+            transport = TRANSPORT,
+            phase = request.kind.phase(),
+            model.call_index = request.call_index,
+            api.request = %encoded.raw().get(),
+            "OpenAI Responses API request"
+        );
         request.observer.emit(
             AgentEventKind::ApiEvent,
             ApiEvent {
@@ -312,7 +335,7 @@ impl ResponsesService {
                 stream::receive(
                     &mut stream::ResponseEventSource::WebSocket(socket),
                     ResponsesTransport::WebSocket.as_str(),
-                    &request.observer.events,
+                    &request.observer,
                     required_call_index(request)?,
                     started_at,
                 )
@@ -323,7 +346,7 @@ impl ResponsesService {
                 stream::receive_compaction(
                     &mut stream::ResponseEventSource::WebSocket(socket),
                     ResponsesTransport::WebSocket.as_str(),
-                    &request.observer.events,
+                    &request.observer,
                     required_call_index(request)?,
                     started_at,
                 )
@@ -374,6 +397,15 @@ impl ResponsesService {
         let span = tracing::Span::current();
         span.record("request.bytes", request_bytes);
         span.record("request.encode.duration_ns", encode_duration_ns);
+        tracing::trace!(
+            target: "nanocodex_oai_api",
+            direction = "outbound",
+            transport,
+            phase = request.kind.phase(),
+            model.call.index = request.call_index,
+            api.request = %encoded.raw().get(),
+            "OpenAI Responses API request"
+        );
         request.observer.emit(
             AgentEventKind::ApiEvent,
             ApiEvent {
@@ -397,7 +429,7 @@ impl ResponsesService {
                 stream::receive(
                     &mut source,
                     transport,
-                    &request.observer.events,
+                    &request.observer,
                     required_call_index(request)?,
                     started_at,
                 )
@@ -407,7 +439,7 @@ impl ResponsesService {
                 stream::receive_compaction(
                     &mut source,
                     transport,
-                    &request.observer.events,
+                    &request.observer,
                     required_call_index(request)?,
                     started_at,
                 )
@@ -536,7 +568,7 @@ impl ResponsesService {
             },
         )?;
         let connect_span = info_span!(
-            target: "nanocodex_service",
+            target: "nanocodex_oai_api",
             "responses.connect",
             otel.kind = "client",
             otel.status_code = tracing::field::Empty,
@@ -712,7 +744,7 @@ fn record_pipeline_stats(
         stats.inter_delta_stall_250ms_count,
     );
     tracing::info!(
-        target: "nanocodex_service",
+        target: "nanocodex_oai_api",
         stage = "responses.pipeline.completed",
         request.bytes = request_bytes,
         request.encode.duration_ns = encode_duration_ns,
@@ -747,27 +779,11 @@ impl Service<ResponsesAttempt> for ResponsesService {
     fn call(&mut self, mut request: ResponsesAttempt) -> Self::Future {
         request.limit_attempts(self.max_attempts);
         let service = self.clone();
+        let parent = tracing::Span::current();
         Box::pin(async move {
-            let mut connection = service.connection.lock().await;
-            if matches!(
-                service.config.responses_history,
-                ResponsesHistory::FullReplay
-            ) || (matches!(
-                service.config.responses_transport,
-                ResponsesTransport::Https
-            ) && !service.config.store_responses)
-                || (matches!(
-                    service.config.responses_transport,
-                    ResponsesTransport::WebSocket
-                ) && !service.config.store_responses
-                    && connection.socket.is_none()
-                    && request.previous_response_id().is_some())
-            {
-                request.force_full_replay();
-            }
-            let input_item_count = request.input_item_count();
             let span = info_span!(
-                target: "nanocodex_service",
+                target: "nanocodex_oai_api",
+                parent: &parent,
                 "responses.attempt",
                 otel.kind = "client",
                 otel.status_code = tracing::field::Empty,
@@ -775,8 +791,9 @@ impl Service<ResponsesAttempt> for ResponsesService {
                 model.call_index = request.call_index,
                 attempt = request.attempt,
                 max_attempts = request.max_attempts,
-                replay.mode = request.replay_mode(),
-                model.input.item_count = input_item_count,
+                replay.mode = tracing::field::Empty,
+                model.input.item_count = tracing::field::Empty,
+                request.queue.duration_ns = tracing::field::Empty,
                 request.bytes = tracing::field::Empty,
                 request.encode.duration_ns = tracing::field::Empty,
                 request.send.duration_ns = tracing::field::Empty,
@@ -796,10 +813,34 @@ impl Service<ResponsesAttempt> for ResponsesService {
                 status = tracing::field::Empty,
                 duration_ns = tracing::field::Empty,
             );
-            service
-                .run(&mut connection, &request)
-                .instrument(span)
-                .await
+            async move {
+                let queued_at = Instant::now();
+                let mut connection = service.connection.lock().await;
+                tracing::Span::current().record("request.queue.duration_ns", elapsed_ns(queued_at));
+                connection.enter_logical_turn(request.logical_turn);
+                if matches!(
+                    service.config.responses_history,
+                    ResponsesHistory::FullReplay
+                ) || (matches!(
+                    service.config.responses_transport,
+                    ResponsesTransport::Https
+                ) && !service.config.store_responses)
+                    || (matches!(
+                        service.config.responses_transport,
+                        ResponsesTransport::WebSocket
+                    ) && !service.config.store_responses
+                        && connection.socket.is_none()
+                        && request.previous_response_id().is_some())
+                {
+                    request.force_full_replay();
+                }
+                tracing::Span::current().record("replay.mode", request.replay_mode());
+                tracing::Span::current()
+                    .record("model.input.item_count", request.input_item_count());
+                service.run(&mut connection, &request).await
+            }
+            .instrument(span)
+            .await
         })
     }
 }
@@ -811,6 +852,14 @@ async fn receive_warmup(
     loop {
         let received = socket.next_text_or_idle_timeout().await?;
         let raw_event = parse_raw_json(received.text.as_str())?;
+        tracing::trace!(
+            target: "nanocodex_oai_api",
+            direction = "inbound",
+            transport = TRANSPORT,
+            phase = "warmup",
+            api.event = %raw_event.get(),
+            "OpenAI Responses API event"
+        );
         request.observer.events.emit_with_source_sequence(
             AgentEventKind::ApiEvent,
             ApiEvent {
@@ -827,10 +876,7 @@ async fn receive_warmup(
             WarmupServerEvent::Error
             | WarmupServerEvent::Failed
             | WarmupServerEvent::Incomplete => {
-                return Err(ResponsesError::Api {
-                    event: raw_event.get().to_owned(),
-                }
-                .into());
+                return Err(ResponsesError::api_event(raw_event.get().to_owned()).into());
             }
             WarmupServerEvent::Created { response } => drop(response.id),
             WarmupServerEvent::Other => {}
@@ -846,4 +892,25 @@ fn required_call_index(request: &ResponsesAttempt) -> Result<u32, ResponsesServi
             0,
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectionState;
+
+    #[test]
+    fn logical_turn_boundaries_reset_but_same_turn_calls_reuse_turn_state() {
+        let mut connection = ConnectionState::new();
+        connection.turn_state = Some("stale-parent-state".to_owned());
+
+        connection.enter_logical_turn(41);
+        assert_eq!(connection.turn_state, None);
+
+        connection.turn_state = Some("turn-41-state".to_owned());
+        connection.enter_logical_turn(41);
+        assert_eq!(connection.turn_state.as_deref(), Some("turn-41-state"));
+
+        connection.enter_logical_turn(42);
+        assert_eq!(connection.turn_state, None);
+    }
 }

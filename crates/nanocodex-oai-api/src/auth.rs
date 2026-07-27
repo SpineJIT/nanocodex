@@ -8,7 +8,9 @@ use std::{
 /// Authentication mode for the single `OpenAI` service family supported by Nanocodex.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OpenAiAuthMode {
+    /// `OpenAI` Platform API key authentication.
     ApiKey,
+    /// Managed `ChatGPT` subscription authentication.
     ChatGpt,
 }
 
@@ -20,6 +22,7 @@ impl OpenAiAuthMode {
         matches!(self, Self::ApiKey)
     }
 
+    /// Returns the default HTTPS API root for this authentication mode.
     #[must_use]
     pub const fn default_api_base_url(self) -> &'static str {
         match self {
@@ -28,6 +31,7 @@ impl OpenAiAuthMode {
         }
     }
 
+    /// Returns the default Responses WebSocket URL for this authentication mode.
     #[must_use]
     pub const fn default_websocket_url(self) -> &'static str {
         match self {
@@ -70,6 +74,7 @@ impl OpenAiAuthSnapshot {
         }
     }
 
+    /// Returns the authentication mode captured by this snapshot.
     #[must_use]
     pub const fn mode(&self) -> OpenAiAuthMode {
         self.mode
@@ -81,11 +86,13 @@ impl OpenAiAuthSnapshot {
         &self.bearer
     }
 
+    /// Returns the `ChatGPT` account ID when the credential is account-scoped.
     #[must_use]
     pub fn account_id(&self) -> Option<&str> {
         self.account_id.as_deref()
     }
 
+    /// Returns whether the credential targets a `FedRAMP` environment.
     #[must_use]
     pub const fn is_fedramp(&self) -> bool {
         self.fedramp
@@ -114,21 +121,28 @@ impl fmt::Debug for OpenAiAuthSnapshot {
 /// Error produced while resolving or refreshing `OpenAI` credentials.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum OpenAiAuthError {
+    /// The configured credential contained no non-whitespace bytes.
     #[error("OpenAI credentials are empty")]
     Empty,
+    /// The managed credential source is temporarily unavailable.
     #[error("OpenAI credentials are unavailable: {0}")]
     Unavailable(Arc<str>),
+    /// A refreshed credential resolved to a different `ChatGPT` account.
     #[error("the stored ChatGPT account changed while the agent was active")]
     AccountChanged,
+    /// The user must complete an interactive login before retrying.
     #[error("ChatGPT authorization must be refreshed by logging in again: {0}")]
     LoginRequired(Arc<str>),
+    /// Managed `ChatGPT` credential refresh failed.
     #[error("failed to refresh ChatGPT authorization: {0}")]
     Refresh(Arc<str>),
 }
 
 #[cfg(not(target_family = "wasm"))]
+/// Boxed native future returned by a managed authentication source.
 pub type OpenAiAuthFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[cfg(target_family = "wasm")]
+/// Boxed browser future returned by a managed authentication source.
 pub type OpenAiAuthFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 /// Private cross-crate capability behind [`OpenAiAuth`].
@@ -155,6 +169,7 @@ pub struct OpenAiAuth {
 }
 
 impl OpenAiAuth {
+    /// Creates static `OpenAI` Platform API-key authentication.
     #[must_use]
     pub fn api_key(api_key: impl Into<Arc<str>>) -> Self {
         let source = ApiKeyAuth {
@@ -175,6 +190,7 @@ impl OpenAiAuth {
         }
     }
 
+    /// Returns the authentication mode.
     #[must_use]
     pub const fn mode(&self) -> OpenAiAuthMode {
         self.mode

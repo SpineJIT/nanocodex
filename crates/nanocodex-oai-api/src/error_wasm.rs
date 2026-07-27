@@ -31,6 +31,8 @@ pub enum ResponsesError {
     Closed { detail: String },
     #[error("Responses API returned an error event: {event}")]
     Api { event: String },
+    #[error("Responses input exceeded the model context window")]
+    ContextWindowExceeded { event: String },
     #[error("Responses API rejected invalid image data: {event}")]
     InvalidImageRequest { event: String },
 }
@@ -57,6 +59,7 @@ impl ResponsesError {
             | Self::EncodeRequest(_)
             | Self::InvalidPayload { .. }
             | Self::Api { .. }
+            | Self::ContextWindowExceeded { .. }
             | Self::InvalidImageRequest { .. } => return None,
         };
         Some(RetryAdvice {
@@ -83,6 +86,7 @@ impl ResponsesError {
                 "checkpoint_missing"
             }
             Self::Api { .. } => "api",
+            Self::ContextWindowExceeded { .. } => "context_window_exceeded",
             Self::InvalidImageRequest { .. } => "invalid_image_request",
         }
     }
@@ -90,6 +94,19 @@ impl ResponsesError {
     #[must_use]
     pub fn is_checkpoint_missing(&self) -> bool {
         matches!(self, Self::Api { event } if api_error_has_code(event, "previous_response_not_found"))
+    }
+
+    #[must_use]
+    pub const fn is_context_window_exceeded(&self) -> bool {
+        matches!(self, Self::ContextWindowExceeded { .. })
+    }
+
+    pub(crate) fn api_event(event: String) -> Self {
+        if api_error_has_code(&event, "context_length_exceeded") {
+            Self::ContextWindowExceeded { event }
+        } else {
+            Self::Api { event }
+        }
     }
 }
 

@@ -4,8 +4,6 @@ mod agents_md;
 #[cfg(target_family = "wasm")]
 #[path = "agents_md_wasm.rs"]
 mod agents_md;
-mod compaction;
-mod context_manager;
 mod input;
 mod telemetry;
 

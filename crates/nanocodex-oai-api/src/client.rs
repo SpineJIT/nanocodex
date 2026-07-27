@@ -8,22 +8,27 @@ pub struct ResponsesClient<S> {
 }
 
 impl<S> ResponsesClient<S> {
+    /// Wraps an owned Tower service stack.
     pub const fn new(service: S) -> Self {
         Self { service }
     }
 
+    /// Borrows the concrete service stack.
     pub const fn service(&self) -> &S {
         &self.service
     }
 
+    /// Mutably borrows the concrete service stack.
     pub const fn service_mut(&mut self) -> &mut S {
         &mut self.service
     }
 
+    /// Unwraps the concrete service stack.
     pub fn into_service(self) -> S {
         self.service
     }
 
+    /// Transforms the concrete service without boxing it.
     #[must_use]
     pub fn map_service<T>(self, map: impl FnOnce(S) -> T) -> ResponsesClient<T> {
         ResponsesClient::new(map(self.service))

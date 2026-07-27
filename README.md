@@ -253,6 +253,12 @@ set only after the benchmark has a reproducible fixture and recorded baseline.
 Live model and network measurements remain trends with raw artifacts, not
 machine-independent unit-test thresholds.
 
+The target for normal turns is simple: the model and network dominate the
+critical path. Traces separate provider wait from queueing, serialization,
+parsing, event delivery, and tool work, while independent work runs as bounded
+siblings under init4-style spans. Token usage and versioned pricing also produce
+one consistent estimated USD cost for library results, the CLI, and evals.
+
 Existing measurements and their methodology live under
 [`benchmarks/`](benchmarks/) and [`docs/`](docs/). The refactor ports them next
 to their new owners rather than discarding the evidence.

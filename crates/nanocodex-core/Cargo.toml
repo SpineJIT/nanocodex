@@ -11,27 +11,14 @@ repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Typed model, event, and Responses protocol primitives for Nanocodex"
+description = "Compatibility reexports for nanocodex-oai-api"
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["-D", "warnings"]
 
 [dependencies]
-serde.workspace = true
-serde_json.workspace = true
-smallvec.workspace = true
-thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
-web-time.workspace = true
-
-[dev-dependencies]
-criterion.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
-
-[[bench]]
-name = "fork_history"
-harness = false
+nanocodex-oai-api.workspace = true
 
 [lints]
 workspace = true

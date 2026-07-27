@@ -1,18 +1,18 @@
 use std::collections::HashSet;
 
-use nanocodex_core::{
+use crate::{
     ContentItem, FunctionOutputBody, FunctionOutputContent, MessageRole, ResponseItem,
     ResponseItemId, Usage, responses::ResponseHistory,
 };
 
-use super::compaction;
+use crate::compaction;
 
 const TOOL_OUTPUT_TOKEN_LIMIT: usize = 12_000;
 
 /// Typed model-visible transcript. The common prompt path shares its backing
 /// allocation; prompt-only repairs allocate only for incomplete call pairs.
 #[derive(Clone)]
-pub(super) struct ContextManager {
+pub struct ContextManager {
     items: ResponseHistory,
     last_token_usage: Option<Usage>,
     function_calls: HashSet<Box<str>>,
@@ -24,7 +24,8 @@ pub(super) struct ContextManager {
 }
 
 impl ContextManager {
-    pub(super) fn new(items: Vec<ResponseItem>) -> Self {
+    #[must_use]
+    pub fn new(items: Vec<ResponseItem>) -> Self {
         let mut context = Self {
             items: ResponseHistory::default(),
             last_token_usage: None,
@@ -39,19 +40,32 @@ impl ContextManager {
         context
     }
 
-    pub(super) fn flattened_items(&self) -> Vec<ResponseItem> {
+    #[must_use]
+    pub fn flattened_items(&self) -> Vec<ResponseItem> {
         self.items.iter().cloned().collect()
     }
 
-    pub(super) fn shared_items(&self) -> ResponseHistory {
+    #[must_use]
+    pub fn shared_items(&self) -> ResponseHistory {
         self.items.clone()
     }
 
-    pub(super) fn len(&self) -> usize {
+    #[must_use]
+    pub fn len(&self) -> usize {
         self.items.len()
     }
 
-    pub(super) fn record_items(&mut self, items: impl IntoIterator<Item = ResponseItem>) {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    #[must_use]
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &ResponseItem> {
+        self.items.iter()
+    }
+
+    pub fn record_items(&mut self, items: impl IntoIterator<Item = ResponseItem>) {
         for mut item in items
             .into_iter()
             .filter(is_api_item)
@@ -63,7 +77,7 @@ impl ContextManager {
         }
     }
 
-    pub(super) fn commit_tail(&mut self) {
+    pub fn commit_tail(&mut self) {
         self.items.commit_tail();
         if self.function_calls == self.function_outputs
             && self.custom_calls == self.custom_outputs
@@ -78,11 +92,7 @@ impl ContextManager {
         }
     }
 
-    pub(super) fn replace_and_recompute(
-        &mut self,
-        mut items: Vec<ResponseItem>,
-        prefix: &[ResponseItem],
-    ) {
+    pub fn replace_and_recompute(&mut self, mut items: Vec<ResponseItem>, prefix: &[ResponseItem]) {
         assign_missing_response_item_ids(&mut items);
         self.items.replace(items);
         let total_tokens = prefix
@@ -106,13 +116,14 @@ impl ContextManager {
         }
     }
 
-    pub(super) fn update_token_info(&mut self, usage: Option<&Usage>) {
+    pub fn update_token_info(&mut self, usage: Option<&Usage>) {
         if let Some(usage) = usage {
             self.last_token_usage = Some(usage.clone());
         }
     }
 
-    pub(super) fn active_context_tokens(&self, server_reasoning_included: bool) -> u64 {
+    #[must_use]
+    pub fn active_context_tokens(&self, server_reasoning_included: bool) -> u64 {
         let reported = self
             .last_token_usage
             .as_ref()
@@ -129,7 +140,8 @@ impl ContextManager {
 
     /// Returns a shared prompt snapshot, allocating a repaired copy only for
     /// missing call outputs or orphan outputs.
-    pub(super) fn prompt_items(&self) -> ResponseHistory {
+    #[must_use]
+    pub fn prompt_items(&self) -> ResponseHistory {
         let needs_repair = self.function_calls != self.function_outputs
             || self.custom_calls != self.custom_outputs
             || self.tool_search_calls != self.tool_search_outputs;
@@ -262,13 +274,13 @@ impl ContextManager {
     }
 }
 
-pub(super) fn assign_missing_response_item_ids(items: &mut [ResponseItem]) {
+pub fn assign_missing_response_item_ids(items: &mut [ResponseItem]) {
     for item in items {
         assign_missing_response_item_id(item);
     }
 }
 
-pub(super) fn assign_missing_response_item_id(item: &mut ResponseItem) {
+pub fn assign_missing_response_item_id(item: &mut ResponseItem) {
     if item.id().is_some_and(|id| !id.is_empty()) {
         return;
     }
@@ -293,7 +305,8 @@ fn new_response_item_id(prefix: &str) -> ResponseItemId {
     )
 }
 
-pub(super) fn has_well_formed_tool_calls(items: &[ResponseItem]) -> bool {
+#[must_use]
+pub fn has_well_formed_tool_calls(items: &[ResponseItem]) -> bool {
     let mut function_calls = HashSet::new();
     let mut function_outputs = HashSet::new();
     let mut custom_calls = HashSet::new();
@@ -357,7 +370,8 @@ fn is_user_turn_boundary(item: &ResponseItem) -> bool {
     item.is_user_message() && !is_contextual_user_message(item)
 }
 
-pub(super) fn is_contextual_user_message(item: &ResponseItem) -> bool {
+#[must_use]
+pub fn is_contextual_user_message(item: &ResponseItem) -> bool {
     let ResponseItem::Message { content, .. } = item else {
         return false;
     };

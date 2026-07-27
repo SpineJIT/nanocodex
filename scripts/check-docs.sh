@@ -6,6 +6,7 @@ cd "$repository_root"
 
 version="$(cargo metadata --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "nanocodex") | .version')"
 crates=(
+  nanocodex-oai-api
   nanocodex-core
   nanocodex-macros
   nanocodex-observability
