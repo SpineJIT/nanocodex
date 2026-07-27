@@ -336,6 +336,9 @@ curl -fsSL https://nanocodex.paradigm.xyz | bash
 
 ## Development
 
+Run `cargo doc --open` from the repository root to browse the public
+`nanocodex` facade and follow its links into the lower-level crates.
+
 The normal local gates are:
 
 ```sh

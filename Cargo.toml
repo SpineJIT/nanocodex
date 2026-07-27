@@ -1,6 +1,8 @@
 [workspace]
 members = ["bin/nanocodex", "bin/nanousd-api", "crates/mpp-egress", "crates/nanocodex", "crates/nanocodex-agent", "crates/nanocodex-core", "crates/nanocodex-oai-api", "crates/nanocodex-observability", "crates/nanocodex-service", "crates/nanocodex-tools", "crates/nanocodex-tools-macros", "crates/nanousd", "examples", "js/bindings", "py/bindings"]
-default-members = ["bin/nanocodex"]
+# Root Cargo commands target the public library facade. Use `just run` for the
+# executable consumer.
+default-members = ["crates/nanocodex"]
 resolver = "2"
 
 [workspace.package]
