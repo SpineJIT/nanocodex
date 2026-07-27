@@ -307,10 +307,12 @@ fn agent_event_encoding(criterion: &mut Criterion) {
             &bytes,
             |bencher, _| {
                 bencher.iter(|| {
-                    let payload = serde_json::value::to_raw_value(&ReplyPayload {
-                        message: black_box(reply),
-                    })
-                    .unwrap();
+                    let payload = Arc::from(
+                        serde_json::value::to_raw_value(&ReplyPayload {
+                            message: black_box(reply),
+                        })
+                        .unwrap(),
+                    );
                     serde_json::to_vec(&AgentEvent {
                         protocol_version: 1,
                         request_id: Arc::clone(&request_id),
@@ -409,6 +411,30 @@ fn timed_agent_event_delivery(criterion: &mut Criterion) {
                 EVENTS_PER_BATCH
             );
             black_box((sink, events));
+        });
+    });
+    group.bench_function("emit_then_try_receive_mirrored_1024", |bencher| {
+        bencher.iter(|| {
+            let (sink, mut session_events) = EventSink::channel("benchmark-session".to_owned());
+            let (turn_sink, mut turn_events) = sink.mirrored_channel();
+            for _ in 0..EVENTS_PER_BATCH {
+                turn_sink
+                    .emit(
+                        AgentEventKind::AssistantDelta,
+                        ReplyPayload { message: "delta" },
+                    )
+                    .unwrap();
+            }
+            let session_received = std::iter::from_fn(|| session_events.try_recv_timed()).count();
+            let turn_received = std::iter::from_fn(|| turn_events.try_recv_timed()).count();
+            assert_eq!(
+                (
+                    u64::try_from(session_received).expect("event count should fit in u64"),
+                    u64::try_from(turn_received).expect("event count should fit in u64"),
+                ),
+                (EVENTS_PER_BATCH, EVENTS_PER_BATCH)
+            );
+            black_box((sink, turn_sink, session_events, turn_events));
         });
     });
     let large_payload = "x".repeat(128 * 1_024);

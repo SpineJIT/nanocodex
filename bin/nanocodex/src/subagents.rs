@@ -225,7 +225,7 @@ impl Tool for ChildAgent {
             agent_id,
             kind: self.kind.result_name(),
             role,
-            report: result.final_message,
+            report: result.into_final_message(),
         }))
     }
 }
@@ -272,7 +272,7 @@ impl Tool for PromptAgent {
         let result = child.prompt(task).await?.result().await?;
         Ok(ToolExecution::json(&FollowUpResult {
             agent_id,
-            report: result.final_message,
+            report: result.into_final_message(),
         }))
     }
 }

@@ -32,6 +32,6 @@ async fn main() -> Result<()> {
         .await?
         .result()
         .await?;
-    println!("{}", result.final_message);
+    println!("{}", result.final_message());
     Ok(())
 }

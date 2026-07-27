@@ -11,8 +11,11 @@ async function check() {
   const sameTurn: Actions.turn.prompt.ReturnType = Actions.turn.prompt(agent, options);
   const message: Actions.turn.getResult.ReturnType = await sameTurn.result();
   const snapshot: SessionSnapshot = sameTurn.snapshot();
+  const usage: Actions.turn.getUsage.ReturnType = sameTurn.usage();
   Actions.turn.getSnapshot(sameTurn);
+  Actions.turn.getUsage(sameTurn);
   void message;
+  void usage;
 
   await Agent.create({ apiKey, resume: snapshot });
 

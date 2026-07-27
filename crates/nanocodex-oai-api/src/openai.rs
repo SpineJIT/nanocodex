@@ -67,6 +67,13 @@ where
     pub(crate) fn make_service(&self) -> F::Service {
         self.factory.make(Arc::new(self.config.clone()))
     }
+
+    /// Consumes the recipe into its validated policy and concrete service factory.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn into_parts(self) -> (ModelConfig, F) {
+        (self.config, self.factory)
+    }
 }
 
 /// Builder for a configured `OpenAI` client and concrete Tower service factory.

@@ -787,10 +787,12 @@ mod tui {
                     request_id: Arc::from("benchmark-session"),
                     seq: index as u64 + 1,
                     kind,
-                    payload: serde_json::value::to_raw_value(&serde_json::json!({
-                        "text": "delta"
-                    }))
-                    .unwrap(),
+                    payload: Arc::from(
+                        serde_json::value::to_raw_value(&serde_json::json!({
+                            "text": "delta"
+                        }))
+                        .unwrap(),
+                    ),
                 },
                 timing: AgentEventTiming {
                     emitted_ns: 0,

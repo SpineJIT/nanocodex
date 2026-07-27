@@ -9,7 +9,7 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use nanocodex_core::{
+use nanocodex_oai_api::{
     OpenAiAuth, OpenAiAuthError, OpenAiAuthFuture, OpenAiAuthMode, OpenAiAuthSnapshot,
     OpenAiAuthSource,
 };
@@ -36,33 +36,52 @@ const AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Non-secret information about a stored `ChatGPT` authorization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatGptAuthStatus {
+    /// Stable account identifier attached to API requests.
     pub account_id: String,
+    /// Account email decoded from the stored identity token, when present.
     pub email: Option<String>,
+    /// Subscription plan decoded from the stored identity token, when present.
     pub plan: Option<String>,
+    /// Whether this credential targets the `FedRAMP` service boundary.
     pub fedramp: bool,
 }
 
 /// Failure while logging in, loading, persisting, or removing `ChatGPT` credentials.
 #[derive(Debug, thiserror::Error)]
 pub enum ChatGptAuthError {
+    /// A credential file could not be read, written, or removed.
     #[error("failed to access ChatGPT authorization file {path}: {source}")]
     Storage {
+        /// Credential file involved in the failed operation.
         path: PathBuf,
+        /// Underlying filesystem failure.
         #[source]
         source: io::Error,
     },
+    /// A credential file was readable but did not contain a valid session.
     #[error("ChatGPT authorization file {path} is invalid: {detail}")]
-    InvalidStore { path: PathBuf, detail: String },
+    InvalidStore {
+        /// Invalid credential file.
+        path: PathBuf,
+        /// Validation failure without token contents.
+        detail: String,
+    },
+    /// The authorization server returned a token that could not be validated.
     #[error("ChatGPT OAuth response was invalid: {0}")]
     InvalidToken(String),
+    /// Neither supported loopback callback port could be bound.
     #[error("could not listen for the OAuth callback on localhost ports 1455 or 1457")]
     CallbackUnavailable,
+    /// The browser did not return to the loopback callback before its deadline.
     #[error("timed out waiting for the ChatGPT OAuth callback")]
     CallbackTimeout,
+    /// The callback state did not match the login attempt.
     #[error("the OAuth callback did not match this login attempt")]
     StateMismatch,
+    /// The authorization request was rejected or returned an invalid callback.
     #[error("ChatGPT login was rejected: {0}")]
     LoginRejected(String),
+    /// Authorization-code or refresh-token exchange failed.
     #[error("ChatGPT token exchange failed: {0}")]
     TokenExchange(String),
 }
@@ -131,6 +150,7 @@ impl ChatGptLogin {
         })
     }
 
+    /// Returns the URL that the user must open to authorize this login.
     #[must_use]
     pub fn authorization_url(&self) -> &str {
         &self.authorization_url
@@ -899,7 +919,7 @@ mod tests {
         read_store, refresh_error_code, unix_now, write_store,
     };
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    use nanocodex_core::{OpenAiAuth, OpenAiAuthError};
+    use nanocodex_oai_api::{OpenAiAuth, OpenAiAuthError};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,

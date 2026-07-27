@@ -1,6 +1,6 @@
 #[cfg(not(target_family = "wasm"))]
 use chrono::{Local, Utc};
-use nanocodex_core::{
+use nanocodex_oai_api::{
     ContentItem, FunctionOutputBody, FunctionOutputContent, MessageRole, ResponseItem,
 };
 use nanocodex_tools::{ToolOutputBody, ToolOutputContent};
@@ -230,7 +230,7 @@ fn function_output(output: ToolOutputBody) -> FunctionOutputBody {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nanocodex_core::ImageDetail;
+    use nanocodex_oai_api::ImageDetail;
     use nanocodex_tools::ToolOutputContent;
     use serde_json::json;
 

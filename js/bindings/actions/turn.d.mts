@@ -1,4 +1,4 @@
-import type { Agent, PromptInput, SessionSnapshot, Turn } from "../types.mjs";
+import type { Agent, PromptInput, SessionSnapshot, Turn, TurnUsage } from "../types.mjs";
 
 /** Accepts a prompt on an owned Agent and returns its independently awaitable Turn. */
 export function prompt<const agent extends Agent<object>>(
@@ -20,6 +20,12 @@ export declare namespace getResult {
 export function getSnapshot(turn: Turn): getSnapshot.ReturnType;
 export declare namespace getSnapshot {
   type ReturnType = SessionSnapshot;
+}
+
+/** Copies exact aggregate token usage from a completed Turn. */
+export function getUsage(turn: Turn): getUsage.ReturnType;
+export declare namespace getUsage {
+  type ReturnType = TurnUsage;
 }
 
 /** Adds input to an active Turn. */

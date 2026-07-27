@@ -8,8 +8,8 @@ use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr, eyre};
 use nanocodex::{
     AgentEvents, DurableSession, McpHandle, Nanocodex, OpenAiAuth, OpenAiAuthMode, ReasoningMode,
-    Responses, ResponsesHistory, ResponsesTransport, RolloutConfig, SessionSnapshot, Thinking,
-    Tools,
+    Responses, ResponsesHistory, ResponsesTransport, RolloutConfig, SessionId, SessionSnapshot,
+    Thinking, Tools,
 };
 
 use crate::mcp::{ConfiguredMcp, McpArgs};
@@ -26,7 +26,7 @@ pub(crate) struct ConfiguredAgent {
 
 struct SessionBuild {
     workspace: PathBuf,
-    session_id: Option<String>,
+    session_id: Option<SessionId>,
     snapshot: Option<SessionSnapshot>,
     rollout: Option<RolloutConfig>,
 }
@@ -286,7 +286,11 @@ fn prepare_session_build(
     let (session_id, snapshot, rollout) = session.into_parts();
     Ok(SessionBuild {
         workspace: restored,
-        session_id: Some(session_id),
+        session_id: Some(
+            session_id
+                .parse()
+                .wrap_err("resumed Codex thread ID is not UUIDv7")?,
+        ),
         snapshot: Some(snapshot),
         rollout: rollouts.then_some(rollout),
     })

@@ -12,7 +12,9 @@ py/bindings/.venv/bin/python examples/python/follow_on.py
 ```
 
 `prompt()` only accepts the turn and returns a `Turn`; `Turn.result()` does the
-blocking wait while releasing Python's GIL. `AgentEvents.recv_json()` likewise
+blocking wait while releasing Python's GIL. Once it completes, `Turn.usage()`
+returns exact aggregate input, cache-read, cache-write, output, reasoning, and
+total token counts as a dictionary. `AgentEvents.recv_json()` likewise
 releases the GIL, so applications can consume it from a normal Python thread.
 `agent.set_thinking("high")` changes the effort for subsequently accepted turns
 without replacing the session. `agent.set_fast_mode(True)` similarly enables

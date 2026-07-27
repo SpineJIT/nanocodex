@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-use nanocodex::{
+use nanocodex_agent::{
     Nanocodex, NanocodexError, Responses, ResponsesAttempt, ResponsesServiceResponse, Tools,
 };
 use tokio::sync::mpsc;

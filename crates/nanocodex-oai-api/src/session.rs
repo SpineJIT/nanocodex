@@ -17,7 +17,10 @@ use crate::{
     ContentItem, EventSink, MessageRole, OpenAi, ResponseEvent, ResponseItem, ResponsesAttempt,
     ResponsesAttemptFactory, ResponsesClient, ResponsesOutput, ResponsesServiceError,
     ResponsesServiceResponse, Thinking, ToolDefinition, TransportStats, Usage, compaction,
-    context::{ContextManager, assign_missing_response_item_id},
+    context::{
+        ContextManager, assign_missing_response_item_id, assign_missing_response_item_ids,
+        has_well_formed_tool_calls,
+    },
     openai::{MakeResponsesService, StandardServiceFactory},
     responses::{RequestProfile, ResponseHistory},
 };
@@ -107,6 +110,236 @@ pub enum SessionIdError {
     },
 }
 
+/// OAI-owned mutable state shared by the standalone session and agent loop.
+///
+/// This is a lower-layer integration surface for `nanocodex-agent`. Normal
+/// API consumers should use [`Session`], which prevents invalid mutations.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ManagedSessionState {
+    context: ContextManager,
+    delta_start: usize,
+    previous_response_id: Option<String>,
+    history_revision: u64,
+    server_reasoning_included: bool,
+}
+
+impl ManagedSessionState {
+    /// Creates fresh continuation state around uncommitted typed input.
+    #[must_use]
+    pub fn new(mut items: Vec<ResponseItem>) -> Self {
+        assign_missing_response_item_ids(&mut items);
+        Self {
+            context: ContextManager::new(items),
+            delta_start: 0,
+            previous_response_id: None,
+            history_revision: 0,
+            server_reasoning_included: false,
+        }
+    }
+
+    /// Restores complete committed history without trusting a provider
+    /// continuation checkpoint.
+    ///
+    /// The next request performs a full replay. History must be non-empty,
+    /// contain only supported API items, and have complete ordered tool-call
+    /// pairs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed structural error when the retained history is empty,
+    /// contains unsupported items, or has malformed tool-call pairing.
+    pub fn resume(mut items: Vec<ResponseItem>) -> Result<Self, ManagedSessionStateError> {
+        if items.is_empty() {
+            return Err(ManagedSessionStateError::EmptyHistory);
+        }
+        assign_missing_response_item_ids(&mut items);
+        if !has_well_formed_tool_calls(&items) {
+            return Err(ManagedSessionStateError::MalformedToolCalls);
+        }
+        let history_len = items.len();
+        let mut state = Self::new(items);
+        if state.context.len() != history_len {
+            return Err(ManagedSessionStateError::UnsupportedHistoryItem);
+        }
+        state.context.commit_tail();
+        state.delta_start = state.context.len();
+        Ok(state)
+    }
+
+    /// Returns the number of retained typed history items.
+    #[must_use]
+    pub fn history_len(&self) -> usize {
+        self.context.len()
+    }
+
+    /// Returns whether retained typed history is empty.
+    #[must_use]
+    pub fn history_is_empty(&self) -> bool {
+        self.context.is_empty()
+    }
+
+    /// Iterates over retained typed history in provider order.
+    #[must_use]
+    pub fn history(&self) -> impl ExactSizeIterator<Item = &ResponseItem> {
+        self.context.iter()
+    }
+
+    /// Materializes complete retained typed history.
+    #[must_use]
+    pub fn flattened_history(&self) -> Vec<ResponseItem> {
+        self.context.flattened_items()
+    }
+
+    /// Returns an O(1) shared checkpoint of retained typed history.
+    #[must_use]
+    pub fn shared_history(&self) -> ResponseHistory {
+        self.context.shared_items()
+    }
+
+    /// Returns request-ready history, repairing incomplete tool-call pairs in
+    /// an isolated copy only when required.
+    #[must_use]
+    pub fn prompt_history(&self) -> ResponseHistory {
+        self.context.prompt_items()
+    }
+
+    /// Appends client- or provider-authored typed items to the active tail.
+    ///
+    /// Unsupported non-API items are ignored and bounded tool-output policy is
+    /// applied by the underlying context manager.
+    pub fn append(&mut self, items: impl IntoIterator<Item = ResponseItem>) {
+        self.context.record_items(items);
+    }
+
+    /// Records usage from the most recent completed provider operation.
+    pub fn update_token_info(&mut self, usage: Option<&Usage>) {
+        self.context.update_token_info(usage);
+    }
+
+    /// Records whether the active transport includes retained reasoning in
+    /// provider-reported input usage.
+    pub fn observe_server_reasoning(&mut self, included: bool) {
+        self.server_reasoning_included |= included;
+    }
+
+    /// Returns the best available estimate of active provider context tokens.
+    #[must_use]
+    pub fn active_context_tokens(&self) -> u64 {
+        self.context
+            .active_context_tokens(self.server_reasoning_included)
+    }
+
+    /// Returns the first history index not retained by the current provider
+    /// continuation checkpoint.
+    #[must_use]
+    pub const fn delta_start(&self) -> usize {
+        self.delta_start
+    }
+
+    /// Returns the private provider continuation checkpoint, when healthy.
+    ///
+    /// Higher layers use this only to construct requests and compatibility
+    /// telemetry; it must not become an application-owned session identity.
+    #[must_use]
+    pub fn previous_response_id(&self) -> Option<&str> {
+        self.previous_response_id.as_deref()
+    }
+
+    /// Installs a completed provider continuation checkpoint.
+    pub fn set_previous_response_id(&mut self, response_id: impl Into<String>) {
+        self.previous_response_id = Some(response_id.into());
+    }
+
+    /// Excludes all currently retained items from the next healthy
+    /// continuation delta.
+    pub fn clear_delta(&mut self) {
+        self.delta_start = self.context.len();
+    }
+
+    /// Discards the provider checkpoint so the next request replays complete
+    /// client-owned history.
+    pub fn reset_for_full_request(&mut self) {
+        self.delta_start = 0;
+        self.previous_response_id = None;
+    }
+
+    /// Commits the active tail after a completed provider response.
+    ///
+    /// A provider continuation ID is required so a healthy next request cannot
+    /// accidentally omit committed history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagedSessionStateError::MissingResponseId`] when no
+    /// completed provider continuation has been installed.
+    pub fn commit(&mut self) -> Result<(), ManagedSessionStateError> {
+        if self.previous_response_id.is_none() {
+            return Err(ManagedSessionStateError::MissingResponseId);
+        }
+        self.context.commit_tail();
+        self.delta_start = self.context.len();
+        Ok(())
+    }
+
+    /// Commits repaired client-authored cancellation state and forces the next
+    /// request to replay all retained history.
+    pub fn commit_interrupted(&mut self) {
+        self.reset_for_full_request();
+        self.context.commit_tail();
+    }
+
+    /// Commits the active tail without changing continuation state.
+    ///
+    /// The agent uses this only when publishing a safe in-turn fork boundary.
+    pub fn commit_tail(&mut self) {
+        self.context.commit_tail();
+    }
+
+    /// Installs one completed compaction item atomically and forces a full
+    /// replay on the next request.
+    ///
+    /// `initial_context` contains caller-owned canonical items that must
+    /// survive summarization, such as an agent's developer and task context.
+    pub fn install_compaction(
+        &mut self,
+        item: ResponseItem,
+        initial_context: impl IntoIterator<Item = ResponseItem>,
+        request_prefix: &[ResponseItem],
+    ) {
+        let initial_context = initial_context.into_iter().collect::<Vec<_>>();
+        let history =
+            compaction::install_history(&self.context.flattened_items(), &initial_context, item);
+        self.context.replace_and_recompute(history, request_prefix);
+        self.reset_for_full_request();
+        self.history_revision = self.history_revision.saturating_add(1);
+    }
+
+    /// Returns the monotonic number of installed history replacements.
+    #[must_use]
+    pub const fn history_revision(&self) -> u64 {
+        self.history_revision
+    }
+}
+
+/// Invalid state supplied to or produced by the managed session state engine.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ManagedSessionStateError {
+    /// Restored history was empty.
+    #[error("conversation history must not be empty")]
+    EmptyHistory,
+    /// Restored history contained an unsupported item.
+    #[error("conversation history contains an unsupported item")]
+    UnsupportedHistoryItem,
+    /// Restored history contained an unmatched or misordered tool call.
+    #[error("conversation history contains an unmatched or misordered tool call")]
+    MalformedToolCalls,
+    /// A completed response was missing its provider continuation identity.
+    #[error("completed response did not have a response ID")]
+    MissingResponseId,
+}
+
 /// Builder for one instruction-bound managed Responses session.
 #[derive(Clone)]
 pub struct SessionBuilder<F = StandardServiceFactory> {
@@ -193,14 +426,11 @@ where
             id: session_id,
             client: ResponsesClient::new(service),
             profile,
-            context: ContextManager::new(Vec::new()),
-            previous_response_id: None,
-            delta_start: 0,
+            state: ManagedSessionState::new(Vec::new()),
             next_call_index: 1,
             next_logical_turn: 1,
             thinking: config.thinking,
             fast_mode: config.fast_mode,
-            server_reasoning_included: false,
             transport_stats: Arc::new(TransportStats::default()),
         })
     }
@@ -225,14 +455,11 @@ pub struct Session<S> {
     id: SessionId,
     client: ResponsesClient<S>,
     profile: RequestProfile,
-    context: ContextManager,
-    previous_response_id: Option<String>,
-    delta_start: usize,
+    state: ManagedSessionState,
     next_call_index: u32,
     next_logical_turn: u64,
     thinking: Thinking,
     fast_mode: bool,
-    server_reasoning_included: bool,
     transport_stats: Arc<TransportStats>,
 }
 
@@ -259,13 +486,13 @@ impl<S> Session<S> {
     /// Returns the number of committed typed history items.
     #[must_use]
     pub fn history_len(&self) -> usize {
-        self.context.len()
+        self.state.history_len()
     }
 
     /// Iterates over committed authoritative history without exposing mutable
     /// access.
     pub fn history(&self) -> impl ExactSizeIterator<Item = &ResponseItem> {
-        self.context.iter()
+        self.state.history()
     }
 
     /// Returns the best available estimate of tokens in the active provider
@@ -277,8 +504,7 @@ impl<S> Session<S> {
     /// [`ResponseTurn::compact`].
     #[must_use]
     pub fn active_context_tokens(&self) -> u64 {
-        self.context
-            .active_context_tokens(self.server_reasoning_included)
+        self.state.active_context_tokens()
     }
 }
 
@@ -779,8 +1005,8 @@ where
     let session = &mut *turn.session;
     let call_index = session.next_call_index;
     session.next_call_index = session.next_call_index.saturating_add(1);
-    let mut candidate = session.context.clone();
-    candidate.record_items(input.items);
+    let mut candidate = session.state.clone();
+    candidate.append(input.items);
 
     let factory = ResponsesAttemptFactory::new(
         session.profile.clone(),
@@ -791,27 +1017,28 @@ where
     .for_logical_turn(turn.logical_turn);
     let request = factory.generation(
         call_index,
-        candidate.prompt_items(),
-        candidate.shared_items(),
-        session.delta_start,
-        session.previous_response_id.as_deref(),
+        candidate.prompt_history(),
+        candidate.shared_history(),
+        candidate.delta_start(),
+        candidate.previous_response_id(),
         session.thinking,
         session.fast_mode,
     );
     let success = session.client.execute(request).await.map_err(Into::into)?;
-    session.server_reasoning_included |= success.server_reasoning_included();
+    candidate.observe_server_reasoning(success.server_reasoning_included());
     let ResponsesOutput::Generation(response) = success.into_output() else {
         return Err(ResponseError::protocol(
             "response.create returned a non-generation output",
         ));
     };
 
-    candidate.record_items(response.output_items.clone());
+    candidate.append(response.output_items.clone());
     candidate.update_token_info(response.usage.as_ref());
-    candidate.commit_tail();
-    session.context = candidate;
-    session.delta_start = session.context.len();
-    session.previous_response_id = Some(response.id);
+    candidate.set_previous_response_id(response.id);
+    candidate
+        .commit()
+        .map_err(|error| ResponseError::protocol(error.to_string()))?;
+    session.state = candidate;
 
     let output: Arc<[ResponseItem]> = response.output_items.into();
     let output_text = response
@@ -845,33 +1072,30 @@ where
         Arc::clone(&session.transport_stats),
     )
     .for_logical_turn(turn.logical_turn);
-    let mut history = session.context.prompt_items();
+    let mut history = session.state.prompt_history();
     compaction::trim_tool_outputs_to_fit_context_window(&mut history, session.profile.prefix());
     let request = factory.compaction(
         call_index,
         history.clone(),
         history,
-        session.delta_start,
-        session.previous_response_id.as_deref(),
+        session.state.delta_start(),
+        session.state.previous_response_id(),
         compaction::trigger(),
         session.thinking,
         session.fast_mode,
     );
     let success = session.client.execute(request).await.map_err(Into::into)?;
-    session.server_reasoning_included |= success.server_reasoning_included();
+    let server_reasoning_included = success.server_reasoning_included();
     let ResponsesOutput::Compaction(response) = success.into_output() else {
         return Err(ResponseError::protocol(
             "response.compact returned a non-compaction output",
         ));
     };
 
-    let installed =
-        compaction::install_history(&session.context.flattened_items(), &[], response.item);
-    session
-        .context
-        .replace_and_recompute(installed, session.profile.prefix());
-    session.delta_start = 0;
-    session.previous_response_id = None;
+    let mut candidate = session.state.clone();
+    candidate.observe_server_reasoning(server_reasoning_included);
+    candidate.install_compaction(response.item, [], session.profile.prefix());
+    session.state = candidate;
 
     Ok(CompletedCompaction {
         usage: response.usage,
@@ -883,7 +1107,7 @@ impl<S> Session<S> {
     fn checkpoint(&self) -> ResponseCheckpoint {
         ResponseCheckpoint {
             session_id: self.id,
-            history: self.context.shared_items(),
+            history: self.state.shared_history(),
         }
     }
 }

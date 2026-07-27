@@ -3,6 +3,7 @@
 # config is passed only to the non-publishing package validation step.
 [patch.crates-io]
 nanocodex = { path = "crates/nanocodex" }
+nanocodex-agent = { path = "crates/nanocodex-agent" }
 nanocodex-core = { path = "crates/nanocodex-core" }
 nanocodex-oai-api = { path = "crates/nanocodex-oai-api" }
 nanocodex-observability = { path = "crates/nanocodex-observability" }

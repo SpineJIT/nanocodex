@@ -49,6 +49,10 @@ export function getTurnSnapshot(turn) {
   return JSON.parse(turnState(turn).raw.snapshot());
 }
 
+export function getTurnUsage(turn) {
+  return JSON.parse(turnState(turn).raw.usage());
+}
+
 export function steer(turn, options) {
   const state = turnState(turn);
   const input = actionInput(options);
@@ -265,6 +269,7 @@ function createTurn(raw, agent) {
     get agent() { return state.agent; },
     result: () => getTurnResult(turn),
     snapshot: () => getTurnSnapshot(turn),
+    usage: () => getTurnUsage(turn),
     steer: (input) => steer(turn, input),
     cancel: () => cancel(turn),
     dispose() {

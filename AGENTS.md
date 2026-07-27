@@ -49,16 +49,19 @@
 
 ## Workspace boundaries
 
-- `nanocodex-core` owns dependency-light public data: prompts, events, model
-  configuration, and complete typed Responses wire/domain types.
-- `nanocodex-service` owns behavior at the API boundary: the persistent
-  WebSocket, stream processing, retry policy, telemetry, and generic Tower
-  service/client.
+- `nanocodex-oai-api` owns the complete OpenAI boundary: dependency-light
+  prompts/events/wire types, the managed context state machine, persistent
+  transports, typed retry policy, telemetry, and generic Tower client.
+- `nanocodex-core` and `nanocodex-service` are temporary compatibility
+  reexports only. New production code must import `nanocodex-oai-api`
+  directly; delete the compatibility crates after every consumer migrates.
 - `nanocodex-tools` owns code mode, built-in tools, the heterogeneous registry,
   MCP transports and discovery, deferred tool search, and remote dispatch. MCP
   is always available on native targets.
-- `nanocodex` composes those crates into the owned agent lifecycle and exports
-  the ergonomic builders and common types.
+- `nanocodex-agent` owns the private driver, lifecycle policy, branching,
+  snapshots, Codex rollouts, and ergonomic agent builders.
+- `nanocodex` is an Alloy-style facade containing reexports, named component
+  modules, and a small prelude. It contains no runtime implementation.
 - `nanocodex-tools-macros` implements `#[tool]`. Keep the executable under
   `bin/nanocodex`; do not move CLI behavior into the library.
 - Each lower crate must remain useful without importing the higher orchestration

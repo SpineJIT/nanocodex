@@ -160,6 +160,8 @@ pub use session::{
     ResponseInput, ResponseTurn, Session, SessionBuildError, SessionBuilder, SessionId,
     SessionIdError,
 };
+#[doc(hidden)]
+pub use session::{ManagedSessionState, ManagedSessionStateError};
 pub use socket::EncodedRequest;
 pub use stream::{
     CodeCall, CodeCallKind, CompactionOutput, GenerationOutput, ResponsePipelineStats,

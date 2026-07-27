@@ -57,6 +57,8 @@ class BindingTests(unittest.TestCase):
         turn = agent.prompt("incomplete")
         with self.assertRaisesRegex(RuntimeError, "turn has not completed"):
             agent.fork_from(turn)
+        with self.assertRaisesRegex(RuntimeError, "turn has not completed"):
+            turn.usage()
         turn.cancel()
 
     @unittest.skipUnless(os.environ.get("OPENAI_API_KEY"), "live API key not configured")

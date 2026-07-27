@@ -36,6 +36,15 @@ export type SessionSnapshot = Readonly<{
   history: readonly Record<string, unknown>[];
 }>;
 
+export type TurnUsage = Readonly<{
+  input_tokens: number;
+  cached_input_tokens: number;
+  cache_write_input_tokens: number;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+}>;
+
 export type ForkOptions = { at?: Turn | undefined };
 export type WatchEventsOptions = { includeAllSessions?: boolean | undefined };
 
@@ -78,6 +87,7 @@ export type Turn<agent extends Agent<object> = Agent<object>> = Readonly<{
   readonly agent: agent;
   result(): Promise<string>;
   snapshot(): SessionSnapshot;
+  usage(): TurnUsage;
   steer(options: { input: PromptInput }): Promise<void>;
   cancel(): Promise<void>;
   dispose(): void;

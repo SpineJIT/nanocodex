@@ -1,12 +1,12 @@
 use std::num::NonZeroU32;
 
-use nanocodex_service::ResponsesRetryPolicy;
+use nanocodex_oai_api::ResponsesRetryPolicy;
 use tower::{
     ServiceBuilder,
     layer::util::{Identity, Stack},
 };
 
-use nanocodex_core::{ResponsesHistory, ResponsesTransport};
+use nanocodex_oai_api::{ModelConfig, ResponsesHistory, ResponsesTransport};
 
 /// Marker used until the standard Responses service is constructed by the
 /// agent builder.
@@ -25,6 +25,11 @@ pub struct LayeredResponses<L>(pub(crate) ServiceBuilder<L>);
 #[derive(Clone)]
 pub struct FactoryResponses<F>(pub(crate) F);
 
+/// Concrete service factory imported from a configured [`nanocodex_oai_api::OpenAi`].
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct OpenAiResponses<F>(pub(crate) F);
+
 /// Responses transport configuration with standard or caller-supplied Tower
 /// service factory policy.
 #[derive(Clone)]
@@ -38,6 +43,22 @@ pub struct Responses<S = StandardResponses> {
     pub(crate) store: Option<bool>,
     pub(crate) max_attempts: NonZeroU32,
     pub(crate) service: S,
+}
+
+impl<S> Responses<S> {
+    pub(crate) fn from_openai(config: &ModelConfig, service: S) -> Self {
+        Self {
+            websocket_url: Some(config.websocket_url.clone()),
+            api_base_url: Some(config.api_base_url.clone()),
+            #[cfg(not(target_family = "wasm"))]
+            http_client: None,
+            transport: config.responses_transport,
+            history: Some(config.responses_history),
+            store: Some(config.store_responses),
+            max_attempts: ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS,
+            service,
+        }
+    }
 }
 
 impl Default for Responses<StandardResponses> {
@@ -57,6 +78,10 @@ impl Default for Responses<StandardResponses> {
 }
 
 impl Responses<StandardResponses> {
+    /// Starts configuring the legacy agent-local Responses stack.
+    ///
+    /// New code should prefer [`nanocodex_oai_api::OpenAi::builder`] and pass
+    /// the resulting client recipe to [`crate::Nanocodex::builder`].
     #[must_use]
     pub fn builder() -> ResponsesBuilder<StandardResponses> {
         ResponsesBuilder {
@@ -175,12 +200,14 @@ impl<S> ResponsesBuilder<S> {
         self
     }
 
+    /// Replaces the persistent Responses WebSocket endpoint.
     #[must_use]
     pub fn websocket_url(mut self, url: impl Into<String>) -> Self {
         self.responses.websocket_url = Some(url.into());
         self
     }
 
+    /// Replaces the HTTPS Responses API base URL.
     #[must_use]
     pub fn api_base_url(mut self, url: impl Into<String>) -> Self {
         self.responses.api_base_url = Some(url.into());
@@ -198,6 +225,7 @@ impl<S> ResponsesBuilder<S> {
         self
     }
 
+    /// Finishes this deferred Responses configuration.
     #[must_use]
     pub fn build(self) -> Responses<S> {
         self.responses

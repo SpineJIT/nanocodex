@@ -1,8 +1,8 @@
-use std::{process, time::Duration};
+use std::time::Duration;
 
 use eyre::{Result, WrapErr};
 use nanocodex::{
-    AgentEventKind, AgentEvents, Nanocodex, NanocodexError, Responses, Thinking, Tools,
+    AgentEventKind, AgentEvents, Nanocodex, NanocodexError, Responses, SessionId, Thinking, Tools,
 };
 use tokio::task::JoinHandle;
 use tower::timeout::TimeoutLayer;
@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
     // subagent tools instead use `tools_factory(|handle| ...)`; see subagents.rs.
     let tools = Tools::builder().without_defaults().build()?;
     let (agent, events) = Nanocodex::builder(api_key)
-        .session_id(format!("lifecycle-example-{}", process::id()))
+        .session_id(SessionId::new())
         .instructions(INSTRUCTIONS)
         .thinking(Thinking::Low)
         .workspace(workspace)
@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
         .await?
         .result()
         .await?;
-    println!("checkpoint: {}", historical_checkpoint.final_message);
+    println!("checkpoint: {}", historical_checkpoint.final_message());
 
     // Turn is the direct control capability for unfinished work. TurnControl is
     // only needed when another task owns the single result receiver.
@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
         .steer("Also require zero-downtime database migrations.")
         .await?;
     let steered = result_task.await.wrap_err("steered result task failed")??;
-    println!("steered: {}", steered.final_message);
+    println!("steered: {}", steered.final_message());
 
     // Ordinary prompts are distinct FIFO turns. Cancellation targets the exact
     // accepted Turn whether it is still queued or has just become active.
@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
     assert!(matches!(cancelled, Err(NanocodexError::TurnCancelled)));
     println!(
         "completed ahead of cancelled turn: {}",
-        active.final_message
+        active.final_message()
     );
 
     // Fork commands remain responsive while a root turn runs. fork() samples
@@ -101,9 +101,9 @@ async fn main() -> Result<()> {
         latest_turn.result(),
     )?;
 
-    println!("mainline:   {}", mainline.final_message);
-    println!("historical: {}", historical_result.final_message);
-    println!("latest:     {}", latest_result.final_message);
+    println!("mainline:   {}", mainline.final_message());
+    println!("historical: {}", historical_result.final_message());
+    println!("latest:     {}", latest_result.final_message());
 
     // AgentEvents is independent from typed results. Dropping every command
     // handle stops its private driver and closes that agent's event stream.

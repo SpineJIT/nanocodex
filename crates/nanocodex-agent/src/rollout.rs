@@ -6,7 +6,7 @@ use std::{
 };
 
 use chrono::{Local, SecondsFormat, Utc};
-use nanocodex_core::{
+use nanocodex_oai_api::{
     ImageDetail, Prompt, PromptInput, ResponseItem, UserInput, responses::ResponseHistory,
 };
 use serde::Serialize;
@@ -1178,7 +1178,7 @@ async fn write_async_line(output: &mut tokio::fs::File, line: &impl Serialize) -
 mod tests {
     use std::io::{BufRead, BufReader, Read};
 
-    use nanocodex_core::{ContentItem, MessageRole};
+    use nanocodex_oai_api::{ContentItem, MessageRole};
     use serde_json::Value;
     use tempfile::tempdir;
 

@@ -19,6 +19,7 @@ COPY js/bindings/Cargo.toml js/bindings/Cargo.toml
 COPY py/bindings/Cargo.toml py/bindings/Cargo.toml
 COPY crates/mpp-egress/Cargo.toml crates/mpp-egress/Cargo.toml
 COPY crates/nanocodex/Cargo.toml crates/nanocodex/Cargo.toml
+COPY crates/nanocodex-agent/Cargo.toml crates/nanocodex-agent/Cargo.toml
 COPY crates/nanocodex-core/Cargo.toml crates/nanocodex-core/Cargo.toml
 COPY crates/nanocodex-oai-api/Cargo.toml crates/nanocodex-oai-api/Cargo.toml
 COPY crates/nanocodex-observability/Cargo.toml crates/nanocodex-observability/Cargo.toml
@@ -36,6 +37,8 @@ RUN mkdir bin/nanocodex/src \
         py/bindings/src \
         crates/mpp-egress/src \
         crates/nanocodex/src \
+        crates/nanocodex-agent/src \
+        crates/nanocodex-agent/benches \
         crates/nanocodex-core/src \
         crates/nanocodex-oai-api/src \
         crates/nanocodex-oai-api/benches \
@@ -52,6 +55,8 @@ RUN mkdir bin/nanocodex/src \
     printf '\n' > py/bindings/src/lib.rs && \
     printf '\n' > crates/mpp-egress/src/lib.rs && \
     printf '\n' > crates/nanocodex/src/lib.rs && \
+    printf '\n' > crates/nanocodex-agent/src/lib.rs && \
+    printf 'fn main() {}\n' > crates/nanocodex-agent/benches/agent_lifecycle.rs && \
     printf '\n' > crates/nanocodex-core/src/lib.rs && \
     printf '\n' > crates/nanocodex-oai-api/src/lib.rs && \
     printf 'fn main() {}\n' > crates/nanocodex-oai-api/benches/fork_history.rs && \
@@ -82,6 +87,7 @@ RUN --mount=type=cache,id=nanocodex-cargo-registry,target=/usr/local/cargo/regis
         bin/nanousd-api/src/main.rs \
         crates/mpp-egress/src/lib.rs \
         crates/nanocodex/src/lib.rs \
+        crates/nanocodex-agent/src/lib.rs \
         crates/nanocodex-core/src/lib.rs \
         crates/nanocodex-oai-api/src/lib.rs \
         crates/nanocodex-observability/src/lib.rs \

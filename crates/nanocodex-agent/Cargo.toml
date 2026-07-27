@@ -1,0 +1,65 @@
+[package]
+name = "nanocodex-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Owned OpenAI agent lifecycle for Nanocodex"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["-D", "warnings"]
+
+[dependencies]
+futures-util.workspace = true
+nanocodex-oai-api.workspace = true
+nanocodex-tools.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "sync"] }
+tower.workspace = true
+tracing.workspace = true
+web-time.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+async-trait.workspace = true
+base64.workspace = true
+chrono.workspace = true
+getrandom.workspace = true
+image.workspace = true
+iana-time-zone.workspace = true
+reqwest.workspace = true
+schemars.workspace = true
+sha1.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+url.workspace = true
+uuid.workspace = true
+
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+js-sys.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+eyre.workspace = true
+futures-util.workspace = true
+tempfile.workspace = true
+tokio-tungstenite.workspace = true
+tracing-subscriber.workspace = true
+
+[[bench]]
+name = "agent_lifecycle"
+harness = false
+
+[lints]
+workspace = true

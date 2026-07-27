@@ -463,6 +463,12 @@ impl ResponsesAttemptFactory {
         }
     }
 
+    /// Replaces the event destination without changing request or retry state.
+    #[doc(hidden)]
+    pub fn set_events(&mut self, events: EventSink) {
+        self.observer.events = events;
+    }
+
     pub(crate) fn with_response_events(
         mut self,
         response_events: mpsc::Sender<ResponseEvent>,

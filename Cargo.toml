@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/nanocodex", "bin/nanousd-api", "crates/mpp-egress", "crates/nanocodex", "crates/nanocodex-core", "crates/nanocodex-oai-api", "crates/nanocodex-observability", "crates/nanocodex-service", "crates/nanocodex-tools", "crates/nanocodex-tools-macros", "crates/nanousd", "examples", "js/bindings", "py/bindings"]
+members = ["bin/nanocodex", "bin/nanousd-api", "crates/mpp-egress", "crates/nanocodex", "crates/nanocodex-agent", "crates/nanocodex-core", "crates/nanocodex-oai-api", "crates/nanocodex-observability", "crates/nanocodex-service", "crates/nanocodex-tools", "crates/nanocodex-tools-macros", "crates/nanousd", "examples", "js/bindings", "py/bindings"]
 default-members = ["bin/nanocodex"]
 resolver = "2"
 
@@ -39,6 +39,7 @@ hudsucker = { version = "0.25.0", git = "https://github.com/gakonst/hudsucker", 
 mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "5caad442edeab796821b7f3bb009ab6945106e35", default-features = false }
 mpp-egress = { version = "0.2.0", path = "crates/mpp-egress" }
 nanocodex = { version = "0.2.0", path = "crates/nanocodex" }
+nanocodex-agent = { version = "0.2.0", path = "crates/nanocodex-agent" }
 nanocodex-core = { version = "0.2.0", path = "crates/nanocodex-core" }
 nanocodex-oai-api = { version = "0.2.0", path = "crates/nanocodex-oai-api" }
 nanocodex-observability = { version = "0.2.0", path = "crates/nanocodex-observability" }

@@ -1,12 +1,13 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process,
     time::Instant,
 };
 
 use eyre::{Result, WrapErr, bail, eyre};
-use nanocodex::{AgentEventKind, AgentEvents, Nanocodex, Thinking, Tools, Turn, TurnResult, Usage};
+use nanocodex::{
+    AgentEventKind, AgentEvents, Nanocodex, SessionId, Thinking, Tools, Turn, TurnResult, Usage,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize)]
@@ -117,7 +118,7 @@ async fn main() -> Result<()> {
     if prompt_fnv1a64 != workload.prompt_fnv1a64 {
         bail!("generated prompts do not match the workload digest");
     }
-    let lineage = format!("codex-parity-{}-{}", process::id(), epoch_nanos()?);
+    let lineage = SessionId::new();
     let tools = Tools::builder().without_defaults().build()?;
     let agent_build_started = Instant::now();
     let (agent, mut root_events) = Nanocodex::builder(api_key)
@@ -246,10 +247,10 @@ async fn finish_measurement(
     latency_ms: f64,
     expected: &str,
 ) -> Result<TurnMeasurement> {
-    if result.final_message.trim() != expected {
+    if result.final_message().trim() != expected {
         bail!(
             "unexpected response: expected {expected:?}, got {:?}",
-            result.final_message
+            result.final_message()
         );
     }
     let calls = drain_turn(events).await?;
@@ -273,7 +274,7 @@ async fn finish_measurement(
         model_duration_ms: nanos_ms(model_duration_ns),
         time_to_first_event_ms: nanos_ms(time_to_first_event_ns),
         time_to_first_output_ms: time_to_first_output_ns.map(nanos_ms),
-        final_message: result.final_message.clone(),
+        final_message: result.final_message().to_owned(),
         usage,
     })
 }
@@ -469,11 +470,4 @@ fn median(sorted: &[f64]) -> f64 {
     } else {
         sorted[middle]
     }
-}
-
-fn epoch_nanos() -> Result<u128> {
-    Ok(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .wrap_err("system clock is before Unix epoch")?
-        .as_nanos())
 }

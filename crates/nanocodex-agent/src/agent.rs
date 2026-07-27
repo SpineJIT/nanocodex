@@ -1,18 +1,23 @@
 use std::{
     collections::VecDeque,
     fmt,
+    future::Future,
     path::PathBuf,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    task::{Context, Poll},
 };
 
-use nanocodex_core::{
-    AgentEvents, EventSink, ModelConfig, OpenAiAuth, OpenAiAuthMode, Prompt, ReasoningMode,
-    ResponsesHistory, ResponsesTransport, Thinking,
+use futures_util::Stream;
+use nanocodex_oai_api::{
+    AgentEvent, AgentEvents, EventSink, MakeResponsesService, ModelConfig, OpenAi, OpenAiAuth,
+    OpenAiAuthMode, Prompt, ReasoningMode, ResponsesHistory, ResponsesTransport, SessionId,
+    Thinking,
 };
-use nanocodex_service::{
+use nanocodex_oai_api::{
     DefaultResponsesService, ResponsesAttempt, ResponsesClient, ResponsesService,
     ResponsesServiceResponse, TransportStats,
 };
@@ -31,7 +36,9 @@ use crate::{
         },
         load_global_instructions,
     },
-    responses::{FactoryResponses, LayeredResponses, Responses, StandardResponses},
+    responses::{
+        FactoryResponses, LayeredResponses, OpenAiResponses, Responses, StandardResponses,
+    },
     rollout::{RolloutConfig, RolloutInfo, RolloutOrigin, RolloutRecorder, RolloutTurn},
     session::{CommittedSession, SessionResume, SessionSnapshot},
 };
@@ -51,8 +58,8 @@ enum InitialResume {
 
 struct RolloutResume {
     workspace: String,
-    canonical_context: nanocodex_core::ResponseItem,
-    history: Vec<nanocodex_core::ResponseItem>,
+    canonical_context: nanocodex_oai_api::ResponseItem,
+    history: Vec<nanocodex_oai_api::ResponseItem>,
     prompt_cache_key: Arc<str>,
 }
 
@@ -102,6 +109,7 @@ fn bind_agent_environment(tools: Tools, session_id: &str) -> Result<Tools> {
 #[must_use = "a turn continues running when dropped; await result(), control it, or explicitly drop it"]
 pub struct Turn {
     control: TurnControl,
+    events: AgentEvents,
     result: oneshot::Receiver<Result<TurnResult>>,
 }
 
@@ -139,11 +147,41 @@ impl Turn {
 
     /// Waits for and returns the final typed turn result.
     ///
+    /// This is equivalent to awaiting the turn directly. Any events not
+    /// already consumed through its [`Stream`] implementation are drained
+    /// before the result is returned.
+    ///
     /// # Errors
     ///
     /// Returns the model-run failure or an error if the driver stopped early.
     pub async fn result(self) -> Result<TurnResult> {
-        self.result.await.map_err(|_| NanocodexError::TurnStopped)?
+        self.await
+    }
+}
+
+impl Stream for Turn {
+    type Item = AgentEvent;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.events).poll_next(context)
+    }
+}
+
+impl Future for Turn {
+    type Output = Result<TurnResult>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            match Pin::new(&mut self.events).poll_next(context) {
+                Poll::Ready(Some(_)) => {}
+                Poll::Ready(None) => {
+                    return Pin::new(&mut self.result)
+                        .poll(context)
+                        .map(|result| result.map_err(|_| NanocodexError::TurnStopped)?);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }
 
@@ -198,11 +236,30 @@ struct TurnKey(u64);
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct TurnResult {
-    pub final_message: String,
+    final_message: String,
+    usage: crate::TurnUsage,
     checkpoint: Arc<CommittedSession>,
 }
 
 impl TurnResult {
+    /// Returns the final assistant message for this completed turn.
+    #[must_use]
+    pub fn final_message(&self) -> &str {
+        &self.final_message
+    }
+
+    /// Consumes the result and returns its final assistant message.
+    #[must_use]
+    pub fn into_final_message(self) -> String {
+        self.final_message
+    }
+
+    /// Returns exact aggregate token usage for this logical agent turn.
+    #[must_use]
+    pub const fn usage(&self) -> &crate::TurnUsage {
+        &self.usage
+    }
+
     /// Copies this completed boundary into a serializable, caller-owned session snapshot.
     ///
     /// The snapshot contains the complete unredacted model-visible conversation,
@@ -230,6 +287,7 @@ enum Command {
         thinking: Option<Thinking>,
         fast_mode: Option<bool>,
         parent: Option<tracing::Span>,
+        events: EventSink,
         result: oneshot::Sender<Result<TurnResult>>,
     },
     Steer {
@@ -265,6 +323,7 @@ enum QueuedTurn {
         thinking: Thinking,
         fast_mode: bool,
         parent: Option<tracing::Span>,
+        events: EventSink,
         result: oneshot::Sender<Result<TurnResult>>,
     },
     Cancelled {
@@ -272,6 +331,7 @@ enum QueuedTurn {
         thinking: Thinking,
         fast_mode: bool,
         parent: Option<tracing::Span>,
+        events: EventSink,
         result: oneshot::Sender<Result<TurnResult>>,
     },
 }
@@ -280,9 +340,10 @@ enum QueuedTurn {
 #[derive(Clone)]
 pub struct Nanocodex {
     commands: mpsc::Sender<Command>,
+    events: EventSink,
     next_turn: Arc<AtomicU64>,
     lineage_id: Arc<str>,
-    session_id: Arc<str>,
+    session_id: SessionId,
     rollout: Option<RolloutInfo>,
     rollout_recorder: Option<RolloutRecorder>,
 }
@@ -336,32 +397,22 @@ impl Nanocodex {
     ///
     /// Returns an error when authorization is unavailable or no Tokio runtime is active.
     pub fn new(auth: impl Into<OpenAiAuth>) -> Result<(Self, AgentEvents)> {
-        Self::builder(auth).build()
+        Self::builder(auth.into()).build()
     }
 
     /// Starts configuring an agent with sensible defaults.
     #[must_use]
-    pub fn builder(auth: impl Into<OpenAiAuth>) -> NanocodexBuilder {
-        let config = ModelConfig {
-            auth: auth.into(),
-            ..ModelConfig::default()
-        };
-        NanocodexBuilder {
-            config,
-            tools: ToolsConfiguration::Shared(Tools::default()),
-            workspace: None,
-            session_id: None,
-            prompt_cache: PromptCacheConfig::default(),
-            codex: CodexCompatibility::default(),
-            resume: None,
-            responses: Responses::default(),
-        }
+    pub fn builder<C>(client: C) -> NanocodexBuilder<C::Responses>
+    where
+        C: IntoNanocodexBuilder,
+    {
+        client.into_nanocodex_builder()
     }
 
     /// Returns the stable identity used by events, transport metadata, and any rollout.
     #[must_use]
-    pub fn session_id(&self) -> &str {
-        &self.session_id
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
     }
 
     /// Returns the Codex-compatible rollout identity and path when recording is enabled.
@@ -406,6 +457,7 @@ impl Nanocodex {
         let key = TurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
         let parent = tracing::Span::current();
         let parent = (!parent.is_disabled()).then_some(parent);
+        let (events, event_stream) = self.events.mirrored_channel();
         let (result, receiver) = oneshot::channel();
         if self
             .commands
@@ -415,6 +467,7 @@ impl Nanocodex {
                 thinking: None,
                 fast_mode: None,
                 parent,
+                events,
                 result,
             })
             .await
@@ -427,6 +480,7 @@ impl Nanocodex {
                 key,
                 commands: self.commands.clone(),
             },
+            events: event_stream,
             result: receiver,
         })
     }
@@ -543,11 +597,79 @@ pub struct NanocodexBuilder<S = StandardResponses> {
     config: ModelConfig,
     tools: ToolsConfiguration,
     workspace: Option<PathBuf>,
-    session_id: Option<String>,
+    session_id: Option<SessionId>,
     prompt_cache: PromptCacheConfig,
     codex: CodexCompatibility,
     resume: Option<SessionSnapshot>,
     responses: Responses<S>,
+}
+
+/// Compatibility conversion into the agent's cloneable builder recipe.
+///
+/// Applications normally pass a configured [`OpenAi`] client. API-key strings
+/// and [`OpenAiAuth`] remain supported so existing embedders can migrate
+/// independently.
+#[doc(hidden)]
+pub trait IntoNanocodexBuilder {
+    /// Deferred concrete Responses factory retained by the builder.
+    type Responses;
+
+    /// Converts this value into a fresh agent recipe.
+    fn into_nanocodex_builder(self) -> NanocodexBuilder<Self::Responses>;
+}
+
+impl<F> IntoNanocodexBuilder for OpenAi<F>
+where
+    F: MakeResponsesService,
+{
+    type Responses = OpenAiResponses<F>;
+
+    fn into_nanocodex_builder(self) -> NanocodexBuilder<Self::Responses> {
+        let (config, factory) = self.into_parts();
+        let responses = Responses::from_openai(&config, OpenAiResponses(factory));
+        new_builder(config, responses)
+    }
+}
+
+impl IntoNanocodexBuilder for OpenAiAuth {
+    type Responses = StandardResponses;
+
+    fn into_nanocodex_builder(self) -> NanocodexBuilder<Self::Responses> {
+        let config = ModelConfig {
+            auth: self,
+            ..ModelConfig::default()
+        };
+        new_builder(config, Responses::default())
+    }
+}
+
+impl IntoNanocodexBuilder for String {
+    type Responses = StandardResponses;
+
+    fn into_nanocodex_builder(self) -> NanocodexBuilder<Self::Responses> {
+        OpenAiAuth::from(self).into_nanocodex_builder()
+    }
+}
+
+impl IntoNanocodexBuilder for &str {
+    type Responses = StandardResponses;
+
+    fn into_nanocodex_builder(self) -> NanocodexBuilder<Self::Responses> {
+        OpenAiAuth::from(self).into_nanocodex_builder()
+    }
+}
+
+fn new_builder<S>(config: ModelConfig, responses: Responses<S>) -> NanocodexBuilder<S> {
+    NanocodexBuilder {
+        config,
+        tools: ToolsConfiguration::Shared(Tools::default()),
+        workspace: None,
+        session_id: None,
+        prompt_cache: PromptCacheConfig::default(),
+        codex: CodexCompatibility::default(),
+        resume: None,
+        responses,
+    }
 }
 
 #[derive(Clone, Default)]
@@ -621,10 +743,14 @@ impl<S> NanocodexBuilder<S> {
         self
     }
 
-    /// Sets the root session ID and checkpoint lineage inherited by forks.
+    /// Sets the root agent's `UUIDv7` session identity.
+    ///
+    /// The root identity also seeds its checkpoint lineage. Spawned siblings
+    /// and forks receive fresh session IDs; forks retain the root's opaque
+    /// lineage so [`Nanocodex::fork_from`] can reject unrelated results.
     #[must_use]
-    pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
-        self.session_id = Some(session_id.into());
+    pub const fn session_id(mut self, session_id: SessionId) -> Self {
+        self.session_id = Some(session_id);
         self
     }
 
@@ -711,12 +837,7 @@ impl NanocodexBuilder<StandardResponses> {
     /// active.
     pub fn build(mut self) -> Result<(Nanocodex, AgentEvents)> {
         configure(&mut self.config, &self.responses);
-        validate(
-            &self.config,
-            self.session_id.as_deref(),
-            self.prompt_cache.key.as_deref(),
-            self.codex.rollout.as_ref(),
-        )?;
+        validate(&self.config, self.prompt_cache.key.as_deref())?;
         let config = Arc::new(self.config);
         let max_attempts = self.responses.max_attempts;
         #[cfg(not(target_family = "wasm"))]
@@ -759,6 +880,43 @@ impl NanocodexBuilder<StandardResponses> {
     }
 }
 
+impl<F> NanocodexBuilder<OpenAiResponses<F>>
+where
+    F: MakeResponsesService + Send + Sync + 'static,
+    F::Service: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + Send + 'static,
+    <F::Service as Service<ResponsesAttempt>>::Error: Into<NanocodexError> + Send + 'static,
+    <F::Service as Service<ResponsesAttempt>>::Future: Send,
+{
+    /// Builds an agent from the configured `OpenAI` client recipe.
+    ///
+    /// Each root, spawned sibling, and fork receives a fresh concrete Tower
+    /// service from the client factory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid agent policy or when no Tokio runtime is
+    /// active.
+    pub fn build(self) -> Result<(Nanocodex, AgentEvents)> {
+        validate(&self.config, self.prompt_cache.key.as_deref())?;
+        let config = Arc::new(self.config);
+        let factory = self.responses.service.0;
+        let service_factory: ServiceFactory<F::Service> = Arc::new({
+            let config = Arc::clone(&config);
+            move || factory.make(Arc::clone(&config))
+        });
+        build_agent(
+            config,
+            self.tools,
+            self.workspace,
+            self.session_id,
+            self.prompt_cache,
+            self.codex,
+            self.resume,
+            service_factory,
+        )
+    }
+}
+
 impl<L> NanocodexBuilder<LayeredResponses<L>>
 where
     L: tower::Layer<DefaultResponsesService> + Clone + Send + Sync + 'static,
@@ -776,12 +934,7 @@ where
     /// active.
     pub fn build(mut self) -> Result<(Nanocodex, AgentEvents)> {
         configure(&mut self.config, &self.responses);
-        validate(
-            &self.config,
-            self.session_id.as_deref(),
-            self.prompt_cache.key.as_deref(),
-            self.codex.rollout.as_ref(),
-        )?;
+        validate(&self.config, self.prompt_cache.key.as_deref())?;
         let config = Arc::new(self.config);
         let layers = self.responses.service.0;
         let max_attempts = self.responses.max_attempts;
@@ -842,12 +995,7 @@ where
     /// active.
     pub fn build(mut self) -> Result<(Nanocodex, AgentEvents)> {
         configure(&mut self.config, &self.responses);
-        validate(
-            &self.config,
-            self.session_id.as_deref(),
-            self.prompt_cache.key.as_deref(),
-            self.codex.rollout.as_ref(),
-        )?;
+        validate(&self.config, self.prompt_cache.key.as_deref())?;
         let config = Arc::new(self.config);
         let service_factory: ServiceFactory<S> = Arc::new(self.responses.service.0);
         build_agent(
@@ -978,6 +1126,7 @@ where
                             thinking,
                             fast_mode,
                             parent,
+                            events,
                             result,
                         } => {
                             break Command::Prompt {
@@ -986,6 +1135,7 @@ where
                                 thinking: Some(thinking),
                                 fast_mode: Some(fast_mode),
                                 parent,
+                                events,
                                 result,
                             };
                         }
@@ -994,6 +1144,7 @@ where
                             thinking,
                             fast_mode,
                             parent,
+                            events,
                             result,
                         } => {
                             turn_index += 1;
@@ -1029,12 +1180,14 @@ where
                                 });
                             }
                             let _guard = turn_span.enter();
+                            model.set_events(events);
                             model.emit_cancelled_before_start(
                                 &prompt,
                                 self.workspace.as_deref(),
                                 thinking,
                                 fast_mode,
                             )?;
+                            model.set_events(self.events.clone());
                             drop(result.send(Err(NanocodexError::TurnCancelled)));
                             continue;
                         }
@@ -1055,6 +1208,7 @@ where
                 thinking,
                 fast_mode,
                 parent,
+                events,
                 result,
             } = command
             else {
@@ -1118,6 +1272,7 @@ where
             let mut fork_snapshots_open = true;
             let mut cancel = Some(cancel);
             let mut cancel_result = None;
+            model.set_events(events);
             let mut execution = Box::pin(
                 model
                     .execute(
@@ -1158,6 +1313,7 @@ where
                                 thinking: _,
                                 fast_mode: _,
                                 parent,
+                                events,
                                 result,
                             }) => {
                                 queued_turns.push_back(QueuedTurn::Pending {
@@ -1166,6 +1322,7 @@ where
                                     thinking: default_thinking,
                                     fast_mode: default_fast_mode,
                                     parent,
+                                    events,
                                     result,
                                 });
                             }
@@ -1231,10 +1388,12 @@ where
                 }
             };
             drop(execution);
+            model.set_events(self.events.clone());
             let (outcome, was_cancelled): (Result<TurnResult>, bool) = match completed {
                 Ok(ModelTurnOutcome::Completed(completed)) => {
                     let CompletedModelTurn {
                         final_message,
+                        usage,
                         checkpoint,
                     } = completed;
                     let checkpoint = Arc::new(CommittedSession::new(
@@ -1248,6 +1407,7 @@ where
                     (
                         Ok(TurnResult {
                             final_message,
+                            usage,
                             checkpoint,
                         }),
                         false,
@@ -1347,7 +1507,7 @@ fn agent_turn_span(
         agent.origin = origin.kind,
         agent.depth = origin.depth,
         trace.parented = parented,
-        model = nanocodex_core::MODEL,
+        model = nanocodex_oai_api::MODEL,
         reasoning.mode = reasoning.mode.as_str(),
         reasoning.effort = reasoning.effort.as_str(),
         thinking = reasoning.effort.as_str(),
@@ -1382,6 +1542,7 @@ fn cancel_queued_turn(queued_turns: &mut VecDeque<QueuedTurn>, target: TurnKey) 
         thinking,
         fast_mode,
         parent,
+        events,
         result,
         ..
     } = queued
@@ -1395,6 +1556,7 @@ fn cancel_queued_turn(queued_turns: &mut VecDeque<QueuedTurn>, target: TurnKey) 
             thinking,
             fast_mode,
             parent,
+            events,
             result,
         },
     );
@@ -1453,7 +1615,7 @@ where
         thinking: Thinking,
         fast_mode: bool,
     ) -> Result<(Nanocodex, AgentEvents)> {
-        let session_id = new_session_id();
+        let session_id = SessionId::new();
         let workspace = Some(Arc::<str>::from(checkpoint.model().workspace()));
         let mut spawner = self.clone();
         let mut config = (*spawner.config).clone();
@@ -1483,7 +1645,8 @@ where
         thinking: Thinking,
         fast_mode: bool,
     ) -> Result<(Nanocodex, AgentEvents)> {
-        let session_id = new_session_id();
+        let session_id = SessionId::new();
+        let session_id_text = session_id.to_string();
         let depth = self.depth.saturating_add(1);
         let mut config = (*self.config).clone();
         config.thinking = thinking;
@@ -1491,7 +1654,7 @@ where
         let spawner = Self {
             config: Arc::new(config),
             tools: self.tools.clone(),
-            lineage_id: Arc::from(session_id.as_str()),
+            lineage_id: Arc::from(session_id_text.as_str()),
             prompt_cache_key: self.prompt_cache_key.as_ref().map(Arc::clone),
             shared_prompt_cache: self.shared_prompt_cache.clone(),
             codex_home: self.codex_home.clone(),
@@ -1522,7 +1685,7 @@ fn build_agent<S>(
     config: Arc<ModelConfig>,
     tools: ToolsConfiguration,
     workspace: Option<PathBuf>,
-    session_id: Option<String>,
+    session_id: Option<SessionId>,
     prompt_cache: PromptCacheConfig,
     codex: CodexCompatibility,
     resume: Option<SessionSnapshot>,
@@ -1533,7 +1696,8 @@ where
     S::Error: Into<NanocodexError> + Send + 'static,
     S::Future: Send,
 {
-    let session_id = session_id.unwrap_or_else(new_session_id);
+    let session_id = session_id.unwrap_or_default();
+    let session_id_text = session_id.to_string();
     let PromptCacheConfig { key, shared } = prompt_cache;
     let is_resume = resume.is_some();
     let (lineage_id, prompt_cache_key, initial_resume) = if let Some(snapshot) = resume {
@@ -1567,7 +1731,7 @@ where
         (lineage_id, Some(restored_cache_key), Some(initial))
     } else {
         (
-            Arc::<str>::from(session_id.as_str()),
+            Arc::<str>::from(session_id_text.as_str()),
             key.map(Arc::from),
             None,
         )
@@ -1631,7 +1795,7 @@ where
 
 fn spawn_agent_driver<S>(
     spawner: BranchSpawner<S>,
-    session_id: String,
+    session_id: SessionId,
     workspace: Option<Arc<str>>,
     service: S,
     initial_resume: Option<InitialResume>,
@@ -1645,12 +1809,13 @@ where
 {
     let runtime = tokio::runtime::Handle::try_current()
         .map_err(|_| NanocodexError::TokioRuntimeUnavailable)?;
+    let session_id_text = session_id.to_string();
     let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
     let tools = bind_agent_environment(
         spawner.tools.materialize(AgentHandle {
             commands: commands.downgrade(),
         })?,
-        &session_id,
+        &session_id_text,
     )?;
     let rollout = spawner
         .rollout
@@ -1665,7 +1830,7 @@ where
             RolloutRecorder::create(
                 &runtime,
                 config,
-                &session_id,
+                &session_id_text,
                 &cwd,
                 spawner.config.system_prompt(),
                 RolloutOrigin {
@@ -1681,12 +1846,11 @@ where
         })
         .transpose()?;
     let rollout_info = rollout.as_ref().map(|recorder| recorder.info().clone());
-    let session_id: Arc<str> = Arc::from(session_id);
-    let (events, event_stream) = EventSink::channel(session_id.to_string());
+    let (events, event_stream) = EventSink::channel(session_id_text.clone());
     let initial_model = initial_resume
         .map(|initial| match initial {
             InitialResume::Exact(checkpoint) => {
-                prepare_resumed_checkpoint(*checkpoint, &spawner.config, &tools, &session_id)
+                prepare_resumed_checkpoint(*checkpoint, &spawner.config, &tools, &session_id_text)
             }
             InitialResume::Rollout(resume) => {
                 let RolloutResume {
@@ -1702,7 +1866,7 @@ where
                     prompt_cache_key,
                     &spawner.config,
                     &tools,
-                    &session_id,
+                    &session_id_text,
                 )
             }
         })
@@ -1710,6 +1874,7 @@ where
     let transport_stats = Arc::new(TransportStats::default());
     let agent = Nanocodex {
         commands,
+        events: events.clone(),
         next_turn: Arc::new(AtomicU64::new(1)),
         lineage_id: Arc::clone(&spawner.lineage_id),
         session_id,
@@ -1763,12 +1928,7 @@ fn configure<S>(config: &mut ModelConfig, responses: &Responses<S>) {
         .unwrap_or_else(|| mode.default_api_base_url().to_owned());
 }
 
-fn validate(
-    config: &ModelConfig,
-    session_id: Option<&str>,
-    prompt_cache_key: Option<&str>,
-    rollout: Option<&RolloutConfig>,
-) -> Result<()> {
+fn validate(config: &ModelConfig, prompt_cache_key: Option<&str>) -> Result<()> {
     config
         .auth
         .validate()
@@ -1800,28 +1960,12 @@ fn validate(
             "HTTPS with store: false requires full client-history replay".to_owned(),
         ));
     }
-    if session_id.is_some_and(|session_id| session_id.trim().is_empty()) {
-        return Err(NanocodexError::InvalidRequest(
-            "session_id must not be empty".to_owned(),
-        ));
-    }
     if prompt_cache_key.is_some_and(|prompt_cache_key| prompt_cache_key.trim().is_empty()) {
         return Err(NanocodexError::InvalidRequest(
             "prompt_cache_key must not be empty".to_owned(),
         ));
     }
-    if rollout.is_some()
-        && session_id.is_some_and(|session_id| uuid::Uuid::parse_str(session_id).is_err())
-    {
-        return Err(NanocodexError::InvalidRequest(
-            "session_id must be a UUID when Codex rollout recording is enabled".to_owned(),
-        ));
-    }
     Ok(())
-}
-
-fn new_session_id() -> String {
-    uuid::Uuid::now_v7().to_string()
 }
 
 fn rollout_workspace(workspace: Option<&str>) -> std::io::Result<PathBuf> {
@@ -1990,6 +2134,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_openai_recipe_preserves_its_concrete_service_factory() {
+        let service_builds = Arc::new(AtomicU64::new(0));
+        let factory_builds = Arc::clone(&service_builds);
+        let openai = OpenAi::builder("test")
+            .service(move || {
+                factory_builds.fetch_add(1, Ordering::Relaxed);
+                NeverCalled
+            })
+            .build()
+            .unwrap();
+        let builder = Nanocodex::builder(openai)
+            .instructions("Answer only from supplied facts and preserve exact identifiers.");
+
+        let (first, first_events) = builder.clone().build().unwrap();
+        let (second, second_events) = builder.build().unwrap();
+
+        assert_eq!(service_builds.load(Ordering::Relaxed), 2);
+        assert!(!first.commands.same_channel(&second.commands));
+        drop((first, first_events, second, second_events));
+    }
+
+    #[tokio::test]
     async fn cloned_builders_create_distinct_agents() {
         let service_builds = Arc::new(AtomicU64::new(0));
         let factory_builds = Arc::clone(&service_builds);
@@ -2023,8 +2189,8 @@ mod tests {
             .unwrap();
 
         let rollout = agent.rollout().expect("rollout enabled");
-        assert_eq!(agent.session_id(), events.request_id());
-        assert_eq!(rollout.thread_id(), agent.session_id());
+        assert_eq!(agent.session_id().to_string(), events.request_id());
+        assert_eq!(rollout.thread_id(), agent.session_id().to_string());
         assert!(uuid::Uuid::parse_str(rollout.thread_id()).is_ok());
         assert!(rollout.path().is_file());
         agent.flush_rollout().await.unwrap();
@@ -2085,19 +2251,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollout_rejects_a_non_uuid_explicit_session_id() {
+    async fn rollout_uses_an_explicit_typed_session_id() {
         let home = tempdir().unwrap();
         let responses = Responses::builder().service(|| NeverCalled).build();
-        let outcome = Nanocodex::builder("test")
-            .session_id("application-session")
+        let session_id = SessionId::new();
+        let (agent, events) = Nanocodex::builder("test")
+            .session_id(session_id)
             .rollout(RolloutConfig::new(home.path()))
             .responses(responses)
-            .build();
+            .build()
+            .unwrap();
 
-        let Err(error) = outcome else {
-            panic!("non-UUID rollout session unexpectedly built");
-        };
-        assert!(error.to_string().contains("must be a UUID"));
+        assert_eq!(agent.session_id(), session_id);
+        assert_eq!(
+            agent.rollout().expect("rollout enabled").thread_id(),
+            session_id.to_string()
+        );
+        drop((agent, events));
     }
 
     #[tokio::test]

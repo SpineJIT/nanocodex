@@ -2910,17 +2910,18 @@ mod tests {
 
         let workspace = temporary_workspace("tui-steer")?;
         let responses = Responses::builder().websocket_url(endpoint).build();
+        let session_id = nanocodex::SessionId::new();
         let (agent, mut events) = Nanocodex::builder("test-key")
             .thinking(Thinking::Low)
             .workspace(&workspace)
             .responses(responses)
-            .session_id("tui-steer-test")
+            .session_id(session_id)
             .build()?;
         let (commands, worker_rx) = mpsc::unbounded_channel();
         let (updates, mut update_rx) = mpsc::unbounded_channel();
         spawn_agent_worker(
             agent,
-            std::sync::Arc::from("tui-steer-test"),
+            std::sync::Arc::from(session_id.to_string()),
             None,
             worker_rx,
             updates,
@@ -3023,18 +3024,19 @@ mod tests {
 
         let workspace = temporary_workspace("tui-historical-edit")?;
         let responses = Responses::builder().websocket_url(endpoint).build();
+        let session_id = nanocodex::SessionId::new();
         let (agent, mut events) = Nanocodex::builder("test-key")
             .thinking(Thinking::Low)
             .workspace(&workspace)
             .responses(responses)
-            .session_id("tui-historical-edit-test")
+            .session_id(session_id)
             .build()?;
         let event_drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
         let (commands, worker_rx) = mpsc::unbounded_channel();
         let (updates, mut update_rx) = mpsc::unbounded_channel();
         spawn_agent_worker(
             agent,
-            std::sync::Arc::from("tui-historical-edit-test"),
+            std::sync::Arc::from(session_id.to_string()),
             None,
             worker_rx,
             updates,

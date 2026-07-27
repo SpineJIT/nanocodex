@@ -3,7 +3,7 @@ use std::time::Duration;
 #[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
 
-use nanocodex_core::{ModelConfig, Thinking, Usage};
+use nanocodex_oai_api::{ModelConfig, Thinking, Usage};
 use serde::Serialize;
 use serde_json::value::RawValue;
 use web_time::Instant;
@@ -11,7 +11,7 @@ use web_time::Instant;
 #[cfg(not(target_family = "wasm"))]
 use crate::NanocodexError;
 use crate::Result;
-use nanocodex_service::TransportStatsDelta;
+use nanocodex_oai_api::TransportStatsDelta;
 use nanocodex_tools::ToolOutputBody;
 
 const COST_STATUS: &str = "not_reported_by_responses_api";
@@ -191,6 +191,17 @@ impl RunStats {
         self.connection_duration_ns = delta.connection_duration_ns;
         self.retry_backoff_duration_ns = delta.retry_backoff_duration_ns;
     }
+
+    pub(super) fn turn_usage(&self) -> crate::TurnUsage {
+        crate::TurnUsage::from_counts(
+            self.usage.input_tokens + self.warmup_usage.input_tokens,
+            self.usage.cached_input_tokens + self.warmup_usage.cached_input_tokens,
+            self.usage.cache_write_input_tokens + self.warmup_usage.cache_write_input_tokens,
+            self.usage.output_tokens + self.warmup_usage.output_tokens,
+            self.usage.reasoning_output_tokens + self.warmup_usage.reasoning_output_tokens,
+            self.usage.total_tokens + self.warmup_usage.total_tokens,
+        )
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -230,7 +241,7 @@ pub(super) fn terminal_payload<'a>(
 ) -> TerminalPayload<'a> {
     TerminalPayload {
         status: terminal_status,
-        model: nanocodex_core::MODEL,
+        model: nanocodex_oai_api::MODEL,
         reasoning_mode: config.reasoning_mode.as_str(),
         effort: thinking.as_str(),
         transport: config.responses_transport.as_str(),

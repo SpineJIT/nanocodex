@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use nanocodex_core::{MODEL, responses::RequestProfile};
+use nanocodex_oai_api::{MODEL, responses::RequestProfile};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OnceCell};
 

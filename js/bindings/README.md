@@ -16,6 +16,7 @@ const agent = await Agent.create({
 
 const turn = agent.turn.prompt({ input: "Build the thing." });
 console.log(await turn.result());
+console.log(turn.usage());
 
 await agent.session.setThinking("high");
 await agent.session.setFastMode(true);
@@ -131,6 +132,7 @@ an owned client decorated with matching domain actions:
 
 - `agent.turn.prompt(...)` / `Actions.turn.prompt(agent, ...)`
 - `turn.snapshot()` / `Actions.turn.getSnapshot(turn)`
+- `turn.usage()` / `Actions.turn.getUsage(turn)`
 - `agent.session.fork(...)` / `Actions.session.fork(agent, ...)`
 - `agent.session.setThinking(...)` / `Actions.session.setThinking(agent, ...)`
 - `agent.session.setFastMode(...)` / `Actions.session.setFastMode(agent, ...)`

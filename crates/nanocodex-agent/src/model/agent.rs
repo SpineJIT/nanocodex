@@ -1,20 +1,14 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
-use nanocodex_core::{
-    AgentEventKind, EventSink, MODEL, ModelConfig, Prompt, ResponseItem, ResponseItemId,
-    ResponsesTransport, Thinking, ToolDefinition, Usage, responses::RequestProfile,
+use nanocodex_oai_api::{
+    AgentEventKind, EventSink, MODEL, ManagedSessionState, ModelConfig, Prompt, ResponseItem,
+    ResponseItemId, ResponsesTransport, Thinking, ToolDefinition, Usage, responses::RequestProfile,
 };
-use nanocodex_core::{
-    compaction,
-    context::{
-        ContextManager, assign_missing_response_item_id, assign_missing_response_item_ids,
-        has_well_formed_tool_calls,
-    },
-};
-use nanocodex_service::{
+use nanocodex_oai_api::{
     CodeCall, CodeCallKind, ResponsesAttempt, ResponsesAttemptFactory, ResponsesClient,
     ResponsesOutput, ResponsesServiceResponse, TransportStats, TurnResult,
 };
+use nanocodex_oai_api::{compaction, context::assign_missing_response_item_id};
 use serde::Serialize;
 use serde_json::value::RawValue;
 use tokio::sync::watch;
@@ -50,7 +44,6 @@ pub(crate) struct ModelRun<S> {
     transport_stats: Arc<TransportStats>,
     started_at: Instant,
     stats: RunStats,
-    server_reasoning_included: bool,
     session: Option<ModelSessionState>,
     active_tools: Option<ToolRuntimeControl>,
     active_tool_call: Option<ActiveToolCall>,
@@ -67,6 +60,7 @@ pub(crate) enum ModelTurnOutcome {
 
 pub(crate) struct CompletedModelTurn {
     pub(crate) final_message: String,
+    pub(crate) usage: crate::TurnUsage,
     pub(crate) checkpoint: ModelCheckpoint,
 }
 
@@ -90,13 +84,13 @@ impl ModelCheckpoint {
         &self.workspace
     }
     #[cfg(not(target_family = "wasm"))]
-    pub(crate) fn history(&self) -> nanocodex_core::responses::ResponseHistory {
+    pub(crate) fn history(&self) -> nanocodex_oai_api::responses::ResponseHistory {
         self.conversation.shared_history()
     }
 
     #[cfg(not(target_family = "wasm"))]
     pub(crate) const fn history_revision(&self) -> u64 {
-        self.conversation.history_revision
+        self.conversation.history_revision()
     }
 
     pub(crate) fn request_prefix(&self) -> &[ResponseItem] {
@@ -291,6 +285,11 @@ struct WarmupExecution {
     server_reasoning_included: bool,
 }
 
+struct WarmupOutcome {
+    response_id: Option<String>,
+    server_reasoning_included: bool,
+}
+
 enum ModelTaskOutcome {
     Completed(String),
     Cancelled,
@@ -299,15 +298,11 @@ enum ModelTaskOutcome {
 #[derive(Clone)]
 struct ConversationState {
     canonical_context: Arc<ResponseItem>,
-    context: ContextManager,
-    delta_start: usize,
-    previous_response_id: Option<String>,
-    history_revision: u64,
+    managed: ManagedSessionState,
 }
 
 impl ConversationState {
-    fn new(mut history: Vec<ResponseItem>) -> Result<Self> {
-        assign_missing_response_item_ids(&mut history);
+    fn new(history: Vec<ResponseItem>) -> Result<Self> {
         let canonical_context = history
             .iter()
             .find(|item| item.is_user_message())
@@ -317,76 +312,72 @@ impl ConversationState {
             })?;
         Ok(Self {
             canonical_context: Arc::new(canonical_context),
-            context: ContextManager::new(history),
-            delta_start: 0,
-            previous_response_id: None,
-            history_revision: 0,
+            managed: ManagedSessionState::new(history),
         })
     }
 
-    fn resume(mut canonical_context: ResponseItem, mut history: Vec<ResponseItem>) -> Result<Self> {
-        if history.is_empty() {
-            return Err(NanocodexError::InvalidSessionSnapshot(
-                "conversation history must not be empty".to_owned(),
-            ));
-        }
+    fn resume(mut canonical_context: ResponseItem, history: Vec<ResponseItem>) -> Result<Self> {
         if !canonical_context.is_user_message() {
             return Err(NanocodexError::InvalidSessionSnapshot(
                 "canonical context must be a user message".to_owned(),
             ));
         }
         assign_missing_response_item_id(&mut canonical_context);
-        assign_missing_response_item_ids(&mut history);
-        if !has_well_formed_tool_calls(&history) {
-            return Err(NanocodexError::InvalidSessionSnapshot(
-                "conversation history contains an unmatched or misordered tool call".to_owned(),
-            ));
-        }
-        let history_len = history.len();
-        let mut context = ContextManager::new(history);
-        if context.len() != history_len {
-            return Err(NanocodexError::InvalidSessionSnapshot(
-                "conversation history contains an unsupported item".to_owned(),
-            ));
-        }
-        context.commit_tail();
-        let delta_start = context.len();
+        let managed = ManagedSessionState::resume(history)
+            .map_err(|error| NanocodexError::InvalidSessionSnapshot(error.to_string()))?;
         Ok(Self {
             canonical_context: Arc::new(canonical_context),
-            context,
-            delta_start,
-            previous_response_id: None,
-            history_revision: 0,
+            managed,
         })
     }
 
     fn flattened_history(&self) -> Vec<ResponseItem> {
-        self.context.flattened_items()
+        self.managed.flattened_history()
     }
 
     fn clear_delta(&mut self) {
-        self.delta_start = self.context.len();
+        self.managed.clear_delta();
     }
 
     fn append(&mut self, items: impl IntoIterator<Item = ResponseItem>) {
-        self.context.record_items(items);
+        self.managed.append(items);
     }
 
     fn update_token_info(&mut self, usage: Option<&Usage>) {
-        self.context.update_token_info(usage);
+        self.managed.update_token_info(usage);
     }
 
-    fn active_context_tokens(&self, server_reasoning_included: bool) -> u64 {
-        self.context
-            .active_context_tokens(server_reasoning_included)
+    fn observe_server_reasoning(&mut self, included: bool) {
+        self.managed.observe_server_reasoning(included);
     }
 
-    fn prompt_history(&self) -> nanocodex_core::responses::ResponseHistory {
-        self.context.prompt_items()
+    fn active_context_tokens(&self) -> u64 {
+        self.managed.active_context_tokens()
     }
 
-    fn shared_history(&self) -> nanocodex_core::responses::ResponseHistory {
-        self.context.shared_items()
+    fn prompt_history(&self) -> nanocodex_oai_api::responses::ResponseHistory {
+        self.managed.prompt_history()
+    }
+
+    fn shared_history(&self) -> nanocodex_oai_api::responses::ResponseHistory {
+        self.managed.shared_history()
+    }
+
+    fn delta_start(&self) -> usize {
+        self.managed.delta_start()
+    }
+
+    fn previous_response_id(&self) -> Option<&str> {
+        self.managed.previous_response_id()
+    }
+
+    fn set_previous_response_id(&mut self, response_id: impl Into<String>) {
+        self.managed.set_previous_response_id(response_id);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    const fn history_revision(&self) -> u64 {
+        self.managed.history_revision()
     }
 
     fn install_compaction(
@@ -397,34 +388,29 @@ impl ConversationState {
         request_prefix: &[ResponseItem],
     ) {
         let initial_context = [canonical_developer_context, canonical_context.clone()];
-        let history =
-            compaction::install_history(&self.context.flattened_items(), &initial_context, item);
         self.canonical_context = Arc::new(canonical_context);
-        self.context.replace_and_recompute(history, request_prefix);
-        self.delta_start = 0;
-        self.previous_response_id = None;
-        self.history_revision = self.history_revision.saturating_add(1);
+        self.managed
+            .install_compaction(item, initial_context, request_prefix);
     }
 
     fn reset_for_full_request(&mut self) {
-        self.delta_start = 0;
-        self.previous_response_id = None;
+        self.managed.reset_for_full_request();
     }
 
     fn commit(&mut self) -> Result<()> {
-        if self.previous_response_id.is_none() {
-            return Err(NanocodexError::MalformedResponse {
+        self.managed
+            .commit()
+            .map_err(|_| NanocodexError::MalformedResponse {
                 detail: "completed turn did not have a response ID",
-            });
-        }
-        self.context.commit_tail();
-        self.delta_start = self.context.len();
-        Ok(())
+            })
     }
 
     fn commit_interrupted(&mut self) {
-        self.reset_for_full_request();
-        self.context.commit_tail();
+        self.managed.commit_interrupted();
+    }
+
+    fn commit_tail(&mut self) {
+        self.managed.commit_tail();
     }
 }
 
@@ -449,7 +435,6 @@ impl<S> ModelRun<S> {
             transport_stats,
             started_at: Instant::now(),
             stats: RunStats::default(),
-            server_reasoning_included: false,
             session: None,
             active_tools: None,
             active_tool_call: None,
@@ -494,7 +479,6 @@ impl<S> ModelRun<S> {
             transport_stats,
             started_at: Instant::now(),
             stats: RunStats::default(),
-            server_reasoning_included: false,
             session: Some(ModelSessionState {
                 workspace: checkpoint.workspace,
                 tools: runtime,
@@ -509,6 +493,14 @@ impl<S> ModelRun<S> {
             prompt_cache,
             global_instructions: checkpoint.global_instructions,
         }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn set_events(&mut self, events: EventSink) {
+        if let Some(session) = &mut self.session {
+            session.factory.set_events(events.clone());
+        }
+        self.events = events;
     }
 
     fn attempt_factory(&self, tools: &ToolRuntime) -> ResponsesAttemptFactory {
@@ -736,6 +728,7 @@ where
                 let checkpoint = self.commit_checkpoint()?;
                 Ok(ModelTurnOutcome::Completed(CompletedModelTurn {
                     final_message: message,
+                    usage: self.stats.turn_usage(),
                     checkpoint,
                 }))
             }
@@ -807,7 +800,7 @@ where
         }
         let user_content = prepare_user_input(&task.instruction).await;
         session.conversation.append([ResponseItem::message(
-            nanocodex_core::MessageRole::User,
+            nanocodex_oai_api::MessageRole::User,
             user_content,
         )]);
         Ok(true)
@@ -881,12 +874,16 @@ where
                 return Ok(ModelTaskOutcome::Cancelled);
             };
             match warmup {
-                Ok(Some(response_id)) => {
-                    session.conversation.previous_response_id = Some(response_id);
-                }
-                Ok(None) => {
-                    session.conversation.reset_for_full_request();
-                    self.stats.last_response_id = None;
+                Ok(outcome) => {
+                    session
+                        .conversation
+                        .observe_server_reasoning(outcome.server_reasoning_included);
+                    if let Some(response_id) = outcome.response_id {
+                        session.conversation.set_previous_response_id(response_id);
+                    } else {
+                        session.conversation.reset_for_full_request();
+                        self.stats.last_response_id = None;
+                    }
                 }
                 Err(error) if error.responses_error().is_some() => {
                     session.conversation.reset_for_full_request();
@@ -982,7 +979,7 @@ where
         snapshots: &watch::Sender<Option<ModelCheckpoint>>,
         global_instructions: Option<&Arc<str>>,
     ) {
-        session.conversation.context.commit_tail();
+        session.conversation.commit_tail();
         snapshots.send_replace(Some(ModelCheckpoint {
             workspace: session.workspace.clone(),
             conversation: session.conversation.clone(),
@@ -1010,12 +1007,14 @@ where
             Self::publish_fork_snapshot(session, fork_snapshots, self.global_instructions.as_ref());
             let call_index = self.stats.model_calls + 1;
             let response = self
-                .perform_model_call(call_index, &session.conversation, &session.factory)
+                .perform_model_call(call_index, &mut session.conversation, &session.factory)
                 .await?;
             session
                 .conversation
                 .update_token_info(response.usage.as_ref());
-            session.conversation.previous_response_id = Some(response.id.clone());
+            session
+                .conversation
+                .set_previous_response_id(response.id.clone());
             let end_turn = response.end_turn;
             let final_message = response.final_message;
             let code_calls = response.code_calls;
@@ -1103,7 +1102,7 @@ where
             let instruction_bytes = steer.instruction.text_bytes();
             let user_content = prepare_user_input(&steer.instruction).await;
             conversation.append([ResponseItem::message(
-                nanocodex_core::MessageRole::User,
+                nanocodex_oai_api::MessageRole::User,
                 user_content,
             )]);
             self.stats.steers += 1;
@@ -1248,23 +1247,23 @@ where
         let Some(auto_compact_token_limit) = compaction::auto_compact_token_limit(MODEL) else {
             return Ok(false);
         };
-        let active_context_tokens =
-            conversation.active_context_tokens(self.server_reasoning_included);
+        let active_context_tokens = conversation.active_context_tokens();
         if active_context_tokens < auto_compact_token_limit {
             return Ok(false);
         }
-        let previous_response_id = conversation.previous_response_id.as_deref();
-        let (item, _usage) = self
+        let previous_response_id = conversation.previous_response_id();
+        let (item, _usage, server_reasoning_included) = self
             .perform_compaction(
                 after_model_call_index,
                 conversation.prompt_history(),
-                conversation.delta_start,
+                conversation.delta_start(),
                 previous_response_id,
                 active_context_tokens,
                 auto_compact_token_limit,
                 factory,
             )
             .await?;
+        conversation.observe_server_reasoning(server_reasoning_included);
         let project_instructions = self.load_agent_instructions(project_workspace)?;
         let canonical_context =
             task_context(working_directory, shell, project_instructions.as_deref());
@@ -1277,12 +1276,12 @@ where
         Ok(true)
     }
 
-    async fn perform_warmup(
-        &mut self,
-        factory: &ResponsesAttemptFactory,
-    ) -> Result<Option<String>> {
+    async fn perform_warmup(&mut self, factory: &ResponsesAttemptFactory) -> Result<WarmupOutcome> {
         if matches!(self.config.responses_transport, ResponsesTransport::Https) {
-            return Ok(None);
+            return Ok(WarmupOutcome {
+                response_id: None,
+                server_reasoning_included: false,
+            });
         }
         let started_at = Instant::now();
         self.events.emit(
@@ -1335,9 +1334,8 @@ where
             }
         };
         let duration_ns = elapsed_ns(started_at);
-        let (response_id, source, attempt, connection_generation, usage) =
+        let (response_id, source, attempt, connection_generation, usage, server_reasoning_included) =
             if let Some(execution) = execution {
-                self.server_reasoning_included |= execution.server_reasoning_included;
                 if let Some(usage) = &execution.usage {
                     self.stats.warmup_usage.add(usage);
                 }
@@ -1347,9 +1345,10 @@ where
                     Some(execution.attempt),
                     Some(execution.connection_generation),
                     execution.usage,
+                    execution.server_reasoning_included,
                 )
             } else {
-                (None, "shared_prefix", None, None, None)
+                (None, "shared_prefix", None, None, None, false)
             };
         span.record("warmup.source", source);
         span.record("status", "completed");
@@ -1368,7 +1367,10 @@ where
                 usage: usage.as_ref(),
             },
         )?;
-        Ok(response_id)
+        Ok(WarmupOutcome {
+            response_id,
+            server_reasoning_included,
+        })
     }
 
     async fn execute_warmup(
@@ -1418,10 +1420,10 @@ where
     async fn perform_model_call(
         &mut self,
         call_index: u32,
-        conversation: &ConversationState,
+        conversation: &mut ConversationState,
         factory: &ResponsesAttemptFactory,
     ) -> Result<TurnResult> {
-        let previous_response_id = conversation.previous_response_id.as_deref();
+        let previous_response_id = conversation.previous_response_id();
         let started_at = Instant::now();
         self.stats.model_calls += 1;
         self.events.emit(
@@ -1438,7 +1440,7 @@ where
             call_index,
             conversation.prompt_history(),
             conversation.shared_history(),
-            conversation.delta_start,
+            conversation.delta_start(),
             previous_response_id,
             self.thinking,
             self.fast_mode,
@@ -1466,7 +1468,7 @@ where
         };
         let attempt = success.attempt();
         let connection_generation = success.connection_generation();
-        self.server_reasoning_included |= success.server_reasoning_included();
+        conversation.observe_server_reasoning(success.server_reasoning_included());
         let ResponsesOutput::Generation(response) = success.into_output() else {
             span.record("status", "failed");
             span.record("otel.status_code", "ERROR");
@@ -1518,13 +1520,13 @@ where
     async fn perform_compaction(
         &mut self,
         after_model_call_index: u32,
-        history: nanocodex_core::responses::ResponseHistory,
+        history: nanocodex_oai_api::responses::ResponseHistory,
         incremental_start: usize,
         previous_response_id: Option<&str>,
         active_context_tokens: u64,
         auto_compact_token_limit: u64,
         factory: &ResponsesAttemptFactory,
-    ) -> Result<(ResponseItem, Option<Usage>)> {
+    ) -> Result<(ResponseItem, Option<Usage>, bool)> {
         let trigger = compaction::trigger();
         let mut history = history;
         compaction::trim_tool_outputs_to_fit_context_window(
@@ -1579,7 +1581,7 @@ where
         };
         let attempt = success.attempt();
         let connection_generation = success.connection_generation();
-        self.server_reasoning_included |= success.server_reasoning_included();
+        let server_reasoning_included = success.server_reasoning_included();
         let ResponsesOutput::Compaction(response) = success.into_output() else {
             span.record("status", "failed");
             span.record("otel.status_code", "ERROR");
@@ -1614,7 +1616,7 @@ where
                 usage: response.usage.as_ref(),
             },
         )?;
-        Ok((response.item, response.usage))
+        Ok((response.item, response.usage, server_reasoning_included))
     }
 
     fn compaction_failed<T>(
@@ -1859,8 +1861,8 @@ fn request_profile(
     let mut prefix = [
         ResponseItem::additional_tools(tool_specs),
         ResponseItem::message(
-            nanocodex_core::MessageRole::Developer,
-            [nanocodex_core::ContentItem::InputText {
+            nanocodex_oai_api::MessageRole::Developer,
+            [nanocodex_oai_api::ContentItem::InputText {
                 text: system_prompt.into(),
             }],
         ),
@@ -1882,7 +1884,7 @@ fn assign_request_prefix_ids(prefix: &mut [ResponseItem]) {
         }
         let Some((item_prefix, suffix)) = (match item {
             ResponseItem::Message {
-                role: nanocodex_core::MessageRole::Developer,
+                role: nanocodex_oai_api::MessageRole::Developer,
                 ..
             } => Some(("msg", "nanocodex-instructions")),
             _ => None,

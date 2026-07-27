@@ -93,6 +93,15 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
 
   const first = agent.turn.prompt({ input: "Use multiply for 6 × 7." });
   assert.equal(await first.result(), "42");
+  assert.deepEqual(first.usage(), {
+    input_tokens: 20,
+    cached_input_tokens: 10,
+    cache_write_input_tokens: 0,
+    output_tokens: 4,
+    reasoning_output_tokens: 2,
+    total_tokens: 24,
+  });
+  assert.deepEqual(Actions.turn.getUsage(first), first.usage());
   await agent.session.setThinking("high");
   await agent.session.setFastMode(true);
   const second = Actions.turn.prompt(agent, { input: "Add one to that result." });

@@ -47,6 +47,7 @@ else
         nanocodex-observability \
         nanocodex-service \
         nanocodex-tools \
+        nanocodex-agent \
         nanocodex; do
         generate_crate_changelog "$workspace_root/crates/$crate_name"
     done

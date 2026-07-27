@@ -5,11 +5,11 @@ use std::{
     sync::Arc,
 };
 
-use nanocodex_core::{
-    EventSink, ModelConfig, Prompt, ReasoningMode, ResponseItem, Thinking, UserInput,
-};
-use nanocodex_service::{
+use nanocodex_oai_api::{
     DefaultResponsesService, ResponsesClient, ResponsesService, TransportStats,
+};
+use nanocodex_oai_api::{
+    EventSink, ModelConfig, Prompt, ReasoningMode, ResponseItem, Thinking, UserInput,
 };
 use nanocodex_tools::Tools;
 use serde::Deserialize;
@@ -18,7 +18,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::{
-    NanocodexError, SessionSnapshot,
+    NanocodexError, SessionSnapshot, TurnUsage,
     model::agent::{
         CompletedModelTurn, ModelCheckpoint, ModelRun, ModelTurnOutcome, PreparedCheckpoint,
         prepare_checkpoint, prepare_resumed_checkpoint, prepare_rollout_checkpoint,
@@ -82,6 +82,7 @@ enum WasmInitialResume {
 #[derive(Clone)]
 struct CompletedWasmTurn {
     final_message: String,
+    usage: TurnUsage,
     checkpoint: Arc<CommittedSession>,
 }
 
@@ -166,12 +167,12 @@ impl WasmNanocodex {
             .map_err(js_error)?;
         let session_id = config.session_id.unwrap_or_else(new_session_id);
         let model_config = Arc::new(ModelConfig {
-            auth: nanocodex_core::OpenAiAuth::api_key(config.api_key),
+            auth: nanocodex_oai_api::OpenAiAuth::api_key(config.api_key),
             reasoning_mode,
             thinking,
             fast_mode: config.fast_mode,
-            responses_transport: nanocodex_core::ResponsesTransport::WebSocket,
-            responses_history: nanocodex_core::ResponsesHistory::Incremental,
+            responses_transport: nanocodex_oai_api::ResponsesTransport::WebSocket,
+            responses_history: nanocodex_oai_api::ResponsesHistory::Incremental,
             store_responses: true,
             websocket_url: config.websocket_url,
             api_base_url: config.api_base_url,
@@ -497,6 +498,19 @@ impl WasmTurn {
         let checkpoint = self.completed_checkpoint().map_err(js_error)?;
         serde_json::to_string(&checkpoint.snapshot()).map_err(js_error)
     }
+
+    /// Serialize exact aggregate token usage for this completed logical turn.
+    ///
+    /// Cache reads and writes remain subsets of input tokens, and reasoning
+    /// remains a subset of output tokens.
+    ///
+    /// # Errors
+    ///
+    /// Throws until the turn has completed or if serialization fails.
+    pub fn usage(&self) -> Result<String, JsValue> {
+        let usage = self.completed_usage().map_err(js_error)?;
+        serde_json::to_string(&usage).map_err(js_error)
+    }
 }
 
 fn parse_browser_prompt(content_json: &str) -> Result<Prompt, JsValue> {
@@ -527,6 +541,17 @@ impl WasmTurn {
             TurnState::Completed(Err(error)) => Err(error.clone()),
             TurnState::Pending(_) | TurnState::Waiting => {
                 Err("historical fork requires a completed turn".to_owned())
+            }
+        }
+    }
+
+    fn completed_usage(&self) -> Result<TurnUsage, String> {
+        let state = self.state.borrow();
+        match &*state {
+            TurnState::Completed(Ok(completed)) => Ok(completed.usage.clone()),
+            TurnState::Completed(Err(error)) => Err(error.clone()),
+            TurnState::Pending(_) | TurnState::Waiting => {
+                Err("turn usage requires a completed turn".to_owned())
             }
         }
     }
@@ -789,6 +814,7 @@ async fn run_driver(
         let (outcome, was_cancelled) = match completed {
             Ok(ModelTurnOutcome::Completed(CompletedModelTurn {
                 final_message,
+                usage,
                 checkpoint,
             })) => {
                 let checkpoint = Arc::new(CommittedSession::new(
@@ -799,6 +825,7 @@ async fn run_driver(
                 (
                     Ok(CompletedWasmTurn {
                         final_message,
+                        usage,
                         checkpoint,
                     }),
                     false,

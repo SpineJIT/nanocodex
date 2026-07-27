@@ -12,6 +12,7 @@ crates=(
   nanocodex-observability
   nanocodex-service
   nanocodex-tools
+  nanocodex-agent
   nanocodex
 )
 

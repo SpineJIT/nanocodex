@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use nanocodex::{
     AgentEvents as RustAgentEvents, Nanocodex as RustNanocodex, OpenAiAuth, ReasoningMode,
@@ -188,7 +191,7 @@ impl Turn {
         let turn = {
             let mut state = self.state.lock().map_err(lock_error)?;
             match &*state {
-                TurnState::Completed(result) => return Ok(result.final_message.clone()),
+                TurnState::Completed(result) => return Ok(result.final_message().to_owned()),
                 TurnState::Failed(error) => return Err(PyRuntimeError::new_err(error.clone())),
                 TurnState::Waiting => {
                     return Err(PyRuntimeError::new_err(
@@ -206,7 +209,7 @@ impl Turn {
         let runtime = Arc::clone(&self.runtime);
         match py.detach(move || runtime.block_on(turn.result())) {
             Ok(result) => {
-                let message = result.final_message.clone();
+                let message = result.final_message().to_owned();
                 *self.state.lock().map_err(lock_error)? = TurnState::Completed(result);
                 Ok(message)
             }
@@ -216,6 +219,33 @@ impl Turn {
                 Err(PyRuntimeError::new_err(error))
             }
         }
+    }
+
+    /// Return exact aggregate token usage for this completed logical turn.
+    fn usage(&self) -> PyResult<BTreeMap<&'static str, u64>> {
+        let state = self.state.lock().map_err(lock_error)?;
+        let result = match &*state {
+            TurnState::Completed(result) => result,
+            TurnState::Pending(_) | TurnState::Waiting => {
+                return Err(PyRuntimeError::new_err(
+                    "turn has not completed; await result() before reading usage",
+                ));
+            }
+            TurnState::Failed(error) => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "turn failed and has no usage: {error}"
+                )));
+            }
+        };
+        let usage = result.usage();
+        Ok(BTreeMap::from([
+            ("input_tokens", usage.input_tokens()),
+            ("cached_input_tokens", usage.cached_input_tokens()),
+            ("cache_write_input_tokens", usage.cache_write_input_tokens()),
+            ("output_tokens", usage.output_tokens()),
+            ("reasoning_output_tokens", usage.reasoning_output_tokens()),
+            ("total_tokens", usage.total_tokens()),
+        ]))
     }
 }
 

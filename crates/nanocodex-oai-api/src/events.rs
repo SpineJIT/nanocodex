@@ -46,7 +46,7 @@ pub struct AgentEvent {
     pub seq: u64,
     #[serde(rename = "type")]
     pub kind: AgentEventKind,
-    pub payload: Box<RawValue>,
+    pub payload: Arc<RawValue>,
 }
 
 /// Private in-process timing carried beside an event without changing JSONL.
@@ -230,6 +230,7 @@ pub struct EventSink {
     request_id: Arc<str>,
     next_seq: Arc<AtomicU64>,
     sender: mpsc::UnboundedSender<TimedAgentEvent>,
+    mirror: Option<mpsc::UnboundedSender<TimedAgentEvent>>,
 }
 
 impl EventSink {
@@ -242,6 +243,7 @@ impl EventSink {
                 request_id: Arc::clone(&request_id),
                 next_seq: Arc::new(AtomicU64::new(1)),
                 sender,
+                mirror: None,
             },
             AgentEvents {
                 request_id,
@@ -253,6 +255,29 @@ impl EventSink {
     #[must_use]
     pub fn request_id(&self) -> &str {
         &self.request_id
+    }
+
+    /// Creates a sink that mirrors its events into one independently owned stream.
+    ///
+    /// The returned sink preserves the parent sink's request identity and
+    /// sequence counter. Dropping every clone of it closes only the mirror;
+    /// the original session stream remains available.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn mirrored_channel(&self) -> (Self, AgentEvents) {
+        let (mirror, receiver) = mpsc::unbounded_channel();
+        (
+            Self {
+                request_id: Arc::clone(&self.request_id),
+                next_seq: Arc::clone(&self.next_seq),
+                sender: self.sender.clone(),
+                mirror: Some(mirror),
+            },
+            AgentEvents {
+                request_id: Arc::clone(&self.request_id),
+                receiver,
+            },
+        )
     }
 
     /// Emits an event when a receiver is present and otherwise discards it.
@@ -289,12 +314,17 @@ impl EventSink {
         payload: P,
         source_received_ns: Option<u64>,
     ) -> Result<u64, EventError> {
-        if self.sender.is_closed() {
+        if self.sender.is_closed()
+            && self
+                .mirror
+                .as_ref()
+                .is_none_or(tokio::sync::mpsc::UnboundedSender::is_closed)
+        {
             return Ok(self.next_seq.fetch_add(1, Ordering::Relaxed));
         }
-        let payload = to_raw_value(&payload).map_err(EventError::Encode)?;
+        let payload = Arc::from(to_raw_value(&payload).map_err(EventError::Encode)?);
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        drop(self.sender.send(TimedAgentEvent {
+        let event = TimedAgentEvent {
             event: AgentEvent {
                 protocol_version: PROTOCOL_VERSION,
                 request_id: Arc::clone(&self.request_id),
@@ -306,7 +336,11 @@ impl EventSink {
                 emitted_ns: monotonic_now_ns(),
                 source_received_ns,
             },
-        }));
+        };
+        drop(self.sender.send(event.clone()));
+        if let Some(mirror) = &self.mirror {
+            drop(mirror.send(event));
+        }
         Ok(seq)
     }
 }
@@ -399,5 +433,38 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(sequences, vec![1, 2, 3]);
         assert!(receiver.try_recv_timed().is_none());
+    }
+
+    #[test]
+    fn mirrored_stream_preserves_session_order_and_closes_independently() {
+        let (events, mut session) = EventSink::channel("request-1".to_owned());
+        let (turn_events, mut turn) = events.mirrored_channel();
+
+        turn_events
+            .emit(AgentEventKind::RunStarted, json!({ "turn": 1 }))
+            .unwrap();
+        turn_events
+            .emit(AgentEventKind::RunCompleted, json!({ "turn": 1 }))
+            .unwrap();
+
+        let session_first = session.receiver.try_recv().unwrap().event;
+        let session_second = session.receiver.try_recv().unwrap().event;
+        let turn_first = turn.receiver.try_recv().unwrap().event;
+        let turn_second = turn.receiver.try_recv().unwrap().event;
+        assert_eq!(
+            (session_first.seq, session_second.seq),
+            (turn_first.seq, turn_second.seq)
+        );
+        assert_eq!(turn_second.kind, AgentEventKind::RunCompleted);
+
+        drop(turn_events);
+        assert!(turn.receiver.try_recv().is_err());
+        events
+            .emit(AgentEventKind::RunStarted, json!({ "turn": 2 }))
+            .unwrap();
+        assert_eq!(
+            session.receiver.try_recv().unwrap().event.seq,
+            session_second.seq + 1
+        );
     }
 }

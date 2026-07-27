@@ -194,7 +194,7 @@ let result = turn.await?;
 - `Turn` is non-cloneable.
 - `Turn::control()` returns a cloneable `TurnControl`.
 - `Turn` implements a per-turn typed `Stream`.
-- `Turn` implements `IntoFuture<Output = Result<TurnResult,
+- `Turn` implements `Future<Output = Result<TurnResult,
   NanocodexError>>`.
 - A named `result()` convenience may remain, with its equivalence to awaiting
   the turn documented.
@@ -675,15 +675,29 @@ through a real consumer. Unmapped behavior blocks the deletion.
 ### 4. Agent and facade
 
 - Move the owned driver and lifecycle into `nanocodex-agent`.
-- Implement the agreed `Turn` stream/future API and error/event envelopes.
-- Rebase compaction policy and `AGENTS.md` discovery onto the OAI session.
+- Implement the agreed `Turn` stream/future API and preserve the complete
+  session firehose independently from each turn stream.
+- Rebase context history, continuation, replay, and compaction installation
+  onto one OAI-owned managed session state. Keep the decision to compact and
+  `AGENTS.md` discovery in the agent.
 - Preserve clone, spawn, fork, fork-from, resume, cancellation, and dynamic
   policy behavior.
 - Reduce `nanocodex` to reexports, modules, prelude, and facade documentation.
 - Migrate Rust, Python, Node/WASM, CLI, and TUI consumers.
 
-### 5. Performance stabilization
+Evidence: the extracted lifecycle retains the `master` capability ledger in
+[`benchmarks/refactor_agent_baseline_2026-07-26.md`](benchmarks/refactor_agent_baseline_2026-07-26.md).
+The standalone OAI session and agent share the same authoritative state engine,
+the facade has no runtime implementation, turn payload mirroring is measured,
+and all native and WASM consumers compile against the new owner.
 
+### 5. Observability, cost, and performance stabilization
+
+- Finish the normalized typed agent event projection without weakening the raw
+  OpenAI firehose or complete tracing record.
+- Derive typed USD estimates from authoritative usage and a versioned pricing
+  snapshot with source and effective date; project the same value through Rust,
+  CLI, language bindings, and later eval results.
 - Add cross-component retained fixtures.
 - Establish numeric baselines and budgets for the newly owning crates.
 - Add allocation/work-count checks for asymptotic contracts.

@@ -16,27 +16,38 @@ use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
 use crate::{
     AgentHandle, Nanocodex, NanocodexError, OpenAiAuth, Prompt, ResponseItem, ResponseItemId,
-    Responses, ResponsesError, ResponsesHistory, ResponsesTransport, RolloutConfig,
+    Responses, ResponsesError, ResponsesHistory, ResponsesTransport, RolloutConfig, SessionId,
     SessionSnapshot, Thinking, Tools,
 };
+
+const TEST_SESSION_ID: &str = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+
+fn test_session_id() -> SessionId {
+    TEST_SESSION_ID
+        .parse()
+        .expect("the test session ID is UUIDv7")
+}
 
 #[derive(Clone)]
 struct StaticChatGptAuth;
 
-impl nanocodex_core::OpenAiAuthSource for StaticChatGptAuth {
-    fn validate(&self) -> std::result::Result<(), nanocodex_core::OpenAiAuthError> {
+impl nanocodex_oai_api::OpenAiAuthSource for StaticChatGptAuth {
+    fn validate(&self) -> std::result::Result<(), nanocodex_oai_api::OpenAiAuthError> {
         Ok(())
     }
 
     fn snapshot(
         &self,
-    ) -> nanocodex_core::OpenAiAuthFuture<
+    ) -> nanocodex_oai_api::OpenAiAuthFuture<
         '_,
-        std::result::Result<nanocodex_core::OpenAiAuthSnapshot, nanocodex_core::OpenAiAuthError>,
+        std::result::Result<
+            nanocodex_oai_api::OpenAiAuthSnapshot,
+            nanocodex_oai_api::OpenAiAuthError,
+        >,
     > {
         Box::pin(async {
-            Ok(nanocodex_core::OpenAiAuthSnapshot::new(
-                nanocodex_core::OpenAiAuthMode::ChatGpt,
+            Ok(nanocodex_oai_api::OpenAiAuthSnapshot::new(
+                nanocodex_oai_api::OpenAiAuthMode::ChatGpt,
                 "subscription-token",
                 Some("account-123"),
                 false,
@@ -47,10 +58,10 @@ impl nanocodex_core::OpenAiAuthSource for StaticChatGptAuth {
 
     fn recover_unauthorized(
         &self,
-        _rejected: &nanocodex_core::OpenAiAuthSnapshot,
-    ) -> nanocodex_core::OpenAiAuthFuture<
+        _rejected: &nanocodex_oai_api::OpenAiAuthSnapshot,
+    ) -> nanocodex_oai_api::OpenAiAuthFuture<
         '_,
-        std::result::Result<(), nanocodex_core::OpenAiAuthError>,
+        std::result::Result<(), nanocodex_oai_api::OpenAiAuthError>,
     > {
         Box::pin(async { Ok(()) })
     }
@@ -68,6 +79,71 @@ fn additional_tools_never_carry_client_defined_ids() {
     super::assign_request_prefix_ids(&mut prefix);
 
     assert!(prefix[0].id().is_none());
+}
+
+#[tokio::test]
+async fn a_turn_stream_mirrors_one_turn_and_await_retains_its_result() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        let warmup = next_json(&mut socket).await?;
+        assert_warmup(&warmup);
+        send_warmup(&mut socket, "resp-warmup").await?;
+        let generation = next_json(&mut socket).await?;
+        assert_eq!(generation["previous_response_id"], "resp-warmup");
+        send_final(&mut socket, "resp-final").await
+    });
+
+    let workspace = temporary_workspace("turn-stream")?;
+    let responses = Responses::builder().websocket_url(endpoint).build();
+    let (agent, mut session_events) = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .session_id(test_session_id())
+        .build()?;
+
+    let mut turn = agent.prompt("return one answer").await?;
+    let mut streamed = Vec::new();
+    while let Some(event) = turn.next().await {
+        streamed.push(event);
+    }
+    let result = turn.await?;
+    assert_eq!(result.final_message(), "done");
+    assert_eq!(result.usage().input_tokens(), 10);
+    assert_eq!(result.usage().cached_input_tokens(), 5);
+    assert_eq!(result.usage().cache_write_input_tokens(), 0);
+    assert_eq!(result.usage().output_tokens(), 2);
+    assert_eq!(result.usage().reasoning_output_tokens(), 1);
+    assert_eq!(result.usage().total_tokens(), 12);
+
+    drop(agent);
+    let mut session = Vec::new();
+    while let Some(event) = session_events.recv().await {
+        session.push(event);
+    }
+    assert_eq!(
+        streamed
+            .iter()
+            .map(|event| (event.seq, event.kind, event.payload.get()))
+            .collect::<Vec<_>>(),
+        session
+            .iter()
+            .map(|event| (event.seq, event.kind, event.payload.get()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        streamed.last().map(|event| event.kind),
+        Some(nanocodex_oai_api::AgentEventKind::RunCompleted)
+    );
+
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -103,7 +179,7 @@ async fn https_ephemeral_replays_complete_follow_on_history() -> Result<()> {
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("https-ephemeral")
+        .session_id(test_session_id())
         .build()?;
     assert_eq!(
         agent
@@ -111,7 +187,7 @@ async fn https_ephemeral_replays_complete_follow_on_history() -> Result<()> {
             .await?
             .result()
             .await?
-            .final_message,
+            .final_message(),
         "done"
     );
     assert_eq!(
@@ -120,7 +196,7 @@ async fn https_ephemeral_replays_complete_follow_on_history() -> Result<()> {
             .await?
             .result()
             .await?
-            .final_message,
+            .final_message(),
         "done"
     );
     drop((agent, events));
@@ -158,7 +234,7 @@ async fn https_stored_fork_uses_the_historical_response_checkpoint() -> Result<(
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("https-stored")
+        .session_id(test_session_id())
         .build()?;
     let root = agent.prompt("root prompt").await?.result().await?;
     let (fork, fork_events) = agent.fork_from(&root).await?;
@@ -167,7 +243,7 @@ async fn https_stored_fork_uses_the_historical_response_checkpoint() -> Result<(
             .await?
             .result()
             .await?
-            .final_message,
+            .final_message(),
         "done"
     );
     drop((agent, fork, root_events, fork_events));
@@ -204,7 +280,7 @@ async fn chatgpt_https_uses_subscription_headers_and_ephemeral_replay() -> Resul
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("https-chatgpt")
+        .session_id(test_session_id())
         .build()?;
     assert_eq!(
         agent
@@ -212,7 +288,7 @@ async fn chatgpt_https_uses_subscription_headers_and_ephemeral_replay() -> Resul
             .await?
             .result()
             .await?
-            .final_message,
+            .final_message(),
         "done"
     );
     drop((agent, events));
@@ -250,7 +326,7 @@ async fn https_uses_the_configured_http_client() -> Result<()> {
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("https-configured-client")
+        .session_id(test_session_id())
         .build()?;
 
     assert_eq!(
@@ -259,7 +335,7 @@ async fn https_uses_the_configured_http_client() -> Result<()> {
             .await?
             .result()
             .await?
-            .final_message,
+            .final_message(),
         "done"
     );
     drop((agent, events));
@@ -296,7 +372,7 @@ async fn configured_attempt_limit_prevents_a_paid_request_replay() -> Result<()>
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("https-single-attempt")
+        .session_id(test_session_id())
         .build()?;
 
     let result = agent.prompt("paid request").await?.result().await;
@@ -308,14 +384,14 @@ async fn configured_attempt_limit_prevents_a_paid_request_replay() -> Result<()>
     let mut observed_retry = false;
     while let Some(event) = events.recv().await {
         match event.kind {
-            nanocodex_core::AgentEventKind::ModelAttemptStarted => {
+            nanocodex_oai_api::AgentEventKind::ModelAttemptStarted => {
                 let payload = event.decode_payload::<Value>()?;
                 if payload["phase"] == "generation" {
                     generation_attempts += 1;
                     reported_max_attempts = payload["max_attempts"].as_u64();
                 }
             }
-            nanocodex_core::AgentEventKind::ModelAttemptRetrying => observed_retry = true,
+            nanocodex_oai_api::AgentEventKind::ModelAttemptRetrying => observed_retry = true,
             _ => {}
         }
     }
@@ -403,7 +479,7 @@ async fn websocket_ephemeral_chains_on_connection_and_replays_a_fresh_fork() -> 
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("websocket-ephemeral")
+        .session_id(test_session_id())
         .build()?;
     let first = agent.prompt("first prompt").await?.result().await?;
     assert_eq!(
@@ -412,7 +488,7 @@ async fn websocket_ephemeral_chains_on_connection_and_replays_a_fresh_fork() -> 
             .await?
             .result()
             .await?
-            .final_message,
+            .final_message(),
         "done"
     );
     let (fork, fork_events) = agent.fork_from(&first).await?;
@@ -421,7 +497,7 @@ async fn websocket_ephemeral_chains_on_connection_and_replays_a_fresh_fork() -> 
             .await?
             .result()
             .await?
-            .final_message,
+            .final_message(),
         "done"
     );
     drop((agent, fork, root_events, fork_events));
@@ -467,7 +543,7 @@ async fn websocket_full_replay_never_sends_a_previous_response_id() -> Result<()
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("websocket-replay")
+        .session_id(test_session_id())
         .build()?;
     agent.prompt("first prompt").await?.result().await?;
     agent.prompt("second prompt").await?.result().await?;
@@ -523,23 +599,23 @@ async fn follow_on_prompts_can_change_turn_policy_without_restarting_the_session
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("model-test")
+        .session_id(test_session_id())
         .build()?;
 
     let first = agent.prompt(Prompt::new("first prompt")).await?;
-    assert_eq!(first.result().await?.final_message, "done");
+    assert_eq!(first.result().await?.final_message(), "done");
     agent.set_thinking(Thinking::High).await?;
     agent.set_fast_mode(true).await?;
     let second = agent.prompt(Prompt::new("second prompt")).await?;
-    assert_eq!(second.result().await?.final_message, "done");
+    assert_eq!(second.result().await?.final_message(), "done");
     agent.set_fast_mode(false).await?;
     let third = agent.prompt(Prompt::new("third prompt")).await?;
-    assert_eq!(third.result().await?.final_message, "done");
+    assert_eq!(third.result().await?.final_message(), "done");
     drop(agent);
 
     let mut completed = Vec::new();
     while let Some(event) = events.recv().await {
-        if event.kind == nanocodex_core::AgentEventKind::RunCompleted {
+        if event.kind == nanocodex_oai_api::AgentEventKind::RunCompleted {
             completed.push(event.decode_payload::<Value>()?);
         }
     }
@@ -620,7 +696,7 @@ async fn queued_prompts_retain_the_thinking_captured_when_accepted() -> Result<(
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("model-test")
+        .session_id(test_session_id())
         .build()?;
 
     let first = agent.prompt("first prompt").await?;
@@ -700,10 +776,10 @@ async fn assistant_events_preserve_commentary_and_final_answer_phases() -> Resul
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("model-test")
+        .session_id(test_session_id())
         .build()?;
     let turn = agent.prompt("check the live state").await?;
-    assert_eq!(turn.result().await?.final_message, "Done.");
+    assert_eq!(turn.result().await?.final_message(), "Done.");
     drop(agent);
 
     let mut deltas = Vec::new();
@@ -711,18 +787,18 @@ async fn assistant_events_preserve_commentary_and_final_answer_phases() -> Resul
     let mut timeline = Vec::new();
     while let Some(event) = events.recv().await {
         match event.kind {
-            nanocodex_core::AgentEventKind::AssistantDelta => {
+            nanocodex_oai_api::AgentEventKind::AssistantDelta => {
                 deltas.push(event.decode_payload::<Value>()?);
             }
-            nanocodex_core::AgentEventKind::AssistantMessage => {
+            nanocodex_oai_api::AgentEventKind::AssistantMessage => {
                 let message = event.decode_payload::<Value>()?;
                 timeline.push(message["phase"].clone());
                 messages.push(message);
             }
-            nanocodex_core::AgentEventKind::ToolCall => {
+            nanocodex_oai_api::AgentEventKind::ToolCall => {
                 timeline.push(json!("tool.call"));
             }
-            nanocodex_core::AgentEventKind::ToolResult => {
+            nanocodex_oai_api::AgentEventKind::ToolResult => {
                 timeline.push(json!("tool.result"));
             }
             _ => {}
@@ -807,7 +883,7 @@ async fn steering_is_bounded_fifo_and_joins_at_the_next_model_boundary() -> Resu
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("model-test")
+        .session_id(test_session_id())
         .build()?;
     let turn = agent.prompt(Prompt::new("initial task")).await?;
     first_seen_rx
@@ -821,20 +897,20 @@ async fn steering_is_bounded_fifo_and_joins_at_the_next_model_boundary() -> Resu
     release_first
         .send(())
         .map_err(|()| eyre!("server release receiver dropped"))?;
-    assert_eq!(turn.result().await?.final_message, "done");
+    assert_eq!(turn.result().await?.final_message(), "done");
     drop(agent);
 
     let mut steered_events = 0;
     let mut terminal = None;
     while let Some(event) = events.recv().await {
         match event.kind {
-            nanocodex_core::AgentEventKind::RunSteered => {
+            nanocodex_oai_api::AgentEventKind::RunSteered => {
                 steered_events += 1;
                 let payload = event.decode_payload::<Value>()?;
                 assert_eq!(payload["steer_index"], steered_events);
                 assert_eq!(payload["instruction_bytes"], "constraint 0".len());
             }
-            nanocodex_core::AgentEventKind::RunCompleted => {
+            nanocodex_oai_api::AgentEventKind::RunCompleted => {
                 terminal = Some(event.decode_payload::<Value>()?);
             }
             _ => {}
@@ -899,7 +975,7 @@ async fn steering_during_a_tool_call_joins_after_the_tool_result() -> Result<()>
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("model-test")
+        .session_id(test_session_id())
         .build()?;
     let turn = agent.prompt("print shit a lot of times").await?;
     timeout(std::time::Duration::from_secs(5), async {
@@ -913,12 +989,12 @@ async fn steering_during_a_tool_call_joins_after_the_tool_result() -> Result<()>
     turn.steer("print shat instead").await?;
     assert!(!workspace.join("release-tool").exists());
     std::fs::write(workspace.join("release-tool"), [])?;
-    assert_eq!(turn.result().await?.final_message, "done");
+    assert_eq!(turn.result().await?.final_message(), "done");
     drop(agent);
 
     let mut saw_steer = false;
     while let Some(event) = events.recv().await {
-        saw_steer |= event.kind == nanocodex_core::AgentEventKind::RunSteered;
+        saw_steer |= event.kind == nanocodex_oai_api::AgentEventKind::RunSteered;
     }
     assert!(saw_steer);
     timeout(std::time::Duration::from_secs(5), server)
@@ -972,11 +1048,11 @@ async fn cancellation_retains_interrupted_prompt_and_resumes_from_the_abort_boun
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("model-test")
+        .session_id(test_session_id())
         .build()?;
 
     let first = agent.prompt(Prompt::new("first prompt")).await?;
-    assert_eq!(first.result().await?.final_message, "done");
+    assert_eq!(first.result().await?.final_message(), "done");
 
     let cancelled = agent.prompt("cancel me").await?;
     second_seen_rx
@@ -1010,14 +1086,14 @@ async fn cancellation_retains_interrupted_prompt_and_resumes_from_the_abort_boun
         cancellation.cancel().await,
         Err(NanocodexError::TurnNotCancellable)
     ));
-    assert_eq!(follow_up.result().await?.final_message, "done");
+    assert_eq!(follow_up.result().await?.final_message(), "done");
     drop((queued_control, cancellation, agent));
 
     let mut terminal_statuses = Vec::new();
     while let Some(event) = events.recv().await {
         match event.kind {
-            nanocodex_core::AgentEventKind::RunCompleted
-            | nanocodex_core::AgentEventKind::RunFailed => {
+            nanocodex_oai_api::AgentEventKind::RunCompleted
+            | nanocodex_oai_api::AgentEventKind::RunFailed => {
                 let payload = event.decode_payload::<Value>()?;
                 terminal_statuses.push(payload["status"].as_str().unwrap_or_default().to_owned());
             }
@@ -1114,7 +1190,7 @@ async fn cancellation_pairs_an_active_tool_call_before_resuming() -> Result<()> 
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("model-test")
+        .session_id(test_session_id())
         .build()?;
 
     let interrupted = agent.prompt("run a long tool").await?;
@@ -1123,7 +1199,7 @@ async fn cancellation_pairs_an_active_tool_call_before_resuming() -> Result<()> 
             .recv()
             .await
             .ok_or_else(|| eyre!("event stream closed before the tool call"))?;
-        if event.kind == nanocodex_core::AgentEventKind::ToolCall {
+        if event.kind == nanocodex_oai_api::AgentEventKind::ToolCall {
             break;
         }
     }
@@ -1146,14 +1222,14 @@ async fn cancellation_pairs_an_active_tool_call_before_resuming() -> Result<()> 
             .await?
             .result()
             .await?
-            .final_message,
+            .final_message(),
         "done"
     );
     drop(agent);
 
     let mut saw_cancelled_tool = false;
     while let Some(event) = events.recv().await {
-        if event.kind == nanocodex_core::AgentEventKind::ToolResult {
+        if event.kind == nanocodex_oai_api::AgentEventKind::ToolResult {
             let payload = event.decode_payload::<Value>()?;
             saw_cancelled_tool |= payload["call_id"] == "call-exec"
                 && payload["status"] == "cancelled"
@@ -2090,7 +2166,7 @@ async fn sol_compacts_before_sampling_a_follow_on_turn() -> Result<()> {
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("model-test")
+        .session_id(test_session_id())
         .build()?;
     assert_eq!(
         agent
@@ -2098,7 +2174,7 @@ async fn sol_compacts_before_sampling_a_follow_on_turn() -> Result<()> {
             .await?
             .result()
             .await?
-            .final_message,
+            .final_message(),
         "done"
     );
     assert_eq!(
@@ -2107,7 +2183,7 @@ async fn sol_compacts_before_sampling_a_follow_on_turn() -> Result<()> {
             .await?
             .result()
             .await?
-            .final_message,
+            .final_message(),
         "done"
     );
     drop((agent, events));
@@ -2160,7 +2236,7 @@ async fn latest_fork_during_streaming_inherits_the_active_prompt_delta() -> Resu
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("model-test")
+        .session_id(test_session_id())
         .build()?;
     let root = agent.prompt("active root prompt").await?;
     root_started_rx
@@ -2169,11 +2245,11 @@ async fn latest_fork_during_streaming_inherits_the_active_prompt_delta() -> Resu
     agent.set_thinking(Thinking::High).await?;
     let (fork, fork_events) = agent.fork().await?;
     let branch = fork.prompt("BTW question").await?;
-    assert_eq!(branch.result().await?.final_message, "done");
+    assert_eq!(branch.result().await?.final_message(), "done");
     release_root
         .send(())
         .map_err(|()| eyre!("root release receiver dropped"))?;
-    assert_eq!(root.result().await?.final_message, "done");
+    assert_eq!(root.result().await?.final_message(), "done");
 
     drop((agent, fork, root_events, fork_events));
     timeout(std::time::Duration::from_secs(5), server)
@@ -2289,7 +2365,7 @@ async fn active_boundary_fork_sends_tool_and_steer_delta_then_replays_on_checkpo
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("model-test")
+        .session_id(test_session_id())
         .build()?;
     let root = agent.prompt("active root prompt").await?;
     timeout(std::time::Duration::from_secs(5), async {
@@ -2311,13 +2387,13 @@ async fn active_boundary_fork_sends_tool_and_steer_delta_then_replays_on_checkpo
             .await?
             .result()
             .await?
-            .final_message,
+            .final_message(),
         "done"
     );
     release_root
         .send(())
         .map_err(|()| eyre!("root release receiver dropped"))?;
-    assert_eq!(root.result().await?.final_message, "done");
+    assert_eq!(root.result().await?.final_message(), "done");
 
     drop((agent, fork, root_events, fork_events));
     timeout(std::time::Duration::from_secs(5), server)
@@ -2397,7 +2473,7 @@ async fn latest_and_historical_forks_keep_distinct_boundaries_during_an_active_t
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("model-test")
+        .session_id(test_session_id())
         .build()?;
     let completed = agent
         .prompt("completed root prompt")
@@ -2416,7 +2492,7 @@ async fn latest_and_historical_forks_keep_distinct_boundaries_during_an_active_t
             .await?
             .result()
             .await?
-            .final_message,
+            .final_message(),
         "done"
     );
     let (historical, historical_events) = agent.fork_from(&completed).await?;
@@ -2426,13 +2502,13 @@ async fn latest_and_historical_forks_keep_distinct_boundaries_during_an_active_t
             .await?
             .result()
             .await?
-            .final_message,
+            .final_message(),
         "done"
     );
     release_active
         .send(())
         .map_err(|()| eyre!("active release receiver dropped"))?;
-    assert_eq!(active.result().await?.final_message, "done");
+    assert_eq!(active.result().await?.final_message(), "done");
 
     drop((
         agent,
@@ -2505,7 +2581,7 @@ async fn historical_fork_runs_while_the_mainline_turn_is_in_flight() -> Result<(
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("model-test")
+        .session_id(test_session_id())
         .build()?;
     let first = agent
         .prompt(Prompt::new("first prompt"))
@@ -2521,8 +2597,8 @@ async fn historical_fork_runs_while_the_mainline_turn_is_in_flight() -> Result<(
     let (fork, fork_events) = agent.fork_from(&first).await?;
     let branch = fork.prompt("fork prompt").await?;
     let (mainline, branch) = tokio::join!(mainline.result(), branch.result());
-    assert_eq!(mainline?.final_message, "done");
-    assert_eq!(branch?.final_message, "done");
+    assert_eq!(mainline?.final_message(), "done");
+    assert_eq!(branch?.final_message(), "done");
 
     drop((agent, fork, root_events, fork_events));
     timeout(std::time::Duration::from_secs(5), server)
@@ -2575,7 +2651,7 @@ async fn per_agent_tool_factory_binds_recursive_forks_to_the_invoking_driver() -
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("model-test")
+        .session_id(test_session_id())
         .tools_factory(move |handle| {
             drop(handles.send(handle));
             Tools::builder().without_defaults().build()
@@ -2645,7 +2721,7 @@ async fn clean_spawn_reuses_an_explicit_cache_key_without_history_or_lineage() -
         let child_session = child_warmup["client_metadata"]["session_id"]
             .as_str()
             .ok_or_else(|| eyre!("clean child warmup omitted its session id"))?;
-        assert_ne!(child_session, "root-lineage");
+        assert_ne!(child_session, TEST_SESSION_ID);
         assert_eq!(child_warmup["prompt_cache_key"], "shared-private-prefix");
         assert!(child_warmup.get("previous_response_id").is_none());
         assert!(
@@ -2668,7 +2744,7 @@ async fn clean_spawn_reuses_an_explicit_cache_key_without_history_or_lineage() -
         .instructions("shared private configuration")
         .thinking(Thinking::Low)
         .responses(responses)
-        .session_id("root-lineage")
+        .session_id(test_session_id())
         .prompt_cache_key("shared-private-prefix")
         .workspace(&workspace)
         .tools_factory(move |handle| {
@@ -2737,12 +2813,12 @@ async fn cloned_builders_singleflight_one_shared_prefix_warmup() -> Result<()> {
         .shared_prompt_cache();
 
     let (first, mut first_events) = builder.clone().build()?;
-    let first_session = first.session_id().to_owned();
+    let first_session = first.session_id();
     first.prompt("first turn").await?.result().await?;
     drop(first);
     let mut first_warmup_source = None;
     while let Some(event) = first_events.recv().await {
-        if event.kind == nanocodex_core::AgentEventKind::ModelWarmupCompleted {
+        if event.kind == nanocodex_oai_api::AgentEventKind::ModelWarmupCompleted {
             first_warmup_source = Some(event.decode_payload::<Value>()?["source"].clone());
         }
     }
@@ -2753,7 +2829,7 @@ async fn cloned_builders_singleflight_one_shared_prefix_warmup() -> Result<()> {
     drop(second);
     let mut second_warmup_source = None;
     while let Some(event) = second_events.recv().await {
-        if event.kind == nanocodex_core::AgentEventKind::ModelWarmupCompleted {
+        if event.kind == nanocodex_oai_api::AgentEventKind::ModelWarmupCompleted {
             let payload = event.decode_payload::<Value>()?;
             assert!(payload.get("response_id").is_none());
             second_warmup_source = Some(payload["source"].clone());
@@ -2822,7 +2898,7 @@ async fn missing_stored_checkpoint_replays_local_history_once() -> Result<()> {
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("model-test")
+        .session_id(test_session_id())
         .build()?;
     let first = agent
         .prompt(Prompt::new("root prompt"))
@@ -2831,12 +2907,12 @@ async fn missing_stored_checkpoint_replays_local_history_once() -> Result<()> {
         .await?;
     let (fork, mut fork_events) = agent.fork_from(&first).await?;
     let branch = fork.prompt("branch after eviction").await?;
-    assert_eq!(branch.result().await?.final_message, "done");
+    assert_eq!(branch.result().await?.final_message(), "done");
 
     drop((agent, fork, root_events));
     let mut observed_checkpoint_retry = false;
     while let Some(event) = fork_events.recv().await {
-        if event.kind == nanocodex_core::AgentEventKind::ModelAttemptRetrying {
+        if event.kind == nanocodex_oai_api::AgentEventKind::ModelAttemptRetrying {
             let payload = event.decode_payload::<Value>()?;
             observed_checkpoint_retry = payload["error_class"] == "checkpoint_missing"
                 && payload["replay_mode"] == "full_history"
@@ -2896,7 +2972,7 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .responses(responses)
-        .session_id("019c0d31-c308-7d91-bff4-5dca82d15ac6")
+        .session_id(test_session_id())
         .prompt_cache_key("durable-cache")
         .rollout(RolloutConfig::new(&rollout_home))
         .build()?;
@@ -2910,7 +2986,7 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
     agent.flush_rollout().await?;
     let durable_config = RolloutConfig::new(&rollout_home);
     let durable = durable_config.load_session("019c0d31-c308-7d91-bff4-5dca82d15ac6")?;
-    assert_eq!(durable.thread_id(), agent.session_id());
+    assert_eq!(durable.thread_id(), agent.session_id().to_string());
     assert_eq!(
         Path::new(durable.workspace()).canonicalize()?,
         workspace.canonicalize()?
@@ -3002,7 +3078,7 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
         .instructions("durable instructions")
         .thinking(Thinking::Low)
         .responses(responses)
-        .session_id(thread_id)
+        .session_id(thread_id.parse()?)
         .resume(snapshot)
         .rollout(rollout)
         .build()?;
@@ -3016,7 +3092,7 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
             .await?
             .result()
             .await?
-            .final_message,
+            .final_message(),
         "done"
     );
     resumed.flush_rollout().await?;
@@ -3107,7 +3183,7 @@ async fn serialized_session_resumes_over_ephemeral_https() -> Result<()> {
             .await?
             .result()
             .await?
-            .final_message,
+            .final_message(),
         "done"
     );
 
@@ -3124,7 +3200,7 @@ fn assert_warmup(warmup: &Value) {
     assert_eq!(warmup["generate"], false);
     assert_eq!(warmup["stream"], true);
     assert_eq!(warmup["parallel_tool_calls"], false);
-    assert_eq!(warmup["prompt_cache_key"], "model-test");
+    assert_eq!(warmup["prompt_cache_key"], TEST_SESSION_ID);
     assert_eq!(warmup["input"].as_array().map(Vec::len), Some(2));
     assert_eq!(warmup["input"][0]["type"], "additional_tools");
     assert!(warmup["input"][0].get("id").is_none());
@@ -3156,7 +3232,7 @@ async fn run_model(endpoint: &str, workspace: &Path, instruction: &str) -> Resul
         .thinking(Thinking::Low)
         .workspace(workspace)
         .responses(responses)
-        .session_id("model-test")
+        .session_id(test_session_id())
         .build()?;
     let turn = agent.prompt(task).await?;
     drop(agent);

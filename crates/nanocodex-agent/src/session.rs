@@ -1,6 +1,6 @@
 use std::{fmt, sync::Arc};
 
-use nanocodex_core::{MODEL, MessageRole, ResponseItem};
+use nanocodex_oai_api::{MODEL, MessageRole, ResponseItem};
 
 use crate::{NanocodexError, Result, model::agent::ModelCheckpoint};
 
@@ -27,7 +27,7 @@ impl CommittedSession {
     }
 
     #[cfg(not(target_family = "wasm"))]
-    pub(crate) fn rollout_history(&self) -> nanocodex_core::responses::ResponseHistory {
+    pub(crate) fn rollout_history(&self) -> nanocodex_oai_api::responses::ResponseHistory {
         self.model.history()
     }
 

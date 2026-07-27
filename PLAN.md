@@ -60,17 +60,19 @@ application
 
 Crate ownership is fixed:
 
-- `nanocodex-core`: dependency-light prompts, events, model configuration, and
-  typed Responses request/event/item data.
-- `nanocodex-service`: persistent WebSocket and HTTPS/SSE behavior, complete
-  streamed attempts, Tower service/client, retry policy, typed errors, and
-  transport telemetry.
+- `nanocodex-oai-api`: typed Responses data, managed context state, persistent
+  WebSocket and HTTPS/SSE behavior, complete streamed attempts, Tower
+  service/client, retry policy, typed errors, and transport telemetry.
 - `nanocodex-tools`: code mode, local tools, custom-tool registry, process
   lifecycle, bounded tool output, stdio/Streamable HTTP MCP clients, background
   discovery, authenticated transports, BM25 search, and deferred dispatch.
-- `nanocodex`: builders and the owned stateful agent lifecycle.
+- `nanocodex-agent`: builders and the owned stateful agent lifecycle.
+- `nanocodex`: thin facade, named component reexports, and prelude.
 - `nanocodex-tools-macros`: the `#[tool]` implementation.
 - `bin/nanocodex`: the Ratatui daily-driver and headless JSONL adapter.
+
+`nanocodex-core` and `nanocodex-service` remain compatibility reexports during
+the staged migration and do not own new implementation.
 
 Lower crates must remain usable without importing higher orchestration crates.
 Socket tasks and mutable driver details stay private.

@@ -2,6 +2,7 @@ import {
   cancel as cancelTurn,
   getTurnResult,
   getTurnSnapshot,
+  getTurnUsage,
   prompt as promptTurn,
   steer as steerTurn,
 } from "../internal.mjs";
@@ -16,6 +17,10 @@ export function getResult(turn) {
 
 export function getSnapshot(turn) {
   return getTurnSnapshot(turn);
+}
+
+export function getUsage(turn) {
+  return getTurnUsage(turn);
 }
 
 export function steer(turn, options) {

@@ -12,6 +12,7 @@ crates=(
   nanocodex-observability
   nanocodex-service
   nanocodex-tools
+  nanocodex-agent
   nanocodex
 )
 temporary_dir="$(mktemp -d 2>/dev/null)" || {
