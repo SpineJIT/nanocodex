@@ -994,13 +994,13 @@ tool_timeout_sec = 9.5
             .into_iter()
             .next()
             .unwrap();
-        let context = ToolContext {
-            model: MODEL,
-            session_id: "mcp-lifecycle-benchmark",
-            call_id: "catalog-search",
-            history: &[],
-            output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
-        };
+        let context = ToolContext::new(
+            MODEL,
+            "mcp-lifecycle-benchmark",
+            "catalog-search",
+            &[],
+            DEFAULT_TOOL_OUTPUT_TOKENS,
+        );
         let input = to_raw_value(&json!({
             "query": "search tools domain ownership documentation"
         }))

@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use nanocodex_core::ToolDefinition;
+use nanocodex_oai_api::ToolDefinition;
 use serde::Deserialize;
 
 use crate::{StandardTool, Tool, ToolContext, ToolExecution, ToolInput, ToolResult};
@@ -23,10 +23,6 @@ impl ExecCommandHandler {
 
 #[async_trait::async_trait]
 impl Tool for ExecCommandHandler {
-    fn name(&self) -> &'static str {
-        "exec_command"
-    }
-
     fn definition(&self) -> ToolDefinition {
         StandardTool::ExecCommand.definition()
     }
@@ -59,10 +55,6 @@ impl WriteStdinHandler {
 
 #[async_trait::async_trait]
 impl Tool for WriteStdinHandler {
-    fn name(&self) -> &'static str {
-        "write_stdin"
-    }
-
     fn definition(&self) -> ToolDefinition {
         StandardTool::WriteStdin.definition()
     }

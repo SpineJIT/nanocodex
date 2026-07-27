@@ -171,13 +171,9 @@ impl ChildAgent {
 
 #[async_trait]
 impl Tool for ChildAgent {
-    fn name(&self) -> &'static str {
-        self.kind.name()
-    }
-
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
-            self.name(),
+            self.kind.name(),
             self.kind.description(),
             json!({
                 "type": "object",
@@ -232,13 +228,9 @@ struct PromptAgent {
 
 #[async_trait]
 impl Tool for PromptAgent {
-    fn name(&self) -> &'static str {
-        "prompt_agent"
-    }
-
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
-            self.name(),
+            "prompt_agent",
             "Runs a follow-up turn on a previously spawned or forked agent, preserving that agent's conversation, response chain, cache lineage, WebSocket, and tools.",
             json!({
                 "type": "object",

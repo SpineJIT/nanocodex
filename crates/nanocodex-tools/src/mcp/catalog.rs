@@ -5,13 +5,13 @@ use std::{
 };
 
 use bm25::{Document, Language, SearchEngine, SearchEngineBuilder};
-use nanocodex_core::ToolDefinition;
+use nanocodex_oai_api::ToolDefinition;
 use rmcp::model::Tool as RmcpTool;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::watch;
 
-use crate::client::Client;
+use super::client::Client;
 
 const DEFAULT_SEARCH_LIMIT: usize = 8;
 const MAX_SEARCH_LIMIT: usize = 32;

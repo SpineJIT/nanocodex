@@ -8,7 +8,7 @@ use std::{
 };
 
 use eyre::{Result, eyre};
-use nanocodex_core::{ResponseItem, ToolDefinition};
+use nanocodex_oai_api::{ResponseItem, ToolDefinition};
 use serde_json::Value;
 use tokio::sync::Semaphore;
 
@@ -34,13 +34,9 @@ struct ConcurrencyProbeState {
 
 #[async_trait::async_trait]
 impl Tool for ConcurrencyProbe {
-    fn name(&self) -> &'static str {
-        "concurrency_probe"
-    }
-
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
-            self.name(),
+            "concurrency_probe",
             "Waits until released by the test.",
             serde_json::json!({
                 "type": "object",
@@ -1539,11 +1535,11 @@ fn test_tools(workspace: &std::path::Path) -> ToolRuntime {
         workspace,
         Some(WebSearchConfig {
             endpoint: "http://127.0.0.1:1/v1/alpha/search".to_owned(),
-            auth: nanocodex_core::OpenAiAuth::api_key("test-key"),
+            auth: nanocodex_oai_api::OpenAiAuth::api_key("test-key"),
         }),
         Some(super::super::ImageGenerationConfig {
             api_base_url: "http://127.0.0.1:1/v1".to_owned(),
-            auth: nanocodex_core::OpenAiAuth::api_key("test-key"),
+            auth: nanocodex_oai_api::OpenAiAuth::api_key("test-key"),
             save_root: workspace.to_path_buf(),
         }),
     )
@@ -1554,13 +1550,13 @@ fn test_context(history: &[ResponseItem]) -> ToolContext<'_> {
 }
 
 fn test_context_with_call<'a>(history: &'a [ResponseItem], call_id: &'a str) -> ToolContext<'a> {
-    ToolContext {
-        model: "test-model",
-        session_id: "test-session",
+    ToolContext::new(
+        "test-model",
+        "test-session",
         call_id,
         history,
-        output_token_budget: crate::DEFAULT_TOOL_OUTPUT_TOKENS,
-    }
+        crate::DEFAULT_TOOL_OUTPUT_TOKENS,
+    )
 }
 
 fn temporary_workspace(label: &str) -> Result<PathBuf> {

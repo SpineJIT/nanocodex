@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use eyre::{Result, eyre};
-use nanocodex_core::ResponseItem;
+use nanocodex_oai_api::ResponseItem;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -12,8 +12,9 @@ use tokio::{
 
 use super::{
     ImageGenerationConfig, ImageGenerationHandler, ImageRequest, ImagegenArgs, Tool, ToolContext,
-    ToolOutputBody, ToolOutputContent, request_for_args,
+    ToolOutputContent, request_for_args,
 };
+use crate::ToolOutputBody;
 
 const TINY_PNG: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
@@ -27,7 +28,7 @@ async fn generation_uses_codex_images_request_and_persists_result() -> Result<()
     let (api_base_url, server) = spawn_image_server().await?;
     let handler = ImageGenerationHandler::new(ImageGenerationConfig {
         api_base_url,
-        auth: nanocodex_core::OpenAiAuth::api_key("test-key"),
+        auth: nanocodex_oai_api::OpenAiAuth::api_key("test-key"),
         save_root: workspace.clone(),
     });
     let history = Vec::new();
@@ -35,13 +36,13 @@ async fn generation_uses_codex_images_request_and_persists_result() -> Result<()
     let execution = handler
         .run(
             r#"{"prompt":"paint a blue whale"}"#,
-            ToolContext {
-                model: "gpt-5.6-sol",
-                session_id: "session/one",
-                call_id: "code:1",
-                history: &history,
-                output_token_budget: crate::DEFAULT_TOOL_OUTPUT_TOKENS,
-            },
+            ToolContext::new(
+                "gpt-5.6-sol",
+                "session/one",
+                "code:1",
+                &history,
+                crate::DEFAULT_TOOL_OUTPUT_TOKENS,
+            ),
         )
         .await;
 
@@ -62,7 +63,7 @@ async fn generation_uses_codex_images_request_and_persists_result() -> Result<()
                 && text.contains("already displayed to the user")
     ));
     assert_eq!(
-        execution.value()["image_url"],
+        execution.code_mode_value()["image_url"],
         format!("data:image/png;base64,{encoded}")
     );
     let saved_path = workspace
@@ -163,7 +164,7 @@ async fn edit_accepts_original_local_images_and_recent_conversation_images() -> 
 fn exposes_codex_imagegen_shape() {
     let handler = ImageGenerationHandler::new(ImageGenerationConfig {
         api_base_url: "http://127.0.0.1:1/v1".to_owned(),
-        auth: nanocodex_core::OpenAiAuth::api_key("test-key"),
+        auth: nanocodex_oai_api::OpenAiAuth::api_key("test-key"),
         save_root: PathBuf::from("/tmp/nanocodex-imagegen-test"),
     });
     let spec = serde_json::to_value(handler.definition()).unwrap();

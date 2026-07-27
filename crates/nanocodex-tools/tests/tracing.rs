@@ -54,13 +54,13 @@ fn spawned_cell_preserves_the_parent_span_for_nested_tools() {
     std::fs::create_dir_all(&workspace).unwrap();
     let tools = ToolRuntime::new(&workspace, None, None);
     let history = Vec::new();
-    let context = ToolContext {
-        model: "test-model",
-        session_id: "test-session",
-        call_id: "test-call",
-        history: &history,
-        output_token_budget: nanocodex_tools::DEFAULT_TOOL_OUTPUT_TOKENS,
-    };
+    let context = ToolContext::new(
+        "test-model",
+        "test-session",
+        "test-call",
+        &history,
+        nanocodex_tools::DEFAULT_TOOL_OUTPUT_TOKENS,
+    );
 
     let execution = tracing::dispatcher::with_default(&dispatch, || {
         runtime.block_on(

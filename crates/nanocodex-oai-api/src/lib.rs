@@ -119,6 +119,7 @@ mod socket;
 mod socket;
 mod stream;
 mod telemetry;
+mod tool;
 
 use std::{fmt, path::PathBuf, str::FromStr, sync::Arc};
 
@@ -168,6 +169,11 @@ pub type CompactionResult = CompactionOutput;
 #[doc(hidden)]
 pub type TurnResult = GenerationOutput;
 pub use telemetry::TRANSPORT;
+pub use tool::{
+    DEFAULT_TOOL_OUTPUT_TOKENS, ProcessTraceWire, Tool, ToolContext, ToolError, ToolExecution,
+    ToolExecutionWire, ToolInput, ToolInputError, ToolOutput, ToolOutputBody, ToolOutputContent,
+    ToolOutputWire, ToolResult,
+};
 
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 

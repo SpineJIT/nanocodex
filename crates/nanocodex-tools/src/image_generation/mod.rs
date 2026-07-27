@@ -4,7 +4,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use nanocodex_core::{
+use nanocodex_oai_api::{
     ContentItem, FunctionOutputBody, FunctionOutputContent, OpenAiAuth, OpenAiAuthMode,
     OpenAiAuthSnapshot, ResponseItem, ToolDefinition,
 };
@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use super::{
     ImageDetail, ImageGenerationConfig, Tool, ToolContext, ToolExecution, ToolInput,
-    ToolOutputBody, ToolOutputContent, ToolResult, image::load_for_prompt_data_url,
+    ToolOutputContent, ToolResult, image::load_for_prompt_data_url,
 };
 
 const DESCRIPTION: &str = include_str!("imagegen_description.md");
@@ -57,7 +57,7 @@ impl ImageGenerationHandler {
                 ));
             }
         };
-        let request = match request_for_args(&args, context.history).await {
+        let request = match request_for_args(&args, context.history()).await {
             Ok(request) => request,
             Err(error) => return ToolExecution::error(error),
         };
@@ -82,8 +82,8 @@ impl ImageGenerationHandler {
         };
         let saved_path = match save_result(
             &self.save_root,
-            context.session_id,
-            context.call_id,
+            context.session_id(),
+            context.call_id(),
             &result,
         )
         .await
@@ -107,13 +107,7 @@ impl ImageGenerationHandler {
             });
             code_mode_value["output_hint"] = Value::String(output_hint);
         }
-        ToolExecution {
-            output: ToolOutputBody::Content(output_items),
-            success: true,
-            code_mode_value: Some(code_mode_value),
-            metadata: None,
-            process_trace: None,
-        }
+        ToolExecution::content(output_items).with_code_mode_value(code_mode_value)
     }
 
     async fn post_image_request<R: Serialize + ?Sized>(
@@ -186,13 +180,9 @@ impl ImageGenerationHandler {
 
 #[async_trait::async_trait]
 impl Tool for ImageGenerationHandler {
-    fn name(&self) -> &'static str {
-        "image_gen__imagegen"
-    }
-
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
-            self.name(),
+            "image_gen__imagegen",
             DESCRIPTION,
             json!({
                 "type": "object",

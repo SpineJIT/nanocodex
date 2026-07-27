@@ -1,4 +1,4 @@
-use nanocodex_core::ToolDefinition;
+use nanocodex_oai_api::ToolDefinition;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -11,6 +11,7 @@ pub struct UpdatePlanTool {
 }
 
 impl UpdatePlanTool {
+    /// Creates an empty retained plan.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -27,10 +28,6 @@ impl Default for UpdatePlanTool {
 
 #[async_trait::async_trait]
 impl Tool for UpdatePlanTool {
-    fn name(&self) -> &'static str {
-        "update_plan"
-    }
-
     fn definition(&self) -> ToolDefinition {
         StandardTool::UpdatePlan.definition()
     }

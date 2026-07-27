@@ -40,7 +40,7 @@ async fn retained_turns_and_hostile_tools_preserve_trace_topology() -> Result<()
     let server = tokio::spawn(serve_responses(listener, turns, parallel_calls));
     let workspace = temporary_workspace()?;
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../crates/nanocodex-mcp/tests/fixtures/stdio-server.mjs");
+        .join("../../crates/nanocodex-tools/tests/fixtures/mcp-stdio-server.mjs");
     let process_timeout = Duration::from_secs(
         u64::try_from(turns)
             .unwrap_or(u64::MAX)

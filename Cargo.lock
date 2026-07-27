@@ -3904,8 +3904,6 @@ dependencies = [
  "image",
  "js-sys",
  "nanocodex-core",
- "nanocodex-macros",
- "nanocodex-mcp",
  "nanocodex-service",
  "nanocodex-tools",
  "reqwest",
@@ -4000,40 +3998,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "nanocodex-macros"
-version = "0.2.0"
-dependencies = [
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "nanocodex-mcp"
-version = "0.2.0"
-dependencies = [
- "async-trait",
- "bm25",
- "futures-util",
- "http",
- "nanocodex-core",
- "nanocodex-tools",
- "oauth2",
- "reqwest",
- "rmcp",
- "rustls",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "nanocodex-oai-api"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "base64",
  "criterion",
  "eyre",
@@ -4101,16 +4069,23 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64",
+ "bm25",
+ "criterion",
  "eyre",
  "futures-util",
+ "http",
  "image",
  "js-sys",
- "nanocodex-core",
+ "nanocodex-oai-api",
+ "nanocodex-tools-macros",
  "nix 0.30.1",
+ "oauth2",
  "portable-pty",
  "rand 0.9.5",
  "reqwest",
+ "rmcp",
  "rquickjs",
+ "rustls",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -4121,6 +4096,16 @@ dependencies = [
  "tracing-subscriber",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+]
+
+[[package]]
+name = "nanocodex-tools-macros"
+version = "0.2.0"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

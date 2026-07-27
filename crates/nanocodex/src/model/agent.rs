@@ -269,13 +269,13 @@ async fn execute_code_call(
             .instrument(tool_span.clone())
             .await
     } else {
-        let context = ToolContext {
-            model: MODEL,
+        let context = ToolContext::new(
+            MODEL,
             session_id,
-            call_id: &call.call_id,
-            history: &[],
-            output_token_budget: nanocodex_tools::DEFAULT_TOOL_OUTPUT_TOKENS,
-        };
+            &call.call_id,
+            &[],
+            nanocodex_tools::DEFAULT_TOOL_OUTPUT_TOKENS,
+        );
         tools
             .wait_for_code_with_updates(&call.input, context, observer)
             .instrument(tool_span.clone())

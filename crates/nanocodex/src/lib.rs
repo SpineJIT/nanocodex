@@ -36,22 +36,19 @@ pub use nanocodex_core::{
     ResponseItemId, ResponsesHistory, ResponsesTransport, Thinking, TimedAgentEvent, ToolCaller,
     ToolDefinition, Usage, UserInput, WebSearchAction, monotonic_now_ns,
 };
-#[cfg(not(target_family = "wasm"))]
-pub use nanocodex_macros::tool;
-#[cfg(not(target_family = "wasm"))]
-pub use nanocodex_mcp::{
-    Mcp, McpBuildError, McpBuilder, McpControlError, McpHandle, McpLogin, McpOAuthCredentials,
-    McpOAuthStore, McpServer,
-};
 pub use nanocodex_service::{
     DefaultResponsesService, ResponsesAttempt, ResponsesAttemptKind, ResponsesClient,
     ResponsesRetryPolicy, ResponsesService, ResponsesServiceError, ResponsesServiceResponse,
 };
 #[cfg(not(target_family = "wasm"))]
+pub use nanocodex_tools::tool;
+#[cfg(not(target_family = "wasm"))]
 pub use nanocodex_tools::{
-    DEFAULT_TOOL_OUTPUT_TOKENS, StandardTool, Tool, ToolContext, ToolError, ToolExecution,
-    ToolInput, ToolInputError, ToolOutputBody, ToolOutputContent, ToolResult, Tools,
-    ToolsBuildError, ToolsBuilder, UpdatePlanTool,
+    DEFAULT_TOOL_OUTPUT_TOKENS, Mcp, McpBuildError, McpBuilder, McpControlError, McpHandle,
+    McpLogin, McpOAuthCredentials, McpOAuthStore, McpServer, StandardTool, Tool, ToolContext,
+    ToolError, ToolExecution, ToolInput, ToolInputError, ToolOutput, ToolOutputBody,
+    ToolOutputContent, ToolOutputWire, ToolResult, Tools, ToolsBuildError, ToolsBuilder,
+    UpdatePlanTool,
 };
 #[cfg(not(target_family = "wasm"))]
 #[doc(hidden)]

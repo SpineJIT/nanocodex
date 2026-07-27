@@ -8,11 +8,10 @@ version="$(cargo metadata --no-deps --format-version 1 | jq -er '.packages[] | s
 crates=(
   nanocodex-oai-api
   nanocodex-core
-  nanocodex-macros
+  nanocodex-tools-macros
   nanocodex-observability
   nanocodex-service
   nanocodex-tools
-  nanocodex-mcp
   nanocodex
 )
 

@@ -443,18 +443,21 @@ there is no public `nanocodex-mcp` crate after migration.
 `nanocodex-tools` and the facade:
 
 ```rust,ignore
-#[tool(description = "Add two signed 64-bit integers.")]
-async fn add(
-    left: i64,
-    right: i64,
-) -> Result<i64, std::convert::Infallible> {
-    Ok(left + right)
+#[tool(
+    name = "deployment_region",
+    description = "Return the production region for a named service."
+)]
+async fn deployment_region(
+    service: String,
+) -> Result<String, std::io::Error> {
+    Ok(format!("{service}: us-west-2"))
 }
 ```
 
-The exact `ToolDefinition` builder and `Tools` registration spelling will be
-settled in the tools slice with complete compiled examples. No provisional
-surface is treated as stable before then.
+The definition is the sole registry-name source. Both this macro path and a
+manual `Tool` implementation have compiled examples in their owning crates.
+The retained stack-3 parity and performance record is
+[`benchmarks/refactor_tools_baseline_2026-07-26.md`](benchmarks/refactor_tools_baseline_2026-07-26.md).
 
 ## Systems consolidation
 
@@ -578,7 +581,7 @@ storage and ingress remain above it.
 | `nanocodex-core/benches/fork_history.rs` | context/history owner in `nanocodex-oai-api`, plus agent fork benchmark |
 | `nanocodex-service/benches/tower_responses.rs` | `nanocodex-oai-api` |
 | response transport live benchmark | `nanocodex-oai-api` integration benchmark |
-| MCP repeated-search stress test | formal `nanocodex-tools` benchmark |
+| MCP repeated-search stress test | `nanocodex-tools` search and dispatch Criterion benchmarks |
 | TUI retained-trace benchmarks | CLI/TUI consumer |
 | Nanoeval VM preparation and concurrency measurements | VM image and eval owners |
 | browser canaries and debug benchmarks | browser controller and browser-VM owners |

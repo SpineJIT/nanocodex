@@ -55,12 +55,11 @@
   WebSocket, stream processing, retry policy, telemetry, and generic Tower
   service/client.
 - `nanocodex-tools` owns code mode, built-in tools, the heterogeneous registry,
-  and the public `Tool` trait.
-- `nanocodex-mcp` owns MCP transports, background handshake/discovery,
-  authenticated connection inputs, deferred tool search, and remote dispatch.
+  MCP transports and discovery, deferred tool search, and remote dispatch. MCP
+  is always available on native targets.
 - `nanocodex` composes those crates into the owned agent lifecycle and exports
   the ergonomic builders and common types.
-- `nanocodex-macros` implements `#[tool]`. Keep the executable under
+- `nanocodex-tools-macros` implements `#[tool]`. Keep the executable under
   `bin/nanocodex`; do not move CLI behavior into the library.
 - Each lower crate must remain useful without importing the higher orchestration
   crate. Avoid circular concepts and leaky socket/runtime types.

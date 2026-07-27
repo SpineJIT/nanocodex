@@ -43,11 +43,10 @@ else
     for crate_name in \
         nanocodex-oai-api \
         nanocodex-core \
-        nanocodex-macros \
+        nanocodex-tools-macros \
         nanocodex-observability \
         nanocodex-service \
         nanocodex-tools \
-        nanocodex-mcp \
         nanocodex; do
         generate_crate_changelog "$workspace_root/crates/$crate_name"
     done

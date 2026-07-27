@@ -8,7 +8,6 @@ async fn add(left: i64, right: i64) -> Result<i64, &'static str> {
 
 #[tokio::test]
 async fn macro_generates_schema_and_executes_through_public_tool_trait() {
-    assert_eq!(add.name(), "add_numbers");
     let definition = serde_json::to_value(add.definition()).unwrap();
     assert_eq!(definition["name"], "add_numbers");
     assert_eq!(definition["parameters"]["type"], "object");
@@ -21,13 +20,13 @@ async fn macro_generates_schema_and_executes_through_public_tool_trait() {
     let execution = add
         .execute(
             ToolInput::Function(to_raw_value(&json!({ "left": 20, "right": 22 })).unwrap()),
-            ToolContext {
-                model: "test-model",
-                session_id: "test-session",
-                call_id: "test-call",
-                history: &[],
-                output_token_budget: nanocodex::DEFAULT_TOOL_OUTPUT_TOKENS,
-            },
+            ToolContext::new(
+                "test-model",
+                "test-session",
+                "test-call",
+                &[],
+                nanocodex::DEFAULT_TOOL_OUTPUT_TOKENS,
+            ),
         )
         .await
         .unwrap();
@@ -40,13 +39,13 @@ async fn macro_generates_schema_and_executes_through_public_tool_trait() {
     let overflow = add
         .execute(
             ToolInput::Function(to_raw_value(&json!({ "left": i64::MAX, "right": 1 })).unwrap()),
-            ToolContext {
-                model: "test-model",
-                session_id: "test-session",
-                call_id: "overflow-call",
-                history: &[],
-                output_token_budget: nanocodex::DEFAULT_TOOL_OUTPUT_TOKENS,
-            },
+            ToolContext::new(
+                "test-model",
+                "test-session",
+                "overflow-call",
+                &[],
+                nanocodex::DEFAULT_TOOL_OUTPUT_TOKENS,
+            ),
         )
         .await;
     let Err(error) = overflow else {

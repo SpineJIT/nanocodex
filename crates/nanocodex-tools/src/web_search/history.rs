@@ -1,4 +1,4 @@
-use nanocodex_core::{ContentItem, MessageRole, ResponseItem};
+use nanocodex_oai_api::{ContentItem, MessageRole, ResponseItem};
 
 const ASSISTANT_CONTEXT_TOKEN_LIMIT: usize = 1_000;
 const APPROX_BYTES_PER_TOKEN: usize = 4;
@@ -142,7 +142,7 @@ fn ceil_char_boundary(text: &str, target: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use nanocodex_core::ResponseItem;
+    use nanocodex_oai_api::ResponseItem;
     use serde_json::json;
 
     use super::recent_input;

@@ -16,7 +16,7 @@ async fn repeated_cli_turns_search_and_call_mcp_through_the_library() -> Result<
 
     let workspace = temporary_workspace()?;
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../crates/nanocodex-mcp/tests/fixtures/stdio-server.mjs");
+        .join("../../crates/nanocodex-tools/tests/fixtures/mcp-stdio-server.mjs");
     let output = timeout(
         std::time::Duration::from_secs(30),
         Command::new(env!("CARGO_BIN_EXE_nanocodex"))

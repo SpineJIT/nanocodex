@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use nanocodex_core::JsonSchema;
+use nanocodex_oai_api::{JsonSchema, ToolDefinition};
 use serde_json::Value;
 
 const DEFERRED_NESTED_TOOLS_GUIDANCE: &str = r"Some deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.
@@ -108,10 +108,7 @@ const EXEC_DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose too
 - `ALL_TOOLS`: metadata for the enabled nested tools as `{ name, description }` entries.
 - `yield_control()`: yields the accumulated output to the model immediately while the script keeps running."#;
 
-pub(super) fn exec_description(
-    definitions: &[nanocodex_core::ToolDefinition],
-    has_deferred_tools: bool,
-) -> String {
+pub(super) fn exec_description(definitions: &[ToolDefinition], has_deferred_tools: bool) -> String {
     let mut description = EXEC_DESCRIPTION.to_owned();
     if has_deferred_tools {
         let _ = write!(description, "\n\n{DEFERRED_NESTED_TOOLS_GUIDANCE}");
@@ -128,15 +125,15 @@ pub(super) fn exec_description(
     }
     for spec in definitions {
         let input_name = match &spec {
-            nanocodex_core::ToolDefinition::Function { .. } => "args",
-            nanocodex_core::ToolDefinition::Custom { .. } => "input",
+            ToolDefinition::Function { .. } => "args",
+            ToolDefinition::Custom { .. } => "input",
         };
         let input_type = match &spec {
-            nanocodex_core::ToolDefinition::Function { .. } => spec
+            ToolDefinition::Function { .. } => spec
                 .parameters()
                 .map(JsonSchema::as_value)
                 .map_or_else(|| "unknown".to_owned(), render_json_schema_to_typescript),
-            nanocodex_core::ToolDefinition::Custom { .. } => "string".to_owned(),
+            ToolDefinition::Custom { .. } => "string".to_owned(),
         };
         let output_type = match spec.output_schema().map(JsonSchema::as_value) {
             Some(schema) => match mcp_structured_content_schema(schema) {

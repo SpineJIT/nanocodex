@@ -14,12 +14,10 @@ use std::{
     time::Duration,
 };
 
+use crate::{DynamicToolProvider, Tool, ToolContext, ToolExecution, ToolInput, ToolResult};
 use async_trait::async_trait;
 use catalog::{ProviderState, ToolEntry};
-use nanocodex_core::ToolDefinition;
-use nanocodex_tools::{
-    DynamicToolProvider, Tool, ToolContext, ToolExecution, ToolInput, ToolResult,
-};
+use nanocodex_oai_api::ToolDefinition;
 use rmcp::model::CallToolRequestParams;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -30,7 +28,7 @@ pub use oauth::{McpOAuthCredentials, McpOAuthStore};
 
 const TOOL_SEARCH_NAME: &str = "tool_search";
 
-/// A configured family of MCP servers installed into [`nanocodex_tools::Tools`].
+/// A configured family of MCP servers installed into [`crate::Tools`].
 pub struct Mcp {
     servers: Arc<[NamedServer]>,
     state: Arc<ProviderState>,
@@ -68,49 +66,83 @@ pub struct McpLogin {
     completion: tokio::task::JoinHandle<Result<usize, McpControlError>>,
 }
 
+/// Failure while controlling an already configured MCP provider.
 #[derive(Debug, thiserror::Error)]
 pub enum McpControlError {
+    /// No configured server has the requested name.
     #[error("unknown MCP server `{0}`")]
     UnknownServer(String),
+    /// OAuth login was requested for a stdio server.
     #[error("MCP server `{0}` does not use Streamable HTTP")]
     NotHttp(String),
+    /// OAuth login cannot replace an explicit bearer token.
     #[error("MCP server `{0}` has explicit bearer authentication")]
     ExplicitBearer(String),
+    /// OAuth login requires caller-owned credential persistence.
     #[error("no MCP OAuth credential store is configured")]
     NoOAuthStore,
+    /// OAuth discovery, authorization, callback, or persistence failed.
     #[error("MCP OAuth login failed: {0}")]
     OAuth(String),
+    /// A server replacement connection failed.
     #[error("MCP server `{server}` failed to reload: {error}")]
-    Reload { server: String, error: String },
+    Reload {
+        /// Configured server name.
+        server: String,
+        /// Complete connection or discovery error.
+        error: String,
+    },
+    /// The spawned login task stopped before returning its result.
     #[error("MCP OAuth login task stopped: {0}")]
     LoginTask(String),
 }
 
+/// Invalid MCP provider configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum McpBuildError {
+    /// No servers were configured.
     #[error("at least one MCP server is required")]
     Empty,
+    /// A configured server name was empty.
     #[error("MCP server name must not be empty")]
     EmptyName,
+    /// The same server name was added more than once.
     #[error("MCP server `{0}` is configured more than once")]
     DuplicateServer(String),
+    /// A required transport field was empty.
     #[error("MCP server `{server}` has an empty {field}")]
-    EmptyField { server: String, field: &'static str },
+    EmptyField {
+        /// Configured server name.
+        server: String,
+        /// Invalid field name.
+        field: &'static str,
+    },
+    /// A lifecycle timeout was zero.
     #[error("MCP server `{server}` has a zero {field}")]
-    ZeroTimeout { server: String, field: &'static str },
+    ZeroTimeout {
+        /// Configured server name.
+        server: String,
+        /// Invalid timeout field.
+        field: &'static str,
+    },
+    /// An option was applied to the wrong transport kind.
     #[error("MCP server `{server}` does not support option `{option}` for its transport")]
     UnsupportedOption {
+        /// Configured server name.
         server: String,
+        /// Unsupported builder option.
         option: &'static str,
     },
 }
 
 impl Mcp {
+    /// Starts an empty MCP provider builder.
     #[must_use]
     pub fn builder() -> McpBuilder {
         McpBuilder::default()
     }
 
+    /// Returns a cheap cloneable handle for reload and OAuth operations.
     #[must_use]
     pub fn handle(&self) -> McpHandle {
         McpHandle {
@@ -374,6 +406,7 @@ impl McpHandle {
 }
 
 impl McpLogin {
+    /// Returns the URL the embedding application should open in a browser.
     #[must_use]
     pub fn authorization_url(&self) -> &str {
         &self.authorization_url
@@ -555,10 +588,6 @@ struct SearchInput {
 
 #[async_trait]
 impl Tool for McpSearch {
-    fn name(&self) -> &'static str {
-        TOOL_SEARCH_NAME
-    }
-
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
             TOOL_SEARCH_NAME,
@@ -675,10 +704,14 @@ fn search_description(servers: &[NamedServer]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolOutputBody};
     use futures_util::future::join_all;
-    use nanocodex_core::MODEL;
-    use nanocodex_tools::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolOutputBody};
+    use nanocodex_oai_api::MODEL;
     use serde_json::value::to_raw_value;
+
+    fn test_context(session_id: &'static str, call_id: &'static str) -> ToolContext<'static> {
+        ToolContext::new(MODEL, session_id, call_id, &[], DEFAULT_TOOL_OUTPUT_TOKENS)
+    }
 
     #[test]
     fn validates_empty_and_duplicate_servers() {
@@ -725,7 +758,7 @@ mod tests {
     #[tokio::test]
     async fn stdio_handshake_search_and_call_share_the_background_client() {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/stdio-server.mjs");
+            .join("tests/fixtures/mcp-stdio-server.mjs");
         let mcp = Mcp::builder()
             .server(
                 "fixture",
@@ -734,13 +767,7 @@ mod tests {
             .build()
             .unwrap();
         mcp.start();
-        let context = ToolContext {
-            model: MODEL,
-            session_id: "test-session",
-            call_id: "search-call",
-            history: &[],
-            output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
-        };
+        let context = test_context("test-session", "search-call");
         let search = mcp
             .search
             .execute(
@@ -764,10 +791,7 @@ mod tests {
             .execute(
                 "mcp__fixture__echo",
                 json!({ "message": "hello" }),
-                ToolContext {
-                    call_id: "tool-call",
-                    ..context
-                },
+                test_context("test-session", "tool-call"),
             )
             .await
             .unwrap();
@@ -781,7 +805,7 @@ mod tests {
     #[tokio::test]
     async fn reload_replaces_a_live_server_without_restarting_or_deactivating_tools() {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/stdio-server.mjs");
+            .join("tests/fixtures/mcp-stdio-server.mjs");
         let mcp = Mcp::builder()
             .server(
                 "fixture",
@@ -791,13 +815,7 @@ mod tests {
             .unwrap();
         let handle = mcp.handle();
         mcp.start();
-        let context = ToolContext {
-            model: MODEL,
-            session_id: "reload-session",
-            call_id: "search-call",
-            history: &[],
-            output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
-        };
+        let context = test_context("reload-session", "search-call");
         let search = mcp
             .search
             .execute(
@@ -818,10 +836,7 @@ mod tests {
             .execute(
                 "mcp__fixture__echo",
                 json!({ "message": "after-reload" }),
-                ToolContext {
-                    call_id: "tool-call",
-                    ..context
-                },
+                test_context("reload-session", "tool-call"),
             )
             .await
             .unwrap();
@@ -838,7 +853,7 @@ mod tests {
         const CALLS: usize = 256;
 
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/stdio-server.mjs");
+            .join("tests/fixtures/mcp-stdio-server.mjs");
         let mut builder = Mcp::builder();
         for index in 0..SERVERS {
             builder = builder.server(
@@ -848,13 +863,7 @@ mod tests {
         }
         let mcp = builder.build().unwrap();
         mcp.start();
-        let context = ToolContext {
-            model: MODEL,
-            session_id: "stress-session",
-            call_id: "stress-call",
-            history: &[],
-            output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
-        };
+        let context = test_context("stress-session", "stress-call");
         let search = mcp
             .search
             .execute(
@@ -886,50 +895,6 @@ mod tests {
                 .into_iter()
                 .all(|result| { result.is_some_and(|execution| execution.success) })
         );
-    }
-
-    #[tokio::test]
-    #[ignore = "manual repeated-search stress benchmark"]
-    async fn stress_repeated_tool_search() {
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/stdio-server.mjs");
-        let mcp = Mcp::builder()
-            .server(
-                "fixture",
-                McpServer::stdio("node").arg(fixture.to_string_lossy()),
-            )
-            .build()
-            .unwrap();
-        mcp.start();
-        let context = ToolContext {
-            model: MODEL,
-            session_id: "stress-session",
-            call_id: "stress-search",
-            history: &[],
-            output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
-        };
-        let warmup = mcp
-            .search
-            .execute(
-                ToolInput::Function(to_raw_value(&json!({ "query": "echo message" })).unwrap()),
-                context,
-            )
-            .await
-            .unwrap();
-        assert!(warmup.success);
-        let started = std::time::Instant::now();
-        for _ in 0..10_000 {
-            let result = mcp
-                .search
-                .execute(
-                    ToolInput::Function(to_raw_value(&json!({ "query": "echo message" })).unwrap()),
-                    context,
-                )
-                .await
-                .unwrap();
-            assert!(result.success);
-        }
-        eprintln!("10k prewarmed searches: {:?}", started.elapsed());
     }
 
     #[tokio::test]
@@ -974,13 +939,7 @@ mod tests {
                     }))
                     .unwrap(),
                 ),
-                ToolContext {
-                    model: MODEL,
-                    session_id: "http-smoke-session",
-                    call_id: "http-smoke-search",
-                    history: &[],
-                    output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
-                },
+                test_context("http-smoke-session", "http-smoke-search"),
             )
             .await
             .unwrap();

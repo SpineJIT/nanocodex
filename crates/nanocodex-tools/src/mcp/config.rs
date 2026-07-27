@@ -74,30 +74,35 @@ impl McpServer {
         }
     }
 
+    /// Sets the source description included in `tool_search` instructions.
     #[must_use]
     pub fn description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
         self
     }
 
+    /// Sets the maximum duration for initialize and initial discovery.
     #[must_use]
     pub fn startup_timeout(mut self, timeout: Duration) -> Self {
         self.startup_timeout = timeout;
         self
     }
 
+    /// Sets the maximum duration of one remote tool call.
     #[must_use]
     pub fn tool_timeout(mut self, timeout: Duration) -> Self {
         self.tool_timeout = timeout;
         self
     }
 
+    /// Restricts discovery to the named remote tools.
     #[must_use]
     pub fn enabled_tools(mut self, tools: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.enabled_tools = Some(tools.into_iter().map(Into::into).collect());
         self
     }
 
+    /// Excludes the named remote tools from discovery.
     #[must_use]
     pub fn disabled_tools(mut self, tools: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.disabled_tools = tools.into_iter().map(Into::into).collect();

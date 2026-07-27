@@ -1,5 +1,5 @@
 [package]
-name = "nanocodex-macros"
+name = "nanocodex-tools-macros"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Tool-definition macros for Nanocodex"
+description = "Tool-definition macros for nanocodex-tools"
 
 [package.metadata.docs.rs]
 all-features = true

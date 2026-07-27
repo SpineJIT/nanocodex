@@ -1,10 +1,17 @@
-use std::{collections::HashMap, ffi::OsString, fmt, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::OsString,
+    fmt,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
-use nanocodex_core::{ImageDetail, OpenAiAuth, ResponseItem, ToolDefinition};
+use nanocodex_oai_api::{
+    OpenAiAuth, ResponseItem, Tool, ToolContext, ToolDefinition, ToolExecution, ToolInput,
+};
 use schemars::{JsonSchema, r#gen::SchemaSettings};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::value::{RawValue, to_raw_value};
+use serde_json::value::to_raw_value;
 use serde_json::{Map, Value, json};
 use tracing::{Instrument, info, info_span};
 
@@ -17,63 +24,6 @@ use crate::{
 };
 #[cfg(feature = "remote-tools")]
 use crate::{image_generation, web_search};
-
-pub const DEFAULT_TOOL_OUTPUT_TOKENS: usize = 10_000;
-
-#[derive(Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum ToolOutputBody {
-    Text(String),
-    Content(Vec<ToolOutputContent>),
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ToolOutputContent {
-    InputText {
-        text: String,
-    },
-    InputImage {
-        image_url: String,
-        detail: ImageDetail,
-    },
-    InputAudio {
-        audio_url: String,
-    },
-}
-
-pub struct ToolExecution {
-    pub output: ToolOutputBody,
-    pub success: bool,
-    pub(crate) code_mode_value: Option<Value>,
-    pub metadata: Option<Box<RawValue>>,
-    pub(crate) process_trace: Option<ProcessTrace>,
-}
-
-/// Lossless, serialization-ready representation of a tool execution.
-///
-/// This is intended for process boundaries such as a tool runtime hosted in a
-/// VM. Known output shapes remain typed while the Code Mode value and metadata
-/// stay as validated, opaque JSON.
-#[doc(hidden)]
-#[derive(Deserialize, Serialize)]
-pub struct ToolExecutionWire {
-    pub output: ToolOutputBody,
-    pub success: bool,
-    pub code_mode_value: Option<Box<RawValue>>,
-    pub metadata: Option<Box<RawValue>>,
-    pub process_trace: Option<ProcessTraceWire>,
-}
-
-#[doc(hidden)]
-#[derive(Deserialize, Serialize)]
-pub struct ProcessTraceWire {
-    pub exit_code: Option<i32>,
-    pub session_id: Option<i64>,
-    pub original_token_count: Option<usize>,
-    pub output_bytes: usize,
-    pub wall_time_seconds: f64,
-}
 
 /// Owned context used when a Code Mode cell may outlive the model tool call
 /// that started it.
@@ -106,293 +56,28 @@ impl OwnedToolContext {
 
     pub(crate) fn from_borrowed(context: ToolContext<'_>) -> Self {
         Self::new(
-            context.model,
-            context.session_id,
-            context.call_id,
-            Arc::new(context.history.to_vec()),
-            context.output_token_budget,
+            context.model(),
+            context.session_id(),
+            context.call_id(),
+            Arc::new(context.history().to_vec()),
+            context.output_token_budget(),
         )
     }
 
     pub(crate) fn borrowed(&self) -> ToolContext<'_> {
-        ToolContext {
-            model: &self.model,
-            session_id: &self.session_id,
-            call_id: &self.call_id,
-            history: self.history.as_slice(),
-            output_token_budget: self.output_token_budget,
-        }
+        ToolContext::new(
+            &self.model,
+            &self.session_id,
+            &self.call_id,
+            self.history.as_slice(),
+            self.output_token_budget,
+        )
     }
 
     pub(crate) fn with_output_token_budget(mut self, output_token_budget: usize) -> Self {
         self.output_token_budget = output_token_budget;
         self
     }
-}
-
-pub(crate) struct ProcessTrace {
-    exit_code: Option<i32>,
-    session_id: Option<i64>,
-    original_token_count: Option<usize>,
-    output_bytes: usize,
-    wall_time_seconds: f64,
-}
-
-/// Error returned by an application-defined tool handler.
-pub type ToolError = Box<dyn std::error::Error + Send + Sync + 'static>;
-
-/// Result returned by [`Tool::execute`].
-///
-/// The runtime converts an error into a failed model-visible tool result so the
-/// model can recover. Return `Ok(ToolExecution)` with `success: false` only when
-/// preserving a structured failure payload from a remote tool protocol.
-pub type ToolResult = std::result::Result<ToolExecution, ToolError>;
-
-impl ToolExecution {
-    #[must_use]
-    pub fn text(output: impl Into<String>) -> Self {
-        Self {
-            output: ToolOutputBody::Text(output.into()),
-            success: true,
-            code_mode_value: None,
-            metadata: None,
-            process_trace: None,
-        }
-    }
-
-    #[must_use]
-    pub fn error(error: impl Into<String>) -> Self {
-        Self {
-            output: ToolOutputBody::Text(error.into()),
-            success: false,
-            code_mode_value: None,
-            metadata: None,
-            process_trace: None,
-        }
-    }
-
-    #[must_use]
-    pub fn json(output: &impl Serialize) -> Self {
-        match serde_json::to_string(output) {
-            Ok(output) => Self::text(output),
-            Err(error) => Self::error(format!("failed to encode tool result: {error}")),
-        }
-    }
-
-    /// Returns a JSON value to Code Mode while retaining a serialized form for
-    /// the model-visible tool result and event stream.
-    #[must_use]
-    pub fn from_json(output: Value, success: bool) -> Self {
-        match serde_json::to_string(&output) {
-            Ok(encoded) => Self {
-                output: ToolOutputBody::Text(encoded),
-                success,
-                code_mode_value: Some(output),
-                metadata: None,
-                process_trace: None,
-            },
-            Err(error) => Self::error(format!("failed to encode tool result: {error}")),
-        }
-    }
-
-    /// Returns a successful multimodal tool result.
-    #[must_use]
-    pub fn content(output: Vec<ToolOutputContent>) -> Self {
-        Self {
-            output: ToolOutputBody::Content(output),
-            success: true,
-            code_mode_value: None,
-            metadata: None,
-            process_trace: None,
-        }
-    }
-
-    pub(crate) fn value(&self) -> Value {
-        if let Some(value) = &self.code_mode_value {
-            return value.clone();
-        }
-        match &self.output {
-            ToolOutputBody::Text(text) => {
-                serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.clone()))
-            }
-            ToolOutputBody::Content(content) => {
-                serde_json::to_value(content).unwrap_or(Value::Null)
-            }
-        }
-    }
-
-    pub(crate) fn with_code_mode_value(mut self, value: Value) -> Self {
-        self.code_mode_value = Some(value);
-        self
-    }
-
-    #[must_use]
-    pub fn with_metadata(mut self, metadata: impl Serialize) -> Self {
-        match to_raw_value(&metadata) {
-            Ok(metadata) => self.metadata = Some(metadata),
-            Err(error) => {
-                self.output =
-                    ToolOutputBody::Text(format!("failed to encode tool result metadata: {error}"));
-                self.success = false;
-            }
-        }
-        self
-    }
-
-    pub(crate) fn with_process_trace(
-        mut self,
-        exit_code: Option<i32>,
-        session_id: Option<i64>,
-        original_token_count: Option<usize>,
-        output_bytes: usize,
-        wall_time_seconds: f64,
-    ) -> Self {
-        self.process_trace = Some(ProcessTrace {
-            exit_code,
-            session_id,
-            original_token_count,
-            output_bytes,
-            wall_time_seconds,
-        });
-        self
-    }
-
-    /// Converts this execution into its lossless process-boundary form.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the internal Code Mode JSON cannot be encoded.
-    #[doc(hidden)]
-    pub fn into_wire(self) -> Result<ToolExecutionWire, serde_json::Error> {
-        Ok(ToolExecutionWire {
-            output: self.output,
-            success: self.success,
-            code_mode_value: self
-                .code_mode_value
-                .map(|value| to_raw_value(&value))
-                .transpose()?,
-            metadata: self.metadata,
-            process_trace: self.process_trace.map(Into::into),
-        })
-    }
-
-    /// Restores an execution received from a process boundary.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if an opaque Code Mode value cannot be decoded.
-    #[doc(hidden)]
-    pub fn from_wire(wire: ToolExecutionWire) -> Result<Self, serde_json::Error> {
-        Ok(Self {
-            output: wire.output,
-            success: wire.success,
-            code_mode_value: wire
-                .code_mode_value
-                .map(|value| serde_json::from_str(value.get()))
-                .transpose()?,
-            metadata: wire.metadata,
-            process_trace: wire.process_trace.map(Into::into),
-        })
-    }
-}
-
-impl From<ProcessTrace> for ProcessTraceWire {
-    fn from(trace: ProcessTrace) -> Self {
-        Self {
-            exit_code: trace.exit_code,
-            session_id: trace.session_id,
-            original_token_count: trace.original_token_count,
-            output_bytes: trace.output_bytes,
-            wall_time_seconds: trace.wall_time_seconds,
-        }
-    }
-}
-
-impl From<ProcessTraceWire> for ProcessTrace {
-    fn from(trace: ProcessTraceWire) -> Self {
-        Self {
-            exit_code: trace.exit_code,
-            session_id: trace.session_id,
-            original_token_count: trace.original_token_count,
-            output_bytes: trace.output_bytes,
-            wall_time_seconds: trace.wall_time_seconds,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct ToolContext<'a> {
-    pub model: &'a str,
-    pub session_id: &'a str,
-    pub call_id: &'a str,
-    pub history: &'a [ResponseItem],
-    pub output_token_budget: usize,
-}
-
-/// Canonical input presented to function and freeform tools.
-pub enum ToolInput {
-    Function(Box<RawValue>),
-    Freeform(String),
-}
-
-impl ToolInput {
-    /// Borrows raw JSON function arguments without materializing a value tree.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for freeform input.
-    pub fn function_json(&self) -> Result<&RawValue, ToolInputError> {
-        match self {
-            Self::Function(input) => Ok(input),
-            Self::Freeform(_) => Err(ToolInputError::ExpectedFunction),
-        }
-    }
-
-    /// Decodes JSON function arguments into a caller-selected type.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for freeform input or invalid JSON arguments.
-    pub fn decode_json<T: DeserializeOwned>(&self) -> Result<T, ToolInputError> {
-        serde_json::from_str(self.function_json()?.get()).map_err(ToolInputError::Decode)
-    }
-
-    /// Extracts freeform source text.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for JSON function arguments.
-    pub fn into_freeform(self) -> Result<String, ToolInputError> {
-        match self {
-            Self::Freeform(input) => Ok(input),
-            Self::Function(_) => Err(ToolInputError::ExpectedFreeform),
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ToolInputError {
-    #[error("expected JSON function arguments")]
-    ExpectedFunction,
-
-    #[error("expected freeform tool input")]
-    ExpectedFreeform,
-
-    #[error("failed to parse function arguments: {0}")]
-    Decode(#[source] serde_json::Error),
-}
-
-/// A model-visible tool installed in an agent's heterogeneous tool registry.
-#[async_trait]
-pub trait Tool: Send + Sync {
-    /// Returns the registry and model-visible tool name.
-    fn name(&self) -> &'static str;
-
-    /// Returns the model-visible function or freeform definition.
-    fn definition(&self) -> ToolDefinition;
-
-    /// Executes one tool call.
-    async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult;
 }
 
 /// A lazily populated family of Code Mode tools.
@@ -420,14 +105,21 @@ pub trait DynamicToolProvider: Send + Sync {
     ) -> Option<ToolExecution>;
 }
 
+/// Connection inputs for the built-in `OpenAI` web-search tool.
 pub struct WebSearchConfig {
+    /// Complete search endpoint URL.
     pub endpoint: String,
+    /// Authentication source shared with the `OpenAI` API.
     pub auth: OpenAiAuth,
 }
 
+/// Connection and persistence inputs for the built-in image-generation tool.
 pub struct ImageGenerationConfig {
+    /// Base `OpenAI` API URL; image endpoint paths are appended internally.
     pub api_base_url: String,
+    /// Authentication source shared with the `OpenAI` API.
     pub auth: OpenAiAuth,
+    /// Root under which generated images are retained by session and call.
     pub save_root: PathBuf,
 }
 
@@ -486,7 +178,7 @@ impl fmt::Debug for Tools {
                 &self
                     .registered
                     .iter()
-                    .map(|tool| tool.name())
+                    .map(|tool| tool.definition().name().to_owned())
                     .collect::<Vec<_>>(),
             )
             .field("provider_count", &self.providers.len())
@@ -495,6 +187,7 @@ impl fmt::Debug for Tools {
 }
 
 impl Tools {
+    /// Starts a builder with all standard tools enabled.
     #[must_use]
     pub fn builder() -> ToolsBuilder {
         ToolsBuilder::default()
@@ -548,28 +241,28 @@ pub struct ToolsBuilder {
     tools: Tools,
 }
 
+/// Invalid declarative tool selection.
 #[derive(Debug, thiserror::Error)]
 pub enum ToolsBuildError {
+    /// A custom definition has an empty registry name.
     #[error("tool name must not be empty")]
     EmptyName,
 
+    /// The model-visible working-directory override is empty.
     #[error("working directory override must not be empty")]
     EmptyWorkingDirectory,
 
+    /// The model-visible shell override is empty.
     #[error("default shell override must not be empty")]
     EmptyDefaultShell,
 
+    /// Two custom tools use the same definition name.
     #[error("tool name `{0}` is registered more than once")]
     DuplicateName(Box<str>),
 
+    /// A custom tool collides with an enabled built-in tool.
     #[error("tool name `{0}` conflicts with an enabled built-in tool")]
     BuiltInName(Box<str>),
-
-    #[error("registered tool name `{registered}` does not match definition name `{definition}`")]
-    DefinitionName {
-        registered: Box<str>,
-        definition: Box<str>,
-    },
 }
 
 impl ToolsBuilder {
@@ -589,12 +282,14 @@ impl ToolsBuilder {
         self
     }
 
+    /// Enables or disables the built-in direct web-search tool.
     #[must_use]
     pub fn web_search(mut self, enabled: bool) -> Self {
         self.tools.web_search = enabled;
         self
     }
 
+    /// Enables or disables the built-in image-generation tool.
     #[must_use]
     pub fn image_generation(mut self, enabled: bool) -> Self {
         self.tools.image_generation = enabled;
@@ -663,8 +358,7 @@ impl ToolsBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error for empty, inconsistent, duplicate, or enabled built-in
-    /// tool names.
+    /// Returns an error for empty, duplicate, or enabled built-in tool names.
     pub fn build(self) -> Result<Tools, ToolsBuildError> {
         if self
             .tools
@@ -682,26 +376,19 @@ impl ToolsBuilder {
         {
             return Err(ToolsBuildError::EmptyDefaultShell);
         }
-        let mut names = Vec::with_capacity(self.tools.registered.len());
+        let mut names = HashSet::with_capacity(self.tools.registered.len());
         for tool in &self.tools.registered {
-            let name = tool.name();
+            let definition = tool.definition();
+            let name = definition.name();
             if name.is_empty() {
                 return Err(ToolsBuildError::EmptyName);
-            }
-            let definition = tool.definition();
-            if definition.name() != name {
-                return Err(ToolsBuildError::DefinitionName {
-                    registered: name.into(),
-                    definition: definition.name().into(),
-                });
             }
             if built_in_name(&self.tools, name) {
                 return Err(ToolsBuildError::BuiltInName(name.into()));
             }
-            if names.contains(&name) {
+            if !names.insert(name.to_owned()) {
                 return Err(ToolsBuildError::DuplicateName(name.into()));
             }
-            names.push(name);
         }
         Ok(self.tools)
     }
@@ -717,6 +404,10 @@ fn built_in_name(tools: &Tools, name: &str) -> bool {
         || (tools.image_generation && name == "image_gen__imagegen")
 }
 
+/// Stateful execution runtime for one agent driver.
+///
+/// A runtime retains Code Mode cells and shell sessions across calls. It is
+/// normally owned privately by the higher-level agent driver.
 pub struct ToolRuntime {
     registry: Arc<ToolRegistry>,
     #[cfg(feature = "code-mode")]
@@ -735,6 +426,9 @@ pub struct ToolRuntimeControl {
 }
 
 impl ToolRuntime {
+    /// Creates a runtime with the standard workspace tools enabled.
+    ///
+    /// Pass `None` for either remote-tool configuration to omit that handler.
     pub fn new(
         workspace: impl Into<PathBuf>,
         web_search: Option<WebSearchConfig>,
@@ -828,6 +522,7 @@ impl ToolRuntime {
         }
     }
 
+    /// Extends this runtime with a validated declarative tool selection.
     #[must_use]
     pub fn with_tools(mut self, tools: &Tools) -> Self {
         let registry = Arc::make_mut(&mut self.registry);
@@ -842,11 +537,13 @@ impl ToolRuntime {
         self
     }
 
+    /// Returns the shell name described to the model.
     #[must_use]
     pub fn default_shell_name(&self) -> &str {
         &self.default_shell_name
     }
 
+    /// Returns the working directory described to the model.
     #[must_use]
     pub fn working_directory(&self) -> &str {
         &self.working_directory
@@ -863,6 +560,7 @@ impl ToolRuntime {
     }
 
     #[cfg(feature = "code-mode")]
+    /// Returns the direct model-visible Code Mode tool definitions.
     #[must_use]
     pub fn model_specs(&self) -> Vec<ToolDefinition> {
         vec![
@@ -875,6 +573,7 @@ impl ToolRuntime {
     }
 
     #[cfg(feature = "code-mode")]
+    /// Starts or resumes a Code Mode cell and observes its first terminal boundary.
     pub async fn execute_code(&self, source: &str, context: ToolContext<'_>) -> CodeModeExecution {
         self.code_mode
             .execute(
@@ -930,6 +629,7 @@ impl ToolRuntime {
     }
 
     #[cfg(feature = "code-mode")]
+    /// Waits for a previously yielded Code Mode cell.
     pub async fn wait_for_code(&self, input: &str, context: ToolContext<'_>) -> CodeModeExecution {
         self.code_mode.wait(input, context).await
     }
@@ -1040,8 +740,8 @@ impl ToolRegistry {
             otel.kind = "internal",
             otel.status_code = tracing::field::Empty,
             tool.name = name,
-            session.id = context.session_id,
-            tool.call_id = context.call_id,
+            session.id = context.session_id(),
+            tool.call_id = context.call_id(),
             tool.arguments.bytes = arguments_bytes,
             tool.arguments.kind = arguments_kind,
             tool.arguments.count = arguments_count,
@@ -1082,7 +782,7 @@ impl ToolRegistry {
             "duration_ns",
             u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
         );
-        if let Some(process) = &execution.process_trace {
+        if let Some(process) = execution.process_trace() {
             if let Some(exit_code) = process.exit_code {
                 span.record("process.exit.code", exit_code);
             }
@@ -1143,7 +843,7 @@ impl ToolRegistry {
     pub(crate) fn nested_tool_metadata(&self) -> Vec<Value> {
         let mut metadata = self
             .entries()
-            .map(|(handler, definition)| definition_metadata(handler.name(), definition))
+            .map(|(_, definition)| definition_metadata(definition.name(), definition))
             .collect::<Vec<_>>();
         for definition in self
             .providers
@@ -1155,11 +855,14 @@ impl ToolRegistry {
         metadata
     }
     fn from_ordered(ordered: Vec<Arc<dyn Tool>>) -> Self {
-        let definitions = ordered.iter().map(|tool| tool.definition()).collect();
-        let by_name = ordered
+        let definitions = ordered
+            .iter()
+            .map(|tool| tool.definition())
+            .collect::<Vec<_>>();
+        let by_name = definitions
             .iter()
             .enumerate()
-            .map(|(index, tool)| (tool.name().into(), index))
+            .map(|(index, definition)| (definition.name().into(), index))
             .collect();
         Self {
             ordered,
@@ -1172,8 +875,9 @@ impl ToolRegistry {
     fn extend(&mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) {
         for tool in tools {
             let index = self.ordered.len();
-            self.by_name.insert(tool.name().into(), index);
-            self.definitions.push(tool.definition());
+            let definition = tool.definition();
+            self.by_name.insert(definition.name().into(), index);
+            self.definitions.push(definition);
             self.ordered.push(tool);
         }
     }
@@ -1264,13 +968,15 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
 
-    use nanocodex_core::{OpenAiAuth, ToolDefinition};
+    use nanocodex_oai_api::{OpenAiAuth, ToolDefinition};
     use serde::Deserialize;
     use serde_json::json;
 
+    use crate::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolOutputBody, ToolResult};
+
     use super::{
-        DEFAULT_TOOL_OUTPUT_TOKENS, DynamicToolProvider, ImageGenerationConfig, Tool, ToolContext,
-        ToolExecution, ToolInput, ToolOutputBody, ToolResult, ToolRuntime, Tools, WebSearchConfig,
+        DynamicToolProvider, ImageGenerationConfig, Tool, ToolContext, ToolExecution, ToolInput,
+        ToolRuntime, Tools, WebSearchConfig,
     };
 
     struct Double;
@@ -1295,13 +1001,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tool for Double {
-        fn name(&self) -> &'static str {
-            "double"
-        }
-
         fn definition(&self) -> ToolDefinition {
             ToolDefinition::function(
-                self.name(),
+                "double",
                 "Doubles an integer.",
                 json!({
                     "type": "object",
@@ -1320,13 +1022,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tool for Fails {
-        fn name(&self) -> &'static str {
-            "fails"
-        }
-
         fn definition(&self) -> ToolDefinition {
             ToolDefinition::function(
-                self.name(),
+                "fails",
                 "Always fails.",
                 json!({ "type": "object", "properties": {} }),
             )
@@ -1339,13 +1037,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tool for ReplacementExec {
-        fn name(&self) -> &'static str {
-            "exec_command"
-        }
-
         fn definition(&self) -> ToolDefinition {
             ToolDefinition::function(
-                self.name(),
+                "exec_command",
                 "Replacement command executor.",
                 json!({
                     "type": "object",
@@ -1363,13 +1057,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tool for Search {
-        fn name(&self) -> &'static str {
-            "tool_search"
-        }
-
         fn definition(&self) -> ToolDefinition {
             ToolDefinition::function(
-                self.name(),
+                "tool_search",
                 "Activates a matching deferred tool.",
                 json!({
                     "type": "object",
@@ -1448,7 +1138,7 @@ mod tests {
             enabled
                 .registry
                 .entries()
-                .any(|(handler, _)| handler.name() == "web__run")
+                .any(|(_, definition)| definition.name() == "web__run")
         );
         let enabled_specs = serde_json::to_value(enabled.model_specs()).unwrap();
         assert!(
@@ -1462,7 +1152,7 @@ mod tests {
             disabled
                 .registry
                 .entries()
-                .all(|(handler, _)| handler.name() != "web__run")
+                .all(|(_, definition)| definition.name() != "web__run")
         );
         let disabled_specs = serde_json::to_value(disabled.model_specs()).unwrap();
         assert!(
@@ -1485,7 +1175,7 @@ mod tests {
         let names = runtime
             .registry
             .entries()
-            .map(|(handler, _)| handler.name())
+            .map(|(_, definition)| definition.name())
             .collect::<Vec<_>>();
 
         assert_eq!(names, ["exec_command"]);
@@ -1540,13 +1230,13 @@ mod tests {
 const result = await tools.double({ value: 21 });
 text(result);
 ",
-                ToolContext {
-                    model: "test-model",
-                    session_id: "test-session",
-                    call_id: "test-call",
-                    history: &[],
-                    output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
-                },
+                ToolContext::new(
+                    "test-model",
+                    "test-session",
+                    "test-call",
+                    &[],
+                    DEFAULT_TOOL_OUTPUT_TOKENS,
+                ),
             )
             .await;
         assert!(execution.success);
@@ -1579,13 +1269,13 @@ text(result);
             .execute_nested(
                 "fails",
                 json!({}),
-                ToolContext {
-                    model: "test-model",
-                    session_id: "test-session",
-                    call_id: "test-call",
-                    history: &[],
-                    output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
-                },
+                ToolContext::new(
+                    "test-model",
+                    "test-session",
+                    "test-call",
+                    &[],
+                    DEFAULT_TOOL_OUTPUT_TOKENS,
+                ),
             )
             .await;
 
@@ -1616,13 +1306,13 @@ const found = await tools.tool_search({ query: "echo" });
 const result = await tools[found.name]({ value: 21 });
 text(result.value);
 "#,
-                ToolContext {
-                    model: "test-model",
-                    session_id: "test-session",
-                    call_id: "test-call",
-                    history: &[],
-                    output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
-                },
+                ToolContext::new(
+                    "test-model",
+                    "test-session",
+                    "test-call",
+                    &[],
+                    DEFAULT_TOOL_OUTPUT_TOKENS,
+                ),
             )
             .await;
 

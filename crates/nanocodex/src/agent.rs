@@ -2050,13 +2050,7 @@ mod tests {
             .execute_tool(
                 "exec_command",
                 ToolInput::Function(input),
-                ToolContext {
-                    model: "test",
-                    session_id: "agent-thread",
-                    call_id: "call-1",
-                    history: &[],
-                    output_token_budget: 1_000,
-                },
+                ToolContext::new("test", "agent-thread", "call-1", &[], 1_000),
             )
             .await;
 

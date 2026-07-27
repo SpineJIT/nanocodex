@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/nanocodex", "bin/nanousd-api", "crates/mpp-egress", "crates/nanocodex", "crates/nanocodex-core", "crates/nanocodex-macros", "crates/nanocodex-mcp", "crates/nanocodex-oai-api", "crates/nanocodex-observability", "crates/nanocodex-service", "crates/nanocodex-tools", "crates/nanousd", "examples", "js/bindings", "py/bindings"]
+members = ["bin/nanocodex", "bin/nanousd-api", "crates/mpp-egress", "crates/nanocodex", "crates/nanocodex-core", "crates/nanocodex-oai-api", "crates/nanocodex-observability", "crates/nanocodex-service", "crates/nanocodex-tools", "crates/nanocodex-tools-macros", "crates/nanousd", "examples", "js/bindings", "py/bindings"]
 default-members = ["bin/nanocodex"]
 resolver = "2"
 
@@ -40,12 +40,11 @@ mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "
 mpp-egress = { version = "0.2.0", path = "crates/mpp-egress" }
 nanocodex = { version = "0.2.0", path = "crates/nanocodex" }
 nanocodex-core = { version = "0.2.0", path = "crates/nanocodex-core" }
-nanocodex-macros = { version = "0.2.0", path = "crates/nanocodex-macros" }
-nanocodex-mcp = { version = "0.2.0", path = "crates/nanocodex-mcp" }
 nanocodex-oai-api = { version = "0.2.0", path = "crates/nanocodex-oai-api" }
 nanocodex-observability = { version = "0.2.0", path = "crates/nanocodex-observability" }
 nanocodex-service = { version = "0.2.0", path = "crates/nanocodex-service" }
 nanocodex-tools = { version = "0.2.0", path = "crates/nanocodex-tools" }
+nanocodex-tools-macros = { version = "0.2.0", path = "crates/nanocodex-tools-macros" }
 nanousd = { version = "0.2.0", path = "crates/nanousd" }
 rand = "0.9.2"
 image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg", "png", "pnm", "webp"] }

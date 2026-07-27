@@ -137,24 +137,38 @@ enum CellUpdate {
     HostFailed(String),
 }
 
+/// Complete result of one Code Mode cell observation.
 pub struct CodeModeExecution {
+    /// Ordered model-visible output emitted by the cell.
     pub output: ToolOutputBody,
+    /// Whether the JavaScript cell reached a successful terminal state.
     pub success: bool,
+    /// Nested tool calls in their original invocation order.
     pub nested_calls: Vec<NestedToolCall>,
+    /// Application notifications emitted with `notify(...)`.
     pub notifications: Vec<CodeModeNotification>,
 }
 
+/// One notification emitted by a Code Mode cell.
 pub struct CodeModeNotification {
+    /// Code Mode call that emitted the notification.
     pub call_id: String,
+    /// Complete notification text.
     pub text: String,
 }
 
+/// Incremental nested-tool update observed while a Code Mode cell runs.
 pub enum CodeModeUpdate<'a> {
+    /// A nested call was accepted and may now run concurrently.
     NestedCallStarted {
+        /// Stable nested call identity.
         call_id: &'a str,
+        /// Registered tool name.
         name: &'a str,
+        /// Complete JSON input value.
         input: &'a Value,
     },
+    /// A nested call reached a terminal result.
     NestedCallCompleted(&'a NestedToolCall),
 }
 
@@ -169,14 +183,23 @@ impl CodeModeObserver for IgnoreCodeModeUpdates {
     fn update(&mut self, _update: CodeModeUpdate<'_>) {}
 }
 
+/// Recorded nested tool call made by one Code Mode cell.
 pub struct NestedToolCall {
+    /// Stable call identity derived from the parent Code Mode invocation.
     pub call_id: String,
+    /// Registered tool name.
     pub name: String,
+    /// Complete JSON input value.
     pub input: Value,
+    /// Complete model-visible output.
     pub output: ToolOutputBody,
+    /// Whether the nested operation succeeded.
     pub success: bool,
+    /// Nanoseconds from cell start until this call started.
     pub started_after_ns: u64,
+    /// Nanoseconds spent executing this call.
     pub duration_ns: u64,
+    /// Optional opaque metadata retained for events and adapters.
     pub metadata: Option<Box<RawValue>>,
 }
 
@@ -1241,18 +1264,16 @@ async fn execute_nested_call(
         u64::try_from(started_at.duration_since(cell_started_at).as_nanos()).unwrap_or(u64::MAX);
     let call_id = format!("{}/code-{id}", context.call_id);
     let context = context.borrowed();
-    let execution = tools
-        .execute_nested(
-            &name,
-            input.clone(),
-            ToolContext {
-                call_id: &call_id,
-                ..context
-            },
-        )
-        .await;
+    let context = ToolContext::new(
+        context.model(),
+        context.session_id(),
+        &call_id,
+        context.history(),
+        context.output_token_budget(),
+    );
+    let execution = tools.execute_nested(&name, input.clone(), context).await;
     let duration_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let value = execution.value();
+    let value = execution.code_mode_value();
     CompletedNestedCall {
         id,
         value,

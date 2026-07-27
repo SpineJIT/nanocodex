@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nanocodex_core::ToolDefinition;
+use nanocodex_oai_api::ToolDefinition;
 use serde_json::json;
 
 use super::{StandardTool, Tool, ToolContext, ToolExecution, ToolInput, ToolResult};
@@ -26,10 +26,6 @@ impl ApplyPatchHandler {
 
 #[async_trait::async_trait]
 impl Tool for ApplyPatchHandler {
-    fn name(&self) -> &'static str {
-        "apply_patch"
-    }
-
     fn definition(&self) -> ToolDefinition {
         StandardTool::ApplyPatch.definition()
     }

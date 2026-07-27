@@ -4,7 +4,9 @@ mod wire;
 
 use std::time::Duration;
 
-use nanocodex_core::{OpenAiAuth, OpenAiAuthMode, OpenAiAuthSnapshot, ToolDefinition};
+use nanocodex_oai_api::{
+    OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, OpenAiAuthSnapshot, ToolDefinition,
+};
 use reqwest::header::{AUTHORIZATION, USER_AGENT};
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
@@ -72,7 +74,7 @@ impl WebSearchHandler {
 
         let commands = commands.into_requests();
         let request_count = commands.len();
-        let input = recent_input(context.history);
+        let input = recent_input(context.history());
         let mut outputs = Vec::with_capacity(request_count);
         let mut failures = Vec::new();
         let mut results = Vec::new();
@@ -80,8 +82,8 @@ impl WebSearchHandler {
 
         for (index, commands) in commands.iter().enumerate() {
             let request = SearchRequest {
-                id: context.session_id,
-                model: context.model,
+                id: context.session_id(),
+                model: context.model(),
                 input: input.as_deref(),
                 commands,
                 settings: SearchSettings {
@@ -89,7 +91,7 @@ impl WebSearchHandler {
                     external_web_access: true,
                 },
                 max_output_tokens: request_token_budget(
-                    context.output_token_budget,
+                    context.output_token_budget(),
                     index,
                     request_count,
                 ),
@@ -245,7 +247,7 @@ impl WebSearchHandler {
     }
 }
 
-fn auth_failure(error: &nanocodex_core::OpenAiAuthError) -> RequestFailure {
+fn auth_failure(error: &OpenAiAuthError) -> RequestFailure {
     RequestFailure {
         message: error.to_string(),
         retryable: false,
@@ -254,12 +256,8 @@ fn auth_failure(error: &nanocodex_core::OpenAiAuthError) -> RequestFailure {
 
 #[async_trait::async_trait]
 impl Tool for WebSearchHandler {
-    fn name(&self) -> &'static str {
-        "web__run"
-    }
-
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function(self.name(), DESCRIPTION, commands_schema())
+        ToolDefinition::function("web__run", DESCRIPTION, commands_schema())
     }
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
@@ -334,9 +332,9 @@ mod tests {
     use std::{future::ready, sync::Arc};
 
     use eyre::{Result, eyre};
-    use nanocodex_core::{
+    use nanocodex_oai_api::{
         OpenAiAuth, OpenAiAuthError, OpenAiAuthFuture, OpenAiAuthMode, OpenAiAuthSnapshot,
-        OpenAiAuthSource,
+        OpenAiAuthSource, ResponseItem,
     };
     use serde_json::{Value, json};
     use tokio::{
@@ -366,7 +364,7 @@ mod tests {
             },
             client,
         );
-        let history = serde_json::from_value::<Vec<nanocodex_core::ResponseItem>>(json!([
+        let history = serde_json::from_value::<Vec<ResponseItem>>(json!([
             json!({
                 "type": "message",
                 "role": "user",
@@ -384,13 +382,13 @@ mod tests {
         let execution = handler
             .run(
                 r#"{"search_query":[{"q":"standalone web search"}]}"#,
-                ToolContext {
-                    model: "gpt-5.6-sol",
-                    session_id: "search-session",
-                    call_id: "call-search",
-                    history: &history,
-                    output_token_budget: crate::DEFAULT_TOOL_OUTPUT_TOKENS,
-                },
+                ToolContext::new(
+                    "gpt-5.6-sol",
+                    "search-session",
+                    "call-search",
+                    &history,
+                    crate::DEFAULT_TOOL_OUTPUT_TOKENS,
+                ),
             )
             .await;
 
@@ -400,7 +398,7 @@ mod tests {
             ToolOutputBody::Text(ref text) if text == "Search result with turn0search0"
         ));
         assert_eq!(
-            execution.value(),
+            execution.code_mode_value(),
             Value::String("Search result with turn0search0".to_owned())
         );
         assert_eq!(
@@ -522,7 +520,7 @@ mod tests {
     fn exposes_codex_web_run_schema_and_description() {
         let handler = WebSearchHandler::new(WebSearchConfig {
             endpoint: "http://127.0.0.1:1/v1/alpha/search".to_owned(),
-            auth: nanocodex_core::OpenAiAuth::api_key("test-key"),
+            auth: nanocodex_oai_api::OpenAiAuth::api_key("test-key"),
         });
         let spec = serde_json::to_value(handler.definition()).unwrap();
 

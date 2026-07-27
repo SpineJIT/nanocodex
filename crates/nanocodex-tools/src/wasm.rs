@@ -1,16 +1,14 @@
 use std::{path::PathBuf, sync::Arc};
 
 use js_sys::Promise;
-use nanocodex_core::{
-    ContentItem, CustomToolFormat, ImageDetail, PromptInput, ResponseItem, ToolDefinition,
-    UserInput,
+use nanocodex_oai_api::{
+    ContentItem, CustomToolFormat, OpenAiAuth, PromptInput, ResponseItem, ToolContext,
+    ToolDefinition, ToolOutputBody, UserInput,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
-
-pub const DEFAULT_TOOL_OUTPUT_TOKENS: usize = 10_000;
 
 const EXEC_GRAMMAR: &str = r"start: /[\s\S]+/";
 const EXEC_DESCRIPTION: &str = r"Run JavaScript in the embedded host.
@@ -28,37 +26,6 @@ extern "C" {
 
     #[wasm_bindgen(js_namespace = ["globalThis", "nanocodexHost"], js_name = toolDefinitions)]
     fn host_tool_definitions(session_id: &str) -> String;
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum ToolOutputBody {
-    Text(String),
-    Content(Vec<ToolOutputContent>),
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ToolOutputContent {
-    InputText {
-        text: String,
-    },
-    InputImage {
-        image_url: String,
-        detail: ImageDetail,
-    },
-    InputAudio {
-        audio_url: String,
-    },
-}
-
-#[derive(Clone, Copy)]
-pub struct ToolContext<'a> {
-    pub model: &'a str,
-    pub session_id: &'a str,
-    pub call_id: &'a str,
-    pub history: &'a [ResponseItem],
-    pub output_token_budget: usize,
 }
 
 #[doc(hidden)]
@@ -89,34 +56,48 @@ impl OwnedToolContext {
     }
 
     fn borrowed(&self) -> ToolContext<'_> {
-        ToolContext {
-            model: &self.model,
-            session_id: &self.session_id,
-            call_id: &self.call_id,
-            history: self.history.as_slice(),
-            output_token_budget: self.output_token_budget,
-        }
+        ToolContext::new(
+            &self.model,
+            &self.session_id,
+            &self.call_id,
+            self.history.as_slice(),
+            self.output_token_budget,
+        )
     }
 }
 
+/// Complete result returned by the embedding host for one Code Mode cell.
 pub struct CodeModeExecution {
+    /// Ordered model-visible output emitted by the cell.
     pub output: ToolOutputBody,
+    /// Whether the host reports successful execution.
     pub success: bool,
+    /// Nested host tool calls in invocation order.
     pub nested_calls: Vec<NestedToolCall>,
+    /// Application notifications emitted by the cell.
     pub notifications: Vec<CodeModeNotification>,
 }
 
+/// One notification emitted by a browser or Node Code Mode host.
 pub struct CodeModeNotification {
+    /// Code Mode call that emitted the notification.
     pub call_id: String,
+    /// Complete notification text.
     pub text: String,
 }
 
+/// Incremental nested-tool update replayed from a host execution.
 pub enum CodeModeUpdate<'a> {
+    /// A nested call started.
     NestedCallStarted {
+        /// Stable nested call identity.
         call_id: &'a str,
+        /// Host tool name.
         name: &'a str,
+        /// Complete JSON input value.
         input: &'a Value,
     },
+    /// A nested call reached its terminal result.
     NestedCallCompleted(&'a NestedToolCall),
 }
 
@@ -126,15 +107,24 @@ pub trait CodeModeObserver {
 }
 
 #[derive(Deserialize)]
+/// Recorded nested tool call returned by the embedding host.
 pub struct NestedToolCall {
+    /// Stable nested call identity.
     pub call_id: String,
+    /// Host tool name.
     pub name: String,
+    /// Complete JSON input value.
     pub input: Value,
+    /// Complete model-visible output.
     pub output: ToolOutputBody,
+    /// Whether the nested call succeeded.
     pub success: bool,
+    /// Nanoseconds from cell start until this call started.
     pub started_after_ns: u64,
+    /// Nanoseconds spent executing this call.
     pub duration_ns: u64,
     #[serde(default)]
+    /// Optional opaque metadata retained for events and adapters.
     pub metadata: Option<Box<RawValue>>,
 }
 
@@ -156,32 +146,46 @@ struct HostNotification {
     text: String,
 }
 
+/// Compatibility connection inputs for the unavailable WASM web-search handler.
 pub struct WebSearchConfig {
+    /// Complete search endpoint URL.
     pub endpoint: String,
-    pub auth: nanocodex_core::OpenAiAuth,
+    /// `OpenAI` authentication source.
+    pub auth: OpenAiAuth,
 }
 
+/// Compatibility inputs for the unavailable WASM image-generation handler.
 pub struct ImageGenerationConfig {
+    /// Base `OpenAI` API URL.
     pub api_base_url: String,
-    pub auth: nanocodex_core::OpenAiAuth,
+    /// `OpenAI` authentication source.
+    pub auth: OpenAiAuth,
+    /// Host-side image persistence root.
     pub save_root: PathBuf,
 }
 
+/// Browser tool selection.
+///
+/// Browser and Node tools are supplied by `globalThis.nanocodexHost`; native
+/// built-in selection is intentionally unavailable on WASM.
 #[derive(Clone, Default)]
 pub struct Tools;
 
 impl Tools {
+    /// Returns `false`; native direct web search is unavailable on WASM.
     #[must_use]
     pub const fn web_search_enabled(&self) -> bool {
         false
     }
 
+    /// Returns `false`; native image generation is unavailable on WASM.
     #[must_use]
     pub const fn image_generation_enabled(&self) -> bool {
         false
     }
 }
 
+/// WASM Code Mode adapter over `globalThis.nanocodexHost`.
 pub struct ToolRuntime {
     working_directory: Arc<str>,
 }
@@ -191,6 +195,10 @@ pub struct ToolRuntime {
 pub struct ToolRuntimeControl;
 
 impl ToolRuntime {
+    /// Creates a host-backed runtime.
+    ///
+    /// Native remote-tool configurations are accepted for API compatibility
+    /// but ignored; the embedding host owns all executable tools.
     pub fn new(
         workspace: impl Into<PathBuf>,
         _web_search: Option<WebSearchConfig>,
@@ -213,16 +221,22 @@ impl ToolRuntime {
         Self::new(workspace, web_search, image_generation).with_tools(tools)
     }
 
+    /// Applies a browser tool selection.
+    ///
+    /// Host definitions remain authoritative, so the current selection is a
+    /// no-op on WASM.
     #[must_use]
     pub const fn with_tools(self, _tools: &Tools) -> Self {
         self
     }
 
+    /// Returns the fixed model-visible runtime name.
     #[must_use]
     pub const fn default_shell_name(&self) -> &'static str {
         "javascript"
     }
 
+    /// Returns the model-visible working directory supplied at construction.
     #[must_use]
     pub fn working_directory(&self) -> &str {
         &self.working_directory
@@ -234,6 +248,7 @@ impl ToolRuntime {
         ToolRuntimeControl
     }
 
+    /// Builds the `exec` definition from the host's current tool definitions.
     #[must_use]
     pub fn model_specs(&self, session_id: &str) -> Vec<ToolDefinition> {
         let definitions =
@@ -253,8 +268,9 @@ impl ToolRuntime {
         )]
     }
 
+    /// Executes one JavaScript cell through the embedding host.
     pub async fn execute_code(&self, source: &str, context: ToolContext<'_>) -> CodeModeExecution {
-        let promise = match host_execute_code(source, context.session_id, context.call_id) {
+        let promise = match host_execute_code(source, context.session_id(), context.call_id()) {
             Ok(promise) => promise,
             Err(error) => return failed(&js_error(&error)),
         };
@@ -306,6 +322,7 @@ impl ToolRuntime {
         execution
     }
 
+    /// Returns a failed result because yielded cells are unsupported by this adapter.
     #[expect(
         clippy::unused_async,
         reason = "matches the native tool-runtime contract"
@@ -355,6 +372,7 @@ fn replay_nested_updates(execution: &CodeModeExecution, observer: &mut dyn CodeM
     clippy::unused_async,
     reason = "matches the native input-preparation contract"
 )]
+/// Converts public prompt input to provider-ready content without native image processing.
 pub async fn prepare_user_input(input: &PromptInput) -> Vec<ContentItem> {
     let items = match input {
         PromptInput::Text(text) => vec![UserInput::Text { text: text.clone() }],
@@ -395,6 +413,7 @@ pub async fn prepare_user_input(input: &PromptInput) -> Vec<ContentItem> {
     clippy::unused_async,
     reason = "matches the native output-preparation contract"
 )]
+/// Leaves host-prepared tool images unchanged.
 pub async fn prepare_output_images(_output: &mut ToolOutputBody) {}
 
 fn failed(message: &str) -> CodeModeExecution {

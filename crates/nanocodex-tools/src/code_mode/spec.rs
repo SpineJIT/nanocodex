@@ -1,4 +1,4 @@
-use nanocodex_core::{CustomToolFormat, ToolDefinition};
+use nanocodex_oai_api::{CustomToolFormat, ToolDefinition};
 use serde_json::json;
 
 use super::description;

@@ -13,8 +13,8 @@ use rmcp::{
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{Instrument, Span, info_span};
 
-use crate::config::{McpServer, McpTransport, SecretSource};
-use crate::oauth::{McpOAuthStore, OAuthMetadataCache, OAuthRuntime, transport_from_credentials};
+use super::config::{McpServer, McpTransport, SecretSource};
+use super::oauth::{McpOAuthStore, OAuthMetadataCache, OAuthRuntime, transport_from_credentials};
 
 pub(crate) type Client = Arc<ClientInner>;
 
@@ -28,19 +28,23 @@ impl ClientInner {
         &self,
         params: CallToolRequestParams,
     ) -> Result<CallToolResult, rmcp::service::ServiceError> {
+        let parent = Span::current();
         let result = self.service.call_tool(params).await;
         if let Some(oauth) = &self.oauth
-            && let Err(error) = oauth.persist_if_changed().await
+            && let Err(error) = oauth.persist_if_changed(&parent).await
         {
             tracing::warn!(%error, "failed to persist refreshed MCP OAuth credentials");
         }
         result
     }
 
-    async fn list_all_tools(&self) -> Result<Vec<Tool>, rmcp::service::ServiceError> {
+    async fn list_all_tools(
+        &self,
+        parent: &Span,
+    ) -> Result<Vec<Tool>, rmcp::service::ServiceError> {
         let tools = self.service.list_all_tools().await;
         if let Some(oauth) = &self.oauth
-            && let Err(error) = oauth.persist_if_changed().await
+            && let Err(error) = oauth.persist_if_changed(parent).await
         {
             tracing::warn!(%error, "failed to persist refreshed MCP OAuth credentials");
         }
@@ -303,7 +307,7 @@ async fn connect_stored_oauth(input: StoredOAuthConnect<'_>) -> Result<Connected
     let runtime = oauth.runtime;
     let transport = StreamableHttpClientTransport::with_client(oauth.client, config);
     let client = connect_transport(server, transport, parent).await;
-    if let Err(error) = runtime.persist_if_changed().await {
+    if let Err(error) = runtime.persist_if_changed(parent).await {
         tracing::warn!(%error, "failed to persist refreshed MCP OAuth credentials");
     }
     let client = client?;
@@ -396,14 +400,15 @@ async fn finish_startup(
         status = tracing::field::Empty,
         tool.count = tracing::field::Empty,
     );
-    let tools = match tokio::time::timeout(server.startup_timeout, client.list_all_tools()).await {
-        Ok(Ok(tools)) => Ok(tools
-            .into_iter()
-            .filter(|tool| server.includes_tool(tool.name.as_ref()))
-            .collect::<Vec<_>>()),
-        Ok(Err(error)) => Err(format!("MCP tools/list failed: {}", error_chain(&error))),
-        Err(_) => Err(startup_timeout(server, "tools/list")),
-    };
+    let tools =
+        match tokio::time::timeout(server.startup_timeout, client.list_all_tools(&span)).await {
+            Ok(Ok(tools)) => Ok(tools
+                .into_iter()
+                .filter(|tool| server.includes_tool(tool.name.as_ref()))
+                .collect::<Vec<_>>()),
+            Ok(Err(error)) => Err(format!("MCP tools/list failed: {}", error_chain(&error))),
+            Err(_) => Err(startup_timeout(server, "tools/list")),
+        };
     span.record("status", if tools.is_ok() { "completed" } else { "failed" });
     span.record(
         "otel.status_code",

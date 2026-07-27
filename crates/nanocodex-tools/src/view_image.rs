@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use nanocodex_core::ToolDefinition;
+use nanocodex_oai_api::ToolDefinition;
 use serde::Deserialize;
 use serde_json::json;
 
 use super::{
-    ImageDetail, StandardTool, Tool, ToolContext, ToolExecution, ToolInput, ToolOutputBody,
-    ToolOutputContent, ToolResult,
+    ImageDetail, StandardTool, Tool, ToolContext, ToolExecution, ToolInput, ToolOutputContent,
+    ToolResult,
 };
 
 pub(super) struct ViewImageHandler {
@@ -22,10 +22,6 @@ impl ViewImageHandler {
 
 #[async_trait::async_trait]
 impl Tool for ViewImageHandler {
-    fn name(&self) -> &'static str {
-        "view_image"
-    }
-
     fn definition(&self) -> ToolDefinition {
         StandardTool::ViewImage.definition()
     }
@@ -71,19 +67,14 @@ impl Tool for ViewImageHandler {
             "data:application/octet-stream;base64,{}",
             STANDARD.encode(bytes)
         );
-        Ok(ToolExecution {
-            output: ToolOutputBody::Content(vec![ToolOutputContent::InputImage {
-                image_url: image_url.clone(),
-                detail,
-            }]),
-            success: true,
-            code_mode_value: Some(json!({
-                "image_url": image_url,
-                "detail": detail,
-            })),
-            metadata: None,
-            process_trace: None,
-        })
+        Ok(ToolExecution::content(vec![ToolOutputContent::InputImage {
+            image_url: image_url.clone(),
+            detail,
+        }])
+        .with_code_mode_value(json!({
+            "image_url": image_url,
+            "detail": detail,
+        })))
     }
 }
 

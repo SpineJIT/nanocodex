@@ -66,12 +66,10 @@ Crate ownership is fixed:
   streamed attempts, Tower service/client, retry policy, typed errors, and
   transport telemetry.
 - `nanocodex-tools`: code mode, local tools, custom-tool registry, process
-  lifecycle, and bounded tool output.
-- `nanocodex-mcp`: stdio/Streamable HTTP clients, background handshake and tool
-  discovery, authenticated transports, BM25 search, and deferred Code Mode
-  dispatch.
+  lifecycle, bounded tool output, stdio/Streamable HTTP MCP clients, background
+  discovery, authenticated transports, BM25 search, and deferred dispatch.
 - `nanocodex`: builders and the owned stateful agent lifecycle.
-- `nanocodex-macros`: the `#[tool]` implementation.
+- `nanocodex-tools-macros`: the `#[tool]` implementation.
 - `bin/nanocodex`: the Ratatui daily-driver and headless JSONL adapter.
 
 Lower crates must remain usable without importing higher orchestration crates.

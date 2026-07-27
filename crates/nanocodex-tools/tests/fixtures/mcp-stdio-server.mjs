@@ -1,6 +1,10 @@
 import readline from "node:readline";
 
 const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const toolCount = Number.parseInt(
+  process.env.NANOCODEX_MCP_FIXTURE_TOOL_COUNT ?? "1",
+  10,
+);
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -19,24 +23,26 @@ lines.on("line", (line) => {
       },
     });
   } else if (request.method === "tools/list") {
+    const tools = Array.from({ length: toolCount }, (_, index) => {
+      const suffix = index === 0 ? "" : `_${index}`;
+      return {
+        name: `echo${suffix}`,
+        description: `Echo deterministic MCP fixture message ${index}.`,
+        inputSchema: {
+          type: "object",
+          properties: {
+            message: { type: "string" },
+            delay_ms: { type: "integer", minimum: 0, maximum: 1000 },
+          },
+          required: ["message"],
+          additionalProperties: false,
+        },
+      };
+    });
     send({
       jsonrpc: "2.0",
       id: request.id,
-      result: {
-        tools: [{
-          name: "echo",
-          description: "Echo a message from the deterministic MCP fixture.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              message: { type: "string" },
-              delay_ms: { type: "integer", minimum: 0, maximum: 1000 },
-            },
-            required: ["message"],
-            additionalProperties: false,
-          },
-        }],
-      },
+      result: { tools },
     });
   } else if (request.method === "tools/call") {
     const message = request.params.arguments?.message;

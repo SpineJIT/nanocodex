@@ -22,7 +22,7 @@ use tokio::{
 };
 use tracing::{Instrument, info_span};
 
-use crate::config::SecretSource;
+use super::config::SecretSource;
 
 const LOGIN_TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_CALLBACK_BYTES: usize = 16 * 1024;
@@ -63,6 +63,7 @@ pub struct McpOAuthCredentials {
 }
 
 impl McpOAuthCredentials {
+    /// Creates credentials from a dynamically registered client and access token.
     #[must_use]
     pub fn new(client_id: impl Into<String>, access_token: impl Into<String>) -> Self {
         Self {
@@ -74,44 +75,52 @@ impl McpOAuthCredentials {
         }
     }
 
+    /// Attaches the optional refresh token.
     #[must_use]
     pub fn refresh_token(mut self, refresh_token: impl Into<String>) -> Self {
         self.refresh_token = Some(refresh_token.into());
         self
     }
 
+    /// Sets the access-token expiry as Unix epoch milliseconds.
     #[must_use]
     pub fn expires_at_millis(mut self, expires_at_millis: u64) -> Self {
         self.expires_at_millis = Some(expires_at_millis);
         self
     }
 
+    /// Records the scopes granted by the authorization server.
     #[must_use]
     pub fn scopes(mut self, scopes: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.scopes = scopes.into_iter().map(Into::into).collect();
         self
     }
 
+    /// Returns the dynamically registered OAuth client ID.
     #[must_use]
     pub fn client_id(&self) -> &str {
         &self.client_id
     }
 
+    /// Returns the bearer access token.
     #[must_use]
     pub fn access_token(&self) -> &str {
         &self.access_token
     }
 
+    /// Returns the refresh token when one was issued.
     #[must_use]
     pub fn refresh_token_value(&self) -> Option<&str> {
         self.refresh_token.as_deref()
     }
 
+    /// Returns access-token expiry as Unix epoch milliseconds.
     #[must_use]
     pub const fn expires_at(&self) -> Option<u64> {
         self.expires_at_millis
     }
 
+    /// Returns the scopes granted by the authorization server.
     #[must_use]
     pub fn granted_scopes(&self) -> &[String] {
         &self.scopes
@@ -171,12 +180,14 @@ impl McpOAuthCredentials {
 /// Persistence selected by an embedding application for MCP OAuth credentials.
 #[async_trait]
 pub trait McpOAuthStore: Send + Sync {
+    /// Loads credentials for one configured server and exact URL.
     async fn load(
         &self,
         server_name: &str,
         server_url: &str,
     ) -> Result<Option<McpOAuthCredentials>, String>;
 
+    /// Atomically persists the latest credentials after login or refresh.
     async fn save(
         &self,
         server_name: &str,
@@ -210,7 +221,7 @@ impl OAuthRuntime {
         }
     }
 
-    pub(crate) async fn persist_if_changed(&self) -> Result<(), String> {
+    pub(crate) async fn persist_if_changed(&self, parent: &tracing::Span) -> Result<(), String> {
         let (client_id, response) = self
             .manager
             .lock()
@@ -231,6 +242,7 @@ impl OAuthRuntime {
         }
         let span = info_span!(
             target: "nanocodex_mcp",
+            parent: parent,
             "mcp.oauth.credentials_save",
             otel.kind = "internal",
             otel.status_code = tracing::field::Empty,
@@ -667,7 +679,11 @@ mod tests {
             transport.client.get_access_token().await.unwrap(),
             "refreshed-access"
         );
-        transport.runtime.persist_if_changed().await.unwrap();
+        transport
+            .runtime
+            .persist_if_changed(&tracing::Span::none())
+            .await
+            .unwrap();
         responder.await.unwrap();
 
         let saved = store.saved.lock().await;

@@ -1,3 +1,10 @@
+//! Implementation of `nanocodex_tools::tool`.
+//!
+//! End users should import the macro from `nanocodex-tools` or the `nanocodex`
+//! facade. This crate contains only the expansion implementation.
+
+#![deny(missing_docs, rustdoc::broken_intra_doc_links)]
+
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::Span;
@@ -12,7 +19,12 @@ struct ToolArgs {
     name: Option<LitStr>,
 }
 
-/// Defines a JSON function tool from an async Rust function.
+/// Defines a typed JSON function tool from an async Rust function.
+///
+/// The function must return `Result<T, E>`. Function arguments become a
+/// strict JSON object schema and `T` becomes the output schema. The required
+/// `description = "..."` argument is model-visible; `name = "..."` is
+/// optional and defaults to the Rust function name.
 #[proc_macro_attribute]
 pub fn tool(attributes: TokenStream, item: TokenStream) -> TokenStream {
     expand_tool(attributes.into(), item.into())
@@ -76,10 +88,6 @@ fn expand_tool(
 
         #[#nanocodex::__private::async_trait]
         impl #nanocodex::Tool for #original_ident {
-            fn name(&self) -> &'static str {
-                #tool_name
-            }
-
             fn definition(&self) -> #nanocodex::ToolDefinition {
                 #nanocodex::ToolDefinition::function(
                     #tool_name,
@@ -220,13 +228,17 @@ fn result_output(output: &ReturnType) -> syn::Result<&Type> {
 }
 
 fn nanocodex_path() -> (proc_macro2::TokenStream, String) {
-    match crate_name("nanocodex") {
-        Ok(FoundCrate::Itself) | Err(_) => (quote!(::nanocodex), "::nanocodex".to_owned()),
-        Ok(FoundCrate::Name(name)) => {
+    for package in ["nanocodex", "nanocodex-tools"] {
+        if let Ok(found) = crate_name(package) {
+            let name = match found {
+                FoundCrate::Itself => package.replace('-', "_"),
+                FoundCrate::Name(name) => name,
+            };
             let ident = syn::Ident::new(&name, Span::call_site());
-            (quote!(::#ident), format!("::{name}"))
+            return (quote!(::#ident), format!("::{name}"));
         }
     }
+    (quote!(::nanocodex_tools), "::nanocodex_tools".to_owned())
 }
 
 fn pascal_case(ident: &syn::Ident) -> String {
