@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use eyre::{Result, WrapErr};
 use nanocodex::{
-    AgentEventKind, AgentEvents, Nanocodex, NanocodexError, Responses, SessionId, Thinking, Tools,
+    AgentEvents, Nanocodex, NanocodexError, OpenAi, Thinking, Tools,
+    agent::{events::AgentEventKind, session::SessionId},
 };
 use tokio::task::JoinHandle;
 use tower::timeout::TimeoutLayer;
@@ -19,23 +20,22 @@ async fn main() -> Result<()> {
     let api_key = std::env::var("OPENAI_API_KEY").wrap_err("OPENAI_API_KEY is required")?;
     let workspace = std::env::current_dir().wrap_err("failed to resolve the workspace")?;
 
-    // Layers wrap the standard persistent-WebSocket and retry service. A fully
-    // custom stack uses `Responses::builder().service(|| make_stack())` so
-    // cancellation, forks, and children always receive fresh mutable state.
-    let responses = Responses::builder()
+    // The OpenAI recipe owns transport and Tower policy. A fully custom stack
+    // uses `.service(|| make_stack())`, so cancellation replacements, forks,
+    // and children always receive fresh mutable state.
+    let openai = OpenAi::builder(api_key)
         .layer(TimeoutLayer::new(Duration::from_mins(2)))
-        .build();
+        .build()?;
 
     // `tools(tools)` is the normal path for shareable handlers. Agent-relative
     // subagent tools instead use `tools_factory(|handle| ...)`; see subagents.rs.
     let tools = Tools::builder().without_defaults().build()?;
-    let (agent, events) = Nanocodex::builder(api_key)
+    let (agent, events) = Nanocodex::builder(openai)
         .session_id(SessionId::new())
         .instructions(INSTRUCTIONS)
         .thinking(Thinking::Low)
         .workspace(workspace)
         .tools(tools)
-        .responses(responses)
         .build()?;
     let mut observers = vec![observe("root", events)];
 

@@ -1,6 +1,13 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use nanocodex_tools::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolContext, ToolInput, ToolRuntime};
+use nanocodex_tools::{
+    ToolContext, ToolInput, Tools, contract::DEFAULT_TOOL_OUTPUT_TOKENS, runtime::ToolRuntime, tool,
+};
 use serde_json::{json, value::to_raw_value};
+
+#[tool(description = "Return the supplied benchmark message.")]
+async fn benchmark_echo(message: String) -> Result<String, std::io::Error> {
+    Ok(message)
+}
 
 fn benchmark_process_output(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -26,6 +33,28 @@ fn benchmark_process_output(c: &mut Criterion) {
         benchmark.to_async(&runtime).iter(|| async {
             let output = tools
                 .execute_tool("exec_command", ToolInput::Function(input.clone()), context)
+                .await;
+            assert!(output.success);
+            std::hint::black_box(output);
+        });
+    });
+
+    let selected = Tools::builder()
+        .without_defaults()
+        .tool(benchmark_echo)
+        .build()
+        .expect("benchmark tool registry must be valid");
+    let registered = ToolRuntime::new_with_tools(".", None, None, &selected);
+    let input =
+        to_raw_value(&json!({ "message": "benchmark" })).expect("benchmark input must serialize");
+    c.bench_function("tool_registry_dispatch/registered_function", |benchmark| {
+        benchmark.to_async(&runtime).iter(|| async {
+            let output = registered
+                .execute_tool(
+                    "benchmark_echo",
+                    ToolInput::Function(input.clone()),
+                    context,
+                )
                 .await;
             assert!(output.success);
             std::hint::black_box(output);

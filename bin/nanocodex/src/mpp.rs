@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+mod egress;
+
+use self::egress::{EgressPolicy, MppEgress};
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Context, Result, eyre};
 use mpp::{
@@ -11,7 +14,6 @@ use mpp::{
         methods::tempo::{INTENT_CHARGE, METHOD_NAME},
     },
 };
-use mpp_egress::{EgressPolicy, MppEgress};
 use nanousd::{NANOUSD_ADDRESS, TEMPO_MAINNET_CHAIN_ID};
 
 const DEFAULT_MPP_API_BASE_URL: &str = "https://openai.mpp.tempo.xyz/v1";

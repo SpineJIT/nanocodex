@@ -5,8 +5,9 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use nanocodex_oai_api::{
-    ContentItem, FunctionOutputBody, FunctionOutputContent, OpenAiAuth, OpenAiAuthMode,
-    OpenAiAuthSnapshot, ResponseItem, ToolDefinition,
+    auth::{OpenAiAuth, OpenAiAuthMode, OpenAiAuthSnapshot},
+    responses::{ContentItem, FunctionOutputBody, FunctionOutputContent, ResponseItem},
+    tools::ToolDefinition,
 };
 use reqwest::header::{AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};

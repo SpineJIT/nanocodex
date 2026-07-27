@@ -1,7 +1,7 @@
 import os
 import unittest
 
-from nanocodex import Nanocodex, PricingSnapshot
+from nanocodex import Nanocodex
 
 
 class BindingTests(unittest.TestCase):
@@ -32,31 +32,6 @@ class BindingTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "OpenAI credentials are empty"):
             Nanocodex("")
-
-    def test_pricing_snapshot_is_typed_and_validated(self) -> None:
-        pricing = PricingSnapshot(
-            "team-contract-2026-q3",
-            "https://billing.example.com/openai/2026-q3",
-            "2026-07-01",
-            input_usd_per_million="1.25",
-            cached_input_usd_per_million="0.125",
-            cache_write_input_usd_per_million="1.25",
-            output_usd_per_million="10",
-        )
-        agent, _ = Nanocodex("test-key", pricing=pricing)
-        self.assertIn("team-contract-2026-q3", repr(pricing))
-        self.assertTrue(callable(agent.prompt))
-
-        with self.assertRaisesRegex(ValueError, "effective date"):
-            PricingSnapshot(
-                "invalid",
-                "test",
-                "2026-02-29",
-                input_usd_per_million="1",
-                cached_input_usd_per_million="1",
-                cache_write_input_usd_per_million="1",
-                output_usd_per_million="1",
-            )
 
     def test_spawn_returns_independent_agent_without_network(self) -> None:
         agent, _ = Nanocodex("test-key", thinking="none")

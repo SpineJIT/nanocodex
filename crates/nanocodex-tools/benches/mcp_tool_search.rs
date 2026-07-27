@@ -2,7 +2,10 @@ use std::{path::Path, sync::Arc};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use nanocodex_tools::{
-    DEFAULT_TOOL_OUTPUT_TOKENS, DynamicToolProvider, Mcp, McpServer, Tool, ToolContext, ToolInput,
+    Tool, ToolContext, ToolInput,
+    contract::DEFAULT_TOOL_OUTPUT_TOKENS,
+    mcp::{Mcp, McpServer},
+    runtime::DynamicToolProvider,
 };
 use serde_json::{json, value::to_raw_value};
 use tokio::runtime::Runtime;

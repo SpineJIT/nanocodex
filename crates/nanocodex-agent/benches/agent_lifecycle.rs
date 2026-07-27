@@ -8,9 +8,11 @@ use std::{
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use nanocodex_agent::{Nanocodex, NanocodexError, OpenAi, Tools};
 use nanocodex_oai_api::{
-    ContentItem, GenerationOutput, MessageRole, ResponseItem, ResponsePipelineStats,
-    ResponsesAttempt, ResponsesAttemptKind, ResponsesOutput, ResponsesServiceResponse, Usage,
-    WarmupResponse,
+    responses::{ContentItem, MessageRole, ResponseItem, Usage, WarmupResponse},
+    tower::{
+        GenerationOutput, ResponsePipelineStats, ResponsesAttempt, ResponsesAttemptKind,
+        ResponsesOutput, ResponsesServiceResponse,
+    },
 };
 use tower::Service;
 

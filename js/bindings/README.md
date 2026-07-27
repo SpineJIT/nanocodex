@@ -11,18 +11,6 @@ const agent = await Agent.create({
   apiKey: process.env.OPENAI_API_KEY,
   reasoningMode: "pro",
   thinking: "high",
-  pricing: {
-    id: "team-contract-2026-q3",
-    source: "https://billing.example.com/openai/2026-q3",
-    effective_date: "2026-07-01",
-    model: "gpt-5.6-sol",
-    rates: {
-      input_usd_per_million: "1.25",
-      cached_input_usd_per_million: "0.125",
-      cache_write_input_usd_per_million: "1.25",
-      output_usd_per_million: "10.00",
-    },
-  },
   tools,
 });
 

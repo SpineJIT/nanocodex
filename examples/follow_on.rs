@@ -1,5 +1,5 @@
 use eyre::{Result, WrapErr};
-use nanocodex::{Nanocodex, Thinking, Tools};
+use nanocodex::{Nanocodex, OpenAi, Thinking, Tools};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -8,7 +8,9 @@ async fn main() -> Result<()> {
         .web_search(false)
         .image_generation(false)
         .build()?;
-    let (agent, events) = Nanocodex::builder(api_key)
+    let openai = OpenAi::new(api_key)?;
+    let (agent, events) = Nanocodex::builder(openai)
+        .instructions("Follow the requested output format exactly.")
         .thinking(Thinking::Low)
         .tools(tools)
         .build()?;

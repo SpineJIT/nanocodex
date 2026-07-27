@@ -25,7 +25,6 @@ export function create(options = {}) {
     reasoningMode,
     fastMode,
     instructions,
-    pricing,
     sessionId,
     resume,
     ...hostOptions
@@ -64,7 +63,6 @@ export function create(options = {}) {
     reasoningMode,
     fastMode,
     instructions,
-    pricing,
     sessionId,
     resume,
   });

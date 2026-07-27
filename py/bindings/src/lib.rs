@@ -1,15 +1,14 @@
 use std::sync::{Arc, Mutex};
 
 use nanocodex::{
-    AgentEvents as RustAgentEvents, Nanocodex as RustNanocodex, OpenAiAuth,
-    PricingSnapshot as RustPricingSnapshot, ReasoningMode, Thinking, TokenRates,
-    TurnControl as RustTurnControl, TurnResult as RustTurnResult, UsdPerMillionTokens,
-    load_chatgpt_auth,
+    AgentEvents as RustAgentEvents, Nanocodex as RustNanocodex, OpenAi, ReasoningMode, Thinking,
+    TurnControl as RustTurnControl, TurnResult as RustTurnResult,
+    oai::auth::{OpenAiAuth, load_chatgpt_auth},
 };
 use pyo3::{
     Bound, PyResult, Python,
     exceptions::{PyRuntimeError, PyValueError},
-    prelude::{Py, PyModule, PyRef, pyclass, pymethods, pymodule},
+    prelude::{Py, PyModule, pyclass, pymethods, pymodule},
     types::{PyDict, PyDictMethods, PyModuleMethods},
 };
 use tokio::runtime::Runtime;
@@ -23,7 +22,7 @@ struct Nanocodex {
 #[pymethods]
 impl Nanocodex {
     #[new]
-    #[pyo3(signature = (api_key = None, *, auth_file = None, thinking = "high", reasoning_mode = "standard", fast_mode = false, workspace = None, instructions = None, pricing = None))]
+    #[pyo3(signature = (api_key = None, *, auth_file = None, thinking = "high", reasoning_mode = "standard", fast_mode = false, workspace = None, instructions = None))]
     #[allow(
         clippy::too_many_arguments,
         reason = "PyO3 exposes one flat keyword-only options surface"
@@ -36,7 +35,6 @@ impl Nanocodex {
         fast_mode: bool,
         workspace: Option<String>,
         instructions: Option<String>,
-        pricing: Option<PyRef<'_, PricingSnapshot>>,
     ) -> PyResult<(Self, AgentEvents)> {
         let auth = match (api_key, auth_file) {
             (Some(api_key), None) => OpenAiAuth::api_key(api_key),
@@ -52,11 +50,11 @@ impl Nanocodex {
         };
         let thinking = parse_thinking(thinking)?;
         let reasoning_mode = parse_reasoning_mode(reasoning_mode)?;
-        let pricing = pricing.map(|pricing| pricing.inner.clone());
         let runtime = build_runtime()?;
+        let openai = OpenAi::new(auth).map_err(runtime_error)?;
         let (agent, events) = runtime
             .block_on(async move {
-                let mut builder = RustNanocodex::builder(auth)
+                let mut builder = RustNanocodex::builder(openai)
                     .reasoning_mode(reasoning_mode)
                     .thinking(thinking)
                     .fast_mode(fast_mode);
@@ -65,9 +63,6 @@ impl Nanocodex {
                 }
                 if let Some(instructions) = instructions {
                     builder = builder.instructions(instructions);
-                }
-                if let Some(pricing) = pricing {
-                    builder = builder.pricing(pricing);
                 }
                 builder.build()
             })
@@ -264,45 +259,6 @@ impl Turn {
 }
 
 #[pyclass(frozen, module = "nanocodex._native")]
-struct PricingSnapshot {
-    inner: RustPricingSnapshot,
-}
-
-#[pymethods]
-impl PricingSnapshot {
-    #[new]
-    #[pyo3(signature = (id, source, effective_date, *, input_usd_per_million, cached_input_usd_per_million, cache_write_input_usd_per_million, output_usd_per_million))]
-    fn new(
-        id: String,
-        source: String,
-        effective_date: String,
-        input_usd_per_million: &str,
-        cached_input_usd_per_million: &str,
-        cache_write_input_usd_per_million: &str,
-        output_usd_per_million: &str,
-    ) -> PyResult<Self> {
-        let rates = TokenRates {
-            input: parse_rate(input_usd_per_million)?,
-            cached_input: parse_rate(cached_input_usd_per_million)?,
-            cache_write_input: parse_rate(cache_write_input_usd_per_million)?,
-            output: parse_rate(output_usd_per_million)?,
-        };
-        RustPricingSnapshot::new(id, source, effective_date, rates)
-            .map(|inner| Self { inner })
-            .map_err(|error| PyValueError::new_err(error.to_string()))
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "PricingSnapshot(id={:?}, effective_date={:?}, model={:?})",
-            self.inner.id(),
-            self.inner.effective_date(),
-            self.inner.model()
-        )
-    }
-}
-
-#[pyclass(frozen, module = "nanocodex._native")]
 struct AgentEvents {
     runtime: Arc<Runtime>,
     events: Arc<tokio::sync::Mutex<RustAgentEvents>>,
@@ -355,40 +311,17 @@ fn parse_reasoning_mode(value: &str) -> PyResult<ReasoningMode> {
     value.parse().map_err(PyValueError::new_err)
 }
 
-fn parse_rate(value: &str) -> PyResult<UsdPerMillionTokens> {
-    value
-        .parse()
-        .map_err(|error: nanocodex::UsdParseError| PyValueError::new_err(error.to_string()))
-}
-
 fn estimated_cost_dict<'py>(
     py: Python<'py>,
-    cost: &nanocodex::EstimatedUsdCost,
+    cost: &nanocodex::oai::pricing::EstimatedUsdCost,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let pricing = cost.pricing();
-    let rates = pricing.rates();
-    let rate_dict = PyDict::new(py);
-    rate_dict.set_item("input_usd_per_million", rates.input.decimal())?;
-    rate_dict.set_item("cached_input_usd_per_million", rates.cached_input.decimal())?;
-    rate_dict.set_item(
-        "cache_write_input_usd_per_million",
-        rates.cache_write_input.decimal(),
-    )?;
-    rate_dict.set_item("output_usd_per_million", rates.output.decimal())?;
-    let pricing_dict = PyDict::new(py);
-    pricing_dict.set_item("id", pricing.id())?;
-    pricing_dict.set_item("source", pricing.source())?;
-    pricing_dict.set_item("effective_date", pricing.effective_date())?;
-    pricing_dict.set_item("model", pricing.model())?;
-    pricing_dict.set_item("rates", rate_dict)?;
-
     let output = PyDict::new(py);
     output.set_item("usd", cost.amount().decimal())?;
     output.set_item("input_usd", cost.input().decimal())?;
     output.set_item("cached_input_usd", cost.cached_input().decimal())?;
     output.set_item("cache_write_input_usd", cost.cache_write_input().decimal())?;
     output.set_item("output_usd", cost.output().decimal())?;
-    output.set_item("pricing", pricing_dict)?;
+    output.set_item("service_tier", cost.service_tier().as_str())?;
     Ok(output)
 }
 
@@ -405,7 +338,6 @@ fn lock_error<T>(error: std::sync::PoisonError<T>) -> pyo3::PyErr {
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Nanocodex>()?;
-    module.add_class::<PricingSnapshot>()?;
     module.add_class::<Turn>()?;
     module.add_class::<AgentEvents>()?;
     Ok(())

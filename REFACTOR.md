@@ -218,11 +218,12 @@ Dropping the event receiver has no lifecycle effect.
 
 `TurnUsage` aggregates all Responses calls in the logical agent turn.
 It exposes the exact input, cache-read, cache-write, output, and reasoning
-token counts plus a typed estimated USD cost when a versioned pricing snapshot
-is configured. The estimate's source and effective date remain attached through
-terminal events and eval results; unavailable pricing is explicit rather than
-serialized as a misleading zero. `CostStatus` distinguishes
-`pricing_not_configured` from `usage_not_reported`.
+token counts plus a typed estimated USD cost. Nanocodex supports only
+`gpt-5.6-sol`, so its published standard and priority rates are built in and
+selected from the request's existing `fast_mode` policy. There is no pricing
+builder, file, environment variable, catalog, or caller-defined rate surface.
+`CostStatus::UsageNotReported` keeps omitted provider accounting distinct from
+a genuine zero-token result.
 
 - `agent.clone()` targets the same driver, session, and command queue.
 - `AgentHandle::spawn()` creates a clean sibling from the same recipe.
@@ -626,10 +627,10 @@ network, VM cold-start, and full eval measurements remain scheduled or release
 gates with retained artifacts.
 
 USD cost is derived from the same authoritative per-call usage retained by the
-trace. Pricing is a versioned input with source and effective date because the
-Responses API reports token usage, not billed dollars. Agent terminal results,
-the CLI, and `nanocodex eval` all project the same aggregate instead of
-recomputing it independently.
+trace. The fixed `gpt-5.6-sol` standard and priority rates come directly from
+OpenAI's API pricing documentation. Agent terminal results, the CLI, and
+`nanocodex eval` all project the same aggregate instead of recomputing it
+independently.
 
 Each refactor PR that moves a hot path must move its benchmark in the same PR.
 The stack may not defer all performance evidence until after the architecture
@@ -666,7 +667,8 @@ through a real consumer. Unmapped behavior blocks the deletion.
 ### 3. Tools
 
 - Move the `Tool` contract into `nanocodex-oai-api`.
-- Rename macros to `nanocodex-tools-macros`.
+- Colocate the `nanocodex-tools-macros` package under
+  `nanocodex-tools/macros`.
 - Merge MCP, `tool_search`, and Code Mode into `nanocodex-tools`; MCP is always
   on for native builds.
 - Tighten tool context and registry construction.
@@ -696,8 +698,8 @@ and all native and WASM consumers compile against the new owner.
 
 - Finish the normalized typed agent event projection without weakening the raw
   OpenAI firehose or complete tracing record.
-- Derive typed USD estimates from authoritative usage and a versioned pricing
-  snapshot with source and effective date; project the same value through Rust,
+- Derive typed USD estimates from authoritative usage and the built-in
+  `gpt-5.6-sol` standard or priority rates; project the same value through Rust,
   CLI, language bindings, and later eval results.
 - Add cross-component retained fixtures.
 - Establish numeric baselines and budgets for the newly owning crates.
@@ -708,10 +710,10 @@ Evidence: [`benchmarks/refactor_observability_baseline_2026-07-26.md`](benchmark
 records the retained 358-event projection and fixed-point pricing baselines.
 Retained raw `AgentEvent` records round-trip byte-for-byte, and generated JSONL
 preserves the master envelope and terminal fields while adding exact cost
-provenance. `AgentEvent::data()` adds a lazy typed domain view. One explicitly
-supplied `PricingSnapshot` produces the same exact `EstimatedUsdCost` through
-standalone OAI sessions, owned agent results, terminal events, root/model
-tracing spans, the CLI/TUI, PyO3, and Node/browser WASM.
+accounting. `AgentEvent::data()` adds a lazy typed domain view. The automatic
+`EstimatedUsdCost` is identical through standalone OAI sessions, owned agent
+results, terminal events, root/model tracing spans, the CLI/TUI, PyO3, and
+Node/browser WASM.
 
 ### 6. VM and images
 
@@ -785,9 +787,7 @@ These are intentionally not hidden behind provisional APIs:
 - final crate names for reusable VM image preparation and composed egress;
 - which observability conveniences belong in the facade prelude;
 - final feature policy for heavyweight VM, browser, eval, and managed-service
-  crates; and
-- the semver transition strategy for published `nanocodex-core`,
-  `nanocodex-service`, `nanocodex-mcp`, and `nanocodex-macros`.
+  crates.
 
 Each is resolved in the first implementation slice that needs it, with a
 complete consumer example and benchmark where performance-sensitive.

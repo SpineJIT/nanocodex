@@ -1,8 +1,13 @@
 use std::{fmt, sync::Arc};
 
-use nanocodex_oai_api::{MODEL, MessageRole, ResponseItem};
+use nanocodex_oai_api::{
+    MODEL,
+    responses::{MessageRole, ResponseItem},
+};
 
-use crate::{NanocodexError, Result, model::agent::ModelCheckpoint};
+pub use nanocodex_oai_api::session::SessionId;
+
+use crate::{NanocodexError, Result, model::run::ModelCheckpoint};
 
 const SESSION_SNAPSHOT_VERSION: u32 = 1;
 
@@ -14,7 +19,7 @@ pub(crate) struct CommittedSession {
 }
 
 impl CommittedSession {
-    pub(crate) fn new(lineage_id: Arc<str>, model: ModelCheckpoint) -> Self {
+    pub(crate) const fn new(lineage_id: Arc<str>, model: ModelCheckpoint) -> Self {
         Self { lineage_id, model }
     }
 
@@ -22,7 +27,7 @@ impl CommittedSession {
         &self.lineage_id
     }
 
-    pub(crate) fn model(&self) -> &ModelCheckpoint {
+    pub(crate) const fn model(&self) -> &ModelCheckpoint {
         &self.model
     }
 

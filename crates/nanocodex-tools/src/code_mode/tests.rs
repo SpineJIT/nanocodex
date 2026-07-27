@@ -8,7 +8,7 @@ use std::{
 };
 
 use eyre::{Result, eyre};
-use nanocodex_oai_api::{ResponseItem, ToolDefinition};
+use nanocodex_oai_api::{responses::ResponseItem, tools::ToolDefinition};
 use serde_json::Value;
 use tokio::sync::Semaphore;
 
@@ -19,7 +19,8 @@ use super::{
 };
 use crate::{
     Tool, ToolContext, ToolExecution, ToolInput, ToolOutputBody, ToolOutputContent, ToolResult,
-    ToolRuntime, Tools, WebSearchConfig,
+    Tools,
+    runtime::{ToolRuntime, WebSearchConfig},
 };
 
 struct ConcurrencyProbe {
@@ -1411,7 +1412,7 @@ async fn default_cell_yield_extends_for_a_longer_nested_shell_wait() {
     });
     let mut cell = LiveCell {
         id: 1,
-        output_token_budget: crate::DEFAULT_TOOL_OUTPUT_TOKENS,
+        output_token_budget: crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
         updates,
         terminate: Some(terminate),
         task: Some(task),
@@ -1451,7 +1452,7 @@ async fn explicit_cell_yield_is_not_extended_by_a_nested_shell_wait() {
     });
     let mut cell = LiveCell {
         id: 1,
-        output_token_budget: crate::DEFAULT_TOOL_OUTPUT_TOKENS,
+        output_token_budget: crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
         updates,
         terminate: Some(terminate),
         task: Some(task),
@@ -1535,11 +1536,11 @@ fn test_tools(workspace: &std::path::Path) -> ToolRuntime {
         workspace,
         Some(WebSearchConfig {
             endpoint: "http://127.0.0.1:1/v1/alpha/search".to_owned(),
-            auth: nanocodex_oai_api::OpenAiAuth::api_key("test-key"),
+            auth: nanocodex_oai_api::auth::OpenAiAuth::api_key("test-key"),
         }),
         Some(super::super::ImageGenerationConfig {
             api_base_url: "http://127.0.0.1:1/v1".to_owned(),
-            auth: nanocodex_oai_api::OpenAiAuth::api_key("test-key"),
+            auth: nanocodex_oai_api::auth::OpenAiAuth::api_key("test-key"),
             save_root: workspace.to_path_buf(),
         }),
     )
@@ -1555,7 +1556,7 @@ fn test_context_with_call<'a>(history: &'a [ResponseItem], call_id: &'a str) -> 
         "test-session",
         call_id,
         history,
-        crate::DEFAULT_TOOL_OUTPUT_TOKENS,
+        crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
     )
 }
 

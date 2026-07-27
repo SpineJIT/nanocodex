@@ -1,9 +1,12 @@
-use nanocodex::Nanocodex;
+use nanocodex::{Nanocodex, OpenAi};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("OPENAI_API_KEY")?;
-    let (agent, _) = Nanocodex::new(api_key)?;
+    let openai = OpenAi::new(api_key)?;
+    let (agent, _) = Nanocodex::builder(openai)
+        .instructions("Inspect the repository carefully and report only verified facts.")
+        .build()?;
 
     let turn = agent
         .prompt("Inspect this repository and summarize it.")

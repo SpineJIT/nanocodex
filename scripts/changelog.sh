@@ -40,15 +40,13 @@ if [[ -n "$crate_root" ]]; then
         generate_crate_changelog "$crate_root"
     fi
 else
-    for crate_name in \
+    for crate_path in \
         nanocodex-oai-api \
-        nanocodex-core \
-        nanocodex-tools-macros \
+        nanocodex-tools/macros \
         nanocodex-observability \
-        nanocodex-service \
         nanocodex-tools \
         nanocodex-agent \
         nanocodex; do
-        generate_crate_changelog "$workspace_root/crates/$crate_name"
+        generate_crate_changelog "$workspace_root/crates/$crate_path"
     done
 fi

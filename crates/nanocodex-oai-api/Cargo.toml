@@ -8,7 +8,7 @@ authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 description = "Tower-native OpenAI Responses API and managed context for Nanocodex"
@@ -33,12 +33,15 @@ web-time.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 base64.workspace = true
+chrono.workspace = true
+getrandom.workspace = true
 image.workspace = true
 reqwest.workspace = true
-rustls.workspace = true
 sha1.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+sha2.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-tungstenite.workspace = true
+url.workspace = true
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 js-sys.workspace = true
@@ -51,6 +54,7 @@ eyre.workspace = true
 simd-json.workspace = true
 sonic-rs.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber.workspace = true
 
 [[bench]]
 name = "fork_history"
@@ -58,6 +62,10 @@ harness = false
 
 [[bench]]
 name = "tower_responses"
+harness = false
+
+[[bench]]
+name = "session_lifecycle"
 harness = false
 
 [lints]

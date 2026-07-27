@@ -8,8 +8,12 @@ use std::{
 
 use eyre::{Result, WrapErr};
 use nanocodex::{
-    AgentEventKind, AgentEvents, AgentHandle, Nanocodex, Thinking, Tool, ToolContext,
-    ToolDefinition, ToolExecution, ToolInput, ToolResult, Tools, async_trait,
+    AgentEvents, Nanocodex, OpenAi, Thinking, Tool, Tools,
+    agent::{AgentHandle, events::AgentEventKind},
+    tools::{
+        ToolContext, ToolDefinition, ToolInput, ToolResult,
+        contract::{ToolExecution, async_trait},
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -276,7 +280,8 @@ async fn main() -> Result<()> {
     let workspace = std::env::current_dir().wrap_err("failed to resolve the workspace")?;
     let child_agents = Arc::new(ChildAgents::default());
     let tools_agents = Arc::downgrade(&child_agents);
-    let (agent, events) = Nanocodex::builder(api_key)
+    let openai = OpenAi::new(api_key)?;
+    let (agent, events) = Nanocodex::builder(openai)
         .instructions(
             "You are the lead engineering orchestrator. Code Mode exposes spawn_agent for a reusable clean child, fork_agent for a reusable child with the invoking agent's latest safe context, and prompt_agent for follow-up turns using a returned agent_id. Decide your own decomposition, concurrency, sequencing, follow-ups, and synthesis. Treat worker outputs as attributed evidence rather than fabricating them.",
         )

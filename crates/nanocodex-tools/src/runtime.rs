@@ -1,3 +1,5 @@
+//! Declarative tool selection and the stateful per-agent execution runtime.
+
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
@@ -8,21 +10,21 @@ use std::{
 
 use async_trait::async_trait;
 use nanocodex_oai_api::{
-    OpenAiAuth, ResponseItem, Tool, ToolContext, ToolDefinition, ToolExecution, ToolInput,
+    auth::OpenAiAuth,
+    responses::ResponseItem,
+    tools::{Tool, ToolContext, ToolDefinition, ToolExecution, ToolInput},
 };
 use schemars::{JsonSchema, r#gen::SchemaSettings};
 use serde_json::value::to_raw_value;
 use serde_json::{Map, Value, json};
 use tracing::{Instrument, info, info_span};
 
-#[cfg(feature = "code-mode")]
 use crate::code_mode::{self, CodeModeExecution, CodeModeObserver};
 use crate::{
     apply_patch, plan,
     shell::{self, ShellSessions},
     view_image,
 };
-#[cfg(feature = "remote-tools")]
 use crate::{image_generation, web_search};
 
 /// Owned context used when a Code Mode cell may outlive the model tool call
@@ -74,7 +76,7 @@ impl OwnedToolContext {
         )
     }
 
-    pub(crate) fn with_output_token_budget(mut self, output_token_budget: usize) -> Self {
+    pub(crate) const fn with_output_token_budget(mut self, output_token_budget: usize) -> Self {
         self.output_token_budget = output_token_budget;
         self
     }
@@ -132,7 +134,6 @@ pub struct Tools {
     working_directory: Option<Arc<str>>,
     default_shell: Option<Arc<str>>,
     process_environment: Arc<Vec<(OsString, OsString)>>,
-    #[cfg(feature = "remote-tools")]
     remote_http_client: Option<reqwest::Client>,
     registered: Vec<Arc<dyn Tool>>,
     providers: Vec<Arc<dyn DynamicToolProvider>>,
@@ -147,7 +148,6 @@ impl Default for Tools {
             working_directory: None,
             default_shell: None,
             process_environment: Arc::new(Vec::new()),
-            #[cfg(feature = "remote-tools")]
             remote_http_client: None,
             registered: Vec::new(),
             providers: Vec::new(),
@@ -157,10 +157,7 @@ impl Default for Tools {
 
 impl fmt::Debug for Tools {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        #[cfg(feature = "remote-tools")]
         let remote_http_client_configured = self.remote_http_client.is_some();
-        #[cfg(not(feature = "remote-tools"))]
-        let remote_http_client_configured = false;
         formatter
             .debug_struct("Tools")
             .field("workspace", &self.workspace)
@@ -196,7 +193,7 @@ impl Tools {
     /// Resumes configuring this tool selection while preserving its built-ins,
     /// registered tools, and dynamic providers.
     #[must_use]
-    pub fn into_builder(self) -> ToolsBuilder {
+    pub const fn into_builder(self) -> ToolsBuilder {
         ToolsBuilder { tools: self }
     }
 
@@ -222,7 +219,6 @@ impl Tools {
         Arc::clone(&self.process_environment)
     }
 
-    #[cfg(feature = "remote-tools")]
     fn remote_http_client(&self) -> Option<reqwest::Client> {
         self.remote_http_client.clone()
     }
@@ -268,7 +264,7 @@ pub enum ToolsBuildError {
 impl ToolsBuilder {
     /// Starts from an empty built-in tool set.
     #[must_use]
-    pub fn without_defaults(mut self) -> Self {
+    pub const fn without_defaults(mut self) -> Self {
         self.tools.workspace = false;
         self.tools.web_search = false;
         self.tools.image_generation = false;
@@ -277,21 +273,21 @@ impl ToolsBuilder {
 
     /// Enables or disables the standard command, patch, plan, and file tools.
     #[must_use]
-    pub fn workspace(mut self, enabled: bool) -> Self {
+    pub const fn workspace(mut self, enabled: bool) -> Self {
         self.tools.workspace = enabled;
         self
     }
 
     /// Enables or disables the built-in direct web-search tool.
     #[must_use]
-    pub fn web_search(mut self, enabled: bool) -> Self {
+    pub const fn web_search(mut self, enabled: bool) -> Self {
         self.tools.web_search = enabled;
         self
     }
 
     /// Enables or disables the built-in image-generation tool.
     #[must_use]
-    pub fn image_generation(mut self, enabled: bool) -> Self {
+    pub const fn image_generation(mut self, enabled: bool) -> Self {
         self.tools.image_generation = enabled;
         self
     }
@@ -331,7 +327,6 @@ impl ToolsBuilder {
     }
 
     /// Overrides the HTTP client used by in-process remote tools.
-    #[cfg(feature = "remote-tools")]
     #[must_use]
     pub fn remote_http_client(mut self, client: reqwest::Client) -> Self {
         self.tools.remote_http_client = Some(client);
@@ -410,7 +405,6 @@ fn built_in_name(tools: &Tools, name: &str) -> bool {
 /// normally owned privately by the higher-level agent driver.
 pub struct ToolRuntime {
     registry: Arc<ToolRegistry>,
-    #[cfg(feature = "code-mode")]
     code_mode: code_mode::CodeModeRuntime,
     sessions: Arc<ShellSessions>,
     default_shell_name: Arc<str>,
@@ -420,7 +414,6 @@ pub struct ToolRuntime {
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct ToolRuntimeControl {
-    #[cfg(feature = "code-mode")]
     code_mode: code_mode::CodeModeControl,
     sessions: Arc<ShellSessions>,
 }
@@ -428,7 +421,8 @@ pub struct ToolRuntimeControl {
 impl ToolRuntime {
     /// Creates a runtime with the standard workspace tools enabled.
     ///
-    /// Pass `None` for either remote-tool configuration to omit that handler.
+    /// Pass `None` for web search or image generation to omit that built-in
+    /// HTTP handler.
     pub fn new(
         workspace: impl Into<PathBuf>,
         web_search: Option<WebSearchConfig>,
@@ -440,7 +434,6 @@ impl ToolRuntime {
             image_generation,
             true,
             Arc::new(Vec::new()),
-            #[cfg(feature = "remote-tools")]
             None,
         )
     }
@@ -459,7 +452,6 @@ impl ToolRuntime {
             image_generation,
             tools.workspace_enabled(),
             tools.process_environment(),
-            #[cfg(feature = "remote-tools")]
             tools.remote_http_client(),
         )
         .with_tools(tools)
@@ -471,13 +463,12 @@ impl ToolRuntime {
         image_generation: Option<ImageGenerationConfig>,
         workspace_enabled: bool,
         process_environment: Arc<Vec<(OsString, OsString)>>,
-        #[cfg(feature = "remote-tools")] remote_http_client: Option<reqwest::Client>,
+        remote_http_client: Option<reqwest::Client>,
     ) -> Self {
         let workspace = workspace.into();
         let sessions = Arc::new(ShellSessions::with_environment(process_environment));
         let default_shell_name = Arc::from(sessions.default_shell_name());
         let working_directory = Arc::from(workspace.to_string_lossy().into_owned());
-        #[cfg(feature = "code-mode")]
         let code_mode_workspace = workspace.clone();
         let mut handlers: Vec<Arc<dyn Tool>> = Vec::new();
         if workspace_enabled {
@@ -488,33 +479,27 @@ impl ToolRuntime {
                     Arc::clone(&sessions),
                 )),
                 Arc::new(plan::UpdatePlanTool::new()),
-                Arc::new(view_image::ViewImageHandler::new(workspace.clone())),
+                Arc::new(view_image::ViewImageHandler::new(workspace)),
                 Arc::new(shell::WriteStdinHandler::new(Arc::clone(&sessions))),
             ]);
         }
-        #[cfg(feature = "remote-tools")]
-        {
-            let remote_http_client = remote_http_client.unwrap_or_default();
-            if let Some(web_search) = web_search {
-                handlers.push(Arc::new(web_search::WebSearchHandler::with_client(
-                    web_search,
-                    remote_http_client.clone(),
-                )));
-            }
-            if let Some(image_generation) = image_generation {
-                handlers.push(Arc::new(
-                    image_generation::ImageGenerationHandler::with_client(
-                        image_generation,
-                        remote_http_client,
-                    ),
-                ));
-            }
+        let remote_http_client = remote_http_client.unwrap_or_default();
+        if let Some(web_search) = web_search {
+            handlers.push(Arc::new(web_search::WebSearchHandler::with_client(
+                web_search,
+                remote_http_client.clone(),
+            )));
         }
-        #[cfg(not(feature = "remote-tools"))]
-        let _ = (web_search, image_generation);
+        if let Some(image_generation) = image_generation {
+            handlers.push(Arc::new(
+                image_generation::ImageGenerationHandler::with_client(
+                    image_generation,
+                    remote_http_client,
+                ),
+            ));
+        }
         Self {
             registry: Arc::new(ToolRegistry::from_ordered(handlers)),
-            #[cfg(feature = "code-mode")]
             code_mode: code_mode::CodeModeRuntime::new(code_mode_workspace),
             sessions,
             default_shell_name,
@@ -553,13 +538,11 @@ impl ToolRuntime {
     #[must_use]
     pub fn control(&self) -> ToolRuntimeControl {
         ToolRuntimeControl {
-            #[cfg(feature = "code-mode")]
             code_mode: self.code_mode.control(),
             sessions: Arc::clone(&self.sessions),
         }
     }
 
-    #[cfg(feature = "code-mode")]
     /// Returns the direct model-visible Code Mode tool definitions.
     #[must_use]
     pub fn model_specs(&self) -> Vec<ToolDefinition> {
@@ -572,7 +555,6 @@ impl ToolRuntime {
         ]
     }
 
-    #[cfg(feature = "code-mode")]
     /// Starts or resumes a Code Mode cell and observes its first terminal boundary.
     pub async fn execute_code(&self, source: &str, context: ToolContext<'_>) -> CodeModeExecution {
         self.code_mode
@@ -584,7 +566,6 @@ impl ToolRuntime {
             .await
     }
 
-    #[cfg(feature = "code-mode")]
     #[doc(hidden)]
     pub async fn execute_code_with_updates(
         &self,
@@ -602,7 +583,6 @@ impl ToolRuntime {
             .await
     }
 
-    #[cfg(feature = "code-mode")]
     /// Executes Code Mode without copying an already-owned history snapshot.
     #[doc(hidden)]
     pub async fn execute_code_owned(
@@ -615,7 +595,6 @@ impl ToolRuntime {
             .await
     }
 
-    #[cfg(feature = "code-mode")]
     #[doc(hidden)]
     pub async fn execute_code_owned_with_updates(
         &self,
@@ -628,13 +607,11 @@ impl ToolRuntime {
             .await
     }
 
-    #[cfg(feature = "code-mode")]
     /// Waits for a previously yielded Code Mode cell.
     pub async fn wait_for_code(&self, input: &str, context: ToolContext<'_>) -> CodeModeExecution {
         self.code_mode.wait(input, context).await
     }
 
-    #[cfg(feature = "code-mode")]
     #[doc(hidden)]
     pub async fn wait_for_code_with_updates(
         &self,
@@ -662,13 +639,10 @@ impl ToolRuntime {
 impl ToolRuntimeControl {
     #[doc(hidden)]
     pub async fn cancel(&self) {
-        #[cfg(feature = "code-mode")]
         tokio::join!(
             self.code_mode.terminate_all(),
             self.sessions.terminate_all()
         );
-        #[cfg(not(feature = "code-mode"))]
-        self.sessions.terminate_all().await;
     }
 }
 
@@ -687,13 +661,36 @@ impl ToolRegistry {
         input: ToolInput,
         context: ToolContext<'_>,
     ) -> ToolExecution {
-        let Some((handler, _definition)) = self.get(name) else {
-            return ToolExecution::error(format!("unsupported tool call: {name}"));
+        let trace_content = tracing::enabled!(
+            target: "nanocodex_tools",
+            tracing::Level::INFO
+        );
+        let (arguments_kind, arguments) = match &input {
+            ToolInput::Function(arguments) => ("function", arguments.get()),
+            ToolInput::Freeform(arguments) => ("freeform", arguments.as_str()),
         };
-        match handler.execute(input, context).await {
-            Ok(execution) => execution,
-            Err(error) => ToolExecution::error(error.to_string()),
+        let arguments_content = trace_content.then(|| arguments.to_owned());
+        let span = tool_execution_span(name, context, arguments.len(), arguments_kind, 1, "");
+        if let Some(arguments_content) = &arguments_content {
+            record_tool_content(&span, "tool.arguments", arguments_content);
         }
+        let started_at = std::time::Instant::now();
+        let execution = async {
+            let Some((handler, _definition)) = self.get(name) else {
+                return ToolExecution::error(format!("unsupported tool call: {name}"));
+            };
+            match handler.execute(input, context).await {
+                Ok(execution) => execution,
+                Err(error) => ToolExecution::error(error.to_string()),
+            }
+        }
+        .instrument(span.clone())
+        .await;
+        let output_content = trace_content
+            .then(|| serde_json::to_string(&execution.output).ok())
+            .flatten();
+        finish_tool_execution_span(&span, started_at, &execution, output_content.as_deref());
+        execution
     }
 
     pub(crate) async fn execute_nested(
@@ -734,26 +731,13 @@ impl ToolRegistry {
             })
             .flatten()
             .unwrap_or_default();
-        let span = info_span!(
-            target: "nanocodex_tools",
-            "tool.execute",
-            otel.kind = "internal",
-            otel.status_code = tracing::field::Empty,
-            tool.name = name,
-            session.id = context.session_id(),
-            tool.call_id = context.call_id(),
-            tool.arguments.bytes = arguments_bytes,
-            tool.arguments.kind = arguments_kind,
-            tool.arguments.count = arguments_count,
-            tool.arguments.keys = argument_keys,
-            process.exit.code = tracing::field::Empty,
-            process.running = tracing::field::Empty,
-            process.wall_time_ms = tracing::field::Empty,
-            shell.session.id = tracing::field::Empty,
-            tool.output.bytes = tracing::field::Empty,
-            tool.output.original_tokens = tracing::field::Empty,
-            status = tracing::field::Empty,
-            duration_ns = tracing::field::Empty,
+        let span = tool_execution_span(
+            name,
+            context,
+            arguments_bytes,
+            arguments_kind,
+            arguments_count,
+            &argument_keys,
         );
         if let Some(arguments_content) = &arguments_content {
             record_tool_content(&span, "tool.arguments", arguments_content);
@@ -763,39 +747,10 @@ impl ToolRegistry {
             .execute_nested_inner(name, input, context)
             .instrument(span.clone())
             .await;
-        if trace_content && let Ok(content) = serde_json::to_string(&execution.output) {
-            record_tool_content(&span, "tool.output", &content);
-        }
-        span.record(
-            "status",
-            if execution.success {
-                "completed"
-            } else {
-                "failed"
-            },
-        );
-        span.record(
-            "otel.status_code",
-            if execution.success { "OK" } else { "ERROR" },
-        );
-        span.record(
-            "duration_ns",
-            u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
-        );
-        if let Some(process) = execution.process_trace() {
-            if let Some(exit_code) = process.exit_code {
-                span.record("process.exit.code", exit_code);
-            }
-            span.record("process.running", process.session_id.is_some());
-            span.record("process.wall_time_ms", process.wall_time_seconds * 1_000.0);
-            if let Some(session_id) = process.session_id {
-                span.record("shell.session.id", session_id);
-            }
-            span.record("tool.output.bytes", process.output_bytes);
-            if let Some(original_token_count) = process.original_token_count {
-                span.record("tool.output.original_tokens", original_token_count);
-            }
-        }
+        let output_content = trace_content
+            .then(|| serde_json::to_string(&execution.output).ok())
+            .flatten();
+        finish_tool_execution_span(&span, started_at, &execution, output_content.as_deref());
         execution
     }
 
@@ -907,15 +862,85 @@ fn record_tool_content(span: &tracing::Span, kind: &'static str, content: &str) 
     });
 }
 
+fn tool_execution_span(
+    name: &str,
+    context: ToolContext<'_>,
+    arguments_bytes: usize,
+    arguments_kind: &'static str,
+    arguments_count: usize,
+    argument_keys: &str,
+) -> tracing::Span {
+    info_span!(
+        target: "nanocodex_tools",
+        "tool.execute",
+        otel.kind = "internal",
+        otel.status_code = tracing::field::Empty,
+        tool.name = name,
+        session.id = context.session_id(),
+        tool.call_id = context.call_id(),
+        tool.arguments.bytes = arguments_bytes,
+        tool.arguments.kind = arguments_kind,
+        tool.arguments.count = arguments_count,
+        tool.arguments.keys = argument_keys,
+        process.exit.code = tracing::field::Empty,
+        process.running = tracing::field::Empty,
+        process.wall_time_ms = tracing::field::Empty,
+        shell.session.id = tracing::field::Empty,
+        tool.output.bytes = tracing::field::Empty,
+        tool.output.original_tokens = tracing::field::Empty,
+        status = tracing::field::Empty,
+        duration_ns = tracing::field::Empty,
+    )
+}
+
+fn finish_tool_execution_span(
+    span: &tracing::Span,
+    started_at: std::time::Instant,
+    execution: &ToolExecution,
+    output_content: Option<&str>,
+) {
+    if let Some(output_content) = output_content {
+        record_tool_content(span, "tool.output", output_content);
+        span.record("tool.output.bytes", output_content.len());
+    }
+    span.record(
+        "status",
+        if execution.success {
+            "completed"
+        } else {
+            "failed"
+        },
+    );
+    span.record(
+        "otel.status_code",
+        if execution.success { "OK" } else { "ERROR" },
+    );
+    span.record(
+        "duration_ns",
+        u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+    );
+    if let Some(process) = execution.process_trace() {
+        if let Some(exit_code) = process.exit_code {
+            span.record("process.exit.code", exit_code);
+        }
+        span.record("process.running", process.session_id.is_some());
+        span.record("process.wall_time_ms", process.wall_time_seconds * 1_000.0);
+        if let Some(session_id) = process.session_id {
+            span.record("shell.session.id", session_id);
+        }
+        span.record("tool.output.bytes", process.output_bytes);
+        if let Some(original_token_count) = process.original_token_count {
+            span.record("tool.output.original_tokens", original_token_count);
+        }
+    }
+}
+
 fn definition_metadata(name: &str, definition: &ToolDefinition) -> Value {
     let kind = match definition {
         ToolDefinition::Function { .. } => "function",
         ToolDefinition::Custom { .. } => "freeform",
     };
-    #[cfg(feature = "code-mode")]
     let metadata_name = code_mode::description::normalize_identifier(name);
-    #[cfg(not(feature = "code-mode"))]
-    let metadata_name = name;
     json!({
         "name": metadata_name,
         "tool_name": name,
@@ -968,11 +993,11 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
 
-    use nanocodex_oai_api::{OpenAiAuth, ToolDefinition};
+    use nanocodex_oai_api::{auth::OpenAiAuth, tools::ToolDefinition};
     use serde::Deserialize;
     use serde_json::json;
 
-    use crate::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolOutputBody, ToolResult};
+    use crate::{ToolOutputBody, ToolResult, contract::DEFAULT_TOOL_OUTPUT_TOKENS};
 
     use super::{
         DynamicToolProvider, ImageGenerationConfig, Tool, ToolContext, ToolExecution, ToolInput,

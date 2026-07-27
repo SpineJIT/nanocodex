@@ -11,7 +11,6 @@ export type {
   ForkOptions,
   PromptInput,
   PromptItem,
-  PricingSnapshot,
   ReasoningMode,
   SessionSnapshot,
   Thinking,

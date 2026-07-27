@@ -36,7 +36,10 @@ impl ToolDefinition {
     /// Creates a function tool with non-strict parameters.
     ///
     /// ```
-    /// use nanocodex_oai_api::{JsonSchema, ToolDefinition};
+    /// use nanocodex_oai_api::{
+    ///     responses::JsonSchema,
+    ///     tools::ToolDefinition,
+    /// };
     /// use serde_json::json;
     ///
     /// let definition = ToolDefinition::function(

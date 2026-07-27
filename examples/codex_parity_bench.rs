@@ -6,7 +6,9 @@ use std::{
 
 use eyre::{Result, WrapErr, bail, eyre};
 use nanocodex::{
-    AgentEventKind, AgentEvents, Nanocodex, SessionId, Thinking, Tools, Turn, TurnResult, Usage,
+    AgentEvents, Nanocodex, OpenAi, Thinking, Tools, Turn, TurnResult,
+    agent::{events::AgentEventKind, session::SessionId},
+    oai::{MODEL, responses::Usage},
 };
 use serde::{Deserialize, Serialize};
 
@@ -105,12 +107,7 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let args = parse_args()?;
     let api_key = env::var("OPENAI_API_KEY").wrap_err("OPENAI_API_KEY is required")?;
-    let workload_bytes = fs::read(&args.workload)
-        .wrap_err_with(|| format!("failed to read workload at {}", args.workload.display()))?;
-    let workload: Workload =
-        serde_json::from_slice(&workload_bytes).wrap_err("failed to decode parity workload")?;
-    validate_workload(&workload)?;
-
+    let (workload_bytes, workload) = load_workload(&args.workload)?;
     let agents_md = fs::read(args.cwd.join("AGENTS.md"))
         .wrap_err_with(|| format!("failed to read AGENTS.md from {}", args.cwd.display()))?;
     let prompts = prompts(&workload);
@@ -120,8 +117,9 @@ async fn main() -> Result<()> {
     }
     let lineage = SessionId::new();
     let tools = Tools::builder().without_defaults().build()?;
+    let openai = OpenAi::new(api_key)?;
     let agent_build_started = Instant::now();
-    let (agent, mut root_events) = Nanocodex::builder(api_key)
+    let (agent, mut root_events) = Nanocodex::builder(openai)
         .session_id(lineage)
         .instructions(workload.base_instructions.clone())
         .thinking(Thinking::Low)
@@ -208,6 +206,14 @@ async fn main() -> Result<()> {
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+fn load_workload(path: &Path) -> Result<(Vec<u8>, Workload)> {
+    let bytes = fs::read(path)
+        .wrap_err_with(|| format!("failed to read workload at {}", path.display()))?;
+    let workload = serde_json::from_slice(&bytes).wrap_err("failed to decode parity workload")?;
+    validate_workload(&workload)?;
+    Ok((bytes, workload))
 }
 
 async fn measured_turn(
@@ -422,7 +428,7 @@ fn parse_args() -> Result<Args> {
 
 fn validate_workload(workload: &Workload) -> Result<()> {
     if workload.schema_version != 1
-        || workload.model != nanocodex::MODEL
+        || workload.model != MODEL
         || workload.reasoning_effort != "low"
         || workload.text_verbosity != "low"
         || workload.chain_turns != 10

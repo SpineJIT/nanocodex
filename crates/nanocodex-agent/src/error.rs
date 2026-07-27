@@ -1,7 +1,7 @@
 use std::{error::Error, io, path::PathBuf};
 
-pub use nanocodex_oai_api::ResponsesError;
-use nanocodex_oai_api::ResponsesServiceError;
+use nanocodex_oai_api::tower::ResponsesServiceError;
+pub use nanocodex_oai_api::transport::ResponsesError;
 
 /// Error returned by the Nanocodex library boundary.
 #[derive(Debug, thiserror::Error)]
@@ -133,7 +133,7 @@ pub enum NanocodexError {
 
     /// Contractual agent event serialization failed.
     #[error(transparent)]
-    Event(#[from] nanocodex_oai_api::EventError),
+    Event(#[from] nanocodex_oai_api::events::EventError),
 
     /// The provider protocol or transport failed.
     #[error(transparent)]
@@ -141,7 +141,7 @@ pub enum NanocodexError {
 
     /// The Tower Responses service failed.
     #[error(transparent)]
-    ResponsesService(#[from] nanocodex_oai_api::ResponsesServiceError),
+    ResponsesService(#[from] nanocodex_oai_api::tower::ResponsesServiceError),
 
     /// The configured tool registry or runtime could not be built.
     #[cfg(not(target_family = "wasm"))]
@@ -184,7 +184,7 @@ pub type Result<T> = std::result::Result<T, NanocodexError>;
 #[cfg(test)]
 mod tests {
     use super::{NanocodexError, ResponsesError};
-    use nanocodex_oai_api::ResponsesServiceError;
+    use nanocodex_oai_api::tower::ResponsesServiceError;
 
     #[test]
     fn responses_classification_covers_every_service_boundary() {

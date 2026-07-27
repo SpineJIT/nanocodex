@@ -6,11 +6,11 @@ use std::{
 };
 
 use nanocodex_oai_api::{
-    DefaultResponsesService, ResponsesClient, ResponsesService, TransportStats,
-};
-use nanocodex_oai_api::{
-    EventSink, ModelConfig, PricingSnapshot, Prompt, ReasoningMode, ResponseItem, Thinking,
-    UserInput,
+    ModelConfig, Prompt, ReasoningMode, Thinking, UserInput,
+    events::EventSink,
+    responses::ResponseItem,
+    tower::{DefaultResponsesService, ResponsesClient, ResponsesService},
+    transport::TransportStats,
 };
 use nanocodex_tools::Tools;
 use serde::Deserialize;
@@ -19,13 +19,14 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::{
-    NanocodexError, SessionSnapshot, TurnUsage,
-    model::agent::{
+    NanocodexError,
+    model::run::{
         CompletedModelTurn, ModelCheckpoint, ModelRun, ModelTurnOutcome, PreparedCheckpoint,
         prepare_checkpoint, prepare_resumed_checkpoint, prepare_rollout_checkpoint,
     },
     prompt_cache::ModelPromptCache,
-    session::{CommittedSession, SessionResume},
+    session::{CommittedSession, SessionResume, SessionSnapshot},
+    usage::TurnUsage,
 };
 
 const STEER_CAPACITY: usize = 8;
@@ -58,8 +59,6 @@ struct WasmConfig {
     workspace: Option<String>,
     #[serde(default)]
     resume: Option<SessionSnapshot>,
-    #[serde(default)]
-    pricing: Option<PricingSnapshot>,
 }
 
 #[derive(Clone)]
@@ -170,19 +169,18 @@ impl WasmNanocodex {
             .map_err(js_error)?;
         let session_id = config.session_id.unwrap_or_else(new_session_id);
         let model_config = Arc::new(ModelConfig {
-            auth: nanocodex_oai_api::OpenAiAuth::api_key(config.api_key),
+            auth: nanocodex_oai_api::auth::OpenAiAuth::api_key(config.api_key),
             reasoning_mode,
             thinking,
             fast_mode: config.fast_mode,
-            responses_transport: nanocodex_oai_api::ResponsesTransport::WebSocket,
-            responses_history: nanocodex_oai_api::ResponsesHistory::Incremental,
+            responses_transport: nanocodex_oai_api::transport::ResponsesTransport::WebSocket,
+            responses_history: nanocodex_oai_api::transport::ResponsesHistory::Incremental,
             store_responses: true,
             websocket_url: config.websocket_url,
             api_base_url: config.api_base_url,
             system_prompt: config
                 .instructions
                 .map_or_else(|| ModelConfig::default().system_prompt, Arc::from),
-            pricing: config.pricing.map(Arc::new),
         });
         let configured_workspace = config.workspace.map(Arc::<str>::from);
         let (lineage_id, prompt_cache_key, initial_resume, workspace) =
@@ -672,6 +670,7 @@ async fn run_driver(
                 }
             }
             if !commands_open {
+                model.shutdown().await;
                 return;
             }
             let Some(command) = commands.recv().await else {
@@ -745,6 +744,7 @@ async fn run_driver(
                         )));
                     }
                 }
+                outcome = &mut execution => break outcome,
                 command = commands.recv() => {
                     match command {
                         Some(Command::Prompt {
@@ -791,6 +791,12 @@ async fn run_driver(
                             break execution.as_mut().await;
                         }
                         Some(command @ (Command::Fork { .. } | Command::Spawn { .. })) => {
+                            if let Some(snapshot) = fork_snapshot_rx.borrow_and_update().clone() {
+                                latest_checkpoint = Some(Arc::new(CommittedSession::new(
+                                    Arc::clone(&factory.lineage_id),
+                                    snapshot,
+                                )));
+                            }
                             handle_idle_command(
                                 command,
                                 latest_checkpoint.as_ref(),
@@ -807,10 +813,15 @@ async fn run_driver(
                             default_fast_mode = enabled;
                             drop(result.send(Ok(())));
                         }
-                        None => commands_open = false,
+                        None => {
+                            commands_open = false;
+                            queued_turns.clear();
+                            if let Some(cancel) = cancel.take() {
+                                let _ = cancel.send(());
+                            }
+                        }
                     }
                 }
-                outcome = &mut execution => break outcome,
             }
         };
         drop(execution);

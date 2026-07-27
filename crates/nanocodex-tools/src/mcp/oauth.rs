@@ -84,7 +84,7 @@ impl McpOAuthCredentials {
 
     /// Sets the access-token expiry as Unix epoch milliseconds.
     #[must_use]
-    pub fn expires_at_millis(mut self, expires_at_millis: u64) -> Self {
+    pub const fn expires_at_millis(mut self, expires_at_millis: u64) -> Self {
         self.expires_at_millis = Some(expires_at_millis);
         self
     }
@@ -241,7 +241,7 @@ impl OAuthRuntime {
             return Ok(());
         }
         let span = info_span!(
-            target: "nanocodex_mcp",
+            target: "nanocodex_tools",
             parent: parent,
             "mcp.oauth.credentials_save",
             otel.kind = "internal",
@@ -360,7 +360,7 @@ pub(crate) async fn begin_login(
         .map_err(|error| format!("failed to inspect MCP OAuth callback: {error}"))?;
     let redirect_uri = format!("http://{address}/callback");
     let authorization_span = info_span!(
-        target: "nanocodex_mcp",
+        target: "nanocodex_tools",
         "mcp.oauth.authorization_start",
         otel.kind = "client",
         otel.status_code = tracing::field::Empty,
@@ -423,7 +423,7 @@ async fn complete_login(
     server_url: String,
 ) -> Result<(), String> {
     let callback_span = info_span!(
-        target: "nanocodex_mcp",
+        target: "nanocodex_tools",
         "mcp.oauth.callback_wait",
         otel.kind = "server",
         otel.status_code = tracing::field::Empty,
@@ -451,7 +451,7 @@ async fn complete_login(
     );
     let callback = callback?;
     let exchange_span = info_span!(
-        target: "nanocodex_mcp",
+        target: "nanocodex_tools",
         "mcp.oauth.code_exchange",
         otel.kind = "client",
         otel.status_code = tracing::field::Empty,
@@ -483,7 +483,7 @@ async fn complete_login(
         response.ok_or_else(|| "MCP OAuth provider returned no credentials".to_owned())?;
     let credentials = McpOAuthCredentials::from_token_response(client_id, &response);
     let save_span = info_span!(
-        target: "nanocodex_mcp",
+        target: "nanocodex_tools",
         "mcp.oauth.credentials_save",
         otel.kind = "internal",
         otel.status_code = tracing::field::Empty,

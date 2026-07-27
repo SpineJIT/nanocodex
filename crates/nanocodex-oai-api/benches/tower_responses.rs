@@ -8,11 +8,14 @@ use std::{
 };
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use nanocodex_oai_api::EncodedRequest;
 use nanocodex_oai_api::{
-    AgentEvent, AgentEventKind, ContentItem, EventSink, FunctionOutputBody, FunctionOutputContent,
-    MessageRole, PricingSnapshot, ResponseItem, TokenRates, UsdPerMillionTokens, monotonic_now_ns,
-    responses::ServerEvent,
+    events::{AgentEvent, AgentEventKind, EventSink, monotonic_now_ns},
+    pricing::{ServiceTier, estimate},
+    responses::{
+        ContentItem, FunctionOutputBody, FunctionOutputContent, InputTokenDetails, MessageRole,
+        ResponseItem, ServerEvent, Usage,
+    },
+    transport::EncodedRequest,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, value::RawValue};
@@ -142,7 +145,7 @@ struct StringInlineMessage {
     content: SmallVec<[StringContentItem; 1]>,
 }
 
-fn request(prompt: &str) -> ResponseCreate<'_> {
+const fn request(prompt: &str) -> ResponseCreate<'_> {
     ResponseCreate {
         kind: "response.create",
         model: "benchmark-model",
@@ -370,30 +373,21 @@ fn agent_event_encoding(criterion: &mut Criterion) {
 }
 
 fn pricing_estimation(criterion: &mut Criterion) {
-    let pricing = PricingSnapshot::new(
-        "benchmark-contract",
-        "retained-benchmark-fixture",
-        "2026-07-01",
-        TokenRates {
-            input: "1.25".parse::<UsdPerMillionTokens>().unwrap(),
-            cached_input: "0.125".parse::<UsdPerMillionTokens>().unwrap(),
-            cache_write_input: "1.25".parse::<UsdPerMillionTokens>().unwrap(),
-            output: "10".parse::<UsdPerMillionTokens>().unwrap(),
-        },
-    )
-    .unwrap();
+    let usage = Usage {
+        input_tokens: 128_000,
+        input_tokens_details: Some(InputTokenDetails {
+            cached_tokens: 96_000,
+            cache_write_tokens: 8_000,
+        }),
+        output_tokens: 16_000,
+        output_tokens_details: None,
+        total_tokens: 144_000,
+    };
     let mut group = criterion.benchmark_group("pricing_estimation");
     group.sample_size(100);
     group.measurement_time(Duration::from_secs(3));
     group.bench_function("aggregate_turn_usage", |bencher| {
-        bencher.iter(|| {
-            black_box(pricing.estimate_tokens(
-                black_box(128_000),
-                black_box(96_000),
-                black_box(8_000),
-                black_box(16_000),
-            ))
-        });
+        bencher.iter(|| estimate(black_box(&usage), black_box(ServiceTier::Standard)));
     });
     group.finish();
 }

@@ -68,7 +68,7 @@ pub struct ResponseHistory {
 }
 
 struct HistorySegment {
-    previous: Option<Arc<HistorySegment>>,
+    previous: Option<Arc<Self>>,
     items: Arc<Vec<ResponseItem>>,
     len: usize,
 }
@@ -191,7 +191,7 @@ impl ResponseHistory {
     }
 
     #[cfg(test)]
-    fn committed_head(&self) -> Option<&Arc<HistorySegment>> {
+    const fn committed_head(&self) -> Option<&Arc<HistorySegment>> {
         self.head.as_ref()
     }
 }

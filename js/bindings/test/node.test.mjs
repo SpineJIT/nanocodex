@@ -36,18 +36,6 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
     thinking: "none",
     reasoningMode: "pro",
     sessionId: "wasm-session",
-    pricing: {
-      id: "test-contract",
-      source: "test-fixture",
-      effective_date: "2026-07-01",
-      model: "gpt-5.6-sol",
-      rates: {
-        input_usd_per_million: "1",
-        cached_input_usd_per_million: "0.1",
-        cache_write_input_usd_per_million: "1",
-        output_usd_per_million: "10",
-      },
-    },
     tools: {
       multiply: {
         description: "Multiply two integers.",
@@ -113,23 +101,12 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
     reasoning_output_tokens: 2,
     total_tokens: 24,
     estimated_cost: {
-      usd: "0.000051",
-      input_usd: "0.00001",
-      cached_input_usd: "0.000001",
+      usd: "0.000175",
+      input_usd: "0.00005",
+      cached_input_usd: "0.000005",
       cache_write_input_usd: "0",
-      output_usd: "0.00004",
-      pricing: {
-        id: "test-contract",
-        source: "test-fixture",
-        effective_date: "2026-07-01",
-        model: "gpt-5.6-sol",
-        rates: {
-          input_usd_per_million: "1",
-          cached_input_usd_per_million: "0.1",
-          cache_write_input_usd_per_million: "1",
-          output_usd_per_million: "10",
-        },
-      },
+      output_usd: "0.00012",
+      service_tier: "standard",
     },
     cost_status: "estimated_from_usage",
   });
@@ -145,7 +122,7 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
   assert.equal(events.filter((event) => event.type === "run.completed").length, 2);
   assert.equal(
     events.find((event) => event.type === "run.completed")?.payload.estimated_cost.usd,
-    "0.000051",
+    "0.000175",
   );
   assert.ok(events.some((event) => event.type === "tool.call" && event.payload.tool === "multiply"));
   watch.off();

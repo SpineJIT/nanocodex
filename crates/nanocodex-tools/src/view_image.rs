@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use nanocodex_oai_api::ToolDefinition;
+use nanocodex_oai_api::tools::ToolDefinition;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -15,7 +15,7 @@ pub(super) struct ViewImageHandler {
 }
 
 impl ViewImageHandler {
-    pub(super) fn new(workspace: PathBuf) -> Self {
+    pub(super) const fn new(workspace: PathBuf) -> Self {
         Self { workspace }
     }
 }

@@ -207,7 +207,7 @@ impl ScreenSelection {
         changed
     }
 
-    pub(super) fn is_active(&self) -> bool {
+    pub(super) const fn is_active(&self) -> bool {
         self.anchor.is_some() && self.head.is_some()
     }
 
@@ -258,19 +258,19 @@ impl ScreenSelection {
             (self.dragging && self.auto_scroll.is_some()).then(|| buffer.clone());
     }
 
-    pub(super) fn take_pending_copy(&mut self) -> Option<String> {
+    pub(super) const fn take_pending_copy(&mut self) -> Option<String> {
         self.pending_copy.take()
     }
 
-    pub(super) fn take_pending_click(&mut self) -> Option<SelectionClick> {
+    pub(super) const fn take_pending_click(&mut self) -> Option<SelectionClick> {
         self.pending_click.take()
     }
 
-    pub(super) fn surface_index(&self) -> Option<usize> {
+    pub(super) const fn surface_index(&self) -> Option<usize> {
         self.surface_index
     }
 
-    pub(super) fn selectable_area_count(&self) -> usize {
+    pub(super) const fn selectable_area_count(&self) -> usize {
         self.selectable_area_count
     }
 
@@ -386,7 +386,7 @@ impl ScreenSelection {
         self.clear_active()
     }
 
-    pub(super) fn needs_tick(&self) -> bool {
+    pub(super) const fn needs_tick(&self) -> bool {
         self.copy_at.is_some()
             || self.clear_at.is_some()
             || (self.dragging && self.auto_scroll.is_some())
@@ -420,7 +420,7 @@ impl ScreenSelection {
     }
 }
 
-fn positions_are_near(left: Position, right: Position) -> bool {
+const fn positions_are_near(left: Position, right: Position) -> bool {
     left.x.abs_diff(right.x) <= 1 && left.y.abs_diff(right.y) <= 1
 }
 
@@ -657,7 +657,7 @@ fn selected_row_end(buffer: &Buffer, y: u16, first_x: u16, last_x: u16) -> Optio
     None
 }
 
-fn row_bounds(start: Position, end: Position, y: u16, last_x: u16) -> (u16, u16) {
+const fn row_bounds(start: Position, end: Position, y: u16, last_x: u16) -> (u16, u16) {
     match (y == start.y, y == end.y) {
         (true, true) => (start.x, end.x),
         (true, false) => (start.x, last_x),

@@ -83,14 +83,14 @@ impl McpServer {
 
     /// Sets the maximum duration for initialize and initial discovery.
     #[must_use]
-    pub fn startup_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn startup_timeout(mut self, timeout: Duration) -> Self {
         self.startup_timeout = timeout;
         self
     }
 
     /// Sets the maximum duration of one remote tool call.
     #[must_use]
-    pub fn tool_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn tool_timeout(mut self, timeout: Duration) -> Self {
         self.tool_timeout = timeout;
         self
     }

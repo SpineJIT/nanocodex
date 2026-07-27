@@ -7,9 +7,16 @@ use std::{
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr, eyre};
 use nanocodex::{
-    AgentEvents, DurableSession, McpHandle, Nanocodex, OpenAiAuth, OpenAiAuthMode, PricingSnapshot,
-    ReasoningMode, Responses, ResponsesHistory, ResponsesTransport, RolloutConfig, SessionId,
-    SessionSnapshot, Thinking, Tools,
+    AgentEvents, Nanocodex, OpenAi, ReasoningMode, Thinking, Tools,
+    agent::{
+        rollout::{DurableSession, RolloutConfig},
+        session::{SessionId, SessionSnapshot},
+    },
+    oai::{
+        auth::{OpenAiAuth, OpenAiAuthMode},
+        transport::{ResponsesHistory, ResponsesTransport},
+    },
+    tools::mcp::McpHandle,
 };
 
 use crate::mcp::{ConfiguredMcp, McpArgs};
@@ -60,10 +67,6 @@ pub(crate) struct AgentArgs {
     /// Replace the standard system/developer instructions.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     instructions: Option<String>,
-
-    /// JSON pricing snapshot used to estimate USD cost from token usage.
-    #[arg(long, env = "NANOCODEX_PRICING_FILE")]
-    pricing_file: Option<PathBuf>,
 
     /// Whether standalone web search is exposed to the model.
     #[arg(
@@ -163,7 +166,6 @@ impl AgentArgs {
 
     async fn build_inner(self, durable: Option<DurableSession>) -> Result<ConfiguredAgent> {
         let codex_home = default_codex_home()?;
-        let pricing = load_pricing(self.pricing_file.as_deref())?;
         let responses_transport = self.responses_transport();
         let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
         let mpp_enabled = self.mpp.is_enabled();
@@ -179,31 +181,31 @@ impl AgentArgs {
         };
         let direct_websocket_url = direct_websocket_url(self.websocket_url, auth.mode());
         let mpp_adapter = self.mpp.start().await?;
-        let mut responses = Responses::builder()
+        let mut openai = OpenAi::builder(auth)
             .transport(responses_transport)
             .websocket_url(direct_websocket_url);
         if mpp_enabled {
-            responses = responses.max_attempts(NonZeroU32::MIN);
+            openai = openai.max_attempts(NonZeroU32::MIN);
         }
         if let Some(history) = self.responses_history {
-            responses = responses.history(history);
+            openai = openai.history(history);
         }
         if let Some(store) = self.store_responses {
-            responses = responses.store(store);
+            openai = openai.store(store);
         }
         let api_base_url = selected_api_base_url(
             self.api_base_url,
             mpp_adapter.as_ref().map(MppAdapter::api_base_url),
         );
         if let Some(api_base_url) = api_base_url {
-            responses = responses.api_base_url(api_base_url);
+            openai = openai.api_base_url(api_base_url);
         }
         if matches!(responses_transport, ResponsesTransport::Https)
             && let Some(mpp_adapter) = &mpp_adapter
         {
-            responses = responses.http_client(mpp_adapter.responses_http_client()?);
+            openai = openai.http_client(mpp_adapter.responses_http_client()?);
         }
-        let responses = responses.build();
+        let openai = openai.build()?;
         let mut tools = Tools::builder()
             .web_search(self.web_search)
             .image_generation(self.image_generation);
@@ -219,12 +221,11 @@ impl AgentArgs {
         }
         let tools = tools.build()?;
         let child_agents = self.subagents.then(|| Arc::new(ChildAgents::default()));
-        let mut builder = Nanocodex::builder(auth)
+        let mut builder = Nanocodex::builder(openai)
             .reasoning_mode(self.reasoning_mode)
             .thinking(self.thinking)
             .workspace(session.workspace)
-            .codex_home(codex_home)
-            .responses(responses);
+            .codex_home(codex_home);
         if let Some(session_id) = session.session_id {
             builder = builder.session_id(session_id);
         }
@@ -234,11 +235,8 @@ impl AgentArgs {
         if let Some(rollout) = session.rollout {
             builder = builder.rollout(rollout);
         }
-        if let Some(pricing) = pricing {
-            builder = builder.pricing(pricing);
-        }
         let builder = if let Some(child_agents) = &child_agents {
-            let tools = tools.clone();
+            let tools = tools;
             let child_agents = Arc::downgrade(child_agents);
             builder.tools_factory(move |agent| {
                 subagents::with_subagents(tools.clone(), agent, child_agents.clone())
@@ -260,17 +258,6 @@ impl AgentArgs {
             mcp: mcp_handle,
         })
     }
-}
-
-fn load_pricing(path: Option<&Path>) -> Result<Option<PricingSnapshot>> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    let bytes = std::fs::read(path)
-        .wrap_err_with(|| format!("failed to read pricing snapshot {}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .wrap_err_with(|| format!("invalid pricing snapshot {}", path.display()))
-        .map(Some)
 }
 
 fn prepare_session_build(
@@ -376,7 +363,7 @@ fn environment_api_key() -> Result<Option<String>> {
 }
 
 fn load_subscription_auth(auth_file: &Path) -> Result<OpenAiAuth> {
-    nanocodex::load_chatgpt_auth(auth_file).map_err(|error| {
+    nanocodex::oai::auth::load_chatgpt_auth(auth_file).map_err(|error| {
         eyre!(
             "ChatGPT authorization could not be loaded from {}: {error}. Run `nanocodex auth login`",
             auth_file.display()
@@ -416,11 +403,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use clap::CommandFactory;
-    use nanocodex::OpenAiAuthMode;
+    use nanocodex::oai::auth::OpenAiAuthMode;
 
     use super::{
-        direct_websocket_url, load_pricing, select_auth, select_auth_with_default,
-        selected_api_base_url,
+        direct_websocket_url, select_auth, select_auth_with_default, selected_api_base_url,
     };
 
     #[test]
@@ -465,34 +451,6 @@ mod tests {
             std::process::id(),
             NEXT_PATH.fetch_add(1, Ordering::Relaxed)
         ))
-    }
-
-    #[test]
-    fn pricing_file_retains_exact_rates_and_provenance() {
-        let path = auth_file();
-        std::fs::write(
-            &path,
-            br#"{
-                "id": "team-contract-2026-q3",
-                "source": "billing-contract",
-                "effective_date": "2026-07-01",
-                "model": "gpt-5.6-sol",
-                "rates": {
-                    "input_usd_per_million": "1.25",
-                    "cached_input_usd_per_million": "0.125",
-                    "cache_write_input_usd_per_million": "1.25",
-                    "output_usd_per_million": "10"
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let pricing = load_pricing(Some(&path))
-            .unwrap()
-            .expect("the file should configure pricing");
-        assert_eq!(pricing.id(), "team-contract-2026-q3");
-        assert_eq!(pricing.rates().cached_input.decimal(), "0.125");
-        std::fs::remove_file(path).unwrap();
     }
 
     fn write_chatgpt_auth(path: &std::path::Path) {

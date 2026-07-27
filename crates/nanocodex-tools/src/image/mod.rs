@@ -1,3 +1,5 @@
+//! Prompt image preparation and model-output image normalization.
+
 use std::{
     collections::{HashMap, VecDeque},
     io::Cursor,
@@ -12,7 +14,8 @@ use image::{
     codecs::{jpeg::JpegEncoder, png::PngEncoder, webp::WebPEncoder},
     imageops::FilterType,
 };
-use nanocodex_oai_api::{ContentItem, ImageDetail, PromptInput, UserInput};
+pub use nanocodex_oai_api::ImageDetail;
+use nanocodex_oai_api::{PromptInput, UserInput, responses::ContentItem};
 use sha1::{Digest as _, Sha1};
 
 use super::{ToolOutputBody, ToolOutputContent};

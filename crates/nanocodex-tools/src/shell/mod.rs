@@ -518,7 +518,7 @@ impl CapturedChunk {
 }
 
 impl ExecCommandResult {
-    fn failed(wall_time: Duration, output: String) -> Self {
+    const fn failed(wall_time: Duration, output: String) -> Self {
         Self {
             chunk_id: None,
             wall_time_seconds: wall_time.as_secs_f64(),

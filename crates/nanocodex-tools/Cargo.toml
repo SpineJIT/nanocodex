@@ -8,15 +8,10 @@ authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 description = "Code Mode and heterogeneous tool runtime for Nanocodex"
-
-[features]
-default = ["code-mode", "remote-tools"]
-code-mode = ["dep:rquickjs"]
-remote-tools = []
 
 [package.metadata.docs.rs]
 all-features = true
@@ -40,9 +35,8 @@ nanocodex-tools-macros.workspace = true
 portable-pty.workspace = true
 rand.workspace = true
 reqwest.workspace = true
-rquickjs = { workspace = true, optional = true }
+rquickjs.workspace = true
 rmcp.workspace = true
-rustls.workspace = true
 schemars.workspace = true
 sha1.workspace = true
 thiserror.workspace = true

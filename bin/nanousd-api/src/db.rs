@@ -341,7 +341,7 @@ fn row_to_order(row: &rusqlite::Row<'_>) -> rusqlite::Result<Order> {
     })
 }
 
-fn status_name(status: OrderStatus) -> &'static str {
+const fn status_name(status: OrderStatus) -> &'static str {
     match status {
         OrderStatus::Created => "created",
         OrderStatus::AwaitingPayment => "awaiting_payment",

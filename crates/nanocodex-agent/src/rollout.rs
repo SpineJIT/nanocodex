@@ -7,7 +7,8 @@ use std::{
 
 use chrono::{Local, SecondsFormat, Utc};
 use nanocodex_oai_api::{
-    ImageDetail, Prompt, PromptInput, ResponseItem, UserInput, responses::ResponseHistory,
+    ImageDetail, Prompt, PromptInput, UserInput,
+    responses::{ResponseHistory, ResponseItem},
 };
 use serde::Serialize;
 use tokio::{
@@ -110,7 +111,7 @@ impl DurableSession {
 
     /// Returns the restored model boundary.
     #[must_use]
-    pub fn snapshot(&self) -> &SessionSnapshot {
+    pub const fn snapshot(&self) -> &SessionSnapshot {
         &self.snapshot
     }
 
@@ -410,7 +411,7 @@ impl RolloutCommit {
     }
 
     #[cfg(test)]
-    fn from_history(history: ResponseHistory, revision: u64, turn: RolloutTurn) -> Self {
+    const fn from_history(history: ResponseHistory, revision: u64, turn: RolloutTurn) -> Self {
         Self {
             history,
             revision,
@@ -582,7 +583,7 @@ impl RolloutRecorder {
         }
     }
 
-    pub(crate) fn info(&self) -> &RolloutInfo {
+    pub(crate) const fn info(&self) -> &RolloutInfo {
         &self.info
     }
 
@@ -903,7 +904,7 @@ impl RolloutWriter {
     }
 
     #[cfg(test)]
-    fn inject_write_failures(&mut self, count: usize) {
+    const fn inject_write_failures(&mut self, count: usize) {
         self.injected_write_failures = count;
     }
 }
@@ -1178,7 +1179,7 @@ async fn write_async_line(output: &mut tokio::fs::File, line: &impl Serialize) -
 mod tests {
     use std::io::{BufRead, BufReader, Read};
 
-    use nanocodex_oai_api::{ContentItem, MessageRole};
+    use nanocodex_oai_api::responses::{ContentItem, MessageRole};
     use serde_json::Value;
     use tempfile::tempdir;
 

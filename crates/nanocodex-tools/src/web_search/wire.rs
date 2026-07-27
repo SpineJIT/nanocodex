@@ -1,4 +1,4 @@
-use nanocodex_oai_api::ResponseItem;
+use nanocodex_oai_api::responses::ResponseItem;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;

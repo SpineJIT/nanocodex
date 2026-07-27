@@ -21,6 +21,8 @@ crossterm.workspace = true
 dotenvy.workspace = true
 eyre.workspace = true
 futures-util.workspace = true
+http-body-util.workspace = true
+hudsucker.workspace = true
 image.workspace = true
 nanocodex.workspace = true
 nanocodex-observability.workspace = true
@@ -28,10 +30,9 @@ nix.workspace = true
 nanousd.workspace = true
 pulldown-cmark.workspace = true
 mpp = { workspace = true, features = ["client", "tempo", "reqwest-rustls-tls"] }
-mpp-egress.workspace = true
+rand.workspace = true
 ratatui.workspace = true
-reqwest = { workspace = true, features = ["blocking"] }
-rustls.workspace = true
+reqwest = { workspace = true, features = ["blocking", "stream"] }
 self-replace.workspace = true
 semver.workspace = true
 serde.workspace = true
@@ -41,6 +42,7 @@ two-face.workspace = true
 sha2.workspace = true
 shlex.workspace = true
 tempfile.workspace = true
+thiserror.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite.workspace = true
@@ -54,9 +56,11 @@ chrono.workspace = true
 vergen = { workspace = true, features = ["build", "git", "gitcl"] }
 
 [dev-dependencies]
+axum.workspace = true
 criterion.workspace = true
 nanocodex-tools.workspace = true
 tokio-tungstenite.workspace = true
+tracing-subscriber.workspace = true
 
 [[bench]]
 name = "tui_render"

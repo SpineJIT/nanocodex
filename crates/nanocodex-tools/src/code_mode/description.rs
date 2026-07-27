@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use nanocodex_oai_api::{JsonSchema, ToolDefinition};
+use nanocodex_oai_api::{responses::JsonSchema, tools::ToolDefinition};
 use serde_json::Value;
 
 const DEFERRED_NESTED_TOOLS_GUIDANCE: &str = r"Some deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.

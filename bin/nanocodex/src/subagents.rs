@@ -7,8 +7,12 @@ use std::{
 };
 
 use nanocodex::{
-    AgentEventKind, AgentEvents, AgentHandle, Nanocodex, Tool, ToolContext, ToolDefinition,
-    ToolExecution, ToolInput, ToolResult, Tools, ToolsBuildError, async_trait,
+    AgentEvents, Nanocodex, Tool, Tools,
+    agent::{AgentHandle, events::AgentEventKind},
+    tools::{
+        ToolContext, ToolDefinition, ToolInput, ToolResult, ToolsBuildError,
+        contract::{ToolExecution, async_trait},
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;

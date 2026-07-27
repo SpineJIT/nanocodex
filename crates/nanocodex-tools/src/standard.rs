@@ -1,6 +1,10 @@
-use nanocodex_oai_api::{CustomToolFormat, ToolDefinition};
+//! Stable identities and reusable implementations for standard workspace tools.
+
+use nanocodex_oai_api::{responses::CustomToolFormat, tools::ToolDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+pub use crate::plan::UpdatePlanTool;
 
 const APPLY_PATCH_GRAMMAR: &str = include_str!("apply_patch/apply_patch.lark");
 

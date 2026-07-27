@@ -1,74 +1,69 @@
-//! Facade for the Nanocodex frontier-agent building blocks.
-//!
-//! This crate contains no runtime implementation. It reexports the owned
-//! lifecycle from `nanocodex-agent` and provides named component modules for
-//! lower-level use. Depending on `nanocodex-agent` directly creates the same
-//! agent; the facade is only the convenient, batteries-included import path.
-//!
-//! ```no_run
-//! use nanocodex::{Nanocodex, OpenAi};
-//!
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let openai = OpenAi::new(std::env::var("OPENAI_API_KEY")?)?;
-//! let (agent, _events) = Nanocodex::builder(openai)
-//! .instructions(
-//!     "You are a Rust coding agent. Preserve unrelated work and run relevant tests.",
-//! )
-//! .workspace(std::env::current_dir()?)
-//! .build()?;
-//!
-//! let result = agent
-//!     .prompt("Explain the cause of the failing parser test.")
-//!     .await?
-//!     .await?;
-//! println!("{}", result.final_message());
-//! # Ok(())
-//! # }
-//! ```
-
+#![doc = include_str!("../README.md")]
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
-pub use nanocodex_agent::*;
+pub use nanocodex_agent::{
+    AgentEvents, CostStatus, EstimatedUsdCost, NanocodexError, ServiceTier, TurnUsage, UsdAmount,
+};
+#[cfg(not(target_family = "wasm"))]
+#[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+pub use nanocodex_agent::{Nanocodex, NanocodexBuilder, Turn, TurnControl, TurnResult};
+#[cfg(target_family = "wasm")]
+#[cfg_attr(docsrs, doc(cfg(target_family = "wasm")))]
+pub use nanocodex_agent::{WasmNanocodex, WasmTurn};
+pub use nanocodex_oai_api::{OpenAi, ReasoningMode, Thinking};
+#[cfg(not(target_family = "wasm"))]
+#[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+pub use nanocodex_tools::{Tool, Tools, tool};
 
 /// Owned agent lifecycle, builders, turns, branching, and snapshots.
 pub mod agent {
+    #![doc = include_str!("../../nanocodex-agent/README.md")]
+
+    #[doc(inline)]
     pub use nanocodex_agent::*;
+    pub use nanocodex_agent::{events, input, session, tools, usage};
+    #[cfg(not(target_family = "wasm"))]
+    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+    pub use nanocodex_agent::{rollout, transport};
 }
 
-/// Tower-native `OpenAI` Responses client, state machine, and wire types.
 pub mod oai {
+    #![doc = include_str!("../../nanocodex-oai-api/README.md")]
+
+    #[doc(inline)]
     pub use nanocodex_oai_api::*;
 }
 
-/// Tool contracts, registry, Code Mode, built-ins, and MCP.
 pub mod tools {
-    pub use nanocodex_tools::*;
-}
+    #![doc = include_str!("../../nanocodex-tools/README.md")]
 
-/// Attribute macros for defining typed application tools.
-#[cfg(not(target_family = "wasm"))]
-pub mod macros {
-    pub use nanocodex_tools::tool;
+    #[doc(inline)]
+    pub use nanocodex_tools::*;
 }
 
 /// Application-owned tracing and OpenTelemetry setup.
 #[cfg(not(target_family = "wasm"))]
+#[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
 pub mod observability {
+    #![doc = include_str!("../../nanocodex-observability/README.md")]
+
+    #[doc(inline)]
     pub use nanocodex_observability::*;
 }
 
 /// Common imports for the golden owned-agent path.
 pub mod prelude {
-    pub use nanocodex_agent::{
-        AgentEventData, AgentEvents, AssistantEvent, ContextEvent, EstimatedUsdCost, ModelEvent,
-        NanocodexError, OpenAi, OpenAiAuth, PricingSnapshot, Prompt, ReasoningEvent, ReasoningMode,
-        RunEvent, SessionId, SessionSnapshot, Thinking, TokenRates, ToolEvent, TurnUsage,
-        UsdAmount, UsdPerMillionTokens,
-    };
     #[cfg(not(target_family = "wasm"))]
-    pub use nanocodex_agent::{Nanocodex, NanocodexBuilder, Turn, TurnControl, TurnResult};
+    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+    pub use crate::{Nanocodex, NanocodexBuilder, OpenAi, Tool, Tools, tool};
     #[cfg(target_family = "wasm")]
-    pub use nanocodex_agent::{WasmNanocodex, WasmTurn};
-    #[cfg(not(target_family = "wasm"))]
-    pub use nanocodex_tools::{Tool, ToolOutput, Tools, tool};
+    #[cfg_attr(docsrs, doc(cfg(target_family = "wasm")))]
+    pub use crate::{OpenAi, WasmNanocodex, WasmTurn};
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[doc(hidden)]
+pub mod __private {
+    pub use nanocodex_tools::__private::*;
 }

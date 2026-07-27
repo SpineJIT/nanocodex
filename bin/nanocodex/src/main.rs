@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr};
-use nanocodex::RolloutConfig;
+use nanocodex::agent::rollout::RolloutConfig;
 
 use config::AgentArgs;
 use observability::ObservabilityArgs;
@@ -88,8 +88,6 @@ struct ResumeCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    install_rustls_crypto_provider();
-
     // Keep direct `cargo run` behavior consistent with the Justfile without
     // requiring shell-specific syntax to load the repository's `.env` file.
     let _ = dotenvy::dotenv();
@@ -128,12 +126,6 @@ async fn main() -> Result<()> {
     }
 }
 
-fn install_rustls_crypto_provider() {
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,16 +144,8 @@ mod tests {
         assert!(cli.agent.uses_tempo());
         assert_eq!(
             cli.agent.responses_transport(),
-            nanocodex::ResponsesTransport::Https
+            nanocodex::oai::transport::ResponsesTransport::Https
         );
-    }
-
-    #[test]
-    fn rustls_crypto_provider_is_installed_idempotently() {
-        install_rustls_crypto_provider();
-        install_rustls_crypto_provider();
-
-        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
 
     #[test]
@@ -182,7 +166,7 @@ mod tests {
         assert!(command.agent.uses_tempo());
         assert_eq!(
             command.agent.responses_transport(),
-            nanocodex::ResponsesTransport::Https
+            nanocodex::oai::transport::ResponsesTransport::Https
         );
     }
 
@@ -194,7 +178,7 @@ mod tests {
         assert!(!cli.agent.uses_tempo());
         assert_eq!(
             cli.agent.responses_transport(),
-            nanocodex::ResponsesTransport::WebSocket
+            nanocodex::oai::transport::ResponsesTransport::WebSocket
         );
     }
 

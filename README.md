@@ -127,50 +127,33 @@ IDs, socket tasks, queue capacities, or mutable conversation internals.
 ### Usage, cost, and events
 
 Every completed turn reports exact aggregate token counts. USD is estimated
-only when the application supplies an immutable pricing snapshot; Nanocodex
-does not guess an account's rates:
+automatically from the provider usage using OpenAI's published `gpt-5.6-sol`
+standard or priority rates:
 
 ```rust,ignore
-use nanocodex::{
-    Nanocodex, OpenAi, PricingSnapshot, TokenRates, UsdPerMillionTokens,
-};
+use nanocodex::{Nanocodex, OpenAi};
 
-let pricing = PricingSnapshot::new(
-    "team-contract-2026-q3",
-    "https://billing.example.com/openai/2026-q3",
-    "2026-07-01",
-    TokenRates {
-        input: "1.25".parse::<UsdPerMillionTokens>()?,
-        cached_input: "0.125".parse::<UsdPerMillionTokens>()?,
-        cache_write_input: "1.25".parse::<UsdPerMillionTokens>()?,
-        output: "10.00".parse::<UsdPerMillionTokens>()?,
-    },
-)?;
 let openai = OpenAi::new(std::env::var("OPENAI_API_KEY")?)?;
 let (agent, _events) = Nanocodex::builder(openai)
     .instructions("Answer concisely and preserve exact identifiers.")
-    .pricing(pricing)
     .build()?;
 
 let result = agent.prompt("Explain the identifier req_7f3.").await?.await?;
 println!("{} tokens", result.usage().total_tokens());
 if let Some(cost) = result.usage().estimated_cost() {
-    println!("estimated {} using {}", cost.amount(), cost.pricing().id());
+    println!("estimated {}", cost.amount());
 } else {
     println!("cost unavailable: {}", result.usage().cost_status().as_str());
 }
 ```
 
-The exact estimate and its source/effective date also appear in the terminal
-typed event, JSONL adapter, tracing spans, CLI, and language bindings.
-`CostStatus` distinguishes unconfigured pricing from provider responses that
-omit usage, so missing accounting data is never reported as a zero-dollar turn.
+The same exact estimate appears in the terminal typed event, JSONL adapter,
+tracing spans, CLI, and language bindings. `CostStatus` reports when the
+provider omitted usage, so missing accounting data is never reported as a
+zero-dollar turn.
 `AgentEvent::data()` exposes normalized run, assistant, reasoning, tool, model,
 and compaction events. The original raw payload remains available for a
 lossless OpenAI and transport firehose.
-
-The CLI accepts the same serialized snapshot with
-`--pricing-file pricing.json` or `NANOCODEX_PRICING_FILE`.
 
 ## The Responses API without the agent
 
@@ -256,7 +239,15 @@ nanocodex                       thin facade, modules, and prelude
           ├── nanocodex-tools   tool runtime, MCP, tool_search, Code Mode
           └── nanocodex-oai-api Tower client, sessions, context, Responses
 
-nanocodex-tools-macros          #[tool] implementation
+nanocodex-tools/macros          colocated #[tool] implementation package
+```
+
+Tempo-specific application code stays under `bin/`:
+
+```text
+bin/nanocodex/src/mpp/egress.rs private paid-egress implementation
+bin/nanousd                       shared private credits protocol
+bin/nanousd-api                   credits service
 ```
 
 The monorepo also contains independently useful systems components:
@@ -305,8 +296,9 @@ machine-independent unit-test thresholds.
 The target for normal turns is simple: the model and network dominate the
 critical path. Traces separate provider wait from queueing, serialization,
 parsing, event delivery, and tool work, while independent work runs as bounded
-siblings under init4-style spans. Token usage and versioned pricing also produce
-one consistent estimated USD cost for library results, the CLI, and evals.
+siblings under init4-style spans. Token usage and built-in OpenAI pricing also
+produce one consistent estimated USD cost for library results, the CLI, and
+evals.
 
 Existing measurements and their methodology live under
 [`benchmarks/`](benchmarks/) and [`docs/`](docs/). The refactor ports them next

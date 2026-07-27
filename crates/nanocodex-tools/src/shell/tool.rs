@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use nanocodex_oai_api::ToolDefinition;
+use nanocodex_oai_api::tools::ToolDefinition;
 use serde::Deserialize;
 
 use crate::{StandardTool, Tool, ToolContext, ToolExecution, ToolInput, ToolResult};
@@ -13,7 +13,7 @@ pub(crate) struct ExecCommandHandler {
 }
 
 impl ExecCommandHandler {
-    pub(crate) fn new(workspace: PathBuf, sessions: Arc<ShellSessions>) -> Self {
+    pub(crate) const fn new(workspace: PathBuf, sessions: Arc<ShellSessions>) -> Self {
         Self {
             workspace,
             sessions,
@@ -48,7 +48,7 @@ pub(crate) struct WriteStdinHandler {
 }
 
 impl WriteStdinHandler {
-    pub(crate) fn new(sessions: Arc<ShellSessions>) -> Self {
+    pub(crate) const fn new(sessions: Arc<ShellSessions>) -> Self {
         Self { sessions }
     }
 }

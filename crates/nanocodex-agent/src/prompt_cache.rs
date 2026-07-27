@@ -22,7 +22,7 @@ pub(crate) struct SharedPromptCache {
 }
 
 impl ModelPromptCache {
-    pub(crate) fn new(key: Arc<str>, shared: Option<SharedPromptCache>) -> Self {
+    pub(crate) const fn new(key: Arc<str>, shared: Option<SharedPromptCache>) -> Self {
         Self { key, shared }
     }
 
@@ -30,7 +30,7 @@ impl ModelPromptCache {
         &self.key
     }
 
-    pub(crate) fn shared(&self) -> Option<&SharedPromptCache> {
+    pub(crate) const fn shared(&self) -> Option<&SharedPromptCache> {
         self.shared.as_ref()
     }
 }

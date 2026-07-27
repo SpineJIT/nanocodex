@@ -17,7 +17,7 @@ use std::{
 use crate::{DynamicToolProvider, Tool, ToolContext, ToolExecution, ToolInput, ToolResult};
 use async_trait::async_trait;
 use catalog::{ProviderState, ToolEntry};
-use nanocodex_oai_api::ToolDefinition;
+use nanocodex_oai_api::tools::ToolDefinition;
 use rmcp::model::CallToolRequestParams;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -229,7 +229,7 @@ impl McpHandle {
     /// initialize and list its tools.
     pub async fn reload(&self, server_name: &str) -> Result<usize, McpControlError> {
         let span = info_span!(
-            target: "nanocodex_mcp",
+            target: "nanocodex_tools",
             parent: None,
             "mcp.server_reload",
             otel.kind = "client",
@@ -319,7 +319,7 @@ impl McpHandle {
     /// authorization flow cannot be initialized.
     pub async fn login(&self, server_name: &str) -> Result<McpLogin, McpControlError> {
         let span = info_span!(
-            target: "nanocodex_mcp",
+            target: "nanocodex_tools",
             parent: None,
             "mcp.oauth.login",
             otel.kind = "client",
@@ -438,7 +438,7 @@ impl DynamicToolProvider for Mcp {
             let oauth_store = self.oauth_store.clone();
             let oauth_metadata = Arc::clone(&self.oauth_metadata);
             let span = info_span!(
-                target: "nanocodex_mcp",
+                target: "nanocodex_tools",
                 parent: None,
                 "mcp.server_start",
                 otel.kind = "client",
@@ -514,7 +514,7 @@ impl DynamicToolProvider for Mcp {
         let params =
             CallToolRequestParams::new(entry.remote_name.clone()).with_arguments(arguments);
         let span = info_span!(
-            target: "nanocodex_mcp",
+            target: "nanocodex_tools",
             "mcp.tool_call",
             otel.kind = "client",
             otel.status_code = tracing::field::Empty,
@@ -615,7 +615,7 @@ impl Tool for McpSearch {
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
         let input = input.decode_json::<SearchInput>()?;
         let span = info_span!(
-            target: "nanocodex_mcp",
+            target: "nanocodex_tools",
             "mcp.catalog_search",
             otel.kind = "internal",
             otel.status_code = tracing::field::Empty,
@@ -624,7 +624,13 @@ impl Tool for McpSearch {
             pending_servers = tracing::field::Empty,
             status = tracing::field::Empty,
         );
-        tracing::info!(parent: &span, query = %input.query, limit = input.limit, "MCP catalog search");
+        tracing::info!(
+            target: "nanocodex_tools",
+            parent: &span,
+            query = %input.query,
+            limit = input.limit,
+            "MCP catalog search"
+        );
         let result = self
             .state
             .search(&input.query, input.limit)
@@ -704,7 +710,7 @@ fn search_description(servers: &[NamedServer]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolOutputBody};
+    use crate::{ToolOutputBody, contract::DEFAULT_TOOL_OUTPUT_TOKENS};
     use futures_util::future::join_all;
     use nanocodex_oai_api::MODEL;
     use serde_json::value::to_raw_value;

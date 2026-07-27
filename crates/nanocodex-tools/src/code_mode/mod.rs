@@ -1,3 +1,5 @@
+//! Code Mode execution results, notifications, and nested-tool observation.
+
 pub(crate) mod description;
 mod embedded;
 mod output;
@@ -233,7 +235,7 @@ enum RuntimeEvent {
 }
 
 impl RuntimeEvent {
-    fn cell_id(&self) -> u64 {
+    const fn cell_id(&self) -> u64 {
         match self {
             Self::ToolCall { cell_id, .. }
             | Self::Notify { cell_id, .. }
@@ -611,7 +613,7 @@ struct WaitArguments {
 }
 
 impl CellRegistry {
-    fn allocate_cell_id(&mut self) -> u64 {
+    const fn allocate_cell_id(&mut self) -> u64 {
         let cell_id = self.next_cell_id;
         self.next_cell_id = self.next_cell_id.saturating_add(1);
         cell_id
@@ -1241,7 +1243,7 @@ impl CodeModeNotification {
 }
 
 impl HostFailure {
-    fn new(message: String) -> Self {
+    const fn new(message: String) -> Self {
         Self { message }
     }
 }

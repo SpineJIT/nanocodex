@@ -5,7 +5,7 @@ use std::{
 };
 
 use bm25::{Document, Language, SearchEngine, SearchEngineBuilder};
-use nanocodex_oai_api::ToolDefinition;
+use nanocodex_oai_api::tools::ToolDefinition;
 use rmcp::model::Tool as RmcpTool;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -54,7 +54,7 @@ pub(crate) struct SearchResponse {
 }
 
 impl SearchResponse {
-    pub(crate) fn tool_count(&self) -> usize {
+    pub(crate) const fn tool_count(&self) -> usize {
         self.tools.len()
     }
 
@@ -145,7 +145,7 @@ impl ProviderState {
         catalog.pending_servers.remove(server_name);
         if catalog.pending_servers.is_empty() {
             tracing::info!(
-                target: "nanocodex_mcp",
+                target: "nanocodex_tools",
                 tool_count = catalog.entries.len(),
                 "prewarming MCP tool search index"
             );
@@ -193,7 +193,7 @@ impl ProviderState {
         let mut catalog = self.catalog();
         if catalog.search_index.is_none() {
             tracing::info!(
-                target: "nanocodex_mcp",
+                target: "nanocodex_tools",
                 tool_count = catalog.entries.len(),
                 "building MCP tool search index"
             );
@@ -216,7 +216,7 @@ impl ProviderState {
             catalog.active.insert(entry.canonical_name.clone());
         }
         tracing::debug!(
-            target: "nanocodex_mcp",
+            target: "nanocodex_tools",
             result_count = selected.len(),
             active_count = catalog.active.len(),
             "searched MCP tool catalog"

@@ -3,16 +3,17 @@ use std::time::Duration;
 #[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
 
-use nanocodex_oai_api::{ModelConfig, PricingSnapshot, Thinking, Usage};
+use nanocodex_oai_api::{ModelConfig, Thinking, responses::Usage, transport::TransportStatsDelta};
 use serde::Serialize;
 use serde_json::value::RawValue;
 use web_time::Instant;
 
+use crate::usage::TurnUsage;
+
 #[cfg(not(target_family = "wasm"))]
 use crate::NanocodexError;
 use crate::Result;
-use nanocodex_oai_api::TransportStatsDelta;
-use nanocodex_tools::ToolOutputBody;
+use nanocodex_tools::contract::ToolOutputBody;
 
 #[derive(Serialize)]
 pub(super) struct ModelCallStarted<'a> {
@@ -184,7 +185,7 @@ pub(super) struct RunStats {
 }
 
 impl RunStats {
-    pub(super) fn apply_transport(&mut self, delta: TransportStatsDelta) {
+    pub(super) const fn apply_transport(&mut self, delta: TransportStatsDelta) {
         self.connection_attempts = delta.connection_attempts;
         self.websocket_reconnects = delta.websocket_reconnects;
         self.response_attempts = delta.response_attempts;
@@ -193,8 +194,8 @@ impl RunStats {
         self.retry_backoff_duration_ns = delta.retry_backoff_duration_ns;
     }
 
-    pub(super) fn turn_usage(&self, pricing: Option<&PricingSnapshot>) -> crate::TurnUsage {
-        crate::TurnUsage::from_counts(
+    pub(super) fn turn_usage(&self, fast_mode: bool) -> TurnUsage {
+        TurnUsage::from_counts(
             crate::usage::TurnUsageCounts {
                 input_tokens: self.usage.input_tokens + self.warmup_usage.input_tokens,
                 cached_input_tokens: self.usage.cached_input_tokens
@@ -207,7 +208,7 @@ impl RunStats {
                 total_tokens: self.usage.total_tokens + self.warmup_usage.total_tokens,
                 reported: self.usage.reported || self.warmup_usage.reported,
             },
-            pricing,
+            fast_mode,
         )
     }
 }
@@ -246,7 +247,7 @@ pub(super) fn terminal_payload<'a>(
     config: &'a ModelConfig,
     thinking: Thinking,
     stats: &'a RunStats,
-    usage: &'a crate::TurnUsage,
+    usage: &'a TurnUsage,
 ) -> TerminalPayload<'a> {
     TerminalPayload {
         status: terminal_status,
@@ -301,9 +302,9 @@ pub(super) struct TerminalPayload<'a> {
     #[serde(flatten)]
     stats: &'a RunStats,
     #[serde(skip_serializing_if = "Option::is_none")]
-    estimated_cost: Option<&'a nanocodex_oai_api::EstimatedUsdCost>,
+    estimated_cost: Option<&'a nanocodex_oai_api::pricing::EstimatedUsdCost>,
     cost_usd: Option<f64>,
-    cost_status: nanocodex_oai_api::CostStatus,
+    cost_status: nanocodex_oai_api::pricing::CostStatus,
 }
 
 fn duration_ms(duration: Duration) -> u64 {

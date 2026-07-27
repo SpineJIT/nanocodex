@@ -88,13 +88,13 @@ impl Hunk {
     /// Returns the path affected by this hunk, using the move destination for rename hunks.
     pub fn path(&self) -> &Path {
         match self {
-            Hunk::AddFile { path, .. } => path,
-            Hunk::DeleteFile { path } => path,
-            Hunk::UpdateFile {
+            Self::AddFile { path, .. } => path,
+            Self::DeleteFile { path } => path,
+            Self::UpdateFile {
                 move_path: Some(path),
                 ..
             } => path,
-            Hunk::UpdateFile {
+            Self::UpdateFile {
                 path,
                 move_path: None,
                 ..

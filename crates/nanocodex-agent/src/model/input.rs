@@ -1,9 +1,9 @@
 #[cfg(not(target_family = "wasm"))]
 use chrono::{Local, Utc};
-use nanocodex_oai_api::{
+use nanocodex_oai_api::responses::{
     ContentItem, FunctionOutputBody, FunctionOutputContent, MessageRole, ResponseItem,
 };
-use nanocodex_tools::{ToolOutputBody, ToolOutputContent};
+use nanocodex_tools::contract::{ToolOutputBody, ToolOutputContent};
 
 const PERMISSIONS_INSTRUCTIONS: &str = concat!(
     "<permissions instructions>\n",
@@ -231,7 +231,7 @@ fn function_output(output: ToolOutputBody) -> FunctionOutputBody {
 mod tests {
     use super::*;
     use nanocodex_oai_api::ImageDetail;
-    use nanocodex_tools::ToolOutputContent;
+    use nanocodex_tools::contract::ToolOutputContent;
     use serde_json::json;
 
     #[test]

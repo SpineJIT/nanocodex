@@ -26,8 +26,12 @@ use crossterm::event::{
 use eyre::{Result, WrapErr};
 use futures_util::StreamExt;
 use nanocodex::{
-    AgentEvent, AgentEvents, DurableSession, McpHandle, Nanocodex, NanocodexError, Thinking,
-    TimedAgentEvent, TurnControl, TurnResult,
+    AgentEvents, Nanocodex, NanocodexError, Thinking, TurnControl, TurnResult,
+    agent::{
+        events::{AgentEvent, AgentEventKind, AssistantDelta, TimedAgentEvent},
+        rollout::DurableSession,
+    },
+    tools::mcp::McpHandle,
 };
 use tokio::{
     sync::mpsc,
@@ -279,6 +283,7 @@ enum TerminalAction {
 enum UiAction {
     Terminal(Event),
     Agent(AgentEvent),
+    AssistantDeltas(String),
     AgentStreamClosed,
     Worker(WorkerEvent),
     WorkerStopped,
@@ -324,7 +329,7 @@ struct MouseScrollBurst {
 }
 
 impl MouseScrollBurst {
-    fn new(target: PaneId, direction: ScrollDirection) -> Self {
+    const fn new(target: PaneId, direction: ScrollDirection) -> Self {
         Self {
             target,
             direction,
@@ -349,7 +354,7 @@ impl MouseScrollBurst {
 }
 
 impl UiModel {
-    fn new(app: App, root_session_id: Arc<str>) -> Self {
+    const fn new(app: App, root_session_id: Arc<str>) -> Self {
         Self {
             app,
             root_session_id,
@@ -425,6 +430,15 @@ impl UiModel {
             }
             UiAction::Agent(event) => {
                 let updated = self.app.on_main_agent_event(0, &event);
+                request_navigated_branch_switch(&mut self.app, commands)?;
+                if updated {
+                    Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
+                } else {
+                    Ok(UiUpdate::Ignore)
+                }
+            }
+            UiAction::AssistantDeltas(delta) => {
+                let updated = self.app.push_main_assistant_delta(0, &delta);
                 request_navigated_branch_switch(&mut self.app, commands)?;
                 if updated {
                     Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
@@ -662,42 +676,101 @@ fn apply_main_agent_event_batch(
     agent_events: &mut AgentEvents,
     first: Option<TimedAgentEvent>,
 ) -> Result<bool> {
-    if apply_main_agent_event(ui, worker_tx, stream_telemetry, scheduler, first)? {
-        return Ok(true);
-    }
+    let Some(first) = first else {
+        let update = ui.update(UiAction::AgentStreamClosed, worker_tx)?;
+        return Ok(apply_update(update, scheduler));
+    };
+    let mut events = Vec::with_capacity(MAX_AGENT_EVENTS_PER_BATCH);
+    events.push(first);
     for _ in 1..MAX_AGENT_EVENTS_PER_BATCH {
-        if scheduler.is_due(Instant::now()) {
-            break;
-        }
         let Some(event) = agent_events.try_recv_timed() else {
             break;
         };
-        if apply_main_agent_event(ui, worker_tx, stream_telemetry, scheduler, Some(event))? {
-            return Ok(true);
-        }
+        events.push(event);
     }
-    Ok(false)
+    apply_main_agent_events(ui, worker_tx, stream_telemetry, scheduler, events)
 }
 
-fn apply_main_agent_event(
+fn apply_main_agent_events(
     ui: &mut UiModel,
     worker_tx: &mpsc::UnboundedSender<WorkerCommand>,
     stream_telemetry: &mut StreamTelemetry,
     scheduler: &mut RenderScheduler,
-    event: Option<TimedAgentEvent>,
+    events: Vec<TimedAgentEvent>,
 ) -> Result<bool> {
-    let received = event
-        .as_ref()
-        .map(|event| stream_telemetry.event_received(PaneId::Main, event));
-    let action = event.map_or(UiAction::AgentStreamClosed, |event| {
-        UiAction::Agent(event.event)
-    });
-    let update = ui.update(action, worker_tx)?;
-    if let Some(received) = received {
+    let events = events
+        .into_iter()
+        .map(|event| {
+            let received = stream_telemetry.event_received(PaneId::Main, &event);
+            (event.event, received)
+        })
+        .collect::<Vec<_>>();
+    let mut assistant_text = None::<String>;
+    let mut assistant_events = Vec::new();
+
+    for (event, received) in events {
+        if event.kind == AgentEventKind::AssistantDelta
+            && let Ok(delta) = event.decode_payload::<AssistantDelta>()
+        {
+            assistant_text
+                .get_or_insert_with(String::new)
+                .push_str(&delta.text);
+            assistant_events.push((received, true));
+            continue;
+        }
+        if event.kind == AgentEventKind::ApiEvent {
+            if assistant_text.is_some() {
+                assistant_events.push((received, false));
+            } else {
+                stream_telemetry.event_applied(received, false);
+            }
+            continue;
+        }
+        if flush_main_assistant_deltas(
+            ui,
+            worker_tx,
+            stream_telemetry,
+            scheduler,
+            &mut assistant_text,
+            &mut assistant_events,
+        )? {
+            return Ok(true);
+        }
+        let update = ui.update(UiAction::Agent(event), worker_tx)?;
         stream_telemetry.event_applied(
             received,
             matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming)),
         );
+        if apply_update(update, scheduler) {
+            return Ok(true);
+        }
+    }
+    flush_main_assistant_deltas(
+        ui,
+        worker_tx,
+        stream_telemetry,
+        scheduler,
+        &mut assistant_text,
+        &mut assistant_events,
+    )
+}
+
+fn flush_main_assistant_deltas(
+    ui: &mut UiModel,
+    worker_tx: &mpsc::UnboundedSender<WorkerCommand>,
+    stream_telemetry: &mut StreamTelemetry,
+    scheduler: &mut RenderScheduler,
+    assistant_text: &mut Option<String>,
+    assistant_events: &mut Vec<(telemetry::ReceivedEvent, bool)>,
+) -> Result<bool> {
+    let Some(text) = assistant_text.take() else {
+        debug_assert!(assistant_events.is_empty());
+        return Ok(false);
+    };
+    let update = ui.update(UiAction::AssistantDeltas(text), worker_tx)?;
+    let schedules_frame = matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming));
+    for (received, is_delta) in assistant_events.drain(..) {
+        stream_telemetry.event_applied(received, schedules_frame && is_delta);
     }
     Ok(apply_update(update, scheduler))
 }
@@ -2517,22 +2590,51 @@ fn browser_command(url: &str) -> Command {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use std::{
+        path::PathBuf,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use futures_util::{SinkExt, StreamExt};
-    use nanocodex::{Nanocodex, Responses, Thinking};
+    use nanocodex::{
+        Nanocodex, OpenAi, Thinking,
+        agent::events::{AgentEvent, AgentEventKind, AgentEventTiming, TimedAgentEvent},
+    };
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, sync::mpsc, time::timeout};
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
     use super::{
         BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
-        UiUpdate, WorkerCommand, WorkerEvent, active_session_id, classify_submission, handle_key,
-        handle_worker_update, paste_clipboard_image, prepare_btw_prompt, session_trace_url,
-        spawn_agent_worker,
+        UiUpdate, WorkerCommand, WorkerEvent, active_session_id, apply_main_agent_events,
+        classify_submission, handle_key, handle_worker_update, paste_clipboard_image,
+        prepare_btw_prompt, session_trace_url, spawn_agent_worker,
     };
-    use crate::tui::app::App;
+    use crate::tui::{
+        app::App,
+        scheduler::{RenderScheduler, STREAM_FRAME_INTERVAL},
+        telemetry::StreamTelemetry,
+    };
+
+    fn timed_event(seq: u64, kind: AgentEventKind, payload: Value) -> TimedAgentEvent {
+        let event = serde_json::from_value::<AgentEvent>(json!({
+            "protocol_version": 1,
+            "request_id": "test",
+            "seq": seq,
+            "type": kind,
+            "payload": payload,
+        }))
+        .unwrap();
+        TimedAgentEvent {
+            event,
+            timing: AgentEventTiming {
+                emitted_ns: seq,
+                source_received_ns: Some(seq),
+            },
+        }
+    }
 
     fn mouse_scroll(kind: MouseEventKind) -> Event {
         Event::Mouse(MouseEvent {
@@ -2669,12 +2771,14 @@ mod tests {
 
         assert_eq!(app.input, "[Image #1] ");
         let submission = app.take_submission().unwrap();
-        let nanocodex::PromptInput::Content(content) = submission.into_prompt().instruction else {
+        let nanocodex::agent::input::PromptInput::Content(content) =
+            submission.into_prompt().instruction
+        else {
             panic!("clipboard image should produce typed content");
         };
         assert!(matches!(
             &content[0],
-            nanocodex::UserInput::LocalImage {
+            nanocodex::agent::input::UserInput::LocalImage {
                 path: submitted_path,
                 detail: None,
             } if submitted_path == &path
@@ -2768,6 +2872,54 @@ mod tests {
             UiUpdate::Redraw(RedrawPriority::Streaming)
         );
         assert!(!ui.worker_updates_open);
+    }
+
+    #[test]
+    fn main_event_batches_coalesce_assistant_deltas_across_api_events_only() {
+        let events = vec![
+            timed_event(
+                1,
+                AgentEventKind::AssistantDelta,
+                json!({"model_call_index": 0, "text": "A"}),
+            ),
+            timed_event(2, AgentEventKind::ApiEvent, json!({})),
+            timed_event(
+                3,
+                AgentEventKind::AssistantDelta,
+                json!({"model_call_index": 0, "text": "B"}),
+            ),
+            timed_event(
+                4,
+                AgentEventKind::ReasoningSummaryDelta,
+                json!({"model_call_index": 0, "text": "reasoning"}),
+            ),
+            timed_event(
+                5,
+                AgentEventKind::AssistantDelta,
+                json!({"model_call_index": 0, "text": "C"}),
+            ),
+            timed_event(
+                6,
+                AgentEventKind::AssistantDelta,
+                json!({"malformed": true}),
+            ),
+            timed_event(
+                7,
+                AgentEventKind::AssistantDelta,
+                json!({"model_call_index": 0, "text": "D"}),
+            ),
+        ];
+        let (commands, _worker) = mpsc::unbounded_channel();
+        let mut ui = UiModel::new(App::new("/workspace".into()), Arc::from("main-session"));
+        let mut telemetry = StreamTelemetry::default();
+        let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
+
+        assert!(
+            !apply_main_agent_events(&mut ui, &commands, &mut telemetry, &mut scheduler, events,)
+                .unwrap()
+        );
+        assert_eq!(ui.app.main.assistant_delta_applications(), 3);
+        assert_eq!(ui.app.main.transcript.assistant_sources(), ["AB", "CD"]);
     }
 
     #[test]
@@ -2909,12 +3061,14 @@ mod tests {
         });
 
         let workspace = temporary_workspace("tui-steer")?;
-        let responses = Responses::builder().websocket_url(endpoint).build();
-        let session_id = nanocodex::SessionId::new();
-        let (agent, mut events) = Nanocodex::builder("test-key")
+        let openai = OpenAi::builder("test-key")
+            .websocket_url(endpoint)
+            .build()?;
+        let session_id = nanocodex::agent::session::SessionId::new();
+        let (agent, mut events) = Nanocodex::builder(openai)
+            .instructions("Apply steering at the next safe model boundary.")
             .thinking(Thinking::Low)
             .workspace(&workspace)
-            .responses(responses)
             .session_id(session_id)
             .build()?;
         let (commands, worker_rx) = mpsc::unbounded_channel();
@@ -2963,7 +3117,7 @@ mod tests {
                     .recv()
                     .await
                     .ok_or_else(|| eyre::eyre!("agent events closed before run.steered"))?;
-                if event.kind == nanocodex::AgentEventKind::RunSteered {
+                if event.kind == nanocodex::agent::events::AgentEventKind::RunSteered {
                     return eyre::Result::<()>::Ok(());
                 }
             }
@@ -3023,12 +3177,14 @@ mod tests {
         });
 
         let workspace = temporary_workspace("tui-historical-edit")?;
-        let responses = Responses::builder().websocket_url(endpoint).build();
-        let session_id = nanocodex::SessionId::new();
-        let (agent, mut events) = Nanocodex::builder("test-key")
+        let openai = OpenAi::builder("test-key")
+            .websocket_url(endpoint)
+            .build()?;
+        let session_id = nanocodex::agent::session::SessionId::new();
+        let (agent, mut events) = Nanocodex::builder(openai)
+            .instructions("Preserve committed history when editing a prior turn.")
             .thinking(Thinking::Low)
             .workspace(&workspace)
-            .responses(responses)
             .session_id(session_id)
             .build()?;
         let event_drain = tokio::spawn(async move { while events.recv().await.is_some() {} });

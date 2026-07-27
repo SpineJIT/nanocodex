@@ -2,9 +2,10 @@
 
 ## Boundary
 
-MPP remains an application concern. `bin/nanocodex` composes the private
-`mpp-egress` support crate with the normal Nanocodex HTTPS Responses client.
-No public Nanocodex library crate contains wallet or payment behavior.
+MPP remains an application concern. The private
+`bin/nanocodex/src/mpp/egress.rs` module composes with the normal Nanocodex
+HTTPS Responses client. No public Nanocodex library crate contains wallet or
+payment behavior.
 
 The Tempo provider supports one payment path: estimated, up-front
 `tempo/charge` over HTTPS. It deliberately does not configure an MPP

@@ -1,4 +1,4 @@
-use nanocodex_oai_api::{ContentItem, MessageRole, ResponseItem};
+use nanocodex_oai_api::responses::{ContentItem, MessageRole, ResponseItem};
 
 const ASSISTANT_CONTEXT_TOKEN_LIMIT: usize = 1_000;
 const APPROX_BYTES_PER_TOKEN: usize = 4;
@@ -67,7 +67,7 @@ fn is_context_item(item: &ContentItem) -> bool {
     }
 }
 
-fn is_user_message(item: &ResponseItem) -> bool {
+const fn is_user_message(item: &ResponseItem) -> bool {
     item.is_user_message()
 }
 
@@ -142,7 +142,7 @@ fn ceil_char_boundary(text: &str, target: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use nanocodex_oai_api::ResponseItem;
+    use nanocodex_oai_api::responses::ResponseItem;
     use serde_json::json;
 
     use super::recent_input;

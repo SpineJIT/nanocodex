@@ -1,195 +1,68 @@
-//! Tower-native building blocks for the `OpenAI` Responses API.
-//!
-//! `nanocodex-oai-api` is useful without the Nanocodex agent loop. It owns the
-//! typed request and response model, persistent Responses transport, replayable
-//! Tower attempt boundary, and batteries-included conversation state.
-//!
-//! # Quick start
-//!
-//! Developer instructions create the stable boundary of a client-owned
-//! [`Session`]. Follow-on calls retain completed history automatically:
-//!
-//! ```no_run
-//! use nanocodex_oai_api::OpenAi;
-//!
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let openai = OpenAi::new(std::env::var("OPENAI_API_KEY")?)?;
-//! let mut session = openai
-//!     .instructions(
-//!         "Remember user-provided deployment facts and say when information is missing.",
-//!     )
-//!     .build()?;
-//!
-//! let mut turn = session.turn();
-//! let completed = turn
-//!     .create("The production deployment region is us-west-2.")
-//!     .await?;
-//!
-//! println!("{}", completed.output_text());
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! A [`Response`] is also a typed stream. It retains the completed aggregate
-//! after the stream reaches [`ResponseEvent::Completed`]:
-//!
-//! ```no_run
-//! use futures_util::TryStreamExt;
-//! use nanocodex_oai_api::{OpenAi, ResponseEvent};
-//!
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let openai = OpenAi::new(std::env::var("OPENAI_API_KEY")?)?;
-//! let mut session = openai
-//!     .instructions("Answer concisely and preserve exact identifiers.")
-//!     .build()?;
-//! let mut turn = session.turn();
-//! let mut response = turn.create("Explain the identifier req_7f3.");
-//!
-//! while let Some(event) = response.try_next().await? {
-//!     if let ResponseEvent::OutputTextDelta(delta) = event {
-//!         print!("{delta}");
-//!     }
-//! }
-//!
-//! let completed = response.await?;
-//! assert!(!completed.output_text().is_empty());
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Ownership and replay
-//!
-//! A session owns authoritative typed history and one concrete Tower service.
-//! A [`ResponseTurn`] marks a logical agent turn and keeps WebSocket
-//! turn-scoped state stable across sequential `create` and `compact` calls.
-//! Only completed operations commit. Healthy calls send a delta plus a private
-//! continuation ID; reconnects replay complete committed history.
-//!
-//! The higher-level `nanocodex-agent` crate decides *when* to compact and how
-//! to execute tools. This crate implements the provider operation and atomic
-//! history replacement without embedding agent policy.
-//!
-//! # Tower
-//!
-//! [`OpenAiBuilder::layer`] wraps each session's concrete service without
-//! boxing it. [`OpenAiBuilder::service`] installs a fresh caller-defined
-//! `Service<ResponsesAttempt>` and is useful for custom transports,
-//! deterministic tests, and controlled replay. The standard stack owns its
-//! retry and reconnect policy; caller middleware should add deadlines,
-//! concurrency control, tracing, metrics, or error mapping rather than a
-//! second retry loop.
-//!
-//! Lower-level protocol types are grouped under [`responses`]. Most consumers
-//! need only [`OpenAi`], [`Session`], [`ResponseTurn`], [`Response`], and
-//! [`CompletedResponse`].
-
+#![doc = include_str!("../README.md")]
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
-mod attempt;
-mod auth;
-mod client;
-#[doc(hidden)]
-#[allow(missing_docs)]
-pub mod compaction;
-#[cfg(not(target_family = "wasm"))]
-mod connector;
-#[doc(hidden)]
-#[allow(missing_docs)]
-pub mod context;
-#[cfg(not(target_family = "wasm"))]
-mod error;
-#[cfg(target_family = "wasm")]
-#[allow(missing_docs)]
-#[path = "error_wasm.rs"]
-mod error;
-mod event_data;
-#[allow(missing_docs)]
-mod events;
-#[cfg(not(target_family = "wasm"))]
-mod http;
-mod middleware;
+/// Authentication sources and managed credential snapshots.
+pub mod auth;
+/// Complete typed lifecycle events emitted around Responses operations.
+pub mod events;
 mod openai;
-mod pricing;
+/// Automatic `gpt-5.6-sol` USD estimates from provider token usage.
+pub mod pricing;
+/// Complete typed request, event, and item model for the Responses protocol.
 pub mod responses;
-mod service;
-mod service_error;
-mod session;
-#[cfg(not(target_family = "wasm"))]
-mod socket;
-#[cfg(target_family = "wasm")]
-#[path = "socket_wasm.rs"]
-mod socket;
-mod stream;
-mod telemetry;
-mod tool;
+/// Managed session identities, inputs, checkpoints, and compaction results.
+pub mod session;
+/// Tool contracts shared by agent loops and concrete tool runtimes.
+pub mod tools;
+/// Generic Tower attempt, service, retry, and streamed-output contracts.
+pub mod tower;
+/// Responses transport policy, errors, and connection statistics.
+pub mod transport;
 
 use std::{fmt, path::PathBuf, str::FromStr, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
-pub use attempt::{
-    ResponsesAttempt, ResponsesAttemptFactory, ResponsesAttemptKind, ResponsesOutput,
-    ResponsesServiceResponse, TransportStats, TransportStatsDelta, TransportStatsSnapshot,
+pub(crate) use auth::{OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, OpenAiAuthSnapshot};
+pub(crate) use events::{
+    AgentEventData, AgentEventKind, AssistantEvent, ContextEvent, EventError, EventSink,
+    ModelEvent, ReasoningEvent, RunEvent, ToolEvent, TransportEvent, monotonic_now_ns,
 };
-pub use auth::{
-    OpenAiAuth, OpenAiAuthError, OpenAiAuthFuture, OpenAiAuthMode, OpenAiAuthSnapshot,
-    OpenAiAuthSource,
+pub use openai::{OpenAi, OpenAiBuilder, OpenAiError};
+pub(crate) use pricing::{CostStatus, EstimatedUsdCost};
+pub use responses::ResponseEvent;
+pub(crate) use responses::{
+    ContentItem, FunctionOutputBody, FunctionOutputContent, MessagePhase, MessageRole,
+    ResponseItem, ResponseItemId, ToolDefinition, Usage,
 };
-pub use client::ResponsesClient;
-pub use error::{ResponsesError, RetryAdvice};
-pub use event_data::{
-    AgentEventData, AssistantDelta, AssistantEvent, AssistantMessage, CompactionCompleted,
-    CompactionFailed, CompactionStarted, ContextEvent, EventUsage, ModelCallCompleted,
-    ModelCallFailed, ModelCallStarted, ModelEvent, ModelWarmupCompleted, ModelWarmupFailed,
-    ModelWarmupStarted, OpenAiEvent, ReasoningEvent, ReasoningSummaryDelta, RunError, RunEvent,
-    RunMetrics, RunStarted, RunStatus, RunSteered, RunTerminal, ToolCall, ToolEvent,
-    ToolResultEvent, ToolStatus, TransportEvent,
-};
-#[doc(hidden)]
-pub use events::{
-    AgentEvent, AgentEventKind, AgentEventTiming, AgentEvents, EventError, EventSink,
-    TimedAgentEvent, monotonic_now_ns,
-};
-pub use middleware::{DefaultResponsesService, ResponsesRetryPolicy};
-pub use openai::{
-    CallerServiceFactory, LayeredServiceFactory, MakeResponsesService, OpenAi, OpenAiBuilder,
-    OpenAiError, StandardServiceFactory,
-};
-pub use pricing::{
-    CostStatus, EstimatedUsdCost, PricingError, PricingSnapshot, TokenRates, UsdAmount,
-    UsdParseError, UsdPerMillionTokens,
-};
-pub use responses::{
-    AgentMessageContent, ContentItem, CustomToolFormat, FunctionOutputBody, FunctionOutputContent,
-    InputTokenDetails, InternalMessageMetadata, ItemStatus, JsonSchema, JsonValue,
-    LocalShellAction, LocalShellExecAction, LocalShellStatus, MessagePhase, MessageRole,
-    OutputTextAnnotation, OutputTextLogprob, OutputTextTopLogprob, OutputTokenDetails,
-    ReasoningContent, ReasoningSummary, RequestProfile, ResponseEvent, ResponseItem,
-    ResponseItemId, ToolCaller, ToolDefinition, Usage, WarmupResponse, WebSearchAction,
-};
-pub use service::ResponsesService;
-pub use service_error::ResponsesServiceError;
 pub use session::{
-    CompletedCompaction, CompletedResponse, Response, ResponseCheckpoint, ResponseError,
-    ResponseInput, ResponseTurn, Session, SessionBuildError, SessionBuilder, SessionId,
-    SessionIdError,
+    CompletedResponse, Response, ResponseError, ResponseTurn, Session, SessionBuildError,
+    SessionBuilder,
 };
 #[doc(hidden)]
-pub use session::{ManagedSessionState, ManagedSessionStateError};
-pub use socket::EncodedRequest;
-pub use stream::{
-    CodeCall, CodeCallKind, CompactionOutput, GenerationOutput, ResponsePipelineStats,
+pub use session::{compaction, context};
+pub(crate) use tools::ToolOutputBody;
+pub(crate) use tower::attempt::{
+    ResponsesAttempt, ResponsesAttemptFactory, ResponsesOutput, ResponsesServiceResponse,
+    TransportStats,
+};
+pub(crate) use tower::stream::{CompactionOutput, GenerationOutput};
+pub(crate) use tower::{
+    DefaultResponsesService, ResponsesClient, ResponsesRetryPolicy, ResponsesService,
+    ResponsesServiceError,
 };
 #[doc(hidden)]
 pub type CompactionResult = CompactionOutput;
 #[doc(hidden)]
 pub type TurnResult = GenerationOutput;
-pub use telemetry::TRANSPORT;
-pub use tool::{
-    DEFAULT_TOOL_OUTPUT_TOKENS, ProcessTraceWire, Tool, ToolContext, ToolError, ToolExecution,
-    ToolExecutionWire, ToolInput, ToolInputError, ToolOutput, ToolOutputBody, ToolOutputContent,
-    ToolOutputWire, ToolResult,
-};
+pub(crate) use transport::socket::EncodedRequest;
+pub(crate) use transport::{ResponsesError, ResponsesHistory, ResponsesTransport, RetryAdvice};
+
+pub(crate) use tower::{attempt, middleware, service, service_error, stream};
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use transport::{connector, http};
+pub(crate) use transport::{socket, telemetry};
 
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 
@@ -331,7 +204,7 @@ pub enum ImageDetail {
 #[allow(missing_docs)]
 impl UserInput {
     #[must_use]
-    pub fn text_bytes(&self) -> usize {
+    pub const fn text_bytes(&self) -> usize {
         match self {
             Self::Text { text } => text.len(),
             Self::Image { .. }
@@ -388,8 +261,6 @@ pub struct ModelConfig {
     pub api_base_url: String,
     /// Immutable harness system prompt serialized before session instructions.
     pub system_prompt: Arc<str>,
-    /// Optional application-supplied pricing used only for cost projection.
-    pub pricing: Option<Arc<PricingSnapshot>>,
 }
 
 impl ModelConfig {
@@ -425,85 +296,6 @@ impl Default for ModelConfig {
             websocket_url: "wss://api.openai.com/v1/responses".to_owned(),
             api_base_url: "https://api.openai.com/v1".to_owned(),
             system_prompt: SYSTEM_PROMPT.into(),
-            pricing: None,
-        }
-    }
-}
-
-/// Responses transport selected once when an agent session is built.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ResponsesTransport {
-    /// Persistent Responses WebSocket transport.
-    #[default]
-    WebSocket,
-    /// HTTPS request with a server-sent event response body.
-    Https,
-}
-
-impl ResponsesTransport {
-    /// Returns the stable telemetry name for this transport.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::WebSocket => "responses_websocket_v2",
-            Self::Https => "responses_https_sse",
-        }
-    }
-}
-
-impl fmt::Display for ResponsesTransport {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WebSocket => formatter.write_str("websocket"),
-            Self::Https => formatter.write_str("https"),
-        }
-    }
-}
-
-impl FromStr for ResponsesTransport {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "websocket" | "ws" => Ok(Self::WebSocket),
-            "https" | "http" => Ok(Self::Https),
-            _ => Err(format!(
-                "invalid Responses transport {value:?}; expected websocket or https"
-            )),
-        }
-    }
-}
-
-/// How committed client history is represented in each Responses request.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ResponsesHistory {
-    /// Reuse a response ID when the selected transport and storage policy make
-    /// it valid, falling back to complete client-owned history as needed.
-    #[default]
-    Incremental,
-    /// Send complete committed client-owned history on every request.
-    FullReplay,
-}
-
-impl fmt::Display for ResponsesHistory {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Incremental => formatter.write_str("incremental"),
-            Self::FullReplay => formatter.write_str("full-replay"),
-        }
-    }
-}
-
-impl FromStr for ResponsesHistory {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "incremental" => Ok(Self::Incremental),
-            "full-replay" | "replay" => Ok(Self::FullReplay),
-            _ => Err(format!(
-                "invalid Responses history policy {value:?}; expected incremental or full-replay"
-            )),
         }
     }
 }

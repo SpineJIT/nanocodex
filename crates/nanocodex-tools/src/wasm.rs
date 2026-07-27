@@ -2,8 +2,10 @@ use std::{path::PathBuf, sync::Arc};
 
 use js_sys::Promise;
 use nanocodex_oai_api::{
-    ContentItem, CustomToolFormat, OpenAiAuth, PromptInput, ResponseItem, ToolContext,
-    ToolDefinition, ToolOutputBody, UserInput,
+    PromptInput, UserInput,
+    auth::OpenAiAuth,
+    responses::{ContentItem, CustomToolFormat, ResponseItem},
+    tools::{ToolContext, ToolDefinition, ToolOutputBody},
 };
 use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
@@ -146,7 +148,7 @@ struct HostNotification {
     text: String,
 }
 
-/// Compatibility connection inputs for the unavailable WASM web-search handler.
+/// Web-search connection inputs retained by the host-backed WASM runtime.
 pub struct WebSearchConfig {
     /// Complete search endpoint URL.
     pub endpoint: String,
@@ -154,7 +156,7 @@ pub struct WebSearchConfig {
     pub auth: OpenAiAuth,
 }
 
-/// Compatibility inputs for the unavailable WASM image-generation handler.
+/// Image-generation inputs retained by the host-backed WASM runtime.
 pub struct ImageGenerationConfig {
     /// Base `OpenAI` API URL.
     pub api_base_url: String,
@@ -197,8 +199,8 @@ pub struct ToolRuntimeControl;
 impl ToolRuntime {
     /// Creates a host-backed runtime.
     ///
-    /// Native remote-tool configurations are accepted for API compatibility
-    /// but ignored; the embedding host owns all executable tools.
+    /// HTTP-tool configurations are ignored because the embedding host owns
+    /// all executable tools.
     pub fn new(
         workspace: impl Into<PathBuf>,
         _web_search: Option<WebSearchConfig>,

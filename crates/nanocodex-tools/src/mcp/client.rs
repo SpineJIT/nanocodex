@@ -97,7 +97,7 @@ pub(crate) async fn connect(
         McpTransport::StreamableHttp { .. } => ("streamable_http", "none"),
     };
     let span = info_span!(
-        target: "nanocodex_mcp",
+        target: "nanocodex_tools",
         parent: parent,
         "mcp.transport_connect",
         otel.kind = "client",
@@ -179,10 +179,6 @@ async fn connect_http(input: HttpConnect<'_>) -> Result<ConnectedServer, String>
         oauth_metadata,
         parent,
     } = input;
-    // rmcp deliberately leaves the rustls crypto provider to its host.
-    // Installing ring is idempotent and keeps this crate usable without
-    // requiring nanocodex-service to have opened a WebSocket first.
-    drop(rustls::crypto::ring::default_provider().install_default());
     if url.trim().is_empty() {
         return Err("Streamable HTTP URL must not be empty".to_owned());
     }
@@ -249,7 +245,7 @@ async fn connect_stored_oauth(input: StoredOAuthConnect<'_>) -> Result<Connected
         parent,
     } = input;
     let load_span = info_span!(
-        target: "nanocodex_mcp",
+        target: "nanocodex_tools",
         parent: parent,
         "mcp.oauth.credentials_load",
         otel.kind = "internal",
@@ -283,7 +279,7 @@ async fn connect_stored_oauth(input: StoredOAuthConnect<'_>) -> Result<Connected
     };
 
     let restore_span = info_span!(
-        target: "nanocodex_mcp",
+        target: "nanocodex_tools",
         parent: parent,
         "mcp.oauth.restore",
         otel.kind = "internal",
@@ -324,7 +320,7 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     let span = info_span!(
-        target: "nanocodex_mcp",
+        target: "nanocodex_tools",
         parent: parent,
         "mcp.initialize",
         otel.kind = "client",
@@ -361,7 +357,7 @@ fn drain_server_stderr(server_name: String, stderr: tokio::process::ChildStderr)
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => tracing::info!(
-                    target: "nanocodex_mcp",
+                    target: "nanocodex_tools",
                     server = %server_name,
                     message = %line,
                     "MCP server stderr"
@@ -369,7 +365,7 @@ fn drain_server_stderr(server_name: String, stderr: tokio::process::ChildStderr)
                 Ok(None) => break,
                 Err(error) => {
                     tracing::warn!(
-                        target: "nanocodex_mcp",
+                        target: "nanocodex_tools",
                         server = %server_name,
                         %error,
                         "failed to read MCP server stderr"
@@ -392,7 +388,7 @@ async fn finish_startup(
         oauth,
     });
     let span = info_span!(
-        target: "nanocodex_mcp",
+        target: "nanocodex_tools",
         parent: parent,
         "mcp.tools_list",
         otel.kind = "client",

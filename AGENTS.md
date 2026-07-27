@@ -52,9 +52,6 @@
 - `nanocodex-oai-api` owns the complete OpenAI boundary: dependency-light
   prompts/events/wire types, the managed context state machine, persistent
   transports, typed retry policy, telemetry, and generic Tower client.
-- `nanocodex-core` and `nanocodex-service` are temporary compatibility
-  reexports only. New production code must import `nanocodex-oai-api`
-  directly; delete the compatibility crates after every consumer migrates.
 - `nanocodex-tools` owns code mode, built-in tools, the heterogeneous registry,
   MCP transports and discovery, deferred tool search, and remote dispatch. MCP
   is always available on native targets.
@@ -62,8 +59,11 @@
   snapshots, Codex rollouts, and ergonomic agent builders.
 - `nanocodex` is an Alloy-style facade containing reexports, named component
   modules, and a small prelude. It contains no runtime implementation.
-- `nanocodex-tools-macros` implements `#[tool]`. Keep the executable under
-  `bin/nanocodex`; do not move CLI behavior into the library.
+- `nanocodex-tools/macros` contains the `nanocodex-tools-macros` package that
+  implements `#[tool]`. Keep the executable under `bin/nanocodex`; do not move
+  CLI behavior into the library.
+- Tempo payment, egress, and `NanoUSD` support stay under `bin/`; public
+  `nanocodex-*` library crates must not depend on them.
 - Each lower crate must remain useful without importing the higher orchestration
   crate. Avoid circular concepts and leaky socket/runtime types.
 

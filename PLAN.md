@@ -68,11 +68,12 @@ Crate ownership is fixed:
   discovery, authenticated transports, BM25 search, and deferred dispatch.
 - `nanocodex-agent`: builders and the owned stateful agent lifecycle.
 - `nanocodex`: thin facade, named component reexports, and prelude.
-- `nanocodex-tools-macros`: the `#[tool]` implementation.
+- `nanocodex-tools/macros`: the colocated `#[tool]` implementation package.
 - `bin/nanocodex`: the Ratatui daily-driver and headless JSONL adapter.
+- `bin/nanousd` and `bin/nanousd-api`: private Tempo credits support.
 
-`nanocodex-core` and `nanocodex-service` remain compatibility reexports during
-the staged migration and do not own new implementation.
+Tempo payment and egress integration remain application-owned under `bin/`.
+The public `nanocodex-*` library crates do not depend on Tempo packages.
 
 Lower crates must remain usable without importing higher orchestration crates.
 Socket tasks and mutable driver details stay private.

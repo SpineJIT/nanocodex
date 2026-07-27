@@ -1,8 +1,8 @@
 use std::{hint::black_box, sync::Arc};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use nanocodex_oai_api::{
-    ContentItem, FunctionOutputBody, MessageRole, ResponseItem, responses::ResponseHistory,
+use nanocodex_oai_api::responses::{
+    ContentItem, FunctionOutputBody, MessageRole, ResponseHistory, ResponseItem,
 };
 
 fn history_item(index: usize) -> ResponseItem {

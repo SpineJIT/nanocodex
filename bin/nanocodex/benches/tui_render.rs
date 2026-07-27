@@ -4,7 +4,7 @@ mod tui {
     use std::{cell::Cell, fmt::Write as _, hint::black_box, rc::Rc, sync::Arc, time::Instant};
 
     use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
-    use nanocodex::{AgentEvent, AgentEventKind, AgentEventTiming, TimedAgentEvent};
+    use nanocodex::agent::events::{AgentEvent, AgentEventKind, AgentEventTiming, TimedAgentEvent};
     use ratatui::{
         Terminal, TerminalOptions, Viewport,
         backend::{CrosstermBackend, TestBackend},
@@ -546,6 +546,50 @@ mod tui {
                     black_box(app.main.scroll_from_bottom);
                 },
                 BatchSize::SmallInput,
+            );
+        });
+        group.finish();
+    }
+
+    pub(super) fn single_line_stream_batch_benchmark(criterion: &mut Criterion) {
+        const DELTAS: usize = 128;
+        const TAIL_CHARS: usize = 16 * 1_024;
+
+        fn cached_single_line_app() -> App {
+            let mut app = App::new("/workspace/nanocodex".into());
+            app.main.push_assistant_delta(&"x".repeat(TAIL_CHARS));
+            let mut terminal = Terminal::new(TestBackend::new(120, 40))
+                .expect("single-line stream benchmark terminal should initialize");
+            terminal
+                .draw(|frame| view::render(frame, &mut app))
+                .expect("initial single-line stream frame should render");
+            app
+        }
+
+        let mut group = criterion.benchmark_group("tui_single_line_stream_batch");
+        group.sample_size(20);
+        group.throughput(Throughput::Elements(DELTAS as u64));
+        group.bench_function("128_individual_deltas", |bencher| {
+            bencher.iter_batched(
+                cached_single_line_app,
+                |mut app| {
+                    for _ in 0..DELTAS {
+                        app.main.push_assistant_delta(black_box("x"));
+                    }
+                    black_box(app);
+                },
+                BatchSize::LargeInput,
+            );
+        });
+        group.bench_function("one_128_delta_batch", |bencher| {
+            let delta = "x".repeat(DELTAS);
+            bencher.iter_batched(
+                cached_single_line_app,
+                |mut app| {
+                    app.main.push_assistant_delta(black_box(&delta));
+                    black_box(app);
+                },
+                BatchSize::LargeInput,
             );
         });
         group.finish();
@@ -1138,7 +1182,7 @@ mod tui {
             .map(|index| format!("Read reference {index}."))
             .collect::<Vec<_>>()
             .join("\n");
-        linked.push(TranscriptItem::Assistant(linked_source.clone()));
+        linked.push(TranscriptItem::Assistant(linked_source));
         criterion.bench_function("tui_markdown/semantic_link_copy_64", |bencher| {
             bencher.iter(|| linked.semanticize_copy(black_box(linked_copy.clone())));
         });
@@ -1580,6 +1624,7 @@ criterion_group!(
     tui::live_tail_render_benchmark,
     tui::live_tail_first_frame_benchmark,
     tui::scroll_anchor_benchmark,
+    tui::single_line_stream_batch_benchmark,
     tui::smooth_follow_benchmark,
     tui::terminal_output_benchmark,
     tui::mouse_selection_benchmark,

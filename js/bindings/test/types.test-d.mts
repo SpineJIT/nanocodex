@@ -2,7 +2,6 @@ import {
   Actions,
   Agent,
   type CostStatus,
-  type PricingSnapshot,
   type SessionSnapshot,
   type Turn,
 } from "../node/index.mjs";
@@ -11,23 +10,10 @@ import { Agent as BrowserAgent } from "../browser/index.mjs";
 declare const apiKey: string;
 
 async function check() {
-  const pricing: PricingSnapshot = {
-    id: "team-contract-2026-q3",
-    source: "https://billing.example.com/openai/2026-q3",
-    effective_date: "2026-07-01",
-    model: "gpt-5.6-sol",
-    rates: {
-      input_usd_per_million: "1.25",
-      cached_input_usd_per_million: "0.125",
-      cache_write_input_usd_per_million: "1.25",
-      output_usd_per_million: "10",
-    },
-  };
   const agent = await Agent.create({
     apiKey,
     thinking: "high",
     fastMode: false,
-    pricing,
   });
   await agent.session.setFastMode(true);
   const options: Actions.turn.prompt.Options = { input: "hello" };

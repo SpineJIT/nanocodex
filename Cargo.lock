@@ -1299,7 +1299,6 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -1318,7 +1317,6 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -1958,8 +1956,6 @@ dependencies = [
  "itertools 0.13.0",
  "num-traits",
  "oorandom",
- "plotters",
- "rayon",
  "regex",
  "serde",
  "serde_json",
@@ -1990,16 +1986,6 @@ version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
 dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-deque"
-version = "0.8.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5181e0de7b61eb03a81e347d6dd8797bae9da5146707b51077e2d71a54ec0ceb"
-dependencies = [
- "crossbeam-epoch",
  "crossbeam-utils",
 ]
 
@@ -3850,27 +3836,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mpp-egress"
-version = "0.2.0"
-dependencies = [
- "axum",
- "base64",
- "futures-util",
- "http-body-util",
- "hudsucker",
- "mpp",
- "rand 0.9.5",
- "reqwest",
- "rustls",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "munge"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3894,6 +3859,7 @@ dependencies = [
 name = "nanocodex"
 version = "0.2.0"
 dependencies = [
+ "futures-util",
  "nanocodex-agent",
  "nanocodex-oai-api",
  "nanocodex-observability",
@@ -3907,22 +3873,17 @@ name = "nanocodex-agent"
 version = "0.2.0"
 dependencies = [
  "async-trait",
- "base64",
  "chrono",
  "criterion",
  "eyre",
  "futures-util",
- "getrandom 0.3.4",
  "iana-time-zone",
- "image",
  "js-sys",
  "nanocodex-oai-api",
  "nanocodex-tools",
  "reqwest",
- "schemars 0.8.22",
  "serde",
  "serde_json",
- "sha1",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
@@ -3931,7 +3892,6 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
- "url",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -3945,6 +3905,7 @@ dependencies = [
  "alloy-primitives",
  "arboard",
  "async-trait",
+ "axum",
  "base64",
  "chrono",
  "clap",
@@ -3953,18 +3914,19 @@ dependencies = [
  "dotenvy",
  "eyre",
  "futures-util",
+ "http-body-util",
+ "hudsucker",
  "image",
  "mpp",
- "mpp-egress",
  "nanocodex",
  "nanocodex-observability",
  "nanocodex-tools",
  "nanousd",
  "nix 0.30.1",
  "pulldown-cmark",
+ "rand 0.9.5",
  "ratatui",
  "reqwest",
- "rustls",
  "self-replace",
  "semver 1.0.28",
  "serde",
@@ -3974,21 +3936,16 @@ dependencies = [
  "syntect",
  "tempfile",
  "tempo-alloy",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "two-face",
  "unicode-segmentation",
  "unicode-width 0.2.0",
  "vergen",
-]
-
-[[package]]
-name = "nanocodex-core"
-version = "0.2.0"
-dependencies = [
- "nanocodex-oai-api",
 ]
 
 [[package]]
@@ -4001,7 +3958,6 @@ dependencies = [
  "http",
  "nanocodex",
  "reqwest",
- "rustls",
  "serde",
  "serde_json",
  "tokio",
@@ -4015,17 +3971,19 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64",
+ "chrono",
  "criterion",
  "eyre",
  "futures-util",
+ "getrandom 0.3.4",
  "http",
  "image",
  "js-sys",
  "reqwest",
- "rustls",
  "serde",
  "serde_json",
  "sha1",
+ "sha2 0.10.9",
  "simd-json",
  "smallvec",
  "sonic-rs",
@@ -4034,6 +3992,8 @@ dependencies = [
  "tokio-tungstenite",
  "tower",
  "tracing",
+ "tracing-subscriber",
+ "url",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -4049,7 +4009,6 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "reqwest",
- "rustls",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -4066,13 +4025,6 @@ dependencies = [
  "pyo3",
  "serde_json",
  "tokio",
-]
-
-[[package]]
-name = "nanocodex-service"
-version = "0.2.0"
-dependencies = [
- "nanocodex-oai-api",
 ]
 
 [[package]]
@@ -4097,7 +4049,6 @@ dependencies = [
  "reqwest",
  "rmcp",
  "rquickjs",
- "rustls",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -4125,7 +4076,6 @@ name = "nanocodex-wasm"
 version = "0.2.0"
 dependencies = [
  "nanocodex",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -4514,7 +4464,6 @@ dependencies = [
  "js-sys",
  "pin-project-lite",
  "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
@@ -4800,34 +4749,6 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
-
-[[package]]
-name = "plotters"
-version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5aeb6f403d7a4911efb1e33402027fc44f29b5bf6def3effcc22d7bb75f2b747"
-dependencies = [
- "num-traits",
- "plotters-backend",
- "plotters-svg",
- "wasm-bindgen",
- "web-sys",
-]
-
-[[package]]
-name = "plotters-backend"
-version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df42e13c12958a16b3f7f4386b9ab1f3e7933914ecea48da7139435263a4172a"
-
-[[package]]
-name = "plotters-svg"
-version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51bae2ac328883f7acdfea3d66a7c35751187f870bc81f94563733a154d7a670"
-dependencies = [
- "plotters-backend",
-]
 
 [[package]]
 name = "png"
@@ -5325,26 +5246,6 @@ dependencies = [
  "unicode-segmentation",
  "unicode-truncate",
  "unicode-width 0.2.0",
-]
-
-[[package]]
-name = "rayon"
-version = "1.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
-dependencies = [
- "either",
- "rayon-core",
-]
-
-[[package]]
-name = "rayon-core"
-version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
-dependencies = [
- "crossbeam-deque",
- "crossbeam-utils",
 ]
 
 [[package]]
@@ -6028,7 +5929,6 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
- "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -7416,10 +7316,8 @@ checksum = "adbc64cba7137545b8044cb1fe9814f7aacf3c6b5f9b45be8bb5db538befdb26"
 dependencies = [
  "js-sys",
  "opentelemetry",
- "smallvec",
  "tracing",
  "tracing-core",
- "tracing-log",
  "tracing-subscriber",
  "web-time",
 ]

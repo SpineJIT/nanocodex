@@ -116,7 +116,6 @@ export function toWasmConfig(options = {}) {
   copy(config, "instructions", options.instructions);
   copy(config, "session_id", options.sessionId);
   copy(config, "resume", options.resume);
-  copy(config, "pricing", options.pricing);
   return config;
 }
 

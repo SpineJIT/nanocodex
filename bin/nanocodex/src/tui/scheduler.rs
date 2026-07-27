@@ -12,7 +12,7 @@ pub(super) struct RenderScheduler {
 }
 
 impl RenderScheduler {
-    pub(super) fn new(frame_interval: Duration, now: Instant) -> Self {
+    pub(super) const fn new(frame_interval: Duration, now: Instant) -> Self {
         Self {
             frame_interval,
             last_presented: None,
@@ -43,7 +43,7 @@ impl RenderScheduler {
         );
     }
 
-    pub(super) fn deadline(&self) -> Option<Instant> {
+    pub(super) const fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
 
@@ -51,7 +51,7 @@ impl RenderScheduler {
         self.deadline.is_some_and(|deadline| deadline <= now)
     }
 
-    pub(super) fn presented(&mut self, now: Instant) {
+    pub(super) const fn presented(&mut self, now: Instant) {
         self.deadline = None;
         self.last_presented = Some(now);
     }

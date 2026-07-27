@@ -1,7 +1,7 @@
 use std::{env, path::PathBuf, time::Instant};
 
 use eyre::{Result, WrapErr, eyre};
-use nanocodex::{Nanocodex, RolloutConfig};
+use nanocodex::{Nanocodex, OpenAi, agent::rollout::RolloutConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,6 +18,7 @@ async fn main() -> Result<()> {
     }
 
     let config = RolloutConfig::new(codex_home);
+    let openai = OpenAi::new("benchmark-only")?;
     for thread_id in thread_ids {
         let mut samples = Vec::with_capacity(iterations);
         let mut history_items = 0;
@@ -38,7 +39,7 @@ async fn main() -> Result<()> {
             loaded = Some(session);
         }
         let session = loaded.ok_or_else(|| eyre!("iteration count must be positive"))?;
-        let (agent, events) = Nanocodex::builder("benchmark-only")
+        let (agent, events) = Nanocodex::builder(openai.clone())
             .resume(session.snapshot().clone())
             .build()
             .wrap_err_with(|| format!("failed to construct resumed driver for {thread_id}"))?;

@@ -1,4 +1,4 @@
-use nanocodex_oai_api::ToolDefinition;
+use nanocodex_oai_api::tools::ToolDefinition;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;

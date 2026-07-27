@@ -153,7 +153,7 @@ because neither won the complete immutable-input request path.
 Run the portable benchmarks with:
 
 ```sh
-cargo bench -p nanocodex-service --bench tower_responses
+cargo bench -p nanocodex-oai-api --bench tower_responses
 ```
 
 Add `NANOCODEX_BENCH_EVENTS=/path/to/events.jsonl` to include a retained JSONL

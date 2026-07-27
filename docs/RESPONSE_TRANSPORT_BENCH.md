@@ -173,8 +173,9 @@ At the published standard GPT-5.6 Sol rates of $5 per million uncached input
 tokens and $30 per million output tokens, with cache reads at a 90% discount
 and cache writes at 1.25 times uncached input, the estimated cost is $0.114 per
 variant workload. The 21 successful samples cost an estimated $2.39, excluding
-the rejected partial request. Account-specific or priority pricing may differ.
-See [OpenAI's GPT-5.6 pricing](https://openai.com/index/gpt-5-6/#availability-and-pricing).
+the rejected partial request. Priority processing uses the corresponding
+higher published rates. See
+[OpenAI's API pricing](https://developers.openai.com/api/docs/pricing).
 
 The stable findings are:
 
@@ -238,7 +239,7 @@ should snapshot at the durability cadence they actually require.
 Reproduce the local measurements with:
 
 ```sh
-cargo bench -p nanocodex-core --bench fork_history -- --noplot
+cargo bench -p nanocodex-oai-api --bench fork_history -- --noplot
 ```
 
 ## Design implication

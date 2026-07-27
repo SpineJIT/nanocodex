@@ -18,7 +18,6 @@ export type AgentEvent = {
 
 export type AgentOptions = {
   instructions?: string | undefined;
-  pricing?: PricingSnapshot | undefined;
   reasoningMode?: ReasoningMode | undefined;
   fastMode?: boolean | undefined;
   sessionId?: string | undefined;
@@ -26,31 +25,17 @@ export type AgentOptions = {
   resume?: SessionSnapshot | undefined;
 };
 
-export type PricingSnapshot = Readonly<{
-  id: string;
-  source: string;
-  effective_date: string;
-  model: "gpt-5.6-sol";
-  rates: Readonly<{
-    input_usd_per_million: string;
-    cached_input_usd_per_million: string;
-    cache_write_input_usd_per_million: string;
-    output_usd_per_million: string;
-  }>;
-}>;
-
 export type EstimatedUsdCost = Readonly<{
   usd: string;
   input_usd: string;
   cached_input_usd: string;
   cache_write_input_usd: string;
   output_usd: string;
-  pricing: PricingSnapshot;
+  service_tier: "standard" | "priority";
 }>;
 
 export type CostStatus =
   | "estimated_from_usage"
-  | "pricing_not_configured"
   | "usage_not_reported"
   | "other";
 

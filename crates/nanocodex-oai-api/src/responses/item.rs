@@ -274,7 +274,7 @@ pub enum ResponseItem {
 impl ResponseItem {
     /// Creates the stable developer item that declares session tools.
     #[must_use]
-    pub fn additional_tools(tools: Vec<ToolDefinition>) -> Self {
+    pub const fn additional_tools(tools: Vec<ToolDefinition>) -> Self {
         Self::AdditionalTools {
             id: None,
             role: MessageRole::Developer,
@@ -336,7 +336,7 @@ impl ResponseItem {
 
     /// Returns whether this item is a user-role message.
     #[must_use]
-    pub fn is_user_message(&self) -> bool {
+    pub const fn is_user_message(&self) -> bool {
         matches!(
             self,
             Self::Message {
@@ -348,7 +348,7 @@ impl ResponseItem {
 
     /// Returns the Responses API item ID, if present.
     #[must_use]
-    pub fn id(&self) -> Option<&ResponseItemId> {
+    pub const fn id(&self) -> Option<&ResponseItemId> {
         match self {
             Self::AdditionalTools { id, .. }
             | Self::Message { id, .. }

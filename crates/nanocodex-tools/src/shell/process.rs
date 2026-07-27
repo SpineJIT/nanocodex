@@ -287,7 +287,7 @@ impl ProcessGroupGuard {
         Ok(())
     }
 
-    pub(super) fn disarm(&mut self) {
+    pub(super) const fn disarm(&mut self) {
         self.process_group = None;
     }
 

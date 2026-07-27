@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nanocodex_oai_api::ToolDefinition;
+use nanocodex_oai_api::tools::ToolDefinition;
 use serde_json::json;
 
 use super::{StandardTool, Tool, ToolContext, ToolExecution, ToolInput, ToolResult};
@@ -19,7 +19,7 @@ pub(super) struct ApplyPatchHandler {
 }
 
 impl ApplyPatchHandler {
-    pub(super) fn new(workspace: PathBuf) -> Self {
+    pub(super) const fn new(workspace: PathBuf) -> Self {
         Self { workspace }
     }
 }

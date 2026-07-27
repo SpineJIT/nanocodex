@@ -6,8 +6,15 @@ use std::{
 };
 
 use nanocodex::{
-    AgentEvent, AgentEventData, AgentEventKind, AssistantEvent, Prompt, ReasoningEvent,
-    RolloutTranscriptItem, RunEvent, RunStatus, Thinking, UserInput,
+    Thinking,
+    agent::{
+        events::{
+            AgentEvent, AgentEventData, AgentEventKind, AssistantEvent, ReasoningEvent, RunEvent,
+            RunStatus,
+        },
+        input::{Prompt, UserInput},
+        rollout::RolloutTranscriptItem,
+    },
 };
 use ratatui::{
     buffer::Buffer,
@@ -86,14 +93,14 @@ pub(super) struct SubmittedPrompt {
 }
 
 impl SubmittedPrompt {
-    fn new(display: String, local_images: Vec<PathBuf>) -> Self {
+    const fn new(display: String, local_images: Vec<PathBuf>) -> Self {
         Self {
             display,
             local_images,
         }
     }
 
-    pub(super) fn text(text: String) -> Self {
+    pub(super) const fn text(text: String) -> Self {
         Self::new(text, Vec::new())
     }
 
@@ -235,6 +242,8 @@ pub(super) struct Conversation {
     run_generation: u64,
     applied_steer_runs_waiting_for_ack: VecDeque<u64>,
     interrupting_steers: Option<u64>,
+    #[cfg(test)]
+    assistant_delta_applications: usize,
 }
 
 impl Conversation {
@@ -268,6 +277,8 @@ impl Conversation {
             run_generation: 0,
             applied_steer_runs_waiting_for_ack: VecDeque::new(),
             interrupting_steers: None,
+            #[cfg(test)]
+            assistant_delta_applications: 0,
         }
     }
 
@@ -284,7 +295,7 @@ impl Conversation {
     }
 
     #[cfg(test)]
-    pub(super) fn set_run_started_at(&mut self, started_at: Instant) {
+    pub(super) const fn set_run_started_at(&mut self, started_at: Instant) {
         self.run_started_at = Some(started_at);
     }
 
@@ -767,6 +778,10 @@ impl Conversation {
     }
 
     pub(super) fn push_assistant_delta(&mut self, delta: &str) {
+        #[cfg(test)]
+        {
+            self.assistant_delta_applications = self.assistant_delta_applications.saturating_add(1);
+        }
         let append_to_current = self.streamed_this_turn;
         self.streamed_this_turn = true;
         if append_to_current && self.transcript.tail_is_assistant() {
@@ -775,6 +790,11 @@ impl Conversation {
         } else {
             self.push_output(TranscriptItem::Assistant(delta.to_owned()));
         }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn assistant_delta_applications(&self) -> usize {
+        self.assistant_delta_applications
     }
 
     fn push_reasoning_delta(&mut self, delta: &str) {
@@ -856,12 +876,12 @@ impl Conversation {
         self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(rows);
     }
 
-    pub(super) fn display_scroll_from_bottom(&self) -> usize {
+    pub(super) const fn display_scroll_from_bottom(&self) -> usize {
         self.scroll_from_bottom
             .saturating_add(self.smooth_scroll_from_bottom)
     }
 
-    fn queue_smooth_scroll(&mut self, rows: usize) {
+    const fn queue_smooth_scroll(&mut self, rows: usize) {
         if rows == 0 {
             return;
         }
@@ -873,7 +893,7 @@ impl Conversation {
         self.smooth_scroll_from_bottom = self.smooth_scroll_from_bottom.saturating_sub(drain);
     }
 
-    fn smooth_scroll_pending(&self) -> bool {
+    const fn smooth_scroll_pending(&self) -> bool {
         self.smooth_scroll_from_bottom > 0
     }
 
@@ -971,13 +991,13 @@ impl Conversation {
         pending.new_entries_start.get_or_insert(first);
     }
 
-    fn note_unseen_output(&mut self) {
+    const fn note_unseen_output(&mut self) {
         if self.scroll_from_bottom > 0 || self.selected_user.is_some() {
             self.has_unseen_output = true;
         }
     }
 
-    fn jump_to_bottom(&mut self) {
+    const fn jump_to_bottom(&mut self) {
         self.selected_user = None;
         self.scroll_from_bottom = 0;
         self.smooth_scroll_from_bottom = 0;
@@ -1538,7 +1558,7 @@ impl App {
         }
     }
 
-    pub(super) fn composer_scroll(&self) -> usize {
+    pub(super) const fn composer_scroll(&self) -> usize {
         self.composer_scroll
     }
 
@@ -1647,7 +1667,7 @@ impl App {
             .map(|editor| editor.transcript_index)
     }
 
-    pub(super) fn historical_editor_active(&self) -> bool {
+    pub(super) const fn historical_editor_active(&self) -> bool {
         self.historical_editor.is_some()
     }
 
@@ -1837,7 +1857,7 @@ impl App {
         true
     }
 
-    pub(super) fn branch_navigator_active(&self) -> bool {
+    pub(super) const fn branch_navigator_active(&self) -> bool {
         self.branch_navigator.is_some()
     }
 
@@ -1859,7 +1879,7 @@ impl App {
         self.branch_navigator = ids.get(target).copied();
     }
 
-    pub(super) fn branch_navigator_selected_id(&self) -> Option<u64> {
+    pub(super) const fn branch_navigator_selected_id(&self) -> Option<u64> {
         self.branch_navigator
     }
 
@@ -1888,7 +1908,7 @@ impl App {
         self.request_main_branch_switch(id)
     }
 
-    pub(super) fn close_branch_navigator(&mut self) {
+    pub(super) const fn close_branch_navigator(&mut self) {
         self.branch_navigator = None;
     }
 
@@ -2058,7 +2078,7 @@ impl App {
         expanded
     }
 
-    pub(super) fn tool_details_expanded(&self) -> bool {
+    pub(super) const fn tool_details_expanded(&self) -> bool {
         self.tool_details_expanded
     }
 
@@ -2299,6 +2319,20 @@ impl App {
             .is_some_and(|branch| branch.conversation.on_agent_event(event))
     }
 
+    pub(super) fn push_main_assistant_delta(&mut self, branch_id: u64, delta: &str) -> bool {
+        if self.main_branch_id == branch_id {
+            self.main.push_assistant_delta(delta);
+            return true;
+        }
+        self.main_branches
+            .iter_mut()
+            .find(|branch| branch.id == branch_id)
+            .is_some_and(|branch| {
+                branch.conversation.push_assistant_delta(delta);
+                true
+            })
+    }
+
     pub(super) fn main_branch_event_stream_closed(&mut self, branch_id: u64) {
         let conversation = if self.main_branch_id == branch_id {
             Some(&mut self.main)
@@ -2401,7 +2435,7 @@ impl App {
         self.screen_selection.copy_finished(copied)
     }
 
-    pub(super) fn mouse_selection_needs_redraw(&self) -> bool {
+    pub(super) const fn mouse_selection_needs_redraw(&self) -> bool {
         self.screen_selection.needs_tick()
     }
 
@@ -2522,7 +2556,7 @@ impl App {
         self.fast_mode
     }
 
-    pub(super) fn fast_mode_changed(&mut self, enabled: bool) {
+    pub(super) const fn fast_mode_changed(&mut self, enabled: bool) {
         self.fast_mode = enabled;
     }
 
@@ -2577,7 +2611,7 @@ impl App {
         }
     }
 
-    pub(super) fn back_reasoning_picker(&mut self) {
+    pub(super) const fn back_reasoning_picker(&mut self) {
         self.reasoning_picker = match self.reasoning_picker {
             Some(ReasoningPicker::Advanced) => Some(ReasoningPicker::Standard {
                 selected: STANDARD_THINKING_OPTIONS.len(),
@@ -2586,7 +2620,7 @@ impl App {
         };
     }
 
-    pub(super) fn thinking_changed(&mut self, thinking: Thinking) {
+    pub(super) const fn thinking_changed(&mut self, thinking: Thinking) {
         self.thinking = thinking;
     }
 
@@ -2823,7 +2857,7 @@ impl ContinuedTool {
         }
     }
 
-    fn add_duration(&mut self, duration_ns: Option<u64>) {
+    const fn add_duration(&mut self, duration_ns: Option<u64>) {
         self.duration_ns = match (self.duration_ns, duration_ns) {
             (Some(total), Some(duration)) => Some(total.saturating_add(duration)),
             (total, None) => total,
@@ -3156,7 +3190,11 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use nanocodex::{AgentEvent, AgentEventKind, PromptInput, RolloutTranscriptItem, UserInput};
+    use nanocodex::agent::{
+        events::{AgentEvent, AgentEventKind},
+        input::{PromptInput, UserInput},
+        rollout::RolloutTranscriptItem,
+    };
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
     use serde_json::{Value, json};
 

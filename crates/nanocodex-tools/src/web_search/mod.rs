@@ -5,7 +5,8 @@ mod wire;
 use std::time::Duration;
 
 use nanocodex_oai_api::{
-    OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, OpenAiAuthSnapshot, ToolDefinition,
+    auth::{OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, OpenAiAuthSnapshot},
+    tools::ToolDefinition,
 };
 use reqwest::header::{AUTHORIZATION, USER_AGENT};
 use serde_json::{Value, json};
@@ -329,13 +330,8 @@ fn has_semantic_error(output: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::ready, sync::Arc};
-
     use eyre::{Result, eyre};
-    use nanocodex_oai_api::{
-        OpenAiAuth, OpenAiAuthError, OpenAiAuthFuture, OpenAiAuthMode, OpenAiAuthSnapshot,
-        OpenAiAuthSource, ResponseItem,
-    };
+    use nanocodex_oai_api::responses::ResponseItem;
     use serde_json::{Value, json};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -344,11 +340,12 @@ mod tests {
     };
 
     use super::{Tool, ToolContext, WebSearchConfig, WebSearchHandler};
-    use crate::ToolOutputBody;
+    use crate::{ToolOutputBody, test_support::RotatingChatGptAuth};
 
     #[tokio::test]
     async fn posts_codex_search_request_and_returns_plaintext_output() -> Result<()> {
         let (endpoint, server) = spawn_search_server().await?;
+        let (auth, auth_source) = RotatingChatGptAuth::shared();
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "x-injected-client",
@@ -357,13 +354,7 @@ mod tests {
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .build()?;
-        let handler = WebSearchHandler::with_client(
-            WebSearchConfig {
-                endpoint,
-                auth: subscription_auth(),
-            },
-            client,
-        );
+        let handler = WebSearchHandler::with_client(WebSearchConfig { endpoint, auth }, client);
         let history = serde_json::from_value::<Vec<ResponseItem>>(json!([
             json!({
                 "type": "message",
@@ -387,7 +378,7 @@ mod tests {
                     "search-session",
                     "call-search",
                     &history,
-                    crate::DEFAULT_TOOL_OUTPUT_TOKENS,
+                    crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
                 ),
             )
             .await;
@@ -437,6 +428,7 @@ mod tests {
             }])
         );
         assert!(request.get("reasoning").is_none());
+        assert_eq!(auth_source.recoveries(), 1);
         Ok(())
     }
 
@@ -444,21 +436,18 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}/v1/alpha/search", listener.local_addr()?);
         let server = tokio::spawn(async move {
+            let (mut rejected, _) = listener.accept().await?;
+            let (headers, _) = read_http_request(&mut rejected).await?;
+            assert_search_headers(&headers, "oauth-token-0")?;
+            rejected
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await?;
+
             let (mut stream, _) = listener.accept().await?;
             let (headers, body) = read_http_request(&mut stream).await?;
-            let headers = headers.to_ascii_lowercase();
-            if !headers.contains("authorization: bearer subscription-token") {
-                return Err(eyre!("search request did not contain bearer auth"));
-            }
-            if !headers.contains("chatgpt-account-id: account-test") {
-                return Err(eyre!("search request did not contain the account ID"));
-            }
-            if !headers.contains("x-openai-fedramp: true") {
-                return Err(eyre!("search request did not contain FedRAMP routing"));
-            }
-            if !headers.contains("x-injected-client: true") {
-                return Err(eyre!("search request did not use the injected HTTP client"));
-            }
+            assert_search_headers(&headers, "oauth-token-1")?;
             let response = serde_json::to_vec(&json!({
                 "encrypted_output": "ciphertext",
                 "output": "Search result with turn0search0",
@@ -484,43 +473,26 @@ mod tests {
         Ok((endpoint, server))
     }
 
-    struct StaticSubscriptionAuth;
-
-    impl OpenAiAuthSource for StaticSubscriptionAuth {
-        fn validate(&self) -> std::result::Result<(), OpenAiAuthError> {
-            Ok(())
+    fn assert_search_headers(headers: &str, token: &str) -> Result<()> {
+        let headers = headers.to_ascii_lowercase();
+        for expected in [
+            format!("authorization: bearer {token}"),
+            "chatgpt-account-id: account-test".to_owned(),
+            "x-openai-fedramp: true".to_owned(),
+            "x-injected-client: true".to_owned(),
+        ] {
+            if !headers.contains(&expected) {
+                return Err(eyre!("search request omitted `{expected}`"));
+            }
         }
-
-        fn snapshot(
-            &self,
-        ) -> OpenAiAuthFuture<'_, std::result::Result<OpenAiAuthSnapshot, OpenAiAuthError>>
-        {
-            Box::pin(ready(Ok(OpenAiAuthSnapshot::new(
-                OpenAiAuthMode::ChatGpt,
-                "subscription-token",
-                Some("account-test"),
-                true,
-                1,
-            ))))
-        }
-
-        fn recover_unauthorized(
-            &self,
-            _rejected: &OpenAiAuthSnapshot,
-        ) -> OpenAiAuthFuture<'_, std::result::Result<(), OpenAiAuthError>> {
-            Box::pin(ready(Ok(())))
-        }
-    }
-
-    fn subscription_auth() -> OpenAiAuth {
-        OpenAiAuth::managed_chatgpt(Arc::new(StaticSubscriptionAuth))
+        Ok(())
     }
 
     #[test]
     fn exposes_codex_web_run_schema_and_description() {
         let handler = WebSearchHandler::new(WebSearchConfig {
             endpoint: "http://127.0.0.1:1/v1/alpha/search".to_owned(),
-            auth: nanocodex_oai_api::OpenAiAuth::api_key("test-key"),
+            auth: nanocodex_oai_api::auth::OpenAiAuth::api_key("test-key"),
         });
         let spec = serde_json::to_value(handler.definition()).unwrap();
 
