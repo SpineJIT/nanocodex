@@ -1,5 +1,5 @@
 use std::{
-    fs::{File, TryLockError},
+    fs::File,
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
     time::Instant,
@@ -68,8 +68,8 @@ impl RolloutConfig {
 /// A completed model boundary materialized from a Codex-compatible rollout.
 ///
 /// This value is intentionally single-use: [`Self::into_parts`] transfers the
-/// exclusive rollout continuation into a builder. Forks and spawned agents
-/// always receive fresh rollout files.
+/// rollout continuation into a builder. Forks and spawned agents always receive
+/// fresh rollout files.
 #[derive(Debug)]
 pub struct DurableSession {
     codex_home: PathBuf,
@@ -571,7 +571,6 @@ impl RolloutRecorder {
             },
         };
         let mut file = File::options().write(true).create_new(true).open(&path)?;
-        lock_rollout(&file, &path)?;
         write_line(
             &mut file,
             &RolloutLine {
@@ -592,8 +591,6 @@ impl RolloutRecorder {
         path: &Path,
         history_len: usize,
     ) -> io::Result<Self> {
-        let file = File::options().read(true).append(true).open(path)?;
-        lock_rollout(&file, path)?;
         let state = read_resume_writer_state(path, thread_id)?;
         if state.written_len > history_len {
             return Err(io::Error::new(
@@ -601,6 +598,7 @@ impl RolloutRecorder {
                 "Codex rollout contains history newer than the durable Nanocodex boundary",
             ));
         }
+        let file = File::options().read(true).append(true).open(path)?;
         let writer = RolloutWriter::resumed(tokio::fs::File::from_std(file), state);
         Ok(Self::spawn(runtime, thread_id, path.to_path_buf(), writer))
     }
@@ -674,20 +672,6 @@ impl RolloutRecorder {
         receiver
             .await
             .map_err(|_| io::Error::other("Codex rollout writer stopped"))?
-    }
-}
-
-fn lock_rollout(file: &File, path: &Path) -> io::Result<()> {
-    match file.try_lock() {
-        Ok(()) => Ok(()),
-        Err(TryLockError::WouldBlock) => Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            format!(
-                "Codex rollout {} already has an active writer",
-                path.display()
-            ),
-        )),
-        Err(TryLockError::Error(error)) => Err(error),
     }
 }
 
@@ -1560,32 +1544,6 @@ mod tests {
         assert_eq!(lines[7]["payload"]["message"], "two");
         assert_eq!(lines[8]["type"], "response_item");
         assert_eq!(lines[9]["payload"]["message"], "second");
-    }
-
-    #[tokio::test]
-    async fn rejects_a_second_writer_for_the_same_rollout() {
-        let home = tempdir().expect("temporary Codex home");
-        let original = recorder(home.path());
-        let path = original.info().path().to_path_buf();
-        let resumed = RolloutConfig::new(home.path()).resumed(path);
-
-        let error = RolloutRecorder::create(
-            &Handle::current(),
-            &resumed,
-            "019c0d31-c308-7d91-bff4-5dca82d15ac6",
-            Path::new("/worktree"),
-            "base instructions",
-            RolloutOrigin {
-                kind: "resume",
-                parent_thread_id: None,
-            },
-            Some(0),
-        )
-        .expect_err("a live rollout writer must own the file exclusively");
-
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        assert!(error.to_string().contains("active writer"));
-        drop(original);
     }
 
     #[tokio::test]
