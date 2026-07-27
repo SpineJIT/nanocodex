@@ -1,10 +1,11 @@
 mod auth;
 mod config;
+#[cfg(feature = "tempo")]
 mod credits;
 mod mcp;
+#[cfg_attr(not(feature = "tempo"), path = "mpp_disabled.rs")]
 mod mpp;
 mod observability;
-mod resource;
 mod run;
 mod subagents;
 mod tui;
@@ -48,6 +49,7 @@ enum Command {
     /// Manage `ChatGPT` subscription login.
     Auth(auth::Auth),
     /// Inspect or purchase Nanocodex NANOUSD credits.
+    #[cfg(feature = "tempo")]
     Credits(credits::Credits),
     /// Run one prompt and stream JSONL events to stdout.
     Run(Box<RunCommand>),
@@ -93,17 +95,9 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();
-    let uses_tempo = match &cli.command {
-        Some(Command::Run(command)) => command.agent.uses_tempo(),
-        Some(Command::Resume(command)) => command.agent.uses_tempo(),
-        None => cli.agent.uses_tempo(),
-        Some(Command::Auth(_) | Command::Credits(_) | Command::Update(_)) => false,
-    };
-    if uses_tempo {
-        resource::ensure_mpp_file_descriptor_capacity()?;
-    }
     match cli.command {
         Some(Command::Auth(command)) => command.run().await,
+        #[cfg(feature = "tempo")]
         Some(Command::Credits(command)) => command.run().await,
         Some(Command::Run(command)) => {
             let _observability = command.observability.install(false, command.agent.cwd())?;
@@ -130,6 +124,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "tempo")]
     #[test]
     fn tempo_flag_selects_the_tui_transport() {
         let cli = Cli::try_parse_from([
@@ -148,6 +143,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tempo")]
     #[test]
     fn tempo_flag_selects_the_one_shot_transport() {
         let cli = Cli::try_parse_from([
@@ -182,6 +178,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tempo")]
     #[test]
     fn provider_selection_is_exclusive() {
         let error = Cli::try_parse_from(["nanocodex", "--provider.openai", "--provider.tempo"])
@@ -189,6 +186,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[cfg(not(feature = "tempo"))]
+    #[test]
+    fn tempo_provider_is_absent_from_direct_agent_builds() {
+        let error = Cli::try_parse_from(["nanocodex", "--provider.tempo"])
+            .err()
+            .unwrap();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]

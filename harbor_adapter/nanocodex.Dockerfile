@@ -74,7 +74,8 @@ RUN mkdir bin/nanocodex/src \
     printf 'fn main() {}\n' > examples/rollout_resume_bench.rs
 RUN --mount=type=cache,id=nanocodex-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=nanocodex-target-${TARGETARCH},target=/build/target \
-    cargo build --locked --profile "${CARGO_PROFILE}"
+    cargo build --locked --profile "${CARGO_PROFILE}" \
+        --package nanocodex-bin --bin nanocodex
 
 COPY bin ./bin
 COPY crates ./crates
@@ -89,7 +90,8 @@ RUN --mount=type=cache,id=nanocodex-cargo-registry,target=/usr/local/cargo/regis
         crates/nanocodex-observability/src/lib.rs \
         crates/nanocodex-tools/src/lib.rs \
         crates/nanocodex-tools/macros/src/lib.rs && \
-    cargo build --locked --profile "${CARGO_PROFILE}" && \
+    cargo build --locked --profile "${CARGO_PROFILE}" \
+        --package nanocodex-bin --bin nanocodex && \
     mkdir /out && \
     case "${CARGO_PROFILE}" in \
         dev) artifact_dir=debug ;; \

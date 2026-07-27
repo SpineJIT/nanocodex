@@ -69,7 +69,8 @@ jobs:
         run: |
           VERGEN_GIT_SHA="$BUILD_SHA" \
             cargo build --locked --profile maxperf \
-              --package nanocodex-bin --target ${{ matrix.target }}
+              --package nanocodex-bin --bin nanocodex --features tempo \
+              --target ${{ matrix.target }}
       - name: Stage Unix artifact
         if: runner.os != 'Windows'
         shell: bash

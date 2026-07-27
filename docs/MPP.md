@@ -55,6 +55,13 @@ slippage bound.
 
 ## CLI
 
+Release and nightly artifacts include Tempo support. Source builds opt in so
+the direct-agent development loop does not compile the payment stack:
+
+```console
+cargo build -p nanocodex-bin --bin nanocodex --features tempo
+```
+
 Enable paid Responses and paid HTTP tool egress with:
 
 ```text

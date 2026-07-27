@@ -139,6 +139,7 @@ impl AgentArgs {
         self.cwd.as_deref().unwrap_or_else(|| Path::new("."))
     }
 
+    #[cfg(test)]
     pub(crate) const fn uses_tempo(&self) -> bool {
         self.mpp.is_enabled()
     }

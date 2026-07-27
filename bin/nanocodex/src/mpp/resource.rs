@@ -1,3 +1,5 @@
+//! Process limits required only by the embedded Tempo egress proxy.
+
 use eyre::{Result, WrapErr};
 
 #[cfg(unix)]

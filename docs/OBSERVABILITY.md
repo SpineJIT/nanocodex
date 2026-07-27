@@ -200,7 +200,7 @@ the in-memory demo backend's retained trace volume and is not agent runtime.
 The CLI accepts the same exporter configuration directly:
 
 ```sh
-cargo run --quiet --manifest-path bin/nanocodex/Cargo.toml -- \
+cargo run --quiet -p nanocodex-bin --bin nanocodex -- \
   run \
   --otel-endpoint http://127.0.0.1:4318 \
   --otel-environment local-demo \

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 mod egress;
+mod resource;
 
 use self::egress::{EgressPolicy, MppEgress};
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
@@ -102,6 +103,7 @@ impl MppArgs {
             return Ok(None);
         }
 
+        resource::ensure_mpp_file_descriptor_capacity()?;
         let provider = self.wallet_store.map_or_else(
             TempoAccountsProvider::from_default_store,
             TempoAccountsProvider::from_store,

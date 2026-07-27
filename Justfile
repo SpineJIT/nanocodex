@@ -106,7 +106,7 @@ otel-up:
 run-otel: otel-up
     @test -n "${OPENAI_API_KEY:-}" || { echo "set OPENAI_API_KEY in .env or the environment" >&2; exit 2; }
     @echo "Building and launching the Nanocodex TUI..."
-    @cargo run --manifest-path bin/nanocodex/Cargo.toml -- \
+    @cargo run -p nanocodex-bin --bin nanocodex -- \
         --otel-endpoint http://127.0.0.1:4318 \
         --otel-environment local-tui
 
@@ -116,7 +116,7 @@ run-otel-detail: otel-up
     @test -n "${OPENAI_API_KEY:-}" || { echo "set OPENAI_API_KEY in .env or the environment" >&2; exit 2; }
     @echo "Building and launching the Nanocodex TUI with detailed stream timing..."
     @OTEL_LEVEL="warn,nanocodex=info,nanocodex_oai_api=info,nanocodex_tools=info,nanocodex_stream_timing=trace" \
-        cargo run --manifest-path bin/nanocodex/Cargo.toml -- \
+        cargo run -p nanocodex-bin --bin nanocodex -- \
         --otel-endpoint http://127.0.0.1:4318 \
         --otel-environment local-tui
 
@@ -135,7 +135,7 @@ otel-demo:
     @curl --fail --silent --show-error http://127.0.0.1:16686/ >/dev/null || { echo "run 'just otel-up' first" >&2; exit 2; }
     @mkdir -p .nanocodex/otel-demo
     @rm -f .nanocodex/otel-demo/events.jsonl .nanocodex/otel-demo/tracing.jsonl
-    @cargo run --quiet --manifest-path bin/nanocodex/Cargo.toml -- \
+    @cargo run --quiet -p nanocodex-bin --bin nanocodex -- \
         run \
         --otel-endpoint http://127.0.0.1:4318 \
         --otel-environment local-demo \
@@ -180,7 +180,7 @@ otel-down:
 
 # Tight inner loop: native model process with local code mode, no Harbor or Docker.
 run:
-    @cargo run --quiet --manifest-path bin/nanocodex/Cargo.toml -- run --thinking=low "Use the available exec tool to run pwd exactly once without modifying anything, then report the path."
+    @cargo run --quiet -p nanocodex-bin --bin nanocodex -- run --thinking=low "Use the available exec tool to run pwd exactly once without modifying anything, then report the path."
 
 # Build a static Linux executable for the Docker daemon's native architecture.
 # This is a native container build, not an amd64 cross-compile on Apple Silicon.

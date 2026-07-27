@@ -13,8 +13,8 @@ members = [
     "js/bindings",
     "py/bindings",
 ]
-# Root Cargo commands target the public library facade. Use `just run` for the
-# executable consumer.
+# Root Cargo commands target the public library facade. Use `just run` or
+# `cargo run -p nanocodex-bin --bin nanocodex` for the executable consumer.
 default-members = ["crates/nanocodex"]
 resolver = "2"
 
