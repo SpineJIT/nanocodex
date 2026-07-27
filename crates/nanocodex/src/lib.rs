@@ -17,40 +17,22 @@ pub use nanocodex_oai_api::{OpenAi, ReasoningMode, Thinking};
 pub use nanocodex_tools::{Tool, Tools, tool};
 
 /// Owned agent lifecycle, builders, turns, branching, and snapshots.
-pub mod agent {
-    #![doc = include_str!("../../nanocodex-agent/README.md")]
+#[doc(inline)]
+pub use nanocodex_agent as agent;
 
-    #[doc(inline)]
-    pub use nanocodex_agent::*;
-    pub use nanocodex_agent::{events, input, session, tools, usage};
-    #[cfg(not(target_family = "wasm"))]
-    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
-    pub use nanocodex_agent::{rollout, transport};
-}
+/// Tower-native OpenAI Responses client, sessions, protocol, and transport.
+#[doc(inline)]
+pub use nanocodex_oai_api as oai;
 
-pub mod oai {
-    #![doc = include_str!("../../nanocodex-oai-api/README.md")]
-
-    #[doc(inline)]
-    pub use nanocodex_oai_api::*;
-}
-
-pub mod tools {
-    #![doc = include_str!("../../nanocodex-tools/README.md")]
-
-    #[doc(inline)]
-    pub use nanocodex_tools::*;
-}
+/// Tool registry, built-ins, MCP, tool search, and Code Mode.
+#[doc(inline)]
+pub use nanocodex_tools as tools;
 
 /// Application-owned tracing and OpenTelemetry setup.
 #[cfg(not(target_family = "wasm"))]
 #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
-pub mod observability {
-    #![doc = include_str!("../../nanocodex-observability/README.md")]
-
-    #[doc(inline)]
-    pub use nanocodex_observability::*;
-}
+#[doc(inline)]
+pub use nanocodex_observability as observability;
 
 /// Common imports for the golden owned-agent path.
 pub mod prelude {
