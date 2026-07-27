@@ -53,6 +53,7 @@ RUN mkdir bin/nanocodex/src \
     printf 'fn main() {}\n' > crates/nanocodex-agent/benches/agent_lifecycle.rs && \
     printf '\n' > crates/nanocodex-oai-api/src/lib.rs && \
     printf 'fn main() {}\n' > crates/nanocodex-oai-api/benches/fork_history.rs && \
+    printf 'fn main() {}\n' > crates/nanocodex-oai-api/benches/session_lifecycle.rs && \
     printf 'fn main() {}\n' > crates/nanocodex-oai-api/benches/tower_responses.rs && \
     printf '\n' > crates/nanocodex-observability/src/lib.rs && \
     printf '\n' > crates/nanocodex-tools/src/lib.rs && \
@@ -61,11 +62,16 @@ RUN mkdir bin/nanocodex/src \
     printf '\n' > crates/nanocodex-tools/macros/src/lib.rs && \
     printf 'fn main() {}\n' > examples/minimal.rs && \
     printf 'fn main() {}\n' > examples/follow_on.rs && \
+    printf 'fn main() {}\n' > examples/resume.rs && \
+    printf 'fn main() {}\n' > examples/lifecycle.rs && \
     printf 'fn main() {}\n' > examples/custom_tool.rs && \
     printf 'fn main() {}\n' > examples/subagents.rs && \
     printf 'fn main() {}\n' > examples/mcp.rs && \
     printf 'fn main() {}\n' > examples/fork_conversations.rs && \
-    printf 'fn main() {}\n' > examples/fork_checkpoint_bench.rs
+    printf 'fn main() {}\n' > examples/fork_checkpoint_bench.rs && \
+    printf 'fn main() {}\n' > examples/response_transport_bench.rs && \
+    printf 'fn main() {}\n' > examples/codex_parity_bench.rs && \
+    printf 'fn main() {}\n' > examples/rollout_resume_bench.rs
 RUN --mount=type=cache,id=nanocodex-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=nanocodex-target-${TARGETARCH},target=/build/target \
     cargo build --locked --profile "${CARGO_PROFILE}"
