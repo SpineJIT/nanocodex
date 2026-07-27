@@ -18,7 +18,7 @@ env:
 
 concurrency:
   group: ${{ inputs.pr && format('pr-artifacts-{0}', inputs.pr) || 'nightly-release' }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ inputs.pr != '' }}
 
 jobs:
   build:
