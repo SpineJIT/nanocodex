@@ -62,6 +62,47 @@ test("browser host opens application sockets through MPP", async () => {
   assert.deepEqual(socket.sent.map(JSON.parse), [{ mpp: "message", data: "request" }]);
 });
 
+test("browser host does not require a global constructor for host-owned sockets", async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
+  try {
+    Object.defineProperty(globalThis, "WebSocket", {
+      configurable: true,
+      value: undefined,
+      writable: true,
+    });
+
+    const paidSocket = new FakeWebSocket("wss://paid.test");
+    paidSocket.readyState = FakeWebSocket.OPEN;
+    const paid = createBrowserHost({
+      mpp: {
+        async ws() {
+          return paidSocket;
+        },
+      },
+    });
+    await paid.connect("wss://paid.test", "mpp-managed", "paid-session");
+    assert.equal(JSON.parse(await paid.send(1, "request")).ok, true);
+
+    const directSocket = new FakeWebSocket("wss://direct.test");
+    const direct = createBrowserHost({
+      createWebSocket() {
+        return directSocket;
+      },
+    });
+    const connecting = direct.connect(
+      "wss://direct.test",
+      "host-managed",
+      "direct-session",
+    );
+    directSocket.open();
+    await connecting;
+    assert.equal(JSON.parse(await direct.send(1, "request")).ok, true);
+  } finally {
+    if (descriptor) Object.defineProperty(globalThis, "WebSocket", descriptor);
+    else delete globalThis.WebSocket;
+  }
+});
+
 test("browser host bounds queued receives and buffered sends", async () => {
   const host = createBrowserHost({
     WebSocketImpl: FakeWebSocket,
