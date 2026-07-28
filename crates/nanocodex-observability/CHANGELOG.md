@@ -5,12 +5,31 @@ All notable changes to Nanocodex are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0](https://github.com/gakonst/nanocodex/releases/tag/v0.3.0) - 2026-07-28
+
+### Other
+
+- Merge pull request [#50](https://github.com/gakonst/nanocodex/issues/50) from gakonst/refactor/05-observability
+
+### Refactor
+
+- Stabilize public SDK surface
+- Consolidate the OpenAI Responses API
+
+### Testing
+
+- [observability] Verify full-fidelity turn traces
+
 ## [0.2.0](https://github.com/gakonst/nanocodex/releases/tag/v0.2.0) - 2026-07-26
 
 ### Features
 
 - [mcp] Prewarm deferred default servers
 - [cli] Route OpenAI through Tempo MPP
+
+### Miscellaneous Tasks
+
+- [release] Prepare 0.2.0
 
 ### Other
 

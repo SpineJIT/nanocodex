@@ -5,6 +5,145 @@ All notable changes to Nanocodex are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0](https://github.com/gakonst/nanocodex/releases/tag/v0.3.0) - 2026-07-28
+
+### Bug Fixes
+
+- [release] Validate dynamic Python version
+- [ci] Satisfy strict Clippy checks
+- [ci] Build optimized Python wheels
+- [js] Permit immutable preview versions
+- [web] Join controller agent shutdown
+- [example] Own browser CDN agent creation
+- [wasm] Join graceful agent shutdown
+- [web] Cancel replaced active turns
+- [wasm] Support host-owned browser sockets
+- [examples] Consume typed turn results
+- [web] Close replaced payment sessions
+- [web] Own browser agent lifecycle
+- [tui] Deduplicate terminal failures
+- [react] Own worker generations
+- [wasm] Satisfy target-specific lint gates
+- [js] Keep transport mechanics private
+- [js] Isolate concurrent event observers
+- [js] Preserve configured workspace
+- [js] Snapshot hosted tool boundaries
+- [js] Bound and release event iterators
+- [docs] Honor configured Cargo target directory
+- [code-mode] Schedule timers on the host worker
+- [react] Accept the current SDK package
+- [python] Align binding package version
+- [cli] Flush terminal event after interrupt
+- [mcp] Bound stdio stderr buffering
+- [agent] Fail malformed continuations before terminal
+- [oai] Reject empty continuation checkpoints
+- [oai] Bound WebSocket pump backlog
+- [mcp] Own and bound stdio subprocesses
+- [mcp] Stop cross-origin credential redirects
+- [wasm] Enable clock support and enforce runtime tests
+- [js] Honor configured Cargo target directory
+- [oai] Ignore non-assistant final messages
+- [bench] Support shared ChatGPT auth
+- [oai] Preserve stable item ids in ephemeral requests
+- [tui] Bound syntax highlighting work
+- [mcp] Send a deterministic HTTP user agent
+- [agent] Remove rollout writer locking
+- [ci] Include every benchmark target in Harbor builds
+- [wasm] Release completed turn controls
+- [api] Restore refactored consumer builds
+- [agent] Align retained context with Codex
+- [release] Package the current crate graph
+- [docs] Open facade docs from workspace root
+- [release] Tolerate npm propagation delay
+
+### Documentation
+
+- Show per-turn stream consumption
+- Show agent event consumption
+- Rename the minimal API example
+- Streamline the public README
+- Finalize the PR 50 public API guide
+- [python] Show the owned binding workflow
+- [oai] Prepare package changelog
+- [parity] Classify Codex through be2e4afc
+- [plan] Record PR 50 CI completion
+- [perf] Record paired model latency
+- [parity] Classify Codex through 3418498f
+- [facade] Keep packaged API guides canonical
+- [plan] Scope delivery to PR 50
+- [tui] Explain event batching
+- Frame nanocodex as frontier agent building blocks
+
+### Features
+
+- [python] Expose the owned agent lifecycle
+- Stabilize observability and USD cost
+
+### Miscellaneous Tasks
+
+- [consumers] Gate promoted language bindings
+- [js] Ship compiled tui entrypoints
+- Disable Python bindings on pull requests
+- Run preview checks from package directory
+- Keep hanging wasm tests non-blocking
+- Cancel superseded PR artifact builds
+- Build PR binaries on demand
+- Ignore local VM caches
+
+### Other
+
+- Merge pull request [#50](https://github.com/gakonst/nanocodex/issues/50) from gakonst/refactor/05-observability
+- Run full leaderboard jobs from PR artifacts
+
+### Performance
+
+- [web] Cap initial bundle request fan-out
+- [python] Gate binding resource budgets
+- [web] Gate controller lifecycle throughput
+- [web] Gate production bundle graph
+- [example] Isolate browser mpp runtime
+- Gate PR 50 hot paths
+- Keep Tempo out of direct CLI builds
+
+### Refactor
+
+- [api] Stabilize Tower and lifecycle boundaries
+- [js] Preserve typed turn results
+- [oai] Contain agent-only session internals
+- [agent] Decompose model lifecycle
+- [tools] Decompose runtime ownership
+- [agent] Decompose driver control
+- [agent] Decompose rollout persistence
+- Align agent lifecycle with Codex
+- Isolate platform runtime boundaries
+- [api] Enforce canonical crate boundaries
+- Stabilize public SDK surface
+- Extract owned agent lifecycle
+- Consolidate tools and MCP
+- Consolidate the OpenAI Responses API
+
+### Styling
+
+- [oai] Format final-message regression
+- [oai] Format item id policy
+
+### Testing
+
+- [python] Gate lifecycle and binding performance
+- [js] Isolate performance gates
+- [js] Gate binding overhead and package size
+- [wasm] Lock owned session lifecycle
+- [js] Validate installed package boundary
+- [observability] Isolate tracing capture
+- [agent] Expect stable response item ids
+- [observability] Verify full-fidelity turn traces
+- [oai] Compare tool search arguments semantically
+- [mcp] Exercise provider-native discovery
+- [tui] Lock lifecycle parity
+- [mcp] Verify read-only parallel dispatch
+- [tools] Serialize traced runtime integration tests
+- [tui] Preserve stored checkpoint branch coverage
+
 ## [0.2.0](https://github.com/gakonst/nanocodex/releases/tag/v0.2.0) - 2026-07-26
 
 ### Bug Fixes
@@ -90,6 +229,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Miscellaneous Tasks
 
+- [release] Prepare 0.2.0
 - [tempo] Use final shared SDK revisions
 - [tempo] Finalize Accounts dependency stack
 - [tempo] Pin Accounts wallet fixes

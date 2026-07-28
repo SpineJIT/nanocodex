@@ -5,6 +5,36 @@ All notable changes to Nanocodex are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0](https://github.com/gakonst/nanocodex/releases/tag/v0.3.0) - 2026-07-28
+
+### Bug Fixes
+
+- [api] Restore refactored consumer builds
+- [release] Package the current crate graph
+
+### Documentation
+
+- Finalize the PR 50 public API guide
+- [facade] Keep packaged API guides canonical
+
+### Features
+
+- Stabilize observability and USD cost
+
+### Other
+
+- Merge pull request [#50](https://github.com/gakonst/nanocodex/issues/50) from gakonst/refactor/05-observability
+
+### Refactor
+
+- Align agent lifecycle with Codex
+- Isolate platform runtime boundaries
+- [api] Enforce canonical crate boundaries
+- Stabilize public SDK surface
+- Extract owned agent lifecycle
+- Consolidate tools and MCP
+- Consolidate the OpenAI Responses API
+
 ## [0.2.0](https://github.com/gakonst/nanocodex/releases/tag/v0.2.0) - 2026-07-26
 
 ### Bug Fixes
@@ -39,6 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Miscellaneous Tasks
 
+- [release] Prepare 0.2.0
 - Raise Rust baseline to 1.97
 
 ### Other
