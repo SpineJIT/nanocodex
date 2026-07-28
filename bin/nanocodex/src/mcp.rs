@@ -773,8 +773,8 @@ mod tests {
         assert!(args.build(Path::new("/missing")).is_err());
     }
 
-    #[test]
-    fn codex_servers_merge_between_explicit_entries_and_defaults() {
+    #[tokio::test]
+    async fn codex_servers_merge_between_explicit_entries_and_defaults() {
         let codex_home = tempfile::tempdir().unwrap();
         fs::write(
             codex_home.path().join("config.toml"),
@@ -1109,8 +1109,8 @@ tool_timeout_sec = 9.5
         })
     }
 
-    #[test]
-    fn defaults_add_only_deferred_search_to_the_initial_tool_context() {
+    #[tokio::test]
+    async fn defaults_add_only_deferred_search_to_the_initial_tool_context() {
         let baseline_tools = Tools::builder().build().unwrap();
         let baseline = serde_json::to_vec(
             &ToolRuntime::new_with_tools(".", None, None, &baseline_tools)

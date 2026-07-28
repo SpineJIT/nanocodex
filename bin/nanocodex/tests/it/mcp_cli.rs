@@ -75,9 +75,10 @@ async fn serve_responses(listener: TcpListener) -> Result<()> {
         warmup["input"][0]["tools"]
             .as_array()
             .is_some_and(|tools| tools.iter().any(|tool| {
-                tool["description"]
-                    .as_str()
-                    .is_some_and(|description| description.contains("### `tool_search`"))
+                tool["type"] == "tool_search"
+                    && tool["description"]
+                        .as_str()
+                        .is_some_and(|description| description.contains("# Tool discovery"))
             })),
         "tool_search was missing from warmup: {warmup}"
     );
@@ -88,6 +89,34 @@ async fn serve_responses(listener: TcpListener) -> Result<()> {
         let generation = next_json(&mut socket).await?;
         assert_eq!(generation["previous_response_id"], previous_response);
         assert!(generation.get("tools").is_none());
+        let search_response = format!("response-search-{turn}");
+        send_completed(
+            &mut socket,
+            &search_response,
+            &[json!({
+                "type": "tool_search_call",
+                "call_id": format!("call-search-{turn}"),
+                "execution": "client",
+                "arguments": {
+                    "query": "echo message",
+                    "limit": 1
+                }
+            })],
+        )
+        .await?;
+
+        let searched = next_json(&mut socket).await?;
+        assert_eq!(searched["previous_response_id"], search_response);
+        assert_eq!(searched["input"][0]["type"], "tool_search_output");
+        assert_eq!(
+            searched["input"][0]["call_id"],
+            format!("call-search-{turn}")
+        );
+        assert!(
+            searched["input"][0]["tools"]
+                .to_string()
+                .contains("mcp__fixture__")
+        );
         let tool_response = format!("response-tool-{turn}");
         send_completed(
             &mut socket,
@@ -97,8 +126,7 @@ async fn serve_responses(listener: TcpListener) -> Result<()> {
                 "call_id": format!("call-exec-{turn}"),
                 "name": "exec",
                 "input": format!(
-                    "const found = await tools.tool_search({{query: \"echo message\"}}); \
-                     const called = await tools[found.tools[0].name]({{message: \"turn-{turn}\"}}); \
+                    "const called = await tools.mcp__fixture__echo({{message: \"turn-{turn}\"}}); \
                      text(called);"
                 )
             })],
