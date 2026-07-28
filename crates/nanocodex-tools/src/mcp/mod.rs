@@ -26,6 +26,20 @@ use tracing::{Instrument, info_span};
 pub use config::McpServer;
 pub use oauth::{McpOAuthCredentials, McpOAuthStore};
 
+fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let follows_same_origin = attempt
+            .previous()
+            .last()
+            .is_some_and(|previous| previous.origin() == attempt.url().origin());
+        if follows_same_origin && attempt.previous().len() <= 10 {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
 /// A configured family of MCP servers installed into [`crate::Tools`].
 pub struct Mcp {
     servers: Arc<[NamedServer]>,

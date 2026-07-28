@@ -189,6 +189,7 @@ async fn connect_http(input: HttpConnect<'_>) -> Result<ConnectedServer, String>
         // Match RMCP's default: its streamed handshake responses are not always fully consumed
         // before the next request, so retaining them as idle connections can stall real peers.
         .pool_max_idle_per_host(0)
+        .redirect(super::same_origin_redirect_policy())
         .default_headers(default_headers)
         .build()
         .map_err(|error| format!("failed to build MCP HTTP client: {error}"))?;

@@ -517,6 +517,7 @@ fn oauth_http_client(headers: BTreeMap<String, SecretSource>) -> Result<reqwest:
     reqwest::Client::builder()
         .default_headers(resolved)
         .pool_max_idle_per_host(0)
+        .redirect(super::same_origin_redirect_policy())
         .build()
         .map_err(|error| format!("failed to build MCP OAuth HTTP client: {error}"))
 }
@@ -603,6 +604,7 @@ fn now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::oneshot;
 
     #[derive(Default)]
     struct RecordingStore {
@@ -628,6 +630,53 @@ mod tests {
             self.saved.lock().await.push(credentials.clone());
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn oauth_headers_do_not_follow_cross_origin_redirects() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/metadata", target.local_addr().unwrap());
+        let (target_requested, mut target_requested_rx) = oneshot::channel();
+        let target_task = tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            target_requested
+                .send(String::from_utf8_lossy(&request[..read]).into_owned())
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+
+        let redirect = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_url = format!("http://{}/metadata", redirect.local_addr().unwrap());
+        let redirect_task = tokio::spawn(async move {
+            let (mut stream, _) = redirect.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).contains("x-api-key: secret"));
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let client = oauth_http_client(BTreeMap::from([(
+            "x-api-key".to_owned(),
+            SecretSource::Value("secret".to_owned()),
+        )]))
+        .unwrap();
+        let response = client.get(source_url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert!(matches!(
+            target_requested_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        target_task.abort();
+        redirect_task.await.unwrap();
     }
 
     #[tokio::test]
