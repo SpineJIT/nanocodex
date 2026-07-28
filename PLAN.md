@@ -68,9 +68,9 @@ migration, and it must be independently mergeable.
      and all-target tests, rustdoc/doctests/examples, WASM, Node/browser, PyO3,
      CLI/Ratatui, and a live native smoke.
    - Run the stock-Codex differential suite.
-   - Run the complete configured Terminal-Bench 2.1 milestone eval without
-     changing tasks or verifiers, then inspect exact JSONL, trajectories,
-     verifier output, timing, and cost artifacts.
+   - Terminal-Bench 2.1 milestone evaluation is delegated to the user's
+     separate thread. This thread does not bootstrap Harbor, alter eval inputs,
+     or wait on that result.
    - Fix every real PR #50 CI failure and leave required checks green with no
      known merge blocker.
 
@@ -84,9 +84,11 @@ migration, and it must be independently mergeable.
    cfgs, and crate boundaries.
 4. [x] Verify each parity contract and fix confirmed mismatches test-first.
 5. [x] Finish benchmark thresholds and full-fidelity observability verification.
-6. [ ] Run all consumer, differential, smoke, and milestone eval gates.
-7. [ ] Commit and push coherent PR #50 slices, remediate CI, and verify the
-   pull request is mergeable with green required checks.
+6. [x] Run all in-scope consumer, differential, and smoke gates. Terminal-Bench
+   milestone evaluation is delegated to the user's separate thread.
+7. [x] Commit and push coherent PR #50 slices, remediate CI, and verify at
+   `c82205d` that the pull request is `MERGEABLE`/`CLEAN` with green required
+   checks.
 
 ## Current non-goals
 
