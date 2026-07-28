@@ -54,6 +54,18 @@ test("web-target WASM runs the shared model loop through the browser host", asyn
   const branchConnection = new Promise((resolve) => server.once("connection", resolve));
   const branch = await agent.session.fork();
   assert.notEqual(branch.sessionId, agent.sessionId);
+  assert.throws(
+    () => branch.turn.prompt({
+      input: [{ type: "local_image", path: "/private/model-input.png" }],
+    }),
+    /cannot reference local filesystem paths/,
+  );
+  assert.throws(
+    () => branch.turn.prompt({
+      input: [{ type: "local_audio", path: "/private/model-input.wav" }],
+    }),
+    /cannot reference local filesystem paths/,
+  );
   const branchTurn = branch.turn.prompt({ input: [
     { type: "image", image_url: "data:image/png;base64,iVBORw0KGgo=" },
     { type: "text", text: "Reply with WEB_FORK_OK." },
