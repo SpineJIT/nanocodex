@@ -627,6 +627,11 @@ where
             session
                 .conversation
                 .set_previous_response_id(response.id.clone());
+            if session.conversation.previous_response_id().is_none() {
+                return Err(NanocodexError::MalformedResponse {
+                    detail: "completed turn did not have a response ID",
+                });
+            }
             let end_turn = response.end_turn;
             let final_message = response.final_message;
             let code_calls = response.code_calls;

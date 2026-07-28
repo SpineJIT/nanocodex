@@ -1,6 +1,71 @@
 use super::*;
 
 #[tokio::test]
+async fn empty_completed_response_id_fails_before_the_terminal_event() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut socket).await?);
+        send_warmup(&mut socket, "resp-warmup").await?;
+
+        let _generation = next_json(&mut socket).await?;
+        send_final(&mut socket, "").await
+    });
+
+    let workspace = temporary_workspace("empty-response-id")?;
+    let openai = OpenAi::builder("test-key")
+        .websocket_url(endpoint)
+        .build()?;
+    let (agent, mut events) = Nanocodex::builder(openai)
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .session_id(test_session_id())
+        .build()?;
+
+    let error = agent
+        .prompt("reject an empty continuation checkpoint")
+        .await?
+        .result()
+        .await
+        .expect_err("an empty completed response ID must fail the turn");
+    assert!(matches!(
+        error,
+        NanocodexError::MalformedResponse {
+            detail: "completed turn did not have a response ID"
+        }
+    ));
+
+    let terminal = timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let event = events
+                .recv()
+                .await
+                .ok_or_else(|| eyre!("event stream closed before a terminal event"))?;
+            if event.kind.is_terminal() {
+                return Result::<AgentEventKind>::Ok(event.kind);
+            }
+        }
+    })
+    .await
+    .map_err(|_| eyre!("turn did not emit a terminal event"))??;
+    assert_eq!(terminal, AgentEventKind::RunFailed);
+    assert!(
+        std::iter::from_fn(|| events.try_recv_timed()).all(|event| !event.event.kind.is_terminal()),
+        "the rejected turn emitted more than one terminal event"
+    );
+
+    agent.shutdown().await?;
+    drop((agent, events));
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn warmup_failure_falls_back_to_a_full_first_request() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
