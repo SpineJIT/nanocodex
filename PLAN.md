@@ -12,129 +12,81 @@ Every stable crate must be useful independently, documented from its own
 README, tested through its public paths, benchmarked at the boundaries it can
 affect, and observable without adopting the Nanocodex CLI.
 
-## Delivery stack
+## PR #50 delivery boundary
 
-The refactor ships as three stacked, independently mergeable pull requests.
-Each PR must preserve all behavior available on `master` unless its removal is
-explicitly agreed and covered by a regression or migration.
-
-### PR 1 — Stable API refactor
-
-This is the current work on PR #50.
+PR #50 is the only active delivery target. It must preserve behavior available
+on `master` unless a removal is explicit and covered by a regression or
+migration, and it must be independently mergeable.
 
 1. **Re-establish Codex parity**
    - Treat `openai/codex@35eaf3ffb0bf2001486c68c47a3d946b34d16634`
      as the last authoritative reviewed checkpoint.
    - Inspect and classify every later upstream commit before advancing that
-     checkpoint. The current pending range through `8431dc590a` contains 37
-     commits.
-   - Compare exact agent lifecycle, Responses transport, and tool behavior:
-     prompt-cache identity and stable prefixes; `AGENTS.md` and environment
-     injection; typed history and `previous_response_id`; reconnect and full
-     replay; automatic and manual compaction; steering and cancellation;
-     completed-only commits; tool definitions, results, errors, and process
-     cleanup.
+     checkpoint.
+   - Differentially verify prompt-cache identity and stable prefixes;
+     `AGENTS.md` and environment injection; typed history and
+     `previous_response_id`; reconnect/full replay; automatic/manual
+     compaction; steering/cancellation; completed-only commits; retries and
+     fallback; tool ordering, errors, panics, and process cleanup; and shared
+     ChatGPT authentication.
    - Fix demonstrated mismatches test-first. Record intentional differences
      explicitly; do not silently call them parity.
 
-2. **Stabilize crate ownership**
-   - `nanocodex-oai-api`: typed OpenAI Responses protocol, authentication,
-     context state, WebSocket/HTTPS transports, Tower service/client, retries,
-     telemetry, and the minimal shared tool contracts needed at the API
-     boundary.
-   - `nanocodex-tools`: the public `Tool` implementation layer, built-ins, Code
-     Mode, MCP including `tool_search`, and the colocated macros package.
-   - `nanocodex-agent`: the owned agent loop, context and lifecycle policy,
-     cloneable handles, turns, steering, cancellation, checkpoints, and forks.
-   - `nanocodex`: a thin Alloy-style facade with deliberate reexports and a
-     prelude.
-   - `bin/nanocodex`: a consumer of those libraries, not a second agent
-     implementation.
-   - Remove compatibility crates, duplicate bindings/runtime code, and empty
-     folders rather than carrying adapters that only move data.
+2. **Stabilize crate ownership and public paths**
+   - `nanocodex-oai-api` owns the complete OpenAI boundary and honest Tower
+     seams.
+   - `nanocodex-tools` owns tool implementations, Code Mode, MCP, and deferred
+     search.
+   - `nanocodex-agent` owns the private driver, lifecycle, state, branching,
+     snapshots, and rollouts.
+   - `nanocodex` remains a thin Alloy-style facade.
+   - Keep mutable run configuration, events plumbing, attempt factories,
+     response/turn IDs, queues, sockets, and replay bookkeeping private.
+   - Remove accidental exports, compatibility leftovers, duplicate bindings,
+     empty directories, unused dependencies/features, and unnecessary cfgs.
 
 3. **Make the stable APIs legible**
-   - Give each crate a focused README included into its crate docs.
-   - Make the normal path visible first in `cargo doc`; advanced Tower,
-     protocol, and embedding surfaces follow through progressive disclosure.
-   - Compile every public example. Examples use real instructions and complete
-     values rather than unexplained placeholders.
-   - Keep `.service(...)` and accepted CLI/TUI lifecycle behavior unchanged
-     unless a concrete parity or consumer failure requires a change.
+   - Give each stable crate a focused README included into crate docs.
+   - Put the normal consumer path first and advanced Tower/protocol surfaces
+     behind progressive disclosure.
+   - Compile complete public examples through canonical paths.
+   - Keep `OpenAiBuilder::{layer,service}` as the deliberate transport seam.
 
 4. **Lock in performance and observability**
-   - Define representative Cargo benchmarks and regression thresholds for
-     public hot paths: request construction, history replay/checkpointing,
-     context accounting and compaction, event delivery, tool dispatch, Code
-     Mode, MCP discovery/search, and TUI state/render work where changed.
-   - Keep harness overhead small enough that normal execution remains
-     model-latency bound. Parallelize independent startup and dispatch work
-     where traces and benchmarks justify it.
-   - Follow init4-style bounded spans and explicit parent propagation.
-     Contractual events remain separate from tracing.
-   - Preserve full-fidelity ordered prompts, responses, reasoning, tool
-     activity, steering, cancellation, token usage, cache behavior, latency,
-     and automatic `gpt-5.6-sol` USD cost.
+   - Define representative benchmarks and explicit thresholds for request
+     construction, history replay/checkpointing, context accounting and
+     compaction, event delivery, tool dispatch, Code Mode, MCP discovery/search,
+     and changed TUI state/render work.
+   - Follow init4-style bounded spans and explicit parent propagation while
+     keeping contractual events independent from tracing.
+   - Preserve full-fidelity ordered prompts, model traffic, reasoning and
+     encrypted reasoning, tool activity, steering, cancellation, token/cache
+     data, latency, and automatic `gpt-5.6-sol` USD cost.
 
-5. **Prove the vertical path**
-   - Preserve the CLI, Ratatui, PyO3, and Node/browser WASM consumers as thin
-     adapters over the same owned session API.
-   - Run formatting, warnings-denied Clippy, workspace tests, all-target
-     checks, rustdoc/doctests, public examples, WASM checks, and `just run`.
-   - Run the stock-Codex differential suite for request, context, tool, retry,
-     reconnect, compaction, and cancellation behavior.
-   - Use focused Harbor tasks while iterating. Run the complete configured eval
-     only as the PR milestone gate, inspecting JSONL, trajectory, verifier, and
-     timing artifacts before making a claim.
-
-PR 1 is complete only when the public library path is feature-equivalent to
-`master`, the verified Codex checkpoint is truthful, and the branch is ready
-to merge without relying on the later PRs.
-
-### PR 2 — `nanocodex-eval` and required VM machinery
-
-1. Consolidate the temporary `nanoeval` work into this workspace as
-   `nanocodex-eval`.
-2. Expose evaluations through `nanocodex eval <...>` with Harbor-compatible
-   task, verifier, artifact, JSONL, ATIF, token, latency, and USD accounting.
-3. Add the minimal VM layer required by evaluations, including
-   Dockerfile-derived pre-snapshotted disks and reusable pre-baked images.
-4. Support full Terminal-Bench 2.1 and FrontierBench runs, including Daytona
-   execution where configured. Do not weaken tasks or verifiers.
-5. Produce on-demand PR build artifacts so a run can select a Nanocodex binary
-   built from a pull request without enabling expensive evals on every change.
-6. Separate cold image/bootstrap time from warm agent work and retain exact
-   run artifacts for comparisons.
-
-PR 2 is complete when `nanocodex eval ...` can run the full configured suite
-against a selected local or PR build using the consolidated Rust/library path.
-
-### PR 3 — Experimental managed-agent components
-
-1. Add experimental browser-on-VM, Centaur durability/managed-agent work, and
-   related proxy components under `crates/experimental/` where they are
-   reusable libraries.
-2. Keep executables and Tempo-specific integration under `bin/`.
-3. Add the egress-VM boundary that encapsulates MPP payments and secrets egress
-   without adding Tempo dependencies to stable Nanocodex crates.
-4. Reuse the VM and eval foundations from PR 2; do not duplicate their runtime
-   or artifact model.
-5. Require a concrete consumer, focused tests, tracing, and benchmarks before
-   promoting any experimental component into the stable crate graph.
+5. **Prove the complete PR path**
+   - Validate crate boundaries, formatting, warnings-denied Clippy, workspace
+     and all-target tests, rustdoc/doctests/examples, WASM, Node/browser, PyO3,
+     CLI/Ratatui, and a live native smoke.
+   - Run the stock-Codex differential suite.
+   - Run the complete configured Terminal-Bench 2.1 milestone eval without
+     changing tasks or verifiers, then inspect exact JSONL, trajectories,
+     verifier output, timing, and cost artifacts.
+   - Fix every real PR #50 CI failure and leave required checks green with no
+     known merge blocker.
 
 ## Current execution order
 
-1. [x] Complete the [37-commit Codex parity ledger](docs/CODEX_PARITY.md) from
-   `35eaf3` through `8431dc5`.
-2. [ ] Turn each confirmed lifecycle, Responses, or tools mismatch into a
-   deterministic failing regression, then fix it.
-3. [ ] Review and consolidate the current PR #50 worktree without losing
-   unrelated user work or `master` functionality.
-4. [ ] Finish public-path docs, benchmarks, tracing, and consumer validation
-   needed by the changed surfaces.
-5. [ ] Run the PR 1 validation and differential gates.
-6. [ ] Commit and push the reviewed PR #50 stack only when explicitly asked.
-7. [ ] Begin PR 2 from the mergeable PR 1 boundary.
+1. [x] Complete the [Codex parity ledger](docs/CODEX_PARITY.md) from the pinned
+   checkpoint through local `openai/codex@3418498f01422f5f650ea645d4bd19e05c3a9616`.
+2. [x] Finish the behavior-preserving rollout, model/run, tool/runtime, and
+   driver module decompositions.
+3. [x] Audit stable public paths, crate docs, examples, dependencies, features,
+   cfgs, and crate boundaries.
+4. [ ] Verify each parity contract and fix confirmed mismatches test-first.
+5. [x] Finish benchmark thresholds and full-fidelity observability verification.
+6. [ ] Run all consumer, differential, smoke, and milestone eval gates.
+7. [ ] Commit and push coherent PR #50 slices, remediate CI, and verify the
+   pull request is mergeable with green required checks.
 
 ## Current non-goals
 
@@ -143,6 +95,6 @@ against a selected local or PR build using the consolidated Rust/library path.
 - No audio implementation work.
 - No new `.service(...)` transport design without a concrete consumer.
 - No cosmetic CLI/TUI lifecycle rewrite when existing behavior is accepted.
-- No browser, Centaur, proxy, or experimental VM surface in PR 1.
+- No VM, browser, managed-agent, proxy, or experimental-crate work.
 - No benchmark, task, or verifier modification made solely to improve an eval
   score.
