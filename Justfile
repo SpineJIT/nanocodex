@@ -349,6 +349,8 @@ release-check version:
         test "{{version}}" = "$workspace_version" || { echo "expected workspace version {{version}}, found $workspace_version" >&2; exit 1; }
     @js_version=$(node -p "require('./js/bindings/package.json').version"); \
         test "{{version}}" = "$js_version" || { echo "expected JavaScript package version {{version}}, found $js_version" >&2; exit 1; }
+    @python_version=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("py/bindings/pyproject.toml").read_text())["project"]["version"])'); \
+        test "{{version}}" = "$python_version" || { echo "expected Python package version {{version}}, found $python_version" >&2; exit 1; }
     @cargo metadata --no-deps --format-version 1 | jq -e --arg version "{{version}}" \
         '[.packages[].dependencies[] | select(.source == null and (.name | startswith("nanocodex"))) | .req] | all(. == ("^" + $version))' >/dev/null
     @grep -Fq "## [{{version}}]" CHANGELOG.md
