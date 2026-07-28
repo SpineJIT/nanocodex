@@ -152,11 +152,58 @@ test("event iterators release subscriptions and fail closed before buffering wit
 
   const restarted = watch[Symbol.asyncIterator]();
   assert.equal(subscriptions.size, 1);
+  const firstPending = restarted.next();
+  const secondPending = restarted.next();
+  for (const listener of subscriptions) {
+    listener({ type: "api.event", request_id: agent.sessionId, seq: 4_098 });
+    listener({ type: "api.event", request_id: agent.sessionId, seq: 4_099 });
+  }
+  assert.deepEqual(
+    (await Promise.all([firstPending, secondPending])).map(({ value }) => value.seq),
+    [4_098, 4_099],
+  );
   await restarted.return();
   assert.equal(subscriptions.size, 0);
 
   watch.off();
   agent.dispose();
+});
+
+test("a failing event listener is reported without interrupting other observers", async () => {
+  const subscriptions = new Set();
+  const reported = [];
+  const previousReportError = globalThis.reportError;
+  globalThis.reportError = (error) => reported.push(error);
+  try {
+    const runtime = defineRuntime({
+      create: () => rawAgent("session-observers"),
+      subscribe(listener) {
+        subscriptions.add(listener);
+        return () => subscriptions.delete(listener);
+      },
+      decorate: (agent) => agent.extend(Actions.agentActions()),
+    });
+    const agent = await createAgentClient(runtime);
+    const watch = agent.events.watch();
+    watch.onEvent(() => { throw new Error("observer failed"); });
+    const seen = [];
+    watch.onEvent((event) => seen.push(event.seq));
+    const iterator = watch[Symbol.asyncIterator]();
+    const next = iterator.next();
+
+    for (const listener of subscriptions) {
+      listener({ type: "api.event", request_id: agent.sessionId, seq: 1 });
+    }
+    assert.deepEqual(seen, [1]);
+    assert.equal((await next).value.seq, 1);
+    assert.match(reported[0]?.message, /observer failed/);
+
+    watch.off();
+    agent.dispose();
+  } finally {
+    if (previousReportError === undefined) delete globalThis.reportError;
+    else globalThis.reportError = previousReportError;
+  }
 });
 
 function rawAgent(sessionId) {

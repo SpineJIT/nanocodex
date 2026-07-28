@@ -10,7 +10,13 @@ export function watch(agent, options = {}) {
   let closed = false;
 
   const emit = (event, encodedLength) => {
-    for (const listener of listeners) listener(event);
+    for (const listener of listeners) {
+      try {
+        listener(event);
+      } catch (error) {
+        reportListenerError(error);
+      }
+    }
     for (const iterator of iterators) iterator.push(event, encodedLength);
   };
 
@@ -63,7 +69,8 @@ function eventIterator(onEnd) {
   const queue = [];
   let head = 0;
   let bufferedCharacters = 0;
-  let pending;
+  const pending = [];
+  let pendingHead = 0;
   let ended = false;
   let failure;
   let failureReported = false;
@@ -78,9 +85,12 @@ function eventIterator(onEnd) {
   const iterator = {
     push(event, encodedLength) {
       if (ended || failure) return;
-      if (pending) {
-        const resolve = pending;
-        pending = undefined;
+      if (pendingHead < pending.length) {
+        const resolve = pending[pendingHead++];
+        if (pendingHead === pending.length) {
+          pending.length = 0;
+          pendingHead = 0;
+        }
         resolve({ done: false, value: event });
       } else {
         const characters = encodedLength ?? JSON.stringify(event).length;
@@ -103,8 +113,11 @@ function eventIterator(onEnd) {
       if (ended) return;
       ended = true;
       detach();
-      pending?.({ done: true, value: undefined });
-      pending = undefined;
+      while (pendingHead < pending.length) {
+        pending[pendingHead++]({ done: true, value: undefined });
+      }
+      pending.length = 0;
+      pendingHead = 0;
       queue.length = 0;
       head = 0;
       bufferedCharacters = 0;
@@ -124,7 +137,12 @@ function eventIterator(onEnd) {
         return Promise.reject(failure);
       }
       if (ended || failure) return Promise.resolve({ done: true, value: undefined });
-      return new Promise((resolve) => { pending = resolve; });
+      if (pending.length - pendingHead >= MAX_BUFFERED_EVENTS) {
+        return Promise.reject(new RangeError(
+          `event iterator exceeded its private buffer of ${MAX_BUFFERED_EVENTS} pending reads`,
+        ));
+      }
+      return new Promise((resolve) => { pending.push(resolve); });
     },
     return() {
       iterator.end();
@@ -141,4 +159,16 @@ function emptyIterator() {
     return: () => Promise.resolve({ done: true, value: undefined }),
     [Symbol.asyncIterator]() { return this; },
   };
+}
+
+function reportListenerError(error) {
+  try {
+    if (typeof globalThis.reportError === "function") {
+      globalThis.reportError(error);
+      return;
+    }
+  } catch {}
+  try {
+    globalThis.console?.error?.("Nanocodex event listener failed", error);
+  } catch {}
 }

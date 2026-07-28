@@ -158,6 +158,10 @@ unlisten();
 watch.off();
 ```
 
+A throwing callback is reported through the host's `reportError` hook (or
+`console.error` when that hook is unavailable) without interrupting later
+listeners or the owned agent lifecycle.
+
 The same watcher can instead be consumed as an ordered async iterable; breaking
 the loop releases that iterator, while `watch.off()` terminates the whole watch.
 
