@@ -5,10 +5,13 @@ deterministic gate runs against the built Node and browser WASM packages:
 
 ```sh
 just build-wasm
-node --test --test-timeout=15000 js/bindings/test/performance.test.mjs
+node --test --test-timeout=15000 js/bindings/test/performance.bench.mjs
 ```
 
 The gate measures costs owned by this package, not mocked model latency:
+
+It runs after the functional test pool rather than inside it, so package
+installation and lifecycle fixtures cannot contend with microbenchmarks.
 
 | Boundary | Regression limit |
 | --- | ---: |
