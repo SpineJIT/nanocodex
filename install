@@ -4,6 +4,8 @@ set -euo pipefail
 repository="gakonst/nanocodex"
 install_root="${NANOCODEX_DIR:-$HOME/.nanocodex}"
 bin_dir="$install_root/bin"
+versions_dir="$install_root/versions"
+updater_dir="$install_root/updater"
 
 case "$(uname -s)" in
   Linux) platform="unknown-linux-gnu" ;;
@@ -25,7 +27,6 @@ case "$(uname -m)" in
 esac
 
 asset="nanocodex-${architecture}-${platform}"
-release_url="https://github.com/$repository/releases/latest/download"
 temporary_dir="$(mktemp -d 2>/dev/null)" || {
   echo "nanocodex: failed to create a temporary directory" >&2
   exit 1
@@ -33,6 +34,18 @@ temporary_dir="$(mktemp -d 2>/dev/null)" || {
 trap 'rm -rf -- "$temporary_dir"' EXIT
 
 echo "Installing the latest Nanocodex release..."
+release_redirect="$(
+  curl --fail --silent --show-error --head \
+    --output /dev/null --write-out '%{redirect_url}' \
+    "https://github.com/$repository/releases/latest"
+)"
+release_tag="${release_redirect##*/}"
+version="${release_tag#v}"
+if [[ -z "$release_tag" || -z "$version" || "$version" == "$release_tag" ]]; then
+  echo "nanocodex: could not resolve the latest release version" >&2
+  exit 1
+fi
+release_url="https://github.com/$repository/releases/download/$release_tag"
 curl --fail --silent --show-error --location "$release_url/$asset" --output "$temporary_dir/$asset"
 curl --fail --silent --show-error --location "$release_url/SHA256SUMS" --output "$temporary_dir/SHA256SUMS"
 
@@ -56,8 +69,32 @@ if [[ "$actual" != "$expected" ]]; then
   exit 1
 fi
 
-mkdir -p "$bin_dir"
-install -m 755 "$temporary_dir/$asset" "$bin_dir/nanocodex"
+version_dir="$versions_dir/$version"
+mkdir -p "$bin_dir" "$version_dir" "$updater_dir"
+install -m 755 "$temporary_dir/$asset" "$version_dir/nanocodex"
+printf '%s\n' "$actual" > "$version_dir/nanocodex.sha256"
+install -m 755 "$temporary_dir/$asset" "$updater_dir/nanocodex"
+
+ln -sfn "versions/$version" "$install_root/current"
+
+cat > "$temporary_dir/nanocodex-launcher" <<'EOF'
+#!/bin/sh
+set -eu
+
+case "$0" in
+    */*) launcher=$0 ;;
+    *) launcher=$(command -v "$0") ;;
+esac
+bin_dir=$(CDPATH= cd -- "$(dirname -- "$launcher")" && pwd -P)
+install_root=$(dirname -- "$bin_dir")
+
+if [ "${1-}" = "update" ]; then
+    export NANOCODEX_DIR="$install_root"
+    exec "$install_root/updater/nanocodex" "$@"
+fi
+exec "$install_root/current/nanocodex" "$@"
+EOF
+install -m 755 "$temporary_dir/nanocodex-launcher" "$bin_dir/nanocodex"
 
 path_line="export PATH=\"\$PATH:$bin_dir\""
 profile=""
@@ -86,7 +123,8 @@ if [[ ":$PATH:" != *":$bin_dir:"* && -n "$profile" ]]; then
   fi
 fi
 
-echo "Installed nanocodex to $bin_dir/nanocodex"
+echo "Installed nanocodex $version to $version_dir/nanocodex"
+echo "Activated it through $bin_dir/nanocodex"
 if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
   echo "Restart your shell or add $bin_dir to PATH."
 fi

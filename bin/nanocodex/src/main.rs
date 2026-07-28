@@ -55,7 +55,7 @@ enum Command {
     Run(Box<RunCommand>),
     /// Resume a Codex or Nanocodex thread in the interactive TUI.
     Resume(Box<ResumeCommand>),
-    /// Update this executable from a GitHub release channel.
+    /// Install, cache, or switch CLI builds.
     Update(update::Update),
 }
 

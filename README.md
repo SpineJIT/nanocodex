@@ -34,6 +34,25 @@ Or add the Rust SDK to an application:
 cargo add nanocodex
 ```
 
+Switch the installed CLI between builds:
+
+```sh
+nanocodex update                 # latest stable release
+nanocodex update 0.2.0           # exact release, including downgrades
+nanocodex update --nightly       # latest nightly
+nanocodex update --pr 50         # verified on-demand PR artifact
+nanocodex update --path ./nanocodex  # trusted local binary
+```
+
+Downloaded builds are retained under `~/.nanocodex/versions`. Running
+`nanocodex update 0.2.0` again switches to the cached binary without another
+download. A stable launcher keeps `nanocodex update` available even while an
+older binary is active, and `~/.nanocodex/current` points to the selected
+version.
+
+PR artifacts require an authenticated `gh` CLI and an already completed
+on-demand artifact workflow for that PR.
+
 ## Minimal API Example
 
 ```rust,ignore
