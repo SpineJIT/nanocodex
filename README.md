@@ -2,14 +2,16 @@
 
 <h1>Nanocodex</h1>
 
-<p><strong>Blazing-fast, minimal, library-first reimplementation of Codex.</strong></p>
+<p><strong>Building blocks for frontier OpenAI agents.</strong></p>
 
 [![CI](https://img.shields.io/github/actions/workflow/status/gakonst/nanocodex/ci.yml?branch=master)][ci]
 [![Crates.io](https://img.shields.io/crates/v/nanocodex.svg)][crates]
 [![Docs.rs](https://img.shields.io/docsrs/nanocodex)][docs]
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)][license]
 
-**[Install](#installation)** | **[Thesis](#model-and-harness-co-design)** | **[Why Code Mode?](#why-code-mode)** | **[API](#api)** | **[Examples](examples)** | **[Benchmarks](#how-fast)**
+**[Thesis](#thesis)** · **[Agent API](#the-agent-api)** ·
+**[Components](#components)** · **[Performance](#performance-is-a-contract)** ·
+**[Migration](docs/MIGRATING.md)** · **[Plan](PLAN.md)**
 
 [ci]: https://github.com/gakonst/nanocodex/actions/workflows/ci.yml
 [crates]: https://crates.io/crates/nanocodex
@@ -20,805 +22,341 @@
 
 ---
 
-Nanocodex is a Code Mode-first Rust agents SDK. It provides typed turns, tools,
-events, steering, cancellation, queueing, durable session snapshots, and fast
-historical forks over the OpenAI Responses API. It supports persistent WebSocket
-and HTTPS/SSE transports while keeping the complete coding-agent conversation
-inside your process, without requiring an app server or durable control plane.
+Nanocodex is a Rust toolkit for building frontier OpenAI agents. It provides a
+Tower-native OpenAI Responses client, model-facing tool contracts, MCP and Code
+Mode, context management, and an owned agent lifecycle.
+
+The components are designed to work together, but each implementation crate
+must also have a coherent API when used on its own. The top-level `nanocodex`
+crate is an intentionally thin, Alloy-style facade with a small prelude.
+
+> [`PLAN.md`](PLAN.md) tracks the active delivery work.
+> [`REFACTOR.md`](REFACTOR.md) is the historical design record that led to the
+> current crate boundaries.
+
+## Thesis
+
+Nanocodex starts with three opinions.
+
+### Small, excellent building blocks
+
+Agent infrastructure is easier to understand and improve when the pieces have
+sharp ownership and useful APIs. A Responses client should be usable without
+an agent loop. Tools should be usable without a CLI. A tool runtime should not
+own agent policy. The high-level agent should compose those parts rather than
+hide a second implementation of them.
+
+### The model and harness are co-designed
+
+We do not try to outsmart behavior that the model and Codex harness already
+make explicit. Instructions, `AGENTS.md`, tool shapes, response ordering,
+compaction, cache identity, continuation, reconnect replay, cancellation, and
+process cleanup are part of the model-facing contract.
+
+Codex is evidence rather than an API to clone. Nanocodex preserves the
+invariants that affect agent behavior while giving them a smaller,
+library-first Rust interface.
+
+### Performance is part of API design
+
+Every hot component owns representative `cargo bench` workloads and explicit
+performance budgets. Optimizations must improve retained, realistic traces;
+refactors must preserve asymptotic contracts such as constant-time forks and
+delta-sized healthy turns. End-to-end evals measure the model–harness pair, not
+the model in isolation.
+
+## The agent API
+
+The golden path is one owned agent session, one cheap cloneable handle, and an
+optional independent event stream:
+
+```rust,ignore
+use nanocodex::{Nanocodex, OpenAi};
+
+let openai = OpenAi::new(std::env::var("OPENAI_API_KEY")?)?;
+
+let (agent, _events) = Nanocodex::builder(openai)
+    .instructions(
+        "You are a Rust coding agent. Make focused changes, preserve unrelated \
+         work, and run relevant tests before finishing.",
+    )
+    .workspace(std::env::current_dir()?)
+    .build()?;
+
+// Awaiting prompt means the turn was accepted and ordered.
+let turn = agent
+    .prompt("Find the cause of the failing test and explain it.")
+    .await?;
+
+// Awaiting the turn waits for its result; event consumption is independent.
+let result = turn.await?;
+println!("{}", result.final_message());
+```
+
+`Turn` is both a typed stream and a future for its completed `TurnResult`.
+Polling it as a stream yields events for that turn. Awaiting it waits only for
+the result receiver and does not wait for that event stream to be consumed.
+`AgentEvents` remains the independent session-wide firehose for adapters,
+tracing, JSONL, and durable recording.
+
+Turns can be steered or cancelled without exposing internal IDs:
+
+```rust,ignore
+let turn = agent
+    .prompt("Investigate the parser regression and prepare a fix.")
+    .await?;
+let control = turn.control();
+
+control
+    .steer("Do not edit Cargo.lock; keep the change inside the parser crate.")
+    .await?;
+
+let result = turn.await?;
+```
+
+Follow-on prompts reuse retained history automatically. `agent.clone()` is
+another handle to the same ordered driver. `spawn()` creates a clean sibling;
+`fork()` branches from the latest safe committed boundary; and
+`fork_from(&result)` branches from the exact completed checkpoint represented
+by that result.
+
+The agent owns policy: its tool loop, `AGENTS.md` discovery, compaction timing,
+workspace behavior, cancellation, and branching. It does not expose response
+IDs, socket tasks, queue capacities, or mutable conversation internals.
+
+### Usage, cost, and events
+
+Every completed turn reports exact aggregate token counts. USD is estimated
+automatically from the provider usage using OpenAI's published `gpt-5.6-sol`
+standard or priority rates:
+
+```rust,ignore
+use nanocodex::{Nanocodex, OpenAi};
+
+let openai = OpenAi::new(std::env::var("OPENAI_API_KEY")?)?;
+let (agent, _events) = Nanocodex::builder(openai)
+    .instructions("Answer concisely and preserve exact identifiers.")
+    .build()?;
+
+let result = agent.prompt("Explain the identifier req_7f3.").await?.await?;
+println!("{} tokens", result.usage().total_tokens());
+if let Some(cost) = result.usage().estimated_cost() {
+    println!("estimated {}", cost.amount());
+} else {
+    println!("cost unavailable: {}", result.usage().cost_status().as_str());
+}
+```
+
+The same exact estimate appears in the terminal typed event, JSONL adapter,
+tracing spans, CLI, and language bindings. `CostStatus` reports when the
+provider omitted usage, so missing accounting data is never reported as a
+zero-dollar turn.
+`AgentEvent::data()` exposes normalized run, assistant, reasoning, tool, model,
+and compaction events. The original raw payload remains available for a
+lossless OpenAI and transport firehose.
+
+## The Responses API without the agent
+
+`nanocodex-oai-api` is the lower-level, Tower-native OpenAI client. Its managed
+session owns typed history, usage, continuation state, reconnect replay, and
+the persistent transport. It does not decide when an agent should compact.
+
+```rust,ignore
+use futures_util::TryStreamExt;
+use nanocodex_oai_api::{OpenAi, ResponseEvent};
+
+let openai = OpenAi::new(std::env::var("OPENAI_API_KEY")?)?;
+let mut session = openai
+    .instructions(
+        "Remember user-provided facts and say when required information is missing.",
+    )
+    .build()?;
+
+let mut turn = session.turn();
+let mut response = turn.create("Remember that the deployment region is us-west-2.");
+
+while let Some(event) = response.try_next().await? {
+    if let ResponseEvent::OutputTextDelta(delta) = event {
+        print!("{delta}");
+    }
+}
+
+let completed = response.await?;
+assert!(completed.output_text().contains("us-west-2"));
+```
+
+`Session` is a client-side state machine, not a provider-side session resource.
+One `ResponseTurn` corresponds to one logical agent turn and retains
+turn-scoped protocol state across multiple Responses calls. The higher-level
+agent retains that boundary across model, tool, and steering steps. A direct
+session consumer may call `turn.compact().await?` at a safe boundary.
+
+`Response` implements:
+
+```rust,ignore
+Stream<Item = Result<ResponseEvent, ResponseError>>
+IntoFuture<Output = Result<CompletedResponse, ResponseError>>
+```
+
+A response commits only after the provider's terminal completion event.
+Dropping or failing a partial response commits no history and executes no
+tool. A replacement connection drops its dead continuation ID and replays the
+complete authoritative typed history.
+
+## Tools
+
+The shared tool contract lives with the Responses types in
+`nanocodex-oai-api`. `nanocodex-tools` supplies the heterogeneous registry,
+built-ins, shell and process lifecycle, MCP, `tool_search`, and Code Mode. MCP
+is part of the tools crate on native targets, not an optional public subsystem.
+
+Application tools can implement the trait directly or use `#[tool]`:
+
+```rust,ignore
+use nanocodex::tool;
+
+#[tool(description = "Add two signed 64-bit integers.")]
+async fn add(
+    left: i64,
+    right: i64,
+) -> Result<i64, std::convert::Infallible> {
+    Ok(left + right)
+}
+```
+
+The macro generates the same `Tool` implementation accepted by the registry.
+Tool schemas, inputs, outputs, errors, and call context are typed; workspace,
+agent-driver, MCP-connection, and process-manager state stay in higher
+implementations.
+
+## Components
+
+The core dependency direction is:
+
+```text
+nanocodex                         thin facade, modules, and prelude
+├── nanocodex-agent              owned agent lifecycle and policy
+│   ├── nanocodex-tools          tool runtime, MCP, tool_search, Code Mode
+│   │   ├── nanocodex-oai-api    shared tool and Responses contracts
+│   │   └── nanocodex-tools-macros native #[tool] implementation
+│   └── nanocodex-oai-api        Tower client, sessions, context, Responses
+├── nanocodex-oai-api            direct provider-module reexport
+├── nanocodex-tools              direct tools-module reexport
+└── nanocodex-observability      native observability-module reexport
+```
+
+The facade root is the canonical common path. Detailed APIs live under their
+owning `nanocodex::agent`, `nanocodex::oai`, or `nanocodex::tools` module;
+lower-level consumers can instead depend on the corresponding component crate.
+
+Tempo-specific application code stays under `bin/`:
+
+```text
+bin/nanocodex/src/mpp/egress.rs private paid-egress implementation
+bin/nanousd                       shared private credits protocol
+bin/nanousd-api                   credits service
+```
+
+The repository's stable Rust packages are:
+
+| Package | Responsibility |
+| --- | --- |
+| `nanocodex` | Thin facade, named component modules, and prelude |
+| `nanocodex-agent` | Owned driver, lifecycle policy, branching, and snapshots |
+| `nanocodex-oai-api` | Responses sessions, context, transport, and Tower boundary |
+| `nanocodex-tools` | Registry, built-ins, Code Mode, MCP, and deferred search |
+| `nanocodex-tools-macros` | Native `#[tool]` procedural macro implementation |
+| `nanocodex-observability` | Application-owned tracing and OTLP setup |
+
+The CLI, examples, Node/browser package, and Python package are consumers of
+that same library contract. VM, browser-worker, evaluation, proxy, and managed
+agent crates are outside the PR #50 delivery boundary; they are not presented
+here as implemented packages.
+
+## Performance is a contract
+
+We distinguish deterministic library budgets from noisy live service
+measurements.
+
+Hard contracts include:
+
+- fork and completed-checkpoint creation are O(1) over retained history;
+- a healthy incremental turn serializes the new delta rather than cloning full
+  history;
+- retry reuses replayable owned state and cannot duplicate a partial side
+  effect;
+- event fanout shares raw payloads, preserves lossless monotonic order, and
+  skips serialization as soon as every receiver is dropped;
+- cancellation terminates subprocess groups and descendants; and
+- changed TUI state and terminal output remain bounded during streaming bursts.
+
+Each owning crate carries benchmarks for its public hot paths. Retained trace
+fixtures cover realistic response streams, long conversations, tool bursts,
+and long TUI histories. Numeric regression gates are set only after a benchmark
+has a reproducible fixture and recorded baseline. Live model and network
+measurements remain trends with raw artifacts, not machine-independent
+unit-test thresholds.
+
+The target for normal turns is simple: the model and network dominate the
+critical path. Traces separate provider wait from queueing, serialization,
+parsing, event delivery, and tool work, while independent work runs as bounded
+siblings under init4-style spans. Token usage and built-in OpenAI pricing also
+produce one consistent estimated USD cost for library results, the CLI, and
+language bindings.
+
+Existing measurements and their methodology live under
+[`benchmarks/`](benchmarks/) and [`docs/`](docs/). The
+[current PR #50 milestone](benchmarks/pr50_milestone_2026-07-28.md) records 39
+absolute latency gates plus a paired live run in which model work accounted for
+97.879% of measured turn time.
 
 ## Installation
 
-Install the daily-driver CLI on macOS or Linux:
-
-```sh
-curl -fsSL https://nanocodex.paradigm.xyz | bash
-```
-
-The installer tracks stable releases. Switch an installed CLI to the rolling
-nightly channel with:
-
-```sh
-nanocodex update --nightly
-```
-
-Multi-architecture Linux images are published to GHCR as
-`ghcr.io/gakonst/nanocodex:latest` and `ghcr.io/gakonst/nanocodex:nightly`.
-Immutable version, commit, and `nightly-<commit>` tags are also available.
-
-Add the library to a Rust project:
+The facade crate:
 
 ```sh
 cargo add nanocodex
 ```
 
-Or add it directly to `Cargo.toml`:
-
-```toml
-[dependencies]
-nanocodex = "0.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-```
-
-Node.js 12.22 or newer must be available on `PATH` for Code Mode.
-
-## Model and harness co-design
-
-Nanocodex starts from a simple thesis: **the model and its harness are one
-system**. A coding model is not an interchangeable completion engine floating
-above an arbitrary tool loop. Its effective capabilities depend on the exact
-instructions, tool contracts, response shapes, history ordering, continuation
-semantics, cache identity, streaming behavior, and failure recovery that
-surround it. Change the harness and you change the agent.
-
-That is why Nanocodex begins with how Codex actually works. We inspect the
-concrete Codex implementation, identify the model-facing invariants and
-operational behavior it relies on, and adapt them rather than designing a
-provider-neutral agent abstraction from first principles. Typed Responses
-items, stable prompt prefixes, incremental conversation continuation, complete
-history replay, tool-call ordering, WebSocket lifecycle, cancellation, and
-subprocess cleanup are parts of the behavioral contract, not incidental
-plumbing.
-
-The adaptation is as important as the fidelity. Nanocodex keeps the pieces that
-shape model behavior, then recasts them for a headless, library-first product:
-one owned driver instead of an app server, typed results and optional events
-instead of a durable rollout control plane, caller-defined tools instead of a
-product-wide integration catalog, and generated Code Mode orchestration instead
-of a generic workflow or multi-agent scheduler. Codex is the evidence and the
-behavioral reference; Nanocodex chooses the smaller API boundary.
-
-This also means agent quality and performance belong to the **model–harness
-pair**. We evaluate the complete path—prompt, tools, transport, caching,
-execution, and recovery—because a model-only comparison would miss the system
-we are actually building.
-
-## Why Code Mode?
-
-Most tool-calling agents expose a flat catalog and return to the model between
-operations. Nanocodex instead presents caller-defined Rust tools and MCP tools
-as typed JavaScript functions behind one Code Mode entrypoint. The model can
-write a small program that uses loops, conditions, data transformations, and
-`Promise.all`, so related tool work can be composed inside one cell without a
-model round trip between every operation.
-
-This keeps the model-facing surface small while the application keeps normal
-Rust ownership. Tool implementations, credentials, retry policy, and mutable
-state stay outside the generated program. Code Mode runs cells on a prewarmed,
-session-persistent Node host and gives the model explicit controls for yielding,
-resuming long work, and bounding returned output.
-
-Subagents make that composition especially useful. An application can expose
-`AgentHandle::spawn()` as a clean-room worker, `AgentHandle::fork()` as a worker
-with the latest safe conversation context, and another tool for follow-up turns
-on a retained child. Code Mode can then generate the orchestration topology for
-the task instead of selecting a hard-coded workflow DAG:
-
-```js
-const [independent, contextual] = await Promise.all([
-  tools.spawn_agent({
-    role: "reviewer",
-    task: "Find assumptions the parent may have missed."
-  }),
-  tools.fork_agent({
-    role: "investigator",
-    task: "Trace the suspected regression using our existing context."
-  })
-]);
-
-const followUp = await tools.prompt_agent({
-  agent_id: independent.agent_id,
-  task: `Challenge this conclusion:\n\n${contextual.report}`
-});
-
-text({ independent, contextual, followUp });
-```
-
-That allows dynamic fan-out, fan-in, independent checks, contextual branches,
-and targeted follow-ups while Nanocodex core remains one owned agent lifecycle
-rather than a generic multi-agent scheduler. The bundled CLI exposes this
-example surface with `nanocodex --subagents true`; library consumers define the
-tools and policy themselves. See [`subagents.rs`](examples/subagents.rs) for the
-complete implementation.
-
-## API
-
-```rust
-let (agent, _events) = Nanocodex::new(api_key)?;
-
-// Accepted now.
-let turn = agent.prompt("Inspect this repository.").await?;
-// Optional cloneable control.
-let _control = turn.control();
-// Steer the same active turn.
-turn.steer("Focus on the failing tests.").await?;
-// Completed result and checkpoint.
-let checkpoint = turn.result().await?;
-
-let _follow_on = agent.prompt("Now propose a fix.").await?.result().await?;
-
-let turn = agent.prompt("Run a long investigation.").await?;
-// Cancel queued or active work.
-turn.cancel().await?;
-// Returns Err(TurnCancelled).
-let _cancelled = turn.result().await;
-
-// Fork from the latest safe model/tool boundary.
-let (latest, _events) = agent.fork().await?;
-// Fork from the exact older state.
-let (historical, _events) = agent.fork_from(&checkpoint).await?;
-
-// The application owns snapshot storage and retention.
-let stored = serde_json::to_vec(&checkpoint.snapshot())?;
-drop(agent);
-let snapshot = serde_json::from_slice(&stored)?;
-let (resumed, _events) = Nanocodex::builder(api_key)
-    .resume(snapshot)
-    .build()?;
-```
-
-`prompt().await` means accepted, not completed. The agent retains conversation
-history, tools, cache identity, response chain, and its WebSocket automatically.
-Snapshots contain the complete unredacted conversation and must be protected
-like the prompts and tool data they preserve. Resuming creates fresh runtime
-resources while retaining authoritative typed history and cache lineage. They
-do not persist provider response IDs, so the first resumed request replays that
-history before subsequent turns follow the configured incremental or full-replay
-policy. Use `RolloutConfig` for the existing Codex-compatible on-disk recording
-and `codex resume` handoff;
-snapshots are the library-level checkpoint for application-owned restoration.
-Both project the same immutable committed session boundary: snapshots encode
-the complete native restore state, while rollouts append the Codex-specific
-turn envelope and only the newly committed history.
-
-Creating and retaining that committed boundary is constant-time: forks,
-`TurnResult`, and rollout projection share the immutable typed-history prefix.
-Calling `TurnResult::snapshot()` is deliberately different. It copies the
-complete history into an independently serializable value, so its work and
-memory scale with total retained history; JSON encoding adds another
-content-sized pass. Treat it as a durability boundary rather than something to
-call after every turn unless every boundary must be retained. Rollout recording
-remains incremental during ordinary turns, and the first request after
-restoring a serialized snapshot performs the required full-history replay.
-
-GPT-5.6 Pro is selected independently from reasoning effort; it does not use a
-different model slug. All six effort levels are available in either mode:
-
-```rust
-let (agent, _events) = Nanocodex::builder(api_key)
-    .reasoning_mode(ReasoningMode::Pro)
-    .thinking(Thinking::Xhigh) // None, Low, Medium, High, Xhigh, or Max
-    .fast_mode(true) // Requests priority service.
-    .build()?;
-
-// Later turns can switch priority service without replacing the session.
-agent.set_fast_mode(false).await?;
-```
-
-The CLI equivalents are `--reasoning-mode pro --thinking xhigh`, with matching
-`OPENAI_REASONING_MODE` and `OPENAI_REASONING_EFFORT` environment variables.
-
-Independent agents that use the same immutable instructions and tool definitions
-may deliberately share only their provider-side prompt cache while retaining
-separate conversations, response chains, tools, and workspaces:
-
-```rust
-let (agent, _events) = Nanocodex::builder(api_key)
-    .session_id(attempt_id)
-    .prompt_cache_key(agent_recipe_id)
-    .shared_prompt_cache()
-    .build()?;
-```
-
-Builders cloned after `shared_prompt_cache()` singleflight the first warmup for
-each exact prefix. Later agents skip that redundant request and send their first
-complete generation with the shared provider cache key. The cache key is
-inherited by forks and clean spawned agents. Without an explicit key, every
-clean root or spawned agent retains its own cache identity.
-
-### Lifecycle and dataflow
-
-```text
-NanocodexBuilder
-       │
-       ▼
- private agent driver ───────────────► AgentEvents
-       ▲                                  side channel
-       │
- Nanocodex
- cloneable conversation handle
-       │
-       ├── prompt(...) ──► Turn
-       │                    ├── steer(...)
-       │                    ├── cancel(...)
-       │                    ├── control() ──► cloneable TurnControl
-       │                    └── result() ──► TurnResult
-       │                                         │
-       ├── fork()                                │ checkpoint
-       └── fork_from(&TurnResult) ◄──────────────┘
-
-AgentHandle, supplied to tools_factory(...)
-       ├── spawn()  clean child
-       └── fork()   child from latest safe model/tool boundary
-```
-
-That is the complete ownership model. See the runnable
-[`lifecycle.rs`](examples/lifecycle.rs) for all of it in one file.
-
-### Authentication
-
-Native applications can use either an `OpenAI` API key or a `ChatGPT`
-subscription. Existing API-key construction remains unchanged:
-
-```rust
-let (agent, events) = Nanocodex::new(api_key)?;
-```
-
-For a `ChatGPT` subscription, the bundled CLI performs an authorization-code
-OAuth login with PKCE and reuses Codex's credential file at
-`$CODEX_HOME/auth.json`, or `~/.codex/auth.json` by default. If Codex is already
-logged in, no separate Nanocodex login is required:
+Lower-level consumers can depend only on the component they need:
 
 ```sh
-nanocodex auth login
-nanocodex auth status
-nanocodex
+cargo add nanocodex-oai-api
+cargo add nanocodex-tools
+cargo add nanocodex-agent
 ```
 
-Plain `nanocodex` and `nanocodex run` prefer an existing Codex subscription
-session in `$CODEX_HOME/auth.json` (normally `~/.codex/auth.json`). If that file
-is absent, the CLI falls back to `OPENAI_API_KEY`; direct binary runs load the
-key from the nearest `.env` automatically. An explicit `--api-key` overrides
-both automatic sources, while `NANOCODEX_AUTH_FILE` or `--auth-file` selects a
-specific subscription file. A present but invalid auth file fails visibly
-instead of silently incurring API-key charges. `nanocodex auth logout` removes
-the shared file and therefore logs both Codex and Nanocodex out.
-
-The default Responses policy depends on the selected authorization:
-
-| Authorization | Default transport | Default `store` | Default history |
-| --- | --- | ---: | --- |
-| ChatGPT subscription | WebSocket | `false` | connection-local incremental |
-| API key | WebSocket | `true` | stored incremental |
-
-Selecting HTTPS keeps API-key sessions stored and incremental. ChatGPT HTTPS
-remains `store: false` and automatically switches to complete client-history
-replay because it has no connection-local checkpoint. Explicit
-`--store-responses` and `--responses-history` values override these defaults
-when the combination is supported.
-
-These defaults optimize the normal long-lived interactive session, where the
-retained WebSocket delivered warm first events in 80-151 ms versus 277-369 ms
-over HTTPS. HTTPS is the better explicit choice for cold or fork-heavy
-one-shot work: cold first events were 374-405 ms versus 587-679 ms for
-WebSocket, and fresh HTTPS forks reached their first event in 373-436 ms versus
-about 1.0-1.1 seconds for a new WebSocket. With API-key authentication,
-`store: true` also reduced three historical-fork requests by roughly 97%.
-Completion latency was backend-noisy, and every policy had identical token,
-cache, and estimated-cost behavior in this workload. See the full
-[transport benchmark](docs/RESPONSE_TRANSPORT_BENCH.md).
-
-Library consumers own their login UX and can reuse the same managed session:
-
-```rust
-use nanocodex::{Nanocodex, load_chatgpt_auth};
-
-let auth = load_chatgpt_auth("/path/to/.codex/auth.json")?;
-let (agent, events) = Nanocodex::new(auth)?;
-```
-
-The shared authorization handle selects the matching Responses endpoints,
-attaches the account and FedRAMP routing headers, refreshes shortly before JWT
-expiry, reloads credentials rotated by another process, and retries one rejected
-request after a serialized refresh. Forks and built-in HTTP tools share that
-same rotating session. Browser/WASM embeddings continue to receive an
-already-authorized WebSocket from the host and never own refresh tokens.
-
-## Lifecycle details
-
-`Nanocodex::new` installs the standard instructions, medium thinking, built-in
-tools, persistent WebSocket, and retry/reconnect policy. The builder can instead
-fix HTTPS/SSE, response storage, and full-replay policy for the agent and all of
-its forks. Dropping the event receiver is supported; events then become a no-op.
-
-Callers never pass transcripts, response IDs, tool outputs, or turn IDs back to
-the agent. An incremental transport sends only the new delta with
-`previous_response_id`; full-replay policy transparently sends the authoritative
-typed history. A replacement ephemeral socket and HTTPS with `store: false`
-also replay that history.
-
-The Responses path encodes each wire request once and rejects common
-non-metadata frames before attempting metadata decoding. Every streamed attempt
-records request and response bytes, encode/send and socket-wait time, parsing,
-public-event emission, typed decoding, and time to first event/output as
-structural tracing fields.
-
-### Queue, steer, cancel
-
-Every `prompt` is an ordinary queued turn. Steering is explicit because it has
-different semantics: it joins one already-active turn and is sampled only
-between complete model responses and tool outputs. It does not create a second
-turn or terminal event.
-
-Cancellation targets the same opaque unfinished turn. Cancelling queued work
-removes it before it reaches the model. Cancelling active work waits for model
-work, Code Mode cells, and shell process groups to stop, then resolves the turn
-as `NanocodexError::TurnCancelled`. Partial model or tool work is never
-committed; surviving queued prompts resume from the last completed checkpoint.
-
-Call methods directly when one task owns the turn:
-
-```rust
-let turn = agent.prompt("Investigate the failing tests.").await?;
-turn.steer("Prioritize deterministic failures.").await?;
-let result = turn.result().await?;
-```
-
-Use `TurnControl` only when result and control ownership need to split:
-
-```rust
-use nanocodex::NanocodexError;
-
-let turn = agent.prompt("Run a long investigation.").await?;
-let control = turn.control();
-let result_task = tokio::spawn(async move { turn.result().await });
-
-control.steer("Check the integration tests first.").await?;
-control.cancel().await?;
-assert!(matches!(result_task.await?, Err(NanocodexError::TurnCancelled)));
-```
-
-### Continue and fork conversations
-
-Follow-on prompts reuse retained context automatically:
-
-```rust
-let first = agent
-    .prompt("Choose one word for this project.")
-    .await?
-    .result()
-    .await?;
-
-let second = agent
-    .prompt("Return the word you chose in uppercase.")
-    .await?
-    .result()
-    .await?;
-```
-
-Each completed result is also an opaque historical checkpoint. The mainline can
-keep advancing while multiple branches start from different points:
-
-```rust
-let turn_2 = agent
-    .prompt("Record design decision A.")
-    .await?
-    .result()
-    .await?;
-
-agent
-    .prompt("Record later decision B.")
-    .await?
-    .result()
-    .await?;
-
-// The mainline may continue while both new agents are being constructed.
-let mainline = agent.prompt("Continue the primary analysis.").await?;
-let ((historical, _), (latest, _)) = tokio::try_join!(
-    agent.fork_from(&turn_2),
-    agent.fork(),
-)?;
-
-let historical_turn = historical.prompt("Explore an alternative to A.").await?;
-let latest_turn = latest.prompt("Challenge our newest assumptions.").await?;
-let (mainline, historical, latest) = tokio::try_join!(
-    mainline.result(),
-    historical_turn.result(),
-    latest_turn.result(),
-)?;
-```
-
-#### Why checkpoint forks are efficient
-
-With the stored incremental policy, used by default with API-key
-authentication, each Nanocodex `response.create` request sets `store: true`.
-Once a response completes, the API can retain it as a checkpoint; Nanocodex
-keeps its response ID private inside the completed `TurnResult`. The next
-healthy model call sends that ID as `previous_response_id` plus only the new
-delta—the user message, steer, or tool output added since the stored
-response—not the transcript again.
-
-The same mechanism makes a historical fork cheap:
-
-```text
-prewarm       input: stable instructions/tools, store: true   → prefix response
-root turn A   previous_response_id: prefix, input: A delta    → response A
-root turn B   previous_response_id: A, input: B delta         → response B
-fork from A   previous_response_id: A, input: branch delta    → branch response
-```
-
-The root remains attached to response B and continues independently. The fork
-gets its own driver, WebSocket, response chain, service stack, and tool runtime,
-but its first request references response A and uploads only the branch delta.
-Locally, immutable typed-history segments and stable cache lineage are shared,
-so constructing the branch does not copy the retained conversation either.
-The API still evaluates the complete logical context—and token usage reflects
-that context—even though the request payload carries only the delta.
-
-The local fork remains constant-time under every transport and storage policy.
-What changes is its first wire request: a fresh `store: false` fork cannot use a
-durable provider checkpoint and replays its shared committed history. HTTPS
-with `store: false` also replays on every turn; a persistent WebSocket may use
-connection-local incremental continuation until it is replaced. Stable cache
-lineage is preserved in all cases.
-
-Stored responses are an optimization, not the source of truth. Nanocodex keeps
-complete client-owned typed history for every checkpoint. If the provider no
-longer has a response ID, the retry drops `previous_response_id`, replays that
-committed history once, and then resumes delta-only requests from the new stored
-response. Partial or failed responses are never committed or used as fork
-points.
-
-In the retained checkpoint benchmark, three concurrent branch requests sent
-2,175 bytes instead of an equivalent 84,612-byte full replay—a 97.4% payload
-reduction. See [`benchmarks/fork_results.md`](benchmarks/fork_results.md) for the
-live methodology, cache observations, and raw trials.
-
-See [`fork_conversations.rs`](examples/fork_conversations.rs) for a complete
-ten-checkpoint example with parallel historical forks and a caller-defined
-Tower stack.
-
-### Configure only what your application owns
-
-The common paths remain short; factories appear only when lifecycle isolation
-requires them.
-
-```rust
-use std::time::Duration;
-
-use nanocodex::{Nanocodex, Responses, Thinking};
-use tower::timeout::TimeoutLayer;
-
-let responses = Responses::builder()
-    .layer(TimeoutLayer::new(Duration::from_secs(120)))
-    .build();
-
-let (agent, events) = Nanocodex::builder(api_key)
-    .codex_home("/home/me/.codex")
-    .instructions("You are a concise repository maintenance agent.")
-    .thinking(Thinking::High)
-    .workspace("/work/project")
-    .tools(tools)
-    .responses(responses)
-    .build()?;
-```
-
-Configuring a Codex home loads its `AGENTS.override.md` or `AGENTS.md` before
-workspace-scoped project instructions. Native applications can also opt into a
-Codex-compatible committed-history rollout; rollout configuration implies the
-same Codex home. The agent session ID is also the UUID accepted by
-`codex resume`:
-
-```rust
-use nanocodex::{Nanocodex, RolloutConfig};
-
-let (agent, events) = Nanocodex::builder(api_key)
-    .rollout(RolloutConfig::new("/home/me/.codex"))
-    .build()?;
-
-println!("codex resume {}", agent.session_id());
-println!("rollout: {}", agent.rollout().unwrap().path().display());
-agent.flush_rollout().await?;
-```
-
-Recording appends Codex's model-context response items and its legacy turn and
-message events after each completed or cancelled turn, so both resumed model
-context and the visible Codex transcript are restored. Compaction uses explicit
-replacement-history records, and failed partial output is excluded.
-`nanocodex resume <thread-id>` discovers the same rollout beneath
-`$CODEX_HOME/sessions` (or `archived_sessions`) that `codex resume` uses and
-materializes its latest replacement-history boundary plus subsequent response
-items. No Nanocodex-specific sidecar is required, so Codex-created threads can
-be continued directly. Pass `--prompt "..."` to submit a follow-on prompt as
-soon as the TUI opens.
-The rollout writer projects the same committed session boundary exposed by
-`TurnResult::snapshot()` rather than maintaining a second conversation state.
-`flush_rollout()` retries pending writes and provides a durability barrier.
-Treat a resume as a single-writer handoff: release the Nanocodex session before
-continuing the same rollout in Codex.
-
-Use `tools_factory` when a tool must spawn or fork the agent that invoked it.
-The factory receives a weak `AgentHandle`, not credentials:
-
-```rust
-let (agent, events) = Nanocodex::builder(api_key)
-    .tools_factory(|handle| build_agent_tools(handle))
-    .build()?;
-```
-
-`handle.spawn()` creates a clean child; `handle.fork()` creates a contextual
-child from the invoking agent. Both privately reuse the builder's credentials
-and policy. The application can expose these as Code Mode tools and let the
-model generate loops, fan-out, follow-up prompts, and synthesis without encoding
-a DAG in the SDK. See [`subagents.rs`](examples/subagents.rs) for that complete
-orchestration pattern.
-
-One Tower call is one complete streamed Responses attempt. Nanocodex owns retry
-and reconnect policy; caller middleware can own deadlines, load shedding,
-tracing, metrics, and circuit breaking without creating a second retry loop.
-See [`docs/RESPONSES_TOWER.md`](docs/RESPONSES_TOWER.md) for the boundary and
-ordering rules.
-
-### Tools, MCP, events, and errors
-
-`#[tool]` turns an async Rust function into a typed tool and derives its input
-schema. `Tools::builder()` accepts generated or manual `Tool` implementations;
-`Mcp::builder()` adds deferred Streamable HTTP or stdio MCP providers. The model
-normally sees only Code Mode and its wait operation, then composes nested tools
-with generated JavaScript, including loops, conditionals, and `Promise.all`.
-
-Code Mode prewarms one persistent Node host alongside the first model call and
-reuses it for the session. Cells receive one shared owned history snapshot;
-resumed waits do not copy history they cannot read. A nested shell request can
-extend the default outer-cell yield deadline while an explicit `@exec` deadline
-still wins. Live shell session IDs remain visible for later `write_stdin`
-calls, and stdout/stderr drains share one bounded completion deadline.
-
-`AgentEvents` is an optional ordered stream independent of `TurnResult`. A TUI,
-server, notebook, or binding can consume all events, select a subset, or drop
-the receiver without changing prompt/result behavior. Libraries emit diagnostic
-`tracing` spans but never install a global subscriber. Nested tools that finish
-after a yielded cell retain their original Code Mode and model-call lineage, so
-the public event stream and trace hierarchy agree.
-
-Lifecycle failures are direct `NanocodexError` variants. Common control flow can
-match `TurnCancelled` or `TurnNotSteerable`; transport and API details remain
-available through `responses_error()` and the standard `Error::source` chain.
-
-Runnable API tours:
-
-```sh
-cargo run -p nanocodex-examples --bin minimal
-cargo run -p nanocodex-examples --bin lifecycle
-cargo run -p nanocodex-examples --bin follow-on
-cargo run -p nanocodex-examples --bin custom-tool
-cargo run -p nanocodex-examples --bin mcp
-cargo run -p nanocodex-examples --bin fork-conversations
-cargo run -p nanocodex-examples --bin subagents
-```
-
-## CLI and repository
-
-Install the daily-driver CLI and start it in the workspace the agent should
-edit:
+The daily-driver CLI is available on macOS and Linux:
 
 ```sh
 curl -fsSL https://nanocodex.paradigm.xyz | bash
-
-# Reuse an existing Codex login, or fall back to OPENAI_API_KEY when absent.
-nanocodex
-
-# Create or explicitly select the same subscription store Codex uses.
-nanocodex auth login
-nanocodex --auth-file "${CODEX_HOME:-$HOME/.codex}/auth.json"
 ```
 
-The CLI merges enabled MCP servers from
-`${CODEX_HOME:-$HOME/.codex}/config.toml` with its deferred
-`openaiDeveloperDocs`, `tempo`, and `cloudflare` defaults. Explicit `--mcp` and
-`--mcp-stdio` entries take precedence over Codex config, and Codex entries take
-precedence over same-named defaults. Their catalogs stay out of the stable
-model prompt until Code Mode calls `tool_search`. Disable the built-in set with
-`--mcp-defaults false` and Codex config loading with
-`--mcp-codex-config false`; the environment equivalents are
-`NANOCODEX_MCP_DEFAULTS=false` and `NANOCODEX_MCP_CODEX_CONFIG=false`.
-Streamable HTTP servers also reuse Codex's file-backed MCP OAuth credentials.
-Expired access tokens refresh through the server's OAuth metadata and rotated
-credentials are persisted back to `.credentials.json` under the same
-cross-process lock as Codex.
+## Development
 
-Provider prewarming is scheduled before agent construction returns, so the TUI
-does not wait for HTTP client setup, DNS/TLS, MCP handshakes, `tools/list`, or
-BM25 indexing. Discovery and index construction run in parallel in the
-background while the terminal is idle. Activating a deferred tool changes only
-the nested Code Mode runtime; the model-visible `exec`/`tool_search` prefix stays
-byte-stable for prompt-cache reuse.
+Run `cargo doc --open` from the repository root to browse the public
+`nanocodex` facade and follow its links into the lower-level crates.
 
-The CLI records Codex-compatible rollouts beneath
-`${CODEX_HOME:-$HOME/.codex}/sessions` by default. The `request_id` in headless
-JSONL is the resumable UUID. Restore its workspace, committed typed history, and
-rollout identity in Nanocodex with:
+The normal local gates are:
 
 ```sh
-nanocodex resume <request_id>
-nanocodex resume <request_id> --prompt "Continue where we left off"
+./scripts/check-crate-boundaries.sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 ```
 
-Or hand the interoperable rollout to Codex:
+Run focused `cargo bench -p <crate>` suites while changing a hot component.
+Use `just run` for a live native agent smoke and the configured eval commands
+only at milestone gates. Eval tasks and verifiers are evidence; they are never
+modified to make Nanocodex pass.
 
-```sh
-nanocodex run "Remember this thread"
-codex resume <request_id>
-```
+## License
 
-Use `nanocodex --rollouts false ...` (or `NANOCODEX_ROLLOUTS=false`) when a CLI
-consumer does not want local session recording.
+Licensed under either of:
 
-The TUI retains one session across prompts. Enter submits, Tab explicitly queues
-a follow-up while work is active, and `/cancel` stops the focused turn. At any
-safe model/tool boundary, `/btw <question>` opens a fast fork in a vertical pane
-while the mainline continues. The fork inherits the last completed response ID
-plus complete tool results and applied steers after that response; partial model
-output and unmatched tool calls remain excluded. With local telemetry running,
-`/trace` opens Jaeger filtered to every turn in the focused main or `/btw`
-session. `/mcp login <server>` opens browser OAuth and hot-reloads that server's
-tools into the running session after the callback; `/mcp reload <server>` retries
-discovery without restarting the TUI. The complete keybinding reference,
-retained Amp and Codex research, and
-prioritized Ratatui backlog live in
-[`docs/TUI_NOTES.md`](docs/TUI_NOTES.md). The headless `nanocodex run` adapter
-emits flushed JSONL for scripts and Harbor.
+- Apache License, Version 2.0
+- MIT License
 
-`just run-otel` exports compact per-turn streaming summaries alongside the full
-agent trace. When diagnosing a jagged stream, opt into the individual correlated
-API-delta, TUI-application, and presented-frame records:
-
-```sh
-just run-otel-detail
-```
-
-The TUI log at `.nanocodex/logs/tui.log` correlates each request and event across
-socket receipt, agent emission, TUI receipt, state application, frame
-coalescing, Ratatui changed cells, terminal output bytes, and final flush.
-Detailed mode is intentionally opt-in because long responses can create
-thousands of records. Use `just bench-stream` for the focused event-delivery,
-transcript-update, and steady-frame regression gate. See
-[`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) for the full trace contract.
-
-The workspace also contains publishable [JavaScript](js) and [Python](py)
-libraries plus thin [Node](examples/node), [browser Worker](examples/react-vite),
-and [website](web) consumers.
-Architecture and current work are tracked in [`PLAN.md`](PLAN.md); benchmark
-runner research lives in [`docs/HARBOR_RS_LOG.md`](docs/HARBOR_RS_LOG.md).
-
-```sh
-# Install pinned host dependencies.
-just bootstrap
-# Run the native smoke test.
-just run
-# Build and cache benchmark inputs.
-just prepare-evals
-# Run the pinned Terminal-Bench suite.
-just eval
-# Inspect retained Harbor jobs.
-just view
-```
-
-## Nanocodex versus Codex
-
-Use Nanocodex when the agent is a component of your Rust application. Use Codex
-when you want the complete product: durable threads, approval UX, broad built-in
-integrations, managed subagents, and a mature TUI and IDE ecosystem.
-
-| | Nanocodex | Codex |
-| --- | --- | --- |
-| Product boundary | Rust library in your process | Application and durable agent runtime |
-| State | In-memory authority; optional Codex-compatible rollout | Persisted threads and rollouts |
-| Follow-on turns | Fixed WebSocket or HTTPS policy; automatic delta or full replay | Full Codex session lifecycle |
-| Historical forks | Exact completed checkpoint; parent keeps running | Durable thread reconstruction |
-| Tools | Code Mode over Rust tools and MCP | Broad built-in tool and integration surface |
-| Middleware | Your concrete Tower stack | Codex-owned runtime policy |
-| Results and events | Typed `TurnResult` plus optional ordered `AgentEvents` | Product-wide rollout/event lifecycle |
-| Orchestration | Model composes application-defined agent tools | Managed agents, task identities, mailboxes, and budgets |
-
-The smaller boundary is the feature. A caller builds an agent, receives
-`(Nanocodex, AgentEvents)`, sends prompts through a cheap cloneable handle, and
-awaits independently owned `TurnResult`s. The CLI, Harbor adapter, Python
-binding, and Rust/WASM binding all consume that same API.
-
-### Codex request parity
-
-The deterministic differential drives stock Codex and Nanocodex through basic
-tools, continued PTY shells, bounded output, failures, images, WebSocket
-reconnect/replay, automatic compaction, and SIGINT cleanup:
-
-```bash
-cargo build -p nanocodex-bin
-python3 benchmarks/codex_request_parity.py \
-  --codex-bin ~/github/openai/codex/codex-rs/target/debug/codex \
-  --nanocodex-bin target/debug/nanocodex \
-  --output /tmp/nanocodex-request-parity.json
-```
-
-The default command succeeds when both implementations complete every scenario,
-preserve stable request identity, replay or compact complete history, and clean
-up cancelled descendants. Add `--check` when exact normalized request and
-transport equality is required; it currently reports the documented
-WebSocket-to-HTTPS fallback. App-owned internal turn metadata is an explicit
-normalization exclusion. Use repeated `--scenario <name>` flags to run only
-selected cases.
-
-Nanocodex deliberately defaults to `Thinking::High`; stock Codex currently
-defaults the bundled Sol model to `low`. The differential passes the same
-explicit effort to both binaries so it tests harness behavior rather than that
-product-policy choice.
-
-### How Fast?
-
-Focused local profiling also covers the ordinary streaming and tool path. On an
-M1 Max, prewarming the retained Node host reduced first-cell host latency from
-301 ms to 1.7–2.7 ms and complete top-level Code Mode time from 312 ms to 11–13
-ms across three trials. On a retained 41-task workload, model generation and
-caller-requested subprocesses accounted for 99.864% of summed run time; the
-unattributed local remainder was 0.136%. These are diagnostic measurements, not
-model-service speed guarantees. See
-[`single_prompt_profile_2026-07-20.md`](benchmarks/single_prompt_profile_2026-07-20.md)
-and
-[`long_prompt_profile_2026-07-20.md`](benchmarks/long_prompt_profile_2026-07-20.md)
-for methodology and reproduction commands.
-
-The committed-history benchmark on the current session/rollout implementation
-kept an active checkpoint plus parent append at 0.369–0.394 µs from 100 through
-10,000 retained items. Iterating only the next request suffix stayed near 26
-ns. The full-history flattening component required by an explicit durable
-snapshot scaled from 8.2 µs at 100 items to 92 µs at 1,000 and 992 µs at
-10,000. Those synthetic items contain about 512 bytes of text each; the
-flattening numbers exclude JSON encoding. See the
-[transport benchmark](docs/RESPONSE_TRANSPORT_BENCH.md#committed-session-projection-cost)
-for the table and interpretation.
-
-Our live checkpoint benchmark uses `gpt-5.6-sol`, a deterministic 600-fact
-prefix, ten sequential turns, and concurrent historical forks. Three runs on
-2026-07-20 compared Nanocodex `210ac85` with stock Codex CLI
-`0.145.0-alpha.18`:
-
-| Measurement | Nanocodex | Stock Codex | Difference |
-| --- | ---: | ---: | ---: |
-| Ten sequential turns, median total | 14.78 s | 24.99 s | **1.69x faster** |
-| Warm turn p50, turns 3–10 | 1.304 s | 1.532 s | **1.18x faster** |
-| Historical fork to first answer, p50 | 1.570 s | 6.530 s | **4.16x faster** |
-| Historical fork model time, p50 | 1.291 s | 5.862 s | **4.54x faster** |
-
-**Takeaway: Nanocodex was 1.69x faster across ten turns and 4.16x faster to
-the first historical-fork answer in this checkpoint benchmark.**
-
-A Nanocodex fork sent about 725 bytes of new request data from its stored
-checkpoint. Replaying the same history would send 27–29 KB: a 97.4% reduction.
-On a separate 41-task coding gate, Nanocodex completed 38 tasks with 92.23% of
-input tokens cached, zero Responses retries, and zero WebSocket reconnects.
-
-These are checkpoint-path measurements, not a normalized full-agent quality
-comparison. The Nanocodex arm used a minimal benchmark developer message and no
-production tool definitions; the Codex arm ran the complete stock app-server
-agent. See [`benchmarks/fork_results.md`](benchmarks/fork_results.md) for the
-methodology, cache observations, raw trials, and reproduction commands.
-
-### The tradeoff
-
-Nanocodex currently supports one model family (`gpt-5.6-sol`), one Responses
-WebSocket transport, and caller-defined tools. Sessions and branches live only
-as long as your process. Your application owns sandboxing, permissions,
-durability, and recursive cancellation policy for application-defined child
-agents. Code Mode requires Node.js 12.22 or newer on `PATH`.
-
-That is substantially less product than Codex. It is also much less machinery
-between your code and an agent turn.
+at your option.

@@ -434,7 +434,7 @@ fn display_path(file: &FilePatch) -> String {
     )
 }
 
-fn change_verb(kind: ChangeKind) -> &'static str {
+const fn change_verb(kind: ChangeKind) -> &'static str {
     match kind {
         ChangeKind::Add => "Added",
         ChangeKind::Update => "Edited",

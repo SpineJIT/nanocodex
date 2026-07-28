@@ -1,9 +1,9 @@
-use nanocodex_core::ToolDefinition;
+use nanocodex_oai_api::tools::ToolDefinition;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use super::{StandardTool, Tool, ToolContext, ToolExecution, ToolInput, ToolResult};
+use super::{StandardTool, Tool, ToolContext, ToolInput, ToolOutput, ToolResult};
 
 /// Host-owned standard plan tool for runtimes that replace workspace effects.
 pub struct UpdatePlanTool {
@@ -11,6 +11,7 @@ pub struct UpdatePlanTool {
 }
 
 impl UpdatePlanTool {
+    /// Creates an empty retained plan.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -27,10 +28,6 @@ impl Default for UpdatePlanTool {
 
 #[async_trait::async_trait]
 impl Tool for UpdatePlanTool {
-    fn name(&self) -> &'static str {
-        "update_plan"
-    }
-
     fn definition(&self) -> ToolDefinition {
         StandardTool::UpdatePlan.definition()
     }
@@ -51,7 +48,7 @@ impl Tool for UpdatePlanTool {
             );
         }
         *self.current.lock().await = Some(plan);
-        Ok(ToolExecution::text("Plan updated").with_code_mode_value(json!({})))
+        Ok(ToolOutput::text("Plan updated").with_code_mode_value(json!({})))
     }
 }
 

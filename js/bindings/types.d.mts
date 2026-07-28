@@ -22,8 +22,23 @@ export type AgentOptions = {
   fastMode?: boolean | undefined;
   sessionId?: string | undefined;
   thinking?: Thinking | undefined;
+  workspace?: string | undefined;
   resume?: SessionSnapshot | undefined;
 };
+
+export type EstimatedUsdCost = Readonly<{
+  usd: string;
+  input_usd: string;
+  cached_input_usd: string;
+  cache_write_input_usd: string;
+  output_usd: string;
+  service_tier: "standard" | "priority";
+}>;
+
+export type CostStatus =
+  | "estimated_from_usage"
+  | "usage_not_reported"
+  | "other";
 
 export type SessionSnapshot = Readonly<{
   version: number;
@@ -36,7 +51,18 @@ export type SessionSnapshot = Readonly<{
   history: readonly Record<string, unknown>[];
 }>;
 
-export type ForkOptions = { at?: Turn | undefined };
+export type TurnUsage = Readonly<{
+  input_tokens: number;
+  cached_input_tokens: number;
+  cache_write_input_tokens: number;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+  estimated_cost: EstimatedUsdCost | null;
+  cost_status: CostStatus;
+}>;
+
+export type ForkOptions = { at?: TurnResult | undefined };
 export type WatchEventsOptions = { includeAllSessions?: boolean | undefined };
 
 export type EventWatcher = Readonly<{
@@ -50,9 +76,11 @@ export type AgentActions = {
     watch(options?: WatchEventsOptions): EventWatcher;
   };
   session: {
+    compact(): Promise<void>;
     fork(options?: ForkOptions): Promise<DefaultAgent>;
     setFastMode(enabled: boolean): Promise<void>;
     setThinking(thinking: Thinking): Promise<void>;
+    shutdown(): Promise<void>;
     spawn(): Promise<DefaultAgent>;
   };
   turn: {
@@ -69,6 +97,7 @@ export type Agent<extended extends object = {}> = {
   extend<const extension extends object>(
     decorator: (agent: Agent<extended>) => extension,
   ): Agent<extended & extension>;
+  /** Releases this JavaScript/WASM handle without joining unfinished turns. */
   dispose(): void;
 } & extended;
 
@@ -76,11 +105,17 @@ export type DefaultAgent = Agent<AgentActions>;
 
 export type Turn<agent extends Agent<object> = Agent<object>> = Readonly<{
   readonly agent: agent;
-  result(): Promise<string>;
-  snapshot(): SessionSnapshot;
+  result(): Promise<TurnResult>;
   steer(options: { input: PromptInput }): Promise<void>;
   cancel(): Promise<void>;
+  /** Releases this handle without cancelling its accepted turn. */
   dispose(): void;
+}>;
+
+export type TurnResult = Readonly<{
+  finalMessage: string;
+  snapshot: SessionSnapshot;
+  usage: TurnUsage;
 }>;
 
 export type ToolContext = {

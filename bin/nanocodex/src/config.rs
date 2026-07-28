@@ -7,9 +7,16 @@ use std::{
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr, eyre};
 use nanocodex::{
-    AgentEvents, DurableSession, McpHandle, Nanocodex, OpenAiAuth, OpenAiAuthMode, ReasoningMode,
-    Responses, ResponsesHistory, ResponsesTransport, RolloutConfig, SessionSnapshot, Thinking,
-    Tools,
+    AgentEvents, Nanocodex, OpenAi, ReasoningMode, Thinking, Tools,
+    agent::{
+        rollout::{DurableSession, RolloutConfig},
+        session::{SessionId, SessionSnapshot},
+    },
+    oai::{
+        auth::{OpenAiAuth, OpenAiAuthMode},
+        transport::ResponsesTransport,
+    },
+    tools::mcp::McpHandle,
 };
 
 use crate::mcp::{ConfiguredMcp, McpArgs};
@@ -26,7 +33,7 @@ pub(crate) struct ConfiguredAgent {
 
 struct SessionBuild {
     workspace: PathBuf,
-    session_id: Option<String>,
+    session_id: Option<SessionId>,
     snapshot: Option<SessionSnapshot>,
     rollout: Option<RolloutConfig>,
 }
@@ -108,10 +115,6 @@ pub(crate) struct AgentArgs {
     #[arg(long, env = "NANOCODEX_RESPONSES_TRANSPORT")]
     responses_transport: Option<ResponsesTransport>,
 
-    /// Incremental response-ID chaining or complete history replay.
-    #[arg(long, env = "NANOCODEX_RESPONSES_HISTORY")]
-    responses_history: Option<ResponsesHistory>,
-
     /// Whether the Responses API retains server-side checkpoints.
     #[arg(long, env = "NANOCODEX_STORE_RESPONSES", action = ArgAction::Set)]
     store_responses: Option<bool>,
@@ -132,6 +135,7 @@ impl AgentArgs {
         self.cwd.as_deref().unwrap_or_else(|| Path::new("."))
     }
 
+    #[cfg(test)]
     pub(crate) const fn uses_tempo(&self) -> bool {
         self.mpp.is_enabled()
     }
@@ -174,31 +178,28 @@ impl AgentArgs {
         };
         let direct_websocket_url = direct_websocket_url(self.websocket_url, auth.mode());
         let mpp_adapter = self.mpp.start().await?;
-        let mut responses = Responses::builder()
+        let mut openai = OpenAi::builder(auth)
             .transport(responses_transport)
             .websocket_url(direct_websocket_url);
         if mpp_enabled {
-            responses = responses.max_attempts(NonZeroU32::MIN);
-        }
-        if let Some(history) = self.responses_history {
-            responses = responses.history(history);
+            openai = openai.max_attempts(NonZeroU32::MIN);
         }
         if let Some(store) = self.store_responses {
-            responses = responses.store(store);
+            openai = openai.store(store);
         }
         let api_base_url = selected_api_base_url(
             self.api_base_url,
             mpp_adapter.as_ref().map(MppAdapter::api_base_url),
         );
         if let Some(api_base_url) = api_base_url {
-            responses = responses.api_base_url(api_base_url);
+            openai = openai.api_base_url(api_base_url);
         }
         if matches!(responses_transport, ResponsesTransport::Https)
             && let Some(mpp_adapter) = &mpp_adapter
         {
-            responses = responses.http_client(mpp_adapter.responses_http_client()?);
+            openai = openai.http_client(mpp_adapter.responses_http_client()?);
         }
-        let responses = responses.build();
+        let openai = openai.build()?;
         let mut tools = Tools::builder()
             .web_search(self.web_search)
             .image_generation(self.image_generation);
@@ -214,12 +215,11 @@ impl AgentArgs {
         }
         let tools = tools.build()?;
         let child_agents = self.subagents.then(|| Arc::new(ChildAgents::default()));
-        let mut builder = Nanocodex::builder(auth)
+        let mut builder = Nanocodex::builder(openai)
             .reasoning_mode(self.reasoning_mode)
             .thinking(self.thinking)
             .workspace(session.workspace)
-            .codex_home(codex_home)
-            .responses(responses);
+            .codex_home(codex_home);
         if let Some(session_id) = session.session_id {
             builder = builder.session_id(session_id);
         }
@@ -230,7 +230,7 @@ impl AgentArgs {
             builder = builder.rollout(rollout);
         }
         let builder = if let Some(child_agents) = &child_agents {
-            let tools = tools.clone();
+            let tools = tools;
             let child_agents = Arc::downgrade(child_agents);
             builder.tools_factory(move |agent| {
                 subagents::with_subagents(tools.clone(), agent, child_agents.clone())
@@ -286,7 +286,11 @@ fn prepare_session_build(
     let (session_id, snapshot, rollout) = session.into_parts();
     Ok(SessionBuild {
         workspace: restored,
-        session_id: Some(session_id),
+        session_id: Some(
+            session_id
+                .parse()
+                .wrap_err("resumed Codex thread ID is not UUIDv7")?,
+        ),
         snapshot: Some(snapshot),
         rollout: rollouts.then_some(rollout),
     })
@@ -353,7 +357,7 @@ fn environment_api_key() -> Result<Option<String>> {
 }
 
 fn load_subscription_auth(auth_file: &Path) -> Result<OpenAiAuth> {
-    nanocodex::load_chatgpt_auth(auth_file).map_err(|error| {
+    nanocodex::oai::auth::load_chatgpt_auth(auth_file).map_err(|error| {
         eyre!(
             "ChatGPT authorization could not be loaded from {}: {error}. Run `nanocodex auth login`",
             auth_file.display()
@@ -393,7 +397,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use clap::CommandFactory;
-    use nanocodex::OpenAiAuthMode;
+    use nanocodex::oai::auth::OpenAiAuthMode;
 
     use super::{
         direct_websocket_url, select_auth, select_auth_with_default, selected_api_base_url,
@@ -499,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_transport_is_selected_once_at_startup() {
+    fn responses_transport_and_storage_are_selected_once_at_startup() {
         let command = crate::Cli::command();
         let transport = command
             .get_arguments()
@@ -507,11 +511,12 @@ mod tests {
             .expect("the CLI should expose the Responses transport argument");
         assert!(transport.get_default_values().is_empty());
 
-        let history = command
-            .get_arguments()
-            .find(|argument| argument.get_id() == "responses_history")
-            .expect("the CLI should expose the Responses history argument");
-        assert!(history.get_default_values().is_empty());
+        assert!(
+            command
+                .get_arguments()
+                .all(|argument| argument.get_id() != "responses_history"),
+            "history replay policy is internal and must not be a CLI argument"
+        );
 
         let store = command
             .get_arguments()

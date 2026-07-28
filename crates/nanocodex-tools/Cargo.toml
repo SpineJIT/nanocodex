@@ -8,22 +8,17 @@ authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 description = "Code Mode and heterogeneous tool runtime for Nanocodex"
-
-[features]
-default = ["code-mode", "remote-tools"]
-code-mode = ["dep:rquickjs"]
-remote-tools = ["dep:reqwest"]
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["-D", "warnings"]
 
 [dependencies]
-nanocodex-core.workspace = true
+nanocodex-oai-api.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -31,28 +26,39 @@ tracing.workspace = true
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 async-trait.workspace = true
 base64.workspace = true
+bm25.workspace = true
 futures-util.workspace = true
+getrandom.workspace = true
+http.workspace = true
 image.workspace = true
+oauth2.workspace = true
+nanocodex-tools-macros.workspace = true
 portable-pty.workspace = true
-rand.workspace = true
-reqwest = { workspace = true, optional = true }
-rquickjs = { workspace = true, optional = true }
+reqwest.workspace = true
+rquickjs.workspace = true
+rmcp.workspace = true
 schemars.workspace = true
 sha1.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
+tokio-util.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
 
-[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
-js-sys.workspace = true
-wasm-bindgen.workspace = true
-wasm-bindgen-futures.workspace = true
-
 [dev-dependencies]
+criterion.workspace = true
 eyre.workspace = true
+futures-util.workspace = true
 tracing-subscriber.workspace = true
+
+[[bench]]
+name = "mcp_tool_search"
+harness = false
+
+[[bench]]
+name = "tool_process_output"
+harness = false
 
 [lints]
 workspace = true

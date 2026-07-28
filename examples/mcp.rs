@@ -1,5 +1,8 @@
 use eyre::{Result, WrapErr};
-use nanocodex::{Mcp, McpServer, Nanocodex, Thinking, Tools};
+use nanocodex::{
+    Nanocodex, OpenAi, Thinking, Tools,
+    tools::mcp::{Mcp, McpServer},
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,7 +21,9 @@ async fn main() -> Result<()> {
     };
     let mcp = Mcp::builder().server("docs", server).build()?;
     let tools = Tools::builder().without_defaults().provider(mcp).build()?;
-    let (agent, mut events) = Nanocodex::builder(api_key)
+    let openai = OpenAi::new(api_key)?;
+    let (agent, mut events) = Nanocodex::builder(openai)
+        .instructions("Search configured MCP servers when documentation evidence is needed.")
         .thinking(Thinking::Low)
         .tools(tools)
         .build()?;
@@ -29,6 +34,6 @@ async fn main() -> Result<()> {
         )
         .await?;
     events.write_turn_jsonl(std::io::stdout()).await?;
-    eprintln!("final result: {}", turn.result().await?.final_message);
+    eprintln!("final result: {}", turn.result().await?.final_message());
     Ok(())
 }

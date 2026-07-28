@@ -11,7 +11,7 @@ agents:
       version: "0.144.5"
       reasoning_effort: low
       web_search: disabled
-      system_prompt_path: crates/nanocodex-core/prompts/system.md
+      system_prompt_path: crates/nanocodex-oai-api/prompts/system.md
       agents_md_path: evals/history-derived/AGENTS.md
 
 datasets:

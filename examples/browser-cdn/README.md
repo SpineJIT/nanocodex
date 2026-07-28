@@ -17,3 +17,9 @@ https://app.example/demo?endpoint=wss://app.example/api/responses
 
 The package version is intentionally pinned in the CDN import. Update and test
 that pin explicitly when adopting a new Nanocodex release.
+
+Agent creation is memoized so concurrent form submissions share one session.
+The page starts graceful agent shutdown on `pagehide`, including when creation
+is still in flight. Browsers do not wait for asynchronous page lifecycle
+handlers, so this is best-effort at navigation time; the runtime still drops
+its Worker and WebSocket resources when the page itself is discarded.

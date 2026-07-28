@@ -1,10 +1,23 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { test } from "node:test";
 import { WebSocketServer } from "ws";
 
 import { Actions, Agent } from "../node/index.mjs";
 import { createNodeHost } from "../node/host.mjs";
+
+const SESSION_IDS = Object.freeze({
+  primary: "018f1f9a-7b3c-7a01-8000-000000000001",
+  original: "018f1f9a-7b3c-7a02-8000-000000000002",
+  resumed: "018f1f9a-7b3c-7a03-8000-000000000003",
+  embedded: "018f1f9a-7b3c-7a04-8000-000000000004",
+  left: "018f1f9a-7b3c-7a05-8000-000000000005",
+  right: "018f1f9a-7b3c-7a06-8000-000000000006",
+});
+const PACKAGE_VERSION = JSON.parse(
+  await readFile(new URL("../package.json", import.meta.url), "utf8"),
+).version;
 
 test("Node host opens application sockets through MPP", async () => {
   const socket = new ManagedSocket();
@@ -27,6 +40,37 @@ test("Node host opens application sockets through MPP", async () => {
   host.close(1);
 });
 
+test("Node host preserves structured WebSocket handshake rejection detail", async () => {
+  const server = createServer((_request, response) => {
+    response.writeHead(429, {
+      "content-type": "application/json",
+      "retry-after": "3",
+    });
+    response.end('{"error":"slow down"}');
+  });
+  await new Promise((resolve, reject) => {
+    server.listen(0, "127.0.0.1", resolve);
+    server.once("error", reject);
+  });
+  const endpoint = `ws://127.0.0.1:${server.address().port}`;
+
+  try {
+    await assert.rejects(
+      createNodeHost().connect(endpoint, "test-key", SESSION_IDS.primary),
+      (error) => {
+        assert.equal(error.status, 429);
+        assert.equal(error.body, '{"error":"slow down"}');
+        assert.equal(error.retryAfter, 3);
+        return true;
+      },
+    );
+  } finally {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+  }
+});
+
 test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom tools", async () => {
   const server = await startServer();
   const events = [];
@@ -35,7 +79,7 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
     websocketUrl: server.url,
     thinking: "none",
     reasoningMode: "pro",
-    sessionId: "wasm-session",
+    sessionId: SESSION_IDS.primary,
     tools: {
       multiply: {
         description: "Multiply two integers.",
@@ -55,7 +99,8 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
   const scenario = (async () => {
     const socket = await server.connection;
     assert.equal(socket.request.headers.authorization, "Bearer test-key");
-    assert.equal(socket.request.headers["session-id"], "wasm-session");
+    assert.equal(socket.request.headers["user-agent"], `nanocodex-wasm/${PACKAGE_VERSION}`);
+    assert.equal(socket.request.headers["session-id"], SESSION_IDS.primary);
     const reader = messageReader(socket);
 
     const warmup = await reader.next();
@@ -84,24 +129,52 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
     sendFinal(socket, "resp-first", "42");
 
     const followOn = await reader.next();
-    assert.equal(followOn.previous_response_id, "resp-first");
+    assert.equal(followOn.previous_response_id, undefined);
     assert.equal(followOn.reasoning.effort, "high");
     assert.equal(followOn.service_tier, "priority");
-    assert.match(JSON.stringify(followOn.input), /Add one/);
+    const replay = JSON.stringify(followOn.input);
+    assert.match(replay, /Use multiply/);
+    assert.match(replay, /42/);
+    assert.match(replay, /Add one/);
     sendFinal(socket, "resp-second", "43");
   })();
 
-  const first = agent.turn.prompt({ input: "Use multiply for 6 × 7." });
-  assert.equal(await first.result(), "42");
+  const firstTurn = agent.turn.prompt({ input: "Use multiply for 6 × 7." });
+  const first = await firstTurn.result();
+  assert.equal(first.finalMessage, "42");
+  assert.deepEqual(first.usage, {
+    input_tokens: 20,
+    cached_input_tokens: 10,
+    cache_write_input_tokens: 0,
+    output_tokens: 4,
+    reasoning_output_tokens: 2,
+    total_tokens: 24,
+    estimated_cost: {
+      usd: "0.000175",
+      input_usd: "0.00005",
+      cached_input_usd: "0.000005",
+      cache_write_input_usd: "0",
+      output_usd: "0.00012",
+      service_tier: "standard",
+    },
+    cost_status: "estimated_from_usage",
+  });
+  assert.strictEqual(Actions.turn.getUsage(first), first.usage);
   await agent.session.setThinking("high");
   await agent.session.setFastMode(true);
-  const second = Actions.turn.prompt(agent, { input: "Add one to that result." });
-  assert.equal(await Actions.turn.getResult(second), "43");
+  const second = await Actions.turn.getResult(
+    Actions.turn.prompt(agent, { input: "Add one to that result." }),
+  );
+  assert.equal(second.finalMessage, "43");
   await scenario;
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(server.connections, 1);
   assert.equal(events.filter((event) => event.type === "run.completed").length, 2);
+  assert.equal(
+    events.find((event) => event.type === "run.completed")?.payload.estimated_cost.usd,
+    "0.000175",
+  );
   assert.ok(events.some((event) => event.type === "tool.call" && event.payload.tool === "multiply"));
   watch.off();
   agent.dispose();
@@ -115,7 +188,8 @@ test("WASM snapshots resume authoritative history in a fresh agent", async () =>
     websocketUrl: originalServer.url,
     thinking: "none",
     instructions: "durable wasm instructions",
-    sessionId: "original-session",
+    sessionId: SESSION_IDS.original,
+    workspace: "/virtual/original-workspace",
   });
   const originalScenario = (async () => {
     const socket = await originalServer.connection;
@@ -125,11 +199,12 @@ test("WASM snapshots resume authoritative history in a fresh agent", async () =>
     await reader.next();
     sendFinal(socket, "resp-first", "stored");
   })();
-  const first = original.turn.prompt({ input: "remember cobalt" });
-  assert.equal(await first.result(), "stored");
-  const snapshot = first.snapshot();
+  const first = await original.turn.prompt({ input: "remember cobalt" }).result();
+  assert.equal(first.finalMessage, "stored");
+  const snapshot = first.snapshot;
   assert.equal(snapshot.version, 1);
-  assert.equal(Actions.turn.getSnapshot(first).model, snapshot.model);
+  assert.equal(snapshot.workspace, "/virtual/original-workspace");
+  assert.strictEqual(Actions.turn.getSnapshot(first), snapshot);
   await originalScenario;
   original.dispose();
   await originalServer.close();
@@ -140,12 +215,12 @@ test("WASM snapshots resume authoritative history in a fresh agent", async () =>
     websocketUrl: resumedServer.url,
     thinking: "none",
     instructions: "durable wasm instructions",
-    sessionId: "resumed-session",
+    sessionId: SESSION_IDS.resumed,
     resume: snapshot,
   });
   const resumedScenario = (async () => {
     const socket = await resumedServer.connection;
-    assert.equal(socket.request.headers["session-id"], "resumed-session");
+    assert.equal(socket.request.headers["session-id"], SESSION_IDS.resumed);
     const request = await messageReader(socket).next();
     assert.equal(request.previous_response_id, undefined);
     assert.equal(request.prompt_cache_key, snapshot.prompt_cache_key);
@@ -154,7 +229,7 @@ test("WASM snapshots resume authoritative history in a fresh agent", async () =>
     sendFinal(socket, "resp-resumed", "cobalt");
   })();
   assert.equal(
-    await resumed.turn.prompt({ input: "what did I ask you to remember?" }).result(),
+    (await resumed.turn.prompt({ input: "what did I ask you to remember?" }).result()).finalMessage,
     "cobalt",
   );
   await resumedScenario;
@@ -175,7 +250,10 @@ test("WASM snapshots resume authoritative history in a fresh agent", async () =>
     await reader.next();
     sendFinal(socket, "resp-spawned", "fresh");
   })();
-  assert.equal(await spawned.turn.prompt({ input: "start fresh" }).result(), "fresh");
+  assert.equal(
+    (await spawned.turn.prompt({ input: "start fresh" }).result()).finalMessage,
+    "fresh",
+  );
   await spawnedScenario;
   spawned.dispose();
   resumed.dispose();
@@ -212,7 +290,7 @@ test("Node can load an application-owned web module and resume Codex rollout his
     module: wasm,
     websocketUrl: server.url,
     thinking: "none",
-    sessionId: "raycast-runtime",
+    sessionId: SESSION_IDS.embedded,
     resume: snapshot,
   });
   const scenario = (async () => {
@@ -226,7 +304,8 @@ test("Node can load an application-owned web module and resume Codex rollout his
   })();
 
   assert.equal(
-    await agent.turn.prompt({ input: "what color did I ask you to remember?" }).result(),
+    (await agent.turn.prompt({ input: "what color did I ask you to remember?" }).result())
+      .finalMessage,
     "amber",
   );
   await scenario;
@@ -241,7 +320,7 @@ test("independent agents keep their host connections isolated", async () => {
     apiKey: "left-key",
     websocketUrl: leftServer.url,
     thinking: "none",
-    sessionId: "left-session",
+    sessionId: SESSION_IDS.left,
     tools: {
       leftTool: {
         description: "Only the left agent can see this tool.",
@@ -254,7 +333,7 @@ test("independent agents keep their host connections isolated", async () => {
     apiKey: "right-key",
     websocketUrl: rightServer.url,
     thinking: "none",
-    sessionId: "right-session",
+    sessionId: SESSION_IDS.right,
     tools: {
       rightTool: {
         description: "Only the right agent can see this tool.",
@@ -264,8 +343,8 @@ test("independent agents keep their host connections isolated", async () => {
     },
   });
 
-  const leftTools = globalThis.nanocodexHost.toolDefinitions("left-session");
-  const rightTools = globalThis.nanocodexHost.toolDefinitions("right-session");
+  const leftTools = globalThis.nanocodexHost.toolDefinitions(SESSION_IDS.left);
+  const rightTools = globalThis.nanocodexHost.toolDefinitions(SESSION_IDS.right);
   assert.match(leftTools, /leftTool/);
   assert.doesNotMatch(leftTools, /rightTool/);
   assert.match(rightTools, /rightTool/);
@@ -281,16 +360,16 @@ test("independent agents keep their host connections isolated", async () => {
     sendFinal(socket, `${sessionId}-final`, message);
   };
   const scenarios = Promise.all([
-    serve(leftServer, "left-session", "LEFT"),
-    serve(rightServer, "right-session", "RIGHT"),
+    serve(leftServer, SESSION_IDS.left, "LEFT"),
+    serve(rightServer, SESSION_IDS.right, "RIGHT"),
   ]);
 
   // Prompt the first agent only after the second factory has installed its
   // host. This regresses the old realm-global host overwrite.
-  const [leftResult, rightResult] = await Promise.all([
+  const [leftResult, rightResult] = (await Promise.all([
     left.turn.prompt({ input: "left" }).result(),
     right.turn.prompt({ input: "right" }).result(),
-  ]);
+  ])).map((result) => result.finalMessage);
   assert.equal(leftResult, "LEFT");
   assert.equal(rightResult, "RIGHT");
   await scenarios;

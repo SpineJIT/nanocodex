@@ -4,9 +4,11 @@ Status: implemented.
 
 ## Ownership and public composition
 
-`Nanocodex::new(api_key)` starts the standard fixed-model agent. The builder
-exposes persistent instructions, thinking level, tools, workspace, stable
-session ID, and Responses service policy while keeping driver mechanics private.
+`OpenAi::new(auth)` creates the standard fixed-model client recipe.
+`OpenAi::builder(auth)` exposes transport, storage, history, reasoning, and
+Tower policy. `Nanocodex::builder(openai)` then adds agent instructions, tools,
+workspace, session identity, and lifecycle policy while keeping driver
+mechanics private.
 
 `build()` requires an active Tokio runtime, spawns one stateful driver, and
 returns `(Nanocodex, AgentEvents)`. The driver owns mutable conversation,
@@ -18,40 +20,48 @@ history, code-mode runtime, shell sessions, and prompt-cache identity across
 follow-on turns. A WebSocket policy also reuses its connection. The caller does
 not replay earlier results.
 
-The standard policy is WebSocket plus incremental history. API-key
-authentication defaults to `store: true`; ChatGPT subscription authentication
-defaults to `store: false`. Selecting HTTPS with ChatGPT automatically selects
-full replay. WebSocket is the interactive default because its reused
-connection has the lowest measured warm first-event latency. Native callers
-can select HTTPS when cold start or fresh-fork startup matters more, but a
-session and every fork retain the one policy selected at build time. See
+The standard policy is WebSocket plus incremental history and `store: false`
+for both API-key and ChatGPT subscription authentication. API-key callers can
+opt into durable provider checkpoints with `.store(true)`; ChatGPT
+subscription authentication cannot. Selecting HTTPS with storage disabled
+automatically selects full replay. WebSocket is the interactive default because
+its reused connection has the lowest measured warm first-event latency. Native
+callers can select HTTPS when cold start or fresh-fork startup matters more,
+but a session and every fork retain the one policy selected at build time. See
 [`RESPONSE_TRANSPORT_BENCH.md`](RESPONSE_TRANSPORT_BENCH.md) for the measured
 tradeoffs.
 
-`ResponsesClient<S>` is generic over `Service<ResponsesAttempt>`. The common
-builder defers caller layers until it constructs the configured standard
-service:
+`ResponsesClient<S>` is generic over `Service<ResponsesAttempt>`. The
+`OpenAi` builder applies caller layers when each independent session service is
+constructed:
 
 ```rust,ignore
 use std::time::Duration;
 
-use nanocodex::{Nanocodex, Responses};
+use nanocodex::{Nanocodex, OpenAi};
 use tower::{limit::ConcurrencyLimitLayer, timeout::TimeoutLayer};
 
-let responses = Responses::builder()
+let openai = OpenAi::builder(std::env::var("OPENAI_API_KEY")?)
     .layer(TimeoutLayer::new(Duration::from_secs(180)))
     .layer(ConcurrencyLimitLayer::new(1))
-    .build();
+    .build()?;
 
-let (agent, events) = Nanocodex::builder(api_key)
-    .responses(responses)
+let (agent, events) = Nanocodex::builder(openai)
+    .instructions(
+        "You are a Rust coding agent. Preserve unrelated work and run relevant tests.",
+    )
     .build()?;
 ```
 
-`Responses::builder().service(|| make_stack())` replaces the standard stack
-with a factory for a fully caller-composed service. Every root, cancellation
-replacement, child, and fork receives independent mutable service state.
-Neither path requires boxing, a process server, JSONL, or a global client.
+`OpenAiBuilder::service` replaces the standard stack with a factory for a fully
+caller-composed service. Its API documentation contains the complete compiling
+`tower::service_fn` adapter shape. Every root, cancellation replacement, child,
+and fork receives independent mutable service state. Neither path requires
+boxing, a process server, JSONL, or a global client.
+
+Reasoning and fast-mode values configured on `OpenAiBuilder` become defaults
+for the agent recipe. Calling the corresponding `NanocodexBuilder` method later
+overrides that value for the owned agent.
 
 ## Tower operation boundary
 
@@ -153,7 +163,7 @@ because neither won the complete immutable-input request path.
 Run the portable benchmarks with:
 
 ```sh
-cargo bench -p nanocodex-service --bench tower_responses
+cargo bench -p nanocodex-oai-api --bench tower_responses
 ```
 
 Add `NANOCODEX_BENCH_EVENTS=/path/to/events.jsonl` to include a retained JSONL

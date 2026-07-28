@@ -8,55 +8,30 @@ authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
-description = "A small, high-performance, headless Rust agents SDK"
+description = "Alloy-style facade for the Nanocodex agents SDK"
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["-D", "warnings"]
 
+[features]
+default = []
+observability = ["dep:nanocodex-observability"]
+
 [dependencies]
-nanocodex-core.workspace = true
-nanocodex-service.workspace = true
+nanocodex-agent.workspace = true
+nanocodex-oai-api.workspace = true
 nanocodex-tools.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
-thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "sync"] }
-tower.workspace = true
-tracing.workspace = true
-web-time.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-async-trait.workspace = true
-base64.workspace = true
-chrono.workspace = true
-getrandom.workspace = true
-image.workspace = true
-iana-time-zone.workspace = true
-nanocodex-macros.workspace = true
-nanocodex-mcp.workspace = true
-schemars.workspace = true
-sha1.workspace = true
-reqwest.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
-url.workspace = true
-uuid.workspace = true
-
-[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
-js-sys.workspace = true
-wasm-bindgen.workspace = true
-wasm-bindgen-futures.workspace = true
+nanocodex-observability = { workspace = true, optional = true }
 
 [dev-dependencies]
-eyre.workspace = true
-futures-util.workspace = true
-tokio-tungstenite.workspace = true
-tracing-subscriber.workspace = true
-tempfile.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

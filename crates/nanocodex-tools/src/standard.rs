@@ -1,6 +1,10 @@
-use nanocodex_core::{CustomToolFormat, ToolDefinition};
+//! Stable identities and reusable implementations for standard workspace tools.
+
+use nanocodex_oai_api::{responses::CustomToolFormat, tools::ToolDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+pub use crate::plan::UpdatePlanTool;
 
 const APPLY_PATCH_GRAMMAR: &str = include_str!("apply_patch/apply_patch.lark");
 
@@ -11,14 +15,20 @@ const APPLY_PATCH_GRAMMAR: &str = include_str!("apply_patch/apply_patch.lark");
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StandardTool {
+    /// Spawn or poll a shell command.
     ExecCommand,
+    /// Write to or poll an existing shell session.
     WriteStdin,
+    /// Replace the model's retained task plan.
     UpdatePlan,
+    /// Apply a structured filesystem patch.
     ApplyPatch,
+    /// Load a local image into multimodal model context.
     ViewImage,
 }
 
 impl StandardTool {
+    /// Returns the stable model-visible tool name.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -30,6 +40,7 @@ impl StandardTool {
         }
     }
 
+    /// Returns the complete model-visible definition.
     #[must_use]
     pub fn definition(self) -> ToolDefinition {
         match self {

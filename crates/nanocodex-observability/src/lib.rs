@@ -1,4 +1,7 @@
-//! Application-owned tracing setup for Nanocodex spans.
+#![doc = include_str!("../README.md")]
+#![deny(missing_docs, rustdoc::broken_intra_doc_links)]
+
+extern crate self as nanocodex_observability;
 
 use std::{fs::OpenOptions, io, path::PathBuf};
 
@@ -22,17 +25,22 @@ const DEPLOYMENT_ENVIRONMENT_NAME: &str = "deployment.environment.name";
 /// Human-readable or structured local tracing output.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum LogFormat {
+    /// Multiline human-readable records.
     Pretty,
+    /// Dense human-readable records.
     #[default]
     Compact,
+    /// Structured JSON records.
     Json,
 }
 
 /// Destination for the local formatting layer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum LogOutput {
+    /// Write local records to standard error.
     #[default]
     Stderr,
+    /// Append local records to a file, creating its parent directories.
     File(PathBuf),
 }
 
@@ -55,24 +63,31 @@ pub struct ObservabilityGuard {
     _writer: WorkerGuard,
 }
 
+/// Failure to configure, install, or flush observability.
 #[derive(Debug, thiserror::Error)]
 pub enum ObservabilityError {
+    /// A local or OpenTelemetry filter is invalid.
     #[error("invalid tracing filter: {0}")]
     Filter(#[from] tracing_subscriber::filter::ParseError),
+    /// The configured local output could not be opened.
     #[error("failed to open tracing output: {0}")]
     Output(#[from] io::Error),
+    /// The OTLP exporter could not be constructed.
     #[error("failed to configure OTLP exporter: {0}")]
     Otlp(#[from] opentelemetry_otlp::ExporterBuildError),
+    /// The OpenTelemetry SDK could not flush or shut down.
     #[error("failed to flush or shut down the OpenTelemetry exporter: {0}")]
     OTelSdk(#[from] opentelemetry_sdk::error::OTelSdkError),
+    /// Another process-global tracing subscriber is already installed.
     #[error("a global tracing subscriber is already installed")]
     Subscriber,
 }
 
 impl ObservabilityBuilder {
+    /// Starts a builder with the service identity attached to exported spans.
     #[must_use]
     pub fn new(service_name: impl Into<String>, service_version: impl Into<String>) -> Self {
-        let filter = "warn,nanocodex=info,nanocodex_service=info,nanocodex_tools=info,nanocodex_mcp=info,mpp_egress=info".to_owned();
+        let filter = "warn,nanocodex=info,nanocodex_oai_api=info,nanocodex_tools=info".to_owned();
         Self {
             otel_filter: filter.clone(),
             filter,
@@ -85,6 +100,7 @@ impl ObservabilityBuilder {
         }
     }
 
+    /// Sets the filter applied to local formatted records.
     #[must_use]
     pub fn filter(mut self, filter: impl Into<String>) -> Self {
         self.filter = filter.into();
@@ -98,18 +114,21 @@ impl ObservabilityBuilder {
         self
     }
 
+    /// Selects the local record format.
     #[must_use]
     pub const fn format(mut self, format: LogFormat) -> Self {
         self.format = format;
         self
     }
 
+    /// Selects the local record destination.
     #[must_use]
     pub fn output(mut self, output: LogOutput) -> Self {
         self.output = output;
         self
     }
 
+    /// Sets the deployment environment attached to exported spans.
     #[must_use]
     pub fn environment(mut self, environment: impl Into<String>) -> Self {
         self.environment = Some(environment.into());
@@ -195,7 +214,6 @@ impl ObservabilityBuilder {
         let Some(endpoint) = self.otlp_endpoint.as_deref() else {
             return Ok(None);
         };
-        drop(rustls::crypto::ring::default_provider().install_default());
         let resource = self.resource();
         if current_tokio_runtime_is_multi_thread() {
             let exporter = SpanExporter::builder()
@@ -399,6 +417,7 @@ mod tests {
             let _entered = span.enter();
             tracing::info!("test event");
         }
+        guard.shutdown().unwrap();
         guard.shutdown().unwrap();
         let request = request_received.recv_timeout(OTLP_TEST_TIMEOUT).unwrap();
         assert!(

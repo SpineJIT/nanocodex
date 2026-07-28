@@ -92,7 +92,7 @@ impl Update {
         let checksum_manifest = download(&client, checksums).await?;
         let expected = checksum_for(&checksum_manifest, asset_name)?;
         let contents = download(&client, binary).await?;
-        let actual = format!("{:x}", Sha256::digest(&contents));
+        let actual = hex::encode(Sha256::digest(&contents));
         if actual != expected {
             bail!("checksum mismatch for {asset_name}: expected {expected}, downloaded {actual}");
         }
@@ -115,12 +115,12 @@ impl Update {
         Ok(())
     }
 
-    fn channel(&self) -> &'static str {
+    const fn channel(&self) -> &'static str {
         if self.nightly { "nightly" } else { "stable" }
     }
 }
 
-fn release_api(nightly: bool) -> &'static str {
+const fn release_api(nightly: bool) -> &'static str {
     if nightly {
         NIGHTLY_RELEASE_API
     } else {
@@ -191,7 +191,7 @@ fn checksum_for(manifest: &[u8], asset_name: &str) -> Result<String> {
     bail!("SHA256SUMS does not contain {asset_name}")
 }
 
-fn release_asset_name() -> Result<&'static str> {
+const fn release_asset_name() -> Result<&'static str> {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     return Ok("nanocodex-x86_64-unknown-linux-gnu");
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]

@@ -7,8 +7,12 @@ use std::{
 };
 
 use nanocodex::{
-    AgentEventKind, AgentEvents, AgentHandle, Nanocodex, Tool, ToolContext, ToolDefinition,
-    ToolExecution, ToolInput, ToolResult, Tools, ToolsBuildError, async_trait,
+    AgentEvents, Nanocodex, Tool, Tools,
+    agent::{AgentHandle, events::AgentEventKind},
+    tools::{
+        ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult, ToolsBuildError,
+        contract::async_trait,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -180,13 +184,9 @@ fn drain_events(
 
 #[async_trait]
 impl Tool for ChildAgent {
-    fn name(&self) -> &'static str {
-        self.kind.name()
-    }
-
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
-            self.name(),
+            self.kind.name(),
             self.kind.description(),
             json!({
                 "type": "object",
@@ -204,6 +204,10 @@ impl Tool for ChildAgent {
                 "additionalProperties": false
             }),
         )
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
     }
 
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
@@ -225,11 +229,11 @@ impl Tool for ChildAgent {
             .result()
             .await?;
         agents.insert(agent_id, child, event_task).await;
-        Ok(ToolExecution::json(&WorkerResult {
+        Ok(ToolOutput::json(&WorkerResult {
             agent_id,
             kind: self.kind.result_name(),
             role,
-            report: result.final_message,
+            report: result.into_final_message(),
         }))
     }
 }
@@ -240,13 +244,9 @@ struct PromptAgent {
 
 #[async_trait]
 impl Tool for PromptAgent {
-    fn name(&self) -> &'static str {
-        "prompt_agent"
-    }
-
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
-            self.name(),
+            "prompt_agent",
             "Runs a follow-up turn on a previously spawned or forked child, preserving that child's conversation, response chain, cache lineage, WebSocket, and tools.",
             json!({
                 "type": "object",
@@ -278,9 +278,9 @@ impl Tool for PromptAgent {
             .await
             .ok_or_else(|| std::io::Error::other(format!("unknown agent_id {agent_id}")))?;
         let result = child.prompt(task).await?.result().await?;
-        Ok(ToolExecution::json(&FollowUpResult {
+        Ok(ToolOutput::json(&FollowUpResult {
             agent_id,
-            report: result.final_message,
+            report: result.into_final_message(),
         }))
     }
 }

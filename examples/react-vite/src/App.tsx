@@ -1,20 +1,33 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { formatUnits } from "viem";
-import { useConnect, useConnection, useConnectors } from "wagmi";
-import { tempo } from "wagmi/chains";
-import { Hooks } from "wagmi/tempo";
-import { PATH_USD } from "./tempo-policy";
+import {
+  FormEvent,
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
-type Thinking = "low" | "medium" | "high" | "xhigh";
+import type { MppConnection } from "./MppControls";
+import type {
+  AgentWorkerMessage as WorkerMessage,
+} from "./protocol";
+import type {
+  AgentEvent,
+  Thinking,
+} from "nanocodex";
+import {
+  appendRetainedEvents,
+  summarizeEventBatch,
+} from "./eventBatch";
+
+const MppControls = lazy(async () => ({
+  default: (await import("./MppControls")).MppControls,
+}));
+
 type Status = "waiting" | "starting" | "ready" | "running" | "completed" | "failed";
 type JsonObject = Record<string, unknown>;
-type AgentEvent = {
-  protocol_version: number;
-  request_id: string;
-  seq: number;
-  type: string;
-  payload: JsonObject;
-};
 type TranscriptItem = {
   id: number;
   role: "user" | "assistant" | "error";
@@ -28,19 +41,12 @@ type ToolTrace = {
   status?: string;
   duration_ns?: number;
 };
-type WorkerMessage =
-  | { type: "ready"; transport: "openai" | "mpp"; rootAddress?: string; accessKeyAddress?: string; channelId?: string }
-  | { type: "event"; event: AgentEvent }
-  | { type: "result"; id: number; message: string; payment?: { channelId?: string; cumulative: string } }
-  | { type: "error"; id?: number; message: string };
-
 const DEFAULT_PROMPT = `Inspect the browser runtime with tools.browserInfo(), then explain what is running in Rust/WASM versus JavaScript. End with one concrete idea for a useful browser-native tool.`;
 
 export function App() {
-  const connection = useConnection();
-  const connectors = useConnectors();
-  const connect = useConnect();
   const workerRef = useRef<Worker | null>(null);
+  const eventQueue = useRef<AgentEvent[]>([]);
+  const eventFrame = useRef<number | undefined>(undefined);
   const nextId = useRef(1);
   const startedAt = useRef(0);
   const [thinking, setThinking] = useState<Thinking>("high");
@@ -55,14 +61,47 @@ export function App() {
   const [reasoning, setReasoning] = useState("");
   const [elapsedMs, setElapsedMs] = useState(0);
   const [payment, setPayment] = useState<{ rootAddress?: string; accessKeyAddress?: string; channelId?: string; cumulative?: string }>({});
-  const mppBalance = Hooks.token.useGetBalance({
-    account: connection.address,
-    token: PATH_USD,
-    query: {
-      enabled: transport === "mpp" && connection.status === "connected",
-      refetchInterval: 5_000,
-    },
-  });
+  const [mppConnection, setMppConnection] = useState<MppConnection>();
+  const updateMppConnection = useCallback(
+    (connection: MppConnection | undefined) => setMppConnection(connection),
+    [],
+  );
+  const flushEvents = useCallback(() => {
+    if (eventFrame.current !== undefined) {
+      cancelAnimationFrame(eventFrame.current);
+      eventFrame.current = undefined;
+    }
+    const queued = eventQueue.current;
+    eventQueue.current = [];
+    if (!queued.length) return;
+    const summary = summarizeEventBatch(
+      queued,
+      startedAt.current,
+      Date.now(),
+    );
+    setEvents((current) => appendRetainedEvents(current, queued));
+    const assistant = summary.assistant;
+    if (assistant) {
+      setLiveAnswer((current) => assistant.mode === "replace"
+        ? assistant.text
+        : current + assistant.text);
+    }
+    if (summary.reasoning) {
+      setReasoning((current) => current + summary.reasoning);
+    }
+    if (summary.status) setStatus(summary.status);
+    if (summary.elapsedMs !== undefined) setElapsedMs(summary.elapsedMs);
+    if (summary.errors.length) {
+      setTranscript((current) => [
+        ...current,
+        ...summary.errors.map((text) => ({
+          id: nextId.current++,
+          role: "error" as const,
+          text,
+        })),
+      ]);
+    }
+  }, []);
 
   useEffect(() => {
     const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
@@ -79,31 +118,16 @@ export function App() {
         return;
       }
       if (data.type === "event") {
-        const event = data.event;
-        setEvents((current) => [...current.slice(-499), event]);
-        if (event.type === "run.started") {
-          setStatus("running");
-        } else if (event.type === "assistant.delta") {
-          setLiveAnswer((current) => current + payloadText(event));
-        } else if (event.type === "assistant.message") {
-          setLiveAnswer(payloadText(event));
-        } else if (event.type === "reasoning.summary.delta") {
-          setReasoning((current) => current + payloadText(event));
-        } else if (event.type === "run.completed") {
-          setStatus("completed");
-          setElapsedMs(payloadNumber(event.payload, "duration_ms") ?? Date.now() - startedAt.current);
-        } else if (event.type === "run.failed") {
-          setStatus("failed");
-          setElapsedMs(payloadNumber(event.payload, "duration_ms") ?? Date.now() - startedAt.current);
-        } else if (event.type === "run.error") {
-          const message = payloadString(event.payload, "message") ?? "The run failed.";
-          setTranscript((current) => [...current, { id: nextId.current++, role: "error", text: message }]);
-        }
+        eventQueue.current.push(data.event);
+        eventFrame.current ??= requestAnimationFrame(flushEvents);
         return;
       }
+      flushEvents();
       if (data.type === "result") {
         if (data.payment) setPayment((current) => ({ ...current, ...data.payment }));
         setPending((current) => without(current, data.id));
+        setStatus("completed");
+        setElapsedMs(Date.now() - startedAt.current);
         setLiveAnswer(data.message);
         setTranscript((current) => [
           ...current,
@@ -113,13 +137,28 @@ export function App() {
       }
       if (data.id !== undefined) setPending((current) => without(current, data.id!));
       setStatus("failed");
-      setTranscript((current) => [
-        ...current,
-        { id: data.id ?? nextId.current++, role: "error", text: data.message },
-      ]);
+      setTranscript((current) => {
+        const tail = current.at(-1);
+        return tail?.role === "error" && tail.text === data.message
+          ? current
+          : [
+              ...current,
+              {
+                id: data.id ?? nextId.current++,
+                role: "error",
+                text: data.message,
+              },
+            ];
+      });
     };
-    return () => worker.terminate();
-  }, []);
+    return () => {
+      if (eventFrame.current !== undefined) {
+        cancelAnimationFrame(eventFrame.current);
+      }
+      eventQueue.current = [];
+      worker.terminate();
+    };
+  }, [flushEvents]);
 
   useEffect(() => {
     if (status !== "running") return;
@@ -137,6 +176,11 @@ export function App() {
 
   async function start(event: FormEvent) {
     event.preventDefault();
+    if (eventFrame.current !== undefined) {
+      cancelAnimationFrame(eventFrame.current);
+      eventFrame.current = undefined;
+    }
+    eventQueue.current = [];
     setReady(false);
     setStatus("starting");
     setPending(new Set());
@@ -147,15 +191,10 @@ export function App() {
     setElapsedMs(0);
     try {
       if (transport === "mpp") {
-        const connector = connectors[0];
-        if (!connector) throw new Error("Tempo Wallet connector is unavailable");
-        const connected = connection.status === "connected"
-          ? connection
-          : await connect.mutateAsync({ connector, chainId: tempo.id });
-        const rootAddress = "address" in connected
-          ? connected.address
-          : connected.accounts[0];
-        setPayment({ rootAddress });
+        if (!mppConnection) {
+          throw new Error("Tempo Wallet integration is still loading");
+        }
+        setPayment({ rootAddress: await mppConnection.start() });
       } else {
         setPayment({});
       }
@@ -239,8 +278,21 @@ export function App() {
               <option value="xhigh">xhigh</option>
             </select>
           </label>
-          <button className="connect" type="submit">{ready ? "Reset session" : "Start agent"}</button>
+          <button
+            className="connect"
+            type="submit"
+            disabled={transport === "mpp" && !mppConnection}
+          >
+            {transport === "mpp" && !mppConnection
+              ? "Loading Tempo…"
+              : ready ? "Reset session" : "Start agent"}
+          </button>
         </form>
+        {transport === "mpp" ? (
+          <Suspense fallback={null}>
+            <MppControls onChange={updateMppConnection} />
+          </Suspense>
+        ) : null}
 
         <div className="panel-divider" />
 
@@ -261,7 +313,7 @@ export function App() {
             {transport === "mpp" ? (
               <div>
                 <p>
-                  Tempo root <code>{shortAddress(payment.rootAddress ?? connection.address)}</code> delegates to access key{" "}
+                  Tempo root <code>{shortAddress(payment.rootAddress)}</code> delegates to access key{" "}
                   <code>{shortAddress(payment.accessKeyAddress)}</code>.
                 </p>
                 {payment.channelId && <p>Reusable MPP channel <code>{shortAddress(payment.channelId)}</code>.</p>}
@@ -289,7 +341,7 @@ export function App() {
           <Metric label="MPP paid" value={payment.cumulative ? `${Number(payment.cumulative) / 1_000_000}` : "—"} />
         )}
         {transport === "mpp" && (
-          <Metric label="PathUSD available" value={mppBalance.data === undefined ? "—" : formatUnits(mppBalance.data.amount, 6)} />
+          <Metric label="PathUSD available" value={mppConnection?.balance ?? "—"} />
         )}
       </section>
 
@@ -402,10 +454,6 @@ function isLifecycleEvent(event: AgentEvent): boolean {
     "run.completed",
     "run.failed",
   ].includes(event.type);
-}
-
-function payloadText(event: AgentEvent): string {
-  return payloadString(event.payload, "text") ?? "";
 }
 
 function payloadString(payload: JsonObject, key: string): string | undefined {

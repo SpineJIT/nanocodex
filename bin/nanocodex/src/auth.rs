@@ -2,7 +2,7 @@ use std::{path::PathBuf, process::Command};
 
 use clap::{Args, Subcommand};
 use eyre::{Result, WrapErr};
-use nanocodex::{ChatGptLogin, chatgpt_auth_status, logout_chatgpt};
+use nanocodex::oai::auth::{ChatGptLogin, chatgpt_auth_status, logout_chatgpt};
 
 use crate::config::default_auth_file;
 

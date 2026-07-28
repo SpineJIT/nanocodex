@@ -88,8 +88,6 @@ struct LiveChain {
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     let config = DemoConfig::from_env()?;
     let mut stored_response_ids = Vec::new();
     let result = run_demo(&config, &mut stored_response_ids).await;
@@ -543,7 +541,7 @@ fn parse_usage(usage: Option<&Value>) -> Usage {
 }
 
 impl Usage {
-    fn add(&mut self, other: &Self) {
+    const fn add(&mut self, other: &Self) {
         self.input += other.input;
         self.cached += other.cached;
         self.cache_write += other.cache_write;

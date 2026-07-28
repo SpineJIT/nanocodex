@@ -275,7 +275,7 @@ cargo bench -p nanocodex-bin --bench tui_render
 ```
 
 Use `just bench-stream` for the focused cross-layer gate. It also measures the
-timed agent-event envelope in `nanocodex-service` and the TUI timing aggregator,
+timed agent-event envelope in `nanocodex-oai-api` and the TUI timing aggregator,
 so UI improvements are not credited for delays introduced before Ratatui
 receives an event or for unmeasured instrumentation overhead.
 

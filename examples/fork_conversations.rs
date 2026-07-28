@@ -1,9 +1,10 @@
-use std::{process, time::Duration};
+use std::time::Duration;
 
 use eyre::{Result, WrapErr};
 use nanocodex::{
-    AgentEventKind, AgentEvents, Nanocodex, Responses, ResponsesBuilder, ResponsesTransport,
-    StandardResponses, Thinking, Tools, TurnResult,
+    AgentEvents, Nanocodex, OpenAi, Thinking, Tools, TurnResult,
+    agent::{events::AgentEventKind, session::SessionId},
+    oai::{OpenAiBuilder, tower::StandardServiceFactory, transport::ResponsesTransport},
 };
 use tokio::task::JoinHandle;
 use tower::{limit::ConcurrencyLimitLayer, timeout::TimeoutLayer};
@@ -38,25 +39,24 @@ async fn main() -> Result<()> {
 
     // The fixed transport/storage policy and these layers are inherited by
     // every fork, while each fork receives fresh mutable transport state.
-    let responses = configured_responses()?
+    let openai = configured_openai(api_key)?
         .layer(TimeoutLayer::new(Duration::from_mins(2)))
         .layer(ConcurrencyLimitLayer::new(1))
-        .build();
+        .build()?;
 
     // A fully custom Service<ResponsesAttempt> is supplied as
-    // `Responses::builder().service(|| make_service()).build()` so the root,
-    // cancellation replacements, and every branch get independent mutable
-    // service state.
+    // `OpenAi::builder(api_key).service(|| make_service()).build()` so the
+    // root, cancellation replacements, and every branch get independent
+    // mutable service state.
     let tools = Tools::builder().without_defaults().build()?;
-    let lineage = format!("fork-ledger-example-{}", process::id());
+    let lineage = SessionId::new();
     let workspace = std::env::current_dir().wrap_err("failed to resolve the current directory")?;
-    let (agent, root_events) = Nanocodex::builder(api_key)
-        .session_id(&lineage)
+    let (agent, root_events) = Nanocodex::builder(openai)
+        .session_id(lineage)
         .instructions(LEDGER_PROMPT)
         .thinking(Thinking::Low)
         .tools(tools)
         .workspace(workspace)
-        .responses(responses)
         .build()?;
 
     println!("conversation lineage/cache key: {lineage}");
@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
             .await?
             .result()
             .await?;
-        println!("root {turn:02}: {}", result.final_message);
+        println!("root {turn:02}: {}", result.final_message());
         checkpoints.push(result);
     }
 
@@ -120,11 +120,11 @@ async fn main() -> Result<()> {
         latest_turn.result(),
     )?;
     println!("\ncheckpoint views (UNKNOWN proves later context did not leak backward)");
-    println!("root mainline : {}", mainline_11.final_message);
-    println!("branch from 03: {}", result_3.final_message);
-    println!("branch from 06: {}", result_6.final_message);
-    println!("branch from 09: {}", result_9.final_message);
-    println!("latest at 10 : {}", result_10.final_message);
+    println!("root mainline : {}", mainline_11.final_message());
+    println!("branch from 03: {}", result_3.final_message());
+    println!("branch from 06: {}", result_6.final_message());
+    println!("branch from 09: {}", result_9.final_message());
+    println!("latest at 10 : {}", result_10.final_message());
 
     // A branch is a normal Nanocodex handle: it retains its own response chain
     // and can diverge while the root continues independently.
@@ -143,8 +143,8 @@ async fn main() -> Result<()> {
     let (branch_divergence, root_continuation) =
         tokio::try_join!(branch_divergence.result(), root_continuation.result())?;
     println!("\nindependent continuation");
-    println!("branch from 03: {}", branch_divergence.final_message);
-    println!("root           : {}", root_continuation.final_message);
+    println!("branch from 03: {}", branch_divergence.final_message());
+    println!("root           : {}", root_continuation.final_message());
 
     // Dropping command handles stops their drivers and closes their independent
     // event streams. TurnResults may outlive the agents as inert checkpoints.
@@ -205,12 +205,12 @@ fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_owned())
 }
 
-fn configured_responses() -> Result<ResponsesBuilder<StandardResponses>> {
+fn configured_openai(api_key: String) -> Result<OpenAiBuilder<StandardServiceFactory>> {
     let transport = std::env::var("NANOCODEX_RESPONSES_TRANSPORT")
         .unwrap_or_else(|_| ResponsesTransport::WebSocket.to_string())
         .parse::<ResponsesTransport>()
         .map_err(eyre::Report::msg)?;
-    let mut responses = Responses::builder()
+    let mut openai = OpenAi::builder(api_key)
         .transport(transport)
         .websocket_url(env_or(
             "OPENAI_RESPONSES_WEBSOCKET_URL",
@@ -218,11 +218,11 @@ fn configured_responses() -> Result<ResponsesBuilder<StandardResponses>> {
         ))
         .api_base_url(env_or("OPENAI_API_BASE_URL", DEFAULT_API_BASE_URL));
     if let Ok(store) = std::env::var("NANOCODEX_STORE_RESPONSES") {
-        responses = responses.store(
+        openai = openai.store(
             store
                 .parse::<bool>()
                 .wrap_err("NANOCODEX_STORE_RESPONSES must be true or false")?,
         );
     }
-    Ok(responses)
+    Ok(openai)
 }

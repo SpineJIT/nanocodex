@@ -49,21 +49,28 @@
 
 ## Workspace boundaries
 
-- `nanocodex-core` owns dependency-light public data: prompts, events, model
-  configuration, and complete typed Responses wire/domain types.
-- `nanocodex-service` owns behavior at the API boundary: the persistent
-  WebSocket, stream processing, retry policy, telemetry, and generic Tower
-  service/client.
+- `nanocodex-oai-api` owns the complete OpenAI boundary: dependency-light
+  prompts/events/wire types, the managed context state machine, persistent
+  transports, typed retry policy, telemetry, and generic Tower client.
 - `nanocodex-tools` owns code mode, built-in tools, the heterogeneous registry,
-  and the public `Tool` trait.
-- `nanocodex-mcp` owns MCP transports, background handshake/discovery,
-  authenticated connection inputs, deferred tool search, and remote dispatch.
-- `nanocodex` composes those crates into the owned agent lifecycle and exports
-  the ergonomic builders and common types.
-- `nanocodex-macros` implements `#[tool]`. Keep the executable under
-  `bin/nanocodex`; do not move CLI behavior into the library.
+  MCP transports and discovery, deferred tool search, and remote dispatch. MCP
+  is always available on native targets.
+- `nanocodex-agent` owns the private driver, lifecycle policy, branching,
+  snapshots, Codex rollouts, and ergonomic agent builders.
+- `nanocodex` is an Alloy-style facade containing reexports, named component
+  modules, and a small prelude. It contains no runtime implementation.
+- Keep facade imports canonical: common types may appear at the crate root and
+  detailed APIs under their owning `agent`, `oai`, or `tools` module. Do not add
+  sibling convenience reexports.
+- `nanocodex-tools/macros` contains the `nanocodex-tools-macros` package that
+  implements `#[tool]`. Keep the executable under `bin/nanocodex`; do not move
+  CLI behavior into the library.
+- Tempo payment, egress, and `NanoUSD` support stay under `bin/`; public
+  `nanocodex-*` library crates must not depend on them.
 - Each lower crate must remain useful without importing the higher orchestration
   crate. Avoid circular concepts and leaky socket/runtime types.
+- `scripts/check-crate-boundaries.sh` is the executable dependency policy.
+  Update its snapshot only for a deliberate architecture change.
 
 ## Runtime invariants
 

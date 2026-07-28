@@ -112,7 +112,14 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
     workload = args.workload.resolve()
     env_file = args.env_file.resolve()
     environment = os.environ.copy()
-    environment["OPENAI_API_KEY"] = load_api_key(env_file)
+    auth_file = args.auth_file.resolve() if args.auth_file is not None else None
+    if auth_file is not None:
+        if not auth_file.is_file():
+            raise RuntimeError(f"shared ChatGPT auth file does not exist: {auth_file}")
+        environment.pop("CODEX_API_KEY", None)
+        environment.pop("OPENAI_API_KEY", None)
+    else:
+        environment["OPENAI_API_KEY"] = load_api_key(env_file)
     trials: list[dict[str, Any]] = []
     for trial in range(1, args.trials + 1):
         order = ["nanocodex", "stock_codex"]
@@ -129,6 +136,8 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     "--source-commit",
                     args.nanocodex_commit,
                 ]
+                if auth_file is not None:
+                    command.extend(["--auth-file", str(auth_file)])
             else:
                 app_server = (
                     [str(args.codex_app_server.resolve())]
@@ -142,8 +151,6 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     str(cwd),
                     "--workload",
                     str(workload),
-                    "--env-file",
-                    str(env_file),
                     "--source-commit",
                     args.codex_commit,
                     "--codex-cli-version",
@@ -151,6 +158,10 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     "--app-server",
                     *app_server,
                 ]
+                if auth_file is not None:
+                    command.extend(["--auth-file", str(auth_file)])
+                else:
+                    command.extend(["--env-file", str(env_file)])
             try:
                 result = run_command(command, environment)
                 trials.append(
@@ -201,6 +212,7 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "trials_per_implementation": args.trials,
         "schedule": "alternating_sequential",
+        "auth_mode": "chatgpt" if auth_file is not None else "api_key",
         "summary": summary,
         "trials": trials,
     }
@@ -222,10 +234,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cwd", type=Path, default=Path.cwd())
     parser.add_argument("--workload", type=Path, required=True)
     parser.add_argument("--env-file", type=Path, default=Path.cwd() / ".env")
+    parser.add_argument(
+        "--auth-file",
+        type=Path,
+        help="shared Codex auth.json used by both implementations",
+    )
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
 
-if __name__ == "__main__":
+def main() -> int:
     result = benchmark(parse_args())
-    print(json.dumps({key: result[key] for key in ("workload", "trials_per_implementation", "schedule", "summary")}, indent=2))
+    print(
+        json.dumps(
+            {
+                key: result[key]
+                for key in (
+                    "workload",
+                    "trials_per_implementation",
+                    "schedule",
+                    "auth_mode",
+                    "summary",
+                )
+            },
+            indent=2,
+        )
+    )
+    attempted = result["trials_per_implementation"]
+    return int(
+        any(
+            result["summary"][implementation]["successful_runs"] != attempted
+            for implementation in ("nanocodex", "stock_codex")
+        )
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

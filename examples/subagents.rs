@@ -8,8 +8,11 @@ use std::{
 
 use eyre::{Result, WrapErr};
 use nanocodex::{
-    AgentEventKind, AgentEvents, AgentHandle, Nanocodex, Thinking, Tool, ToolContext,
-    ToolDefinition, ToolExecution, ToolInput, ToolResult, Tools, async_trait,
+    AgentEvents, Nanocodex, OpenAi, Thinking, Tool, Tools,
+    agent::{AgentHandle, events::AgentEventKind},
+    tools::{
+        ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult, contract::async_trait,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -171,13 +174,9 @@ impl ChildAgent {
 
 #[async_trait]
 impl Tool for ChildAgent {
-    fn name(&self) -> &'static str {
-        self.kind.name()
-    }
-
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
-            self.name(),
+            self.kind.name(),
             self.kind.description(),
             json!({
                 "type": "object",
@@ -216,11 +215,11 @@ impl Tool for ChildAgent {
 
         let result = child.prompt(self.kind.prompt(task)).await?.result().await?;
         agents.insert(agent_id, child).await;
-        Ok(ToolExecution::json(&WorkerResult {
+        Ok(ToolOutput::json(&WorkerResult {
             agent_id,
             kind: self.kind.result_name(),
             role,
-            report: result.final_message,
+            report: result.into_final_message(),
         }))
     }
 }
@@ -232,13 +231,9 @@ struct PromptAgent {
 
 #[async_trait]
 impl Tool for PromptAgent {
-    fn name(&self) -> &'static str {
-        "prompt_agent"
-    }
-
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
-            self.name(),
+            "prompt_agent",
             "Runs a follow-up turn on a previously spawned or forked agent, preserving that agent's conversation, response chain, cache lineage, WebSocket, and tools.",
             json!({
                 "type": "object",
@@ -270,9 +265,9 @@ impl Tool for PromptAgent {
             .await
             .ok_or_else(|| std::io::Error::other(format!("unknown agent_id {agent_id}")))?;
         let result = child.prompt(task).await?.result().await?;
-        Ok(ToolExecution::json(&FollowUpResult {
+        Ok(ToolOutput::json(&FollowUpResult {
             agent_id,
-            report: result.final_message,
+            report: result.into_final_message(),
         }))
     }
 }
@@ -284,7 +279,8 @@ async fn main() -> Result<()> {
     let workspace = std::env::current_dir().wrap_err("failed to resolve the workspace")?;
     let child_agents = Arc::new(ChildAgents::default());
     let tools_agents = Arc::downgrade(&child_agents);
-    let (agent, events) = Nanocodex::builder(api_key)
+    let openai = OpenAi::new(api_key)?;
+    let (agent, events) = Nanocodex::builder(openai)
         .instructions(
             "You are the lead engineering orchestrator. Code Mode exposes spawn_agent for a reusable clean child, fork_agent for a reusable child with the invoking agent's latest safe context, and prompt_agent for follow-up turns using a returned agent_id. Decide your own decomposition, concurrency, sequencing, follow-ups, and synthesis. Treat worker outputs as attributed evidence rather than fabricating them.",
         )
@@ -328,6 +324,6 @@ async fn main() -> Result<()> {
         .await?
         .result()
         .await?;
-    println!("{}", result.final_message);
+    println!("{}", result.final_message());
     Ok(())
 }

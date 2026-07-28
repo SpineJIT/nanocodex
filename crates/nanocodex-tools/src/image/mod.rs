@@ -1,3 +1,5 @@
+//! Prompt image preparation and model-output image normalization.
+
 use std::{
     collections::{HashMap, VecDeque},
     io::Cursor,
@@ -12,7 +14,8 @@ use image::{
     codecs::{jpeg::JpegEncoder, png::PngEncoder, webp::WebPEncoder},
     imageops::FilterType,
 };
-use nanocodex_core::{ContentItem, ImageDetail, PromptInput, UserInput};
+pub use nanocodex_oai_api::ImageDetail;
+use nanocodex_oai_api::{PromptInput, UserInput, responses::ContentItem};
 use sha1::{Digest as _, Sha1};
 
 use super::{ToolOutputBody, ToolOutputContent};
@@ -150,6 +153,10 @@ impl ImagePreparationError {
     }
 }
 
+/// Validates, normalizes, and bounds images returned by a tool.
+///
+/// Unsupported or failed images become model-visible text placeholders. CPU
+/// image work runs on the blocking pool.
 pub async fn prepare_output_images(output: &mut ToolOutputBody) {
     let ToolOutputBody::Content(content) = output else {
         return;
@@ -177,6 +184,10 @@ pub async fn prepare_output_images(output: &mut ToolOutputBody) {
     }
 }
 
+/// Converts public prompt input into provider-ready typed content.
+///
+/// Local or data-URL images are validated and resized according to their detail
+/// policy. Audio input is retained as an explicit placeholder until supported.
 pub async fn prepare_user_input(input: &PromptInput) -> Vec<ContentItem> {
     let input = match input {
         PromptInput::Text(text) => vec![UserInput::Text { text: text.clone() }],

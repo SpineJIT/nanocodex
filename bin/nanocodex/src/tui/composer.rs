@@ -45,7 +45,7 @@ impl ComposerLayout {
         Self { rows }
     }
 
-    pub(super) fn row_count(&self) -> usize {
+    pub(super) const fn row_count(&self) -> usize {
         self.rows.len()
     }
 

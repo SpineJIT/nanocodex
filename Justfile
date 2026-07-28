@@ -9,6 +9,7 @@ agent_artifact := agent_artifact_dir + "/nanocodex"
 hosted_agent_artifact_dir := agent_artifact_dir + "/daytona-amd64"
 hosted_agent_artifact := hosted_agent_artifact_dir + "/nanocodex"
 hosted_agent_checksum := hosted_agent_artifact + ".sha256"
+hosted_agent_pr_provenance := hosted_agent_artifact + ".pr.json"
 hosted_agent_release_tag := env_var_or_default("NANOCODEX_HOSTED_AGENT_RELEASE_TAG", "nightly")
 hosted_agent_url := "https://github.com/gakonst/nanocodex/releases/download/" + hosted_agent_release_tag + "/nanocodex-x86_64-unknown-linux-musl"
 default_eval := "evals/terminal-bench-2.yaml"
@@ -105,7 +106,7 @@ otel-up:
 run-otel: otel-up
     @test -n "${OPENAI_API_KEY:-}" || { echo "set OPENAI_API_KEY in .env or the environment" >&2; exit 2; }
     @echo "Building and launching the Nanocodex TUI..."
-    @cargo run --manifest-path bin/nanocodex/Cargo.toml -- \
+    @cargo run -p nanocodex-bin --bin nanocodex -- \
         --otel-endpoint http://127.0.0.1:4318 \
         --otel-environment local-tui
 
@@ -114,18 +115,32 @@ run-otel: otel-up
 run-otel-detail: otel-up
     @test -n "${OPENAI_API_KEY:-}" || { echo "set OPENAI_API_KEY in .env or the environment" >&2; exit 2; }
     @echo "Building and launching the Nanocodex TUI with detailed stream timing..."
-    @OTEL_LEVEL="warn,nanocodex=info,nanocodex_service=info,nanocodex_tools=info,nanocodex_mcp=info,nanocodex_stream_timing=trace" \
-        cargo run --manifest-path bin/nanocodex/Cargo.toml -- \
+    @OTEL_LEVEL="warn,nanocodex=info,nanocodex_oai_api=info,nanocodex_tools=info,nanocodex_stream_timing=trace" \
+        cargo run -p nanocodex-bin --bin nanocodex -- \
         --otel-endpoint http://127.0.0.1:4318 \
         --otel-environment local-tui
 
-# Focused streaming-performance gate: private event-envelope overhead plus
-# trace-shaped transcript updates and steady Ratatui diff rendering.
+# Focused streaming-performance gate: owned agent lifecycle, event-envelope
+# overhead, trace-shaped transcript updates, and steady Ratatui diff rendering.
 bench-stream:
-    cargo bench -p nanocodex-service --bench tower_responses -- timed_agent_event_delivery
+    cargo bench -p nanocodex-agent --bench agent_lifecycle
+    cargo bench -p nanocodex-oai-api --bench tower_responses -- timed_agent_event_delivery
     cargo bench -p nanocodex-bin --bench tui_render -- tui_stream_telemetry
     cargo bench -p nanocodex-bin --bench tui_render -- tui_transcript_delta
     cargo bench -p nanocodex-bin --bench tui_render -- tui_trace_render
+
+# Rebuild every PR #50 hot-path estimate, then enforce the checked-in median
+# latency thresholds. TUI frame-count, changed-cell, and output-byte limits are
+# asserted inside the representative benchmark workloads themselves.
+bench-pr50:
+    cargo bench -p nanocodex-agent --bench agent_lifecycle
+    cargo bench -p nanocodex-oai-api --bench tower_responses -- '(responses_request_encoding/encoded_raw_value/131072|responses_lite_metadata/code_mode_tool_names_64|pricing_estimation/aggregate_turn_usage|timed_agent_event_delivery/emit_then_try_receive_mirrored_1024)'
+    cargo bench -p nanocodex-oai-api --bench fork_history -- '(fork_then_append/immutable_segments/10000|active_boundary_snapshot_then_append/immutable_boundary/10000|incremental_suffix_iteration/last_item/10000|code_mode_history_snapshot/flatten_into_shared_owner/10000|compaction_snapshot/shared_prefix_rewrite/10000|context_accounting_and_compaction/)'
+    cargo bench -p nanocodex-oai-api --bench session_lifecycle
+    cargo bench -p nanocodex-tools --bench tool_process_output
+    cargo bench -p nanocodex-tools --bench mcp_tool_search
+    cargo bench -p nanocodex-bin --bench tui_render -- '^(tui_trace_render/codex_long/tail/(80x24|120x40|200x60)|tui_transcript_delta/assistant_100k|tui_stream_telemetry/apply_1024_and_present|tui_branch_state/codex_long/switch_branch|tui_markdown/syntax_fallback_oversized_line_1m|tui_tool_tree/result_269k_cached_frame/120x40|tui_code_mode_stream/apply_16_out_of_order_completions|tui_trace_resize/codex_long/80x24_to_200x60|tui_live_tail_first_frame/assistant_1m_single_line/120x40|tui_smooth_follow/drain_128_row_backlog/120x40|tui_terminal_output/(catch_up_frame|fast_mode_toggle)/120x40|tui_composer_render/multiline_100k/120x40|tui_large_paste/ingest_100k)$'
+    ./scripts/check-benchmark-thresholds.sh
 
 # Run a tool-using turn and retain events and diagnostic logs independently.
 otel-demo:
@@ -133,7 +148,7 @@ otel-demo:
     @curl --fail --silent --show-error http://127.0.0.1:16686/ >/dev/null || { echo "run 'just otel-up' first" >&2; exit 2; }
     @mkdir -p .nanocodex/otel-demo
     @rm -f .nanocodex/otel-demo/events.jsonl .nanocodex/otel-demo/tracing.jsonl
-    @cargo run --quiet --manifest-path bin/nanocodex/Cargo.toml -- \
+    @cargo run --quiet -p nanocodex-bin --bin nanocodex -- \
         run \
         --otel-endpoint http://127.0.0.1:4318 \
         --otel-environment local-demo \
@@ -150,26 +165,26 @@ otel-stress turns="32" parallel_calls="16":
     NANOCODEX_STRESS_TURNS="{{turns}}" \
         NANOCODEX_STRESS_PARALLEL_CALLS="{{parallel_calls}}" \
         cargo test --locked --manifest-path bin/nanocodex/Cargo.toml \
-        --test observability_stress -- \
-        --ignored --exact retained_turns_and_hostile_tools_preserve_trace_topology \
+        --test it -- \
+        --ignored --exact observability_stress::retained_turns_and_hostile_tools_preserve_trace_topology \
         --nocapture --test-threads=1
 
 # Verify that attached child-agent turns share and overlap in their parent trace.
 otel-subagent-stress:
     @curl --fail --silent --show-error http://127.0.0.1:16686/ >/dev/null || { echo "run 'just otel-up' first" >&2; exit 2; }
     cargo test --locked --manifest-path bin/nanocodex/Cargo.toml \
-        --test observability_stress -- \
-        --ignored --exact attached_subagents_share_the_parent_trace_and_overlap \
+        --test it -- \
+        --ignored --exact observability_stress::attached_subagents_share_the_parent_trace_and_overlap \
         --nocapture --test-threads=1
 
 # Run the identical workload without installing the OTLP layer for comparison.
 otel-stress-baseline turns="32" parallel_calls="16":
     NANOCODEX_STRESS_EXPORT=false \
-        NANOCODEX_STRESS_TURNS="{{turns}}" \
+    NANOCODEX_STRESS_TURNS="{{turns}}" \
         NANOCODEX_STRESS_PARALLEL_CALLS="{{parallel_calls}}" \
         cargo test --locked --manifest-path bin/nanocodex/Cargo.toml \
-        --test observability_stress -- \
-        --ignored --exact retained_turns_and_hostile_tools_preserve_trace_topology \
+        --test it -- \
+        --ignored --exact observability_stress::retained_turns_and_hostile_tools_preserve_trace_topology \
         --nocapture --test-threads=1
 
 # Stop Jaeger and discard its in-memory trace data.
@@ -178,7 +193,7 @@ otel-down:
 
 # Tight inner loop: native model process with local code mode, no Harbor or Docker.
 run:
-    @cargo run --quiet --manifest-path bin/nanocodex/Cargo.toml -- run --thinking=low "Use the available exec tool to run pwd exactly once without modifying anything, then report the path."
+    @cargo run --quiet -p nanocodex-bin --bin nanocodex -- run --thinking=low "Use the available exec tool to run pwd exactly once without modifying anything, then report the path."
 
 # Build a static Linux executable for the Docker daemon's native architecture.
 # This is a native container build, not an amd64 cross-compile on Apple Silicon.
@@ -201,6 +216,17 @@ build-agent-hosted:
 download-agent-hosted:
     ./scripts/download-harbor-agent.sh "{{hosted_agent_release_tag}}" "{{hosted_agent_artifact}}"
     @test -f "{{hosted_agent_artifact}}" && test -x "{{hosted_agent_artifact}}" && test -s "{{hosted_agent_checksum}}"
+
+# Ask the existing release workflow to build every binary from the exact head of
+# one open PR. Nothing is built for ordinary pull_request events.
+build-pr-artifacts pr:
+    ./scripts/dispatch-pr-artifacts.sh "{{pr}}"
+
+# Download the static AMD64 artifact only after its embedded PR number, head SHA,
+# workflow run, artifact name, and SHA-256 checksum all agree.
+download-agent-hosted-pr pr:
+    ./scripts/download-pr-artifact.sh "{{pr}}" "nanocodex-x86_64-unknown-linux-musl" "{{hosted_agent_artifact}}"
+    @test -x "{{hosted_agent_artifact}}" && test -s "{{hosted_agent_checksum}}" && test -s "{{hosted_agent_pr_provenance}}"
 
 check-hosted-auth:
     @test -n "${DAYTONA_API_KEY:-}" || { test -n "${DAYTONA_JWT_TOKEN:-}" && test -n "${DAYTONA_ORGANIZATION_ID:-}"; } || { echo "set DAYTONA_API_KEY (or DAYTONA_JWT_TOKEN and DAYTONA_ORGANIZATION_ID) in .env" >&2; exit 2; }
@@ -250,6 +276,16 @@ eval-task-hosted task effort="low" config=default_eval: check-hosted-auth downlo
         job_name="$(date +%Y-%m-%d__%H-%M-%S)-${task##*/}-daytona-$BASHPID"; \
         HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --env daytona --verifier "{{canonical_verifier}}" --dataset "$dataset" --include-task-name "$task" --job-name "$job_name" --agent-kwarg "binary_url={{hosted_agent_url}}" --agent-kwarg "binary_sha256=$agent_sha" --agent-kwarg "install_node=true" --agent-kwarg "effort={{effort}}"
 
+# Run the exact current PR binary by uploading the SHA-verified Actions artifact
+# from the Harbor controller into Daytona.
+eval-task-hosted-pr pr task effort="low" config=default_eval: check-hosted-auth (download-agent-hosted-pr pr)
+    @test -x "{{harbor}}" || { echo "run 'just bootstrap' first" >&2; exit 2; }
+    @task="{{task}}"; \
+        pr_sha=$(jq -er '.sha' "{{hosted_agent_pr_provenance}}"); \
+        dataset=$(HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --print-config | jq -er '.datasets | if length == 1 then .[0] | "\(.name)@\(.ref)" else error("expected exactly one dataset") end'); \
+        job_name="$(date +%Y-%m-%d__%H-%M-%S)-${task##*/}-pr{{pr}}-${pr_sha:0:10}-daytona-$BASHPID"; \
+        HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --env daytona --verifier "{{canonical_verifier}}" --dataset "$dataset" --include-task-name "$task" --job-name "$job_name" --agent-kwarg "binary_path={{hosted_agent_artifact}}" --agent-kwarg "install_node=true" --agent-kwarg "effort={{effort}}"
+
 # Run the exact k=5, stock-timeout Terminal-Bench 2.1 leaderboard job in
 # hosted AMD64 sandboxes. Upload remains a separate post-validation step.
 eval-leaderboard-hosted: check-hosted-auth download-agent-hosted
@@ -270,6 +306,26 @@ eval-leaderboard-hosted: check-hosted-auth download-agent-hosted
             --quiet \
             --yes
 
+# Run the canonical 89-task, k=5 leaderboard job from an exact PR-head binary.
+# This is a single-agent result; it is not comparable to OpenAI's Ultra mode.
+eval-leaderboard-hosted-pr pr effort="max": check-hosted-auth (download-agent-hosted-pr pr)
+    @test -x "{{harbor}}" || { echo "run 'just bootstrap' first" >&2; exit 2; }
+    @pr_sha=$(jq -er '.sha' "{{hosted_agent_pr_provenance}}"); \
+        job_name="$(date +%Y-%m-%d__%H-%M-%S)-terminal-bench-2-1-pr{{pr}}-${pr_sha:0:10}-{{effort}}-k5-$BASHPID"; \
+        HARBOR_TELEMETRY=off "{{harbor}}" run \
+            --config "evals/terminal-bench-2-1-leaderboard-high.yaml" \
+            --env daytona \
+            --verifier "{{canonical_verifier}}" \
+            --agent-kwarg "binary_path={{hosted_agent_artifact}}" \
+            --agent-kwarg "install_node=true" \
+            --agent-kwarg "effort={{effort}}" \
+            --job-name "$job_name" \
+            --n-attempts 5 \
+            --timeout-multiplier 1 \
+            --n-concurrent "{{hosted_eval_concurrency}}" \
+            --quiet \
+            --yes
+
 # Open all locally retained Harbor jobs unless another jobs directory is supplied.
 view jobs=default_jobs:
     @test -x "{{harbor}}" || { echo "run 'just bootstrap' first" >&2; exit 2; }
@@ -278,6 +334,7 @@ view jobs=default_jobs:
 
 # Checks stay small until the end-to-end agent path is real.
 check:
+    ./scripts/check-crate-boundaries.sh
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo test --workspace
@@ -292,16 +349,19 @@ release-check version:
         test "{{version}}" = "$workspace_version" || { echo "expected workspace version {{version}}, found $workspace_version" >&2; exit 1; }
     @js_version=$(node -p "require('./js/bindings/package.json').version"); \
         test "{{version}}" = "$js_version" || { echo "expected JavaScript package version {{version}}, found $js_version" >&2; exit 1; }
+    @python_version=$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("py/bindings/pyproject.toml").read_text())["project"]["version"])'); \
+        test "{{version}}" = "$python_version" || { echo "expected Python package version {{version}}, found $python_version" >&2; exit 1; }
     @cargo metadata --no-deps --format-version 1 | jq -e --arg version "{{version}}" \
         '[.packages[].dependencies[] | select(.source == null and (.name | startswith("nanocodex"))) | .req] | all(. == ("^" + $version))' >/dev/null
     @grep -Fq "## [{{version}}]" CHANGELOG.md
     @grep -Fq '<!-- generated by git-cliff -->' CHANGELOG.md
-    @for crate in nanocodex-core nanocodex-macros nanocodex-observability nanocodex-service nanocodex-tools nanocodex-mcp nanocodex; do \
-        grep -Fq "## [{{version}}]" "crates/$crate/CHANGELOG.md"; \
-        grep -Fq '<!-- generated by git-cliff -->' "crates/$crate/CHANGELOG.md"; \
+    @for crate_path in nanocodex-oai-api nanocodex-tools/macros nanocodex-observability nanocodex-tools nanocodex-agent nanocodex; do \
+        grep -Fq "## [{{version}}]" "crates/$crate_path/CHANGELOG.md"; \
+        grep -Fq '<!-- generated by git-cliff -->' "crates/$crate_path/CHANGELOG.md"; \
     done
-    bash -n install scripts/changelog.sh scripts/check-docs.sh scripts/publish-crates.sh
-    @for crate in nanocodex-core nanocodex-macros nanocodex-observability nanocodex-service nanocodex-tools nanocodex-mcp nanocodex; do \
+    bash -n install scripts/changelog.sh scripts/check-crate-boundaries.sh scripts/check-docs.sh scripts/publish-crates.sh
+    ./scripts/check-crate-boundaries.sh
+    @for crate in nanocodex-oai-api nanocodex-tools-macros nanocodex-observability nanocodex-tools nanocodex-agent nanocodex; do \
         cargo package --locked --allow-dirty --no-verify --config .cargo/release.toml --package "$crate"; \
     done
     ./scripts/check-docs.sh

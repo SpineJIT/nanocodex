@@ -262,7 +262,7 @@ fn format_units(units: u64) -> String {
     format!("{}.{:02}", units / scale, (units % scale) / 10_000)
 }
 
-fn status_label(status: OrderStatus) -> &'static str {
+const fn status_label(status: OrderStatus) -> &'static str {
     match status {
         OrderStatus::Created => "created",
         OrderStatus::AwaitingPayment => "waiting for payment",

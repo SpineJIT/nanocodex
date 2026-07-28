@@ -22,14 +22,18 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "check:pack": "node scripts/check-pack.mjs",
+    "check:package": "node scripts/check-package.mjs",
+    "prepack": "npm run check:package",
+    "test": "node --test test/*.test.mjs && npm run check:package && npm run check:pack"
   },
   "peerDependencies": {
-    "nanocodex": "^0.1.0",
+    "nanocodex": "^0.2.0",
     "react": ">=18"
   },
   "devDependencies": {
-    "nanocodex": "file:../bindings"
+    "nanocodex": "file:../bindings",
+    "react": "19.2.6"
   },
   "engines": {
     "node": ">=22.13.0"

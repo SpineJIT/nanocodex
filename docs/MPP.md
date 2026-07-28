@@ -2,9 +2,10 @@
 
 ## Boundary
 
-MPP remains an application concern. `bin/nanocodex` composes the private
-`mpp-egress` support crate with the normal Nanocodex HTTPS Responses client.
-No public Nanocodex library crate contains wallet or payment behavior.
+MPP remains an application concern. The private
+`bin/nanocodex/src/mpp/egress.rs` module composes with the normal Nanocodex
+HTTPS Responses client. No public Nanocodex library crate contains wallet or
+payment behavior.
 
 The Tempo provider supports one payment path: estimated, up-front
 `tempo/charge` over HTTPS. It deliberately does not configure an MPP
@@ -53,6 +54,13 @@ MPP may use the Stablecoin DEX to swap from NanoUSD within the configured
 slippage bound.
 
 ## CLI
+
+Release and nightly artifacts include Tempo support. Source builds opt in so
+the direct-agent development loop does not compile the payment stack:
+
+```console
+cargo build -p nanocodex-bin --bin nanocodex --features tempo
+```
 
 Enable paid Responses and paid HTTP tool egress with:
 

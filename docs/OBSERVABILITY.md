@@ -6,7 +6,7 @@ port 4318 and the trace UI is available on port 16686. The checked-in Compose
 service is ephemeral, binds only to localhost, and loses its trace data when it
 is removed.
 
-Every model request asks for `detailed` API-visible reasoning summaries. Their
+Every model request asks for the model's `auto` API-visible reasoning summary. Its
 streaming deltas remain typed `reasoning.summary.delta` agent events, while the
 completed readable summary and encrypted continuation payload are recorded as
 ordered `reasoning` content on the corresponding `model.call` span.
@@ -147,16 +147,25 @@ just otel-stress
 ```
 
 The default workload runs 32 sequential prompts on one session. Every turn
-fans out 16 concurrent MCP calls, then mixes in a synthetic MCP error, malformed
-patch, non-zero shell, bounded high-volume output, yielded/resumed process, and
-unknown JavaScript tool. The gate verifies event counts, exactly one trace root
-per accepted prompt, all parent references, expected success/error span volume,
-shared cell-actor parentage and complete interval overlap for the delayed
-`Promise.all` fan-out,
-presence of structural model/tool fields and API-visible reasoning summaries,
-presence of prompt, readable and encrypted reasoning, and tool-argument
-sentinels in ordered span events, and absence of the separately configured API
-key from exported trace data.
+first exercises the provider-native MCP `tool_search_call`/`tool_search_output`
+pair, then fans out 16 concurrent calls to the discovered read-only tool. It
+also mixes in a synthetic MCP error, malformed patch, non-zero shell, bounded
+high-volume output, yielded/resumed process, and unknown JavaScript tool. The
+gate verifies event counts, exactly one trace root per accepted prompt, all
+parent references, expected success/error span volume, shared cell-actor
+parentage and complete interval overlap for the delayed `Promise.all` fan-out,
+model and terminal latency, exact token/cache fields, automatic
+`gpt-5.6-sol` cost, structural model/tool fields, API-visible reasoning
+summaries, prompt/readable/encrypted reasoning/tool-argument sentinels in
+ordered span events, and absence of the separately configured API key from
+exported trace data.
+
+The PR #50 milestone run on 2026-07-28 emitted 2,215 contractual events and
+retained 32 validated turn roots. The identical 32-turn/16-way workload took
+34.420 seconds without OTLP and 34.504 seconds with OTLP; exporter and Jaeger
+validation then took 399 milliseconds. The observed workload delta was 84
+milliseconds (0.24%); the deliberate one-second yielded subprocess in every
+turn remained the dominant measured harness cost.
 
 Scale it up without changing code:
 
@@ -200,7 +209,7 @@ the in-memory demo backend's retained trace volume and is not agent runtime.
 The CLI accepts the same exporter configuration directly:
 
 ```sh
-cargo run --quiet --manifest-path bin/nanocodex/Cargo.toml -- \
+cargo run --quiet -p nanocodex-bin --bin nanocodex -- \
   run \
   --otel-endpoint http://127.0.0.1:4318 \
   --otel-environment local-demo \

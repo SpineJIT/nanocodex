@@ -107,7 +107,8 @@ try {
   const customPrompt = process.argv.slice(2).filter((argument) => argument !== "--close").join(" ").trim();
   const prompt = customPrompt || "Reply with exactly MPP_JS_OK and nothing else.";
   turn = agent.turn.prompt({ input: prompt });
-  const output = await turn.result();
+  const result = await turn.result();
+  const output = result.finalMessage;
   if (!customPrompt && output.trim() !== "MPP_JS_OK") {
     throw new Error(`unexpected model output: ${JSON.stringify(output)}`);
   }
@@ -115,22 +116,35 @@ try {
   console.error(`Authorized cumulative payment: ${mpp.cumulative}`);
   console.error(`MPP channel: ${mpp.channelId}`);
 } finally {
-  if (process.argv.includes("--close")) {
-    const receipt = await mpp.close();
-    if (receipt) {
-      console.error(`Settled cumulative payment: ${receipt.acceptedCumulative}`);
-      if (receipt.txHash) {
-        console.error(`Settlement transaction: ${receipt.txHash}`);
-        console.error(`Settlement explorer: https://explore.tempo.xyz/tx/${receipt.txHash}`);
-      }
-    }
-  } else if (mpp.channelId) {
-    console.error(`MPP channel retained for reuse: ${mpp.channelId}`);
-  }
   turn?.dispose();
   unwatch?.();
   watch?.off();
-  agent?.dispose();
+  const cleanupErrors = [];
+  try {
+    await agent?.session.shutdown();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  try {
+    if (process.argv.includes("--close")) {
+      const receipt = await mpp.close();
+      if (receipt) {
+        console.error(`Settled cumulative payment: ${receipt.acceptedCumulative}`);
+        if (receipt.txHash) {
+          console.error(`Settlement transaction: ${receipt.txHash}`);
+          console.error(`Settlement explorer: https://explore.tempo.xyz/tx/${receipt.txHash}`);
+        }
+      }
+    } else if (mpp.channelId) {
+      console.error(`MPP channel retained for reuse: ${mpp.channelId}`);
+    }
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  if (cleanupErrors.length === 1) throw cleanupErrors[0];
+  if (cleanupErrors.length > 1) {
+    throw new AggregateError(cleanupErrors, "agent shutdown and MPP settlement both failed");
+  }
 }
 
 async function waitForHydration(store) {

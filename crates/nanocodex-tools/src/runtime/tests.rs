@@ -1,0 +1,761 @@
+use std::{
+    ffi::OsString,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
+
+use nanocodex_oai_api::{auth::OpenAiAuth, tools::ToolDefinition};
+use serde::Deserialize;
+use serde_json::{Value, json, value::to_raw_value};
+
+use crate::{ToolOutputBody, ToolResult, contract::DEFAULT_TOOL_OUTPUT_TOKENS};
+
+use super::{
+    DynamicToolProvider, ImageGenerationConfig, Tool, ToolContext, ToolInput, ToolOutput,
+    ToolRuntime, Tools, WebSearchConfig,
+};
+
+struct Double;
+
+struct Fails;
+
+struct Panics;
+
+struct PanickingProvider;
+
+struct ReplacementExec;
+
+struct Search {
+    activated: Arc<AtomicBool>,
+}
+
+struct DeferredProvider {
+    activated: Arc<AtomicBool>,
+    started: AtomicBool,
+}
+
+struct ProviderStartState {
+    started: AtomicBool,
+    startups: AtomicUsize,
+}
+
+struct StartTrackingProvider {
+    state: Arc<ProviderStartState>,
+}
+
+struct CollisionTool;
+
+struct DeclaredProvider {
+    name: &'static str,
+    parallel_safe: bool,
+    output: &'static str,
+}
+
+#[derive(Deserialize)]
+struct DoubleInput {
+    value: i64,
+}
+
+#[async_trait::async_trait]
+impl Tool for Double {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "double",
+            "Doubles an integer.",
+            json!({
+                "type": "object",
+                "properties": { "value": { "type": "integer" } },
+                "required": ["value"],
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        let input = input.decode_json::<DoubleInput>()?;
+        Ok(ToolOutput::text((input.value * 2).to_string()))
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for Fails {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "fails",
+            "Always fails.",
+            json!({ "type": "object", "properties": {} }),
+        )
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        Err(std::io::Error::other("intentional handler failure").into())
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for Panics {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "panics",
+            "Panics for runtime-isolation tests.",
+            json!({ "type": "object", "properties": {} }),
+        )
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        panic!("registered handler panic payload")
+    }
+}
+
+#[async_trait::async_trait]
+impl DynamicToolProvider for PanickingProvider {
+    fn start(&self) {}
+
+    fn direct_tools(&self) -> Vec<Arc<dyn Tool>> {
+        Vec::new()
+    }
+
+    fn available_definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition::function(
+            "provider_panic",
+            "Panics for provider-isolation tests.",
+            json!({ "type": "object", "properties": {} }),
+        )]
+    }
+
+    async fn execute(
+        &self,
+        name: &str,
+        _input: Value,
+        _context: ToolContext<'_>,
+    ) -> Option<ToolOutput> {
+        assert_eq!(name, "provider_panic");
+        panic!("dynamic provider panic payload")
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for ReplacementExec {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "exec_command",
+            "Replacement command executor.",
+            json!({
+                "type": "object",
+                "properties": { "cmd": { "type": "string" } },
+                "required": ["cmd"],
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        Ok(ToolOutput::text("replacement"))
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for CollisionTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "collision",
+            "Default-unsafe direct collision.",
+            json!({ "type": "object", "properties": {} }),
+        )
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        Ok(ToolOutput::text("direct"))
+    }
+}
+
+#[async_trait::async_trait]
+impl DynamicToolProvider for DeclaredProvider {
+    fn start(&self) {}
+
+    fn direct_tools(&self) -> Vec<Arc<dyn Tool>> {
+        Vec::new()
+    }
+
+    fn available_definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition::function(
+            self.name,
+            "Declared provider collision.",
+            json!({ "type": "object", "properties": {} }),
+        )]
+    }
+
+    fn supports_parallel_tool_calls(&self, name: &str) -> bool {
+        name == self.name && self.parallel_safe
+    }
+
+    async fn execute(
+        &self,
+        name: &str,
+        _input: serde_json::Value,
+        _context: ToolContext<'_>,
+    ) -> Option<ToolOutput> {
+        (name == self.name).then(|| ToolOutput::text(self.output))
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for Search {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "tool_search",
+            "Activates a matching deferred tool.",
+            json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        self.activated.store(true, Ordering::Release);
+        Ok(ToolOutput::from_json(
+            json!({ "name": "deferred_echo" }),
+            true,
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl DynamicToolProvider for DeferredProvider {
+    fn start(&self) {
+        self.started.store(true, Ordering::Release);
+    }
+
+    fn direct_tools(&self) -> Vec<Arc<dyn Tool>> {
+        vec![Arc::new(Search {
+            activated: Arc::clone(&self.activated),
+        })]
+    }
+
+    fn available_definitions(&self) -> Vec<ToolDefinition> {
+        self.activated
+            .load(Ordering::Acquire)
+            .then(|| {
+                ToolDefinition::function(
+                    "deferred_echo",
+                    "Returns its input.",
+                    json!({ "type": "object", "properties": {} }),
+                )
+            })
+            .into_iter()
+            .collect()
+    }
+
+    async fn execute(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+        _context: ToolContext<'_>,
+    ) -> Option<ToolOutput> {
+        (name == "deferred_echo" && self.activated.load(Ordering::Acquire))
+            .then(|| ToolOutput::from_json(input, true))
+    }
+}
+
+#[async_trait::async_trait]
+impl DynamicToolProvider for StartTrackingProvider {
+    fn start(&self) {
+        if !self.state.started.swap(true, Ordering::AcqRel) {
+            self.state.startups.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn direct_tools(&self) -> Vec<Arc<dyn Tool>> {
+        Vec::new()
+    }
+
+    fn available_definitions(&self) -> Vec<ToolDefinition> {
+        Vec::new()
+    }
+
+    async fn execute(
+        &self,
+        _name: &str,
+        _input: Value,
+        _context: ToolContext<'_>,
+    ) -> Option<ToolOutput> {
+        None
+    }
+}
+
+fn runtime(web_search: bool) -> ToolRuntime {
+    ToolRuntime::new(
+        ".",
+        web_search.then(|| WebSearchConfig {
+            endpoint: "http://127.0.0.1:1/v1/alpha/search".to_owned(),
+            auth: OpenAiAuth::api_key("test-key"),
+        }),
+        Some(ImageGenerationConfig {
+            api_base_url: "http://127.0.0.1:1/v1".to_owned(),
+            auth: OpenAiAuth::api_key("test-key"),
+            save_root: std::env::temp_dir().join("nanocodex-test-images"),
+        }),
+    )
+}
+
+#[test]
+fn web_search_handler_and_spec_are_absent_when_disabled() {
+    let enabled = runtime(true);
+    assert!(
+        enabled
+            .registry
+            .entries()
+            .any(|(_, definition)| definition.name() == "web__run")
+    );
+    assert!(enabled.supports_parallel_tool_calls("web__run"));
+    assert!(!enabled.supports_parallel_tool_calls("image_gen__imagegen"));
+    let enabled_specs = serde_json::to_value(enabled.model_specs("test-session")).unwrap();
+    assert!(
+        enabled_specs[0]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("`web__run`"))
+    );
+
+    let disabled = runtime(false);
+    assert!(
+        disabled
+            .registry
+            .entries()
+            .all(|(_, definition)| definition.name() != "web__run")
+    );
+    let disabled_specs = serde_json::to_value(disabled.model_specs("test-session")).unwrap();
+    assert!(
+        disabled_specs[0]["description"]
+            .as_str()
+            .is_some_and(|description| !description.contains("`web__run`"))
+    );
+}
+
+#[test]
+fn runtime_construction_starts_providers_and_preserves_eager_prewarm() {
+    let standalone_state = Arc::new(ProviderStartState {
+        started: AtomicBool::new(false),
+        startups: AtomicUsize::new(0),
+    });
+    let standalone_tools = Tools::builder()
+        .without_defaults()
+        .provider(StartTrackingProvider {
+            state: Arc::clone(&standalone_state),
+        })
+        .build()
+        .unwrap();
+
+    let _runtime = ToolRuntime::new_with_tools(".", None, None, &standalone_tools);
+    assert!(standalone_state.started.load(Ordering::Acquire));
+    assert_eq!(standalone_state.startups.load(Ordering::Relaxed), 1);
+
+    let prewarmed_state = Arc::new(ProviderStartState {
+        started: AtomicBool::new(false),
+        startups: AtomicUsize::new(0),
+    });
+    let prewarmed_tools = Tools::builder()
+        .without_defaults()
+        .provider(StartTrackingProvider {
+            state: Arc::clone(&prewarmed_state),
+        })
+        .build()
+        .unwrap();
+
+    prewarmed_tools.start_providers();
+    let _runtime = ToolRuntime::new_with_tools(".", None, None, &prewarmed_tools);
+    assert!(prewarmed_state.started.load(Ordering::Acquire));
+    assert_eq!(prewarmed_state.startups.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn parallel_safety_follows_direct_then_provider_dispatch_precedence() {
+    let direct_collision = Tools::builder()
+        .without_defaults()
+        .tool(CollisionTool)
+        .provider(DeclaredProvider {
+            name: "collision",
+            parallel_safe: true,
+            output: "provider",
+        })
+        .build()
+        .unwrap();
+    let direct_collision = ToolRuntime::new_with_tools(".", None, None, &direct_collision);
+    assert!(direct_collision.contains("collision"));
+    assert!(!direct_collision.supports_parallel_tool_calls("collision"));
+    let context = ToolContext::new(
+        "test-model",
+        "test-session",
+        "test-call",
+        &[],
+        DEFAULT_TOOL_OUTPUT_TOKENS,
+    );
+    let direct = direct_collision
+        .execute_tool(
+            "collision",
+            ToolInput::Function(to_raw_value(&json!({})).unwrap()),
+            context,
+        )
+        .await;
+    assert_eq!(direct.code_mode_value(), json!("direct"));
+
+    let provider_collision = Tools::builder()
+        .without_defaults()
+        .provider(DeclaredProvider {
+            name: "provider_collision",
+            parallel_safe: false,
+            output: "first",
+        })
+        .provider(DeclaredProvider {
+            name: "provider_collision",
+            parallel_safe: true,
+            output: "second",
+        })
+        .build()
+        .unwrap();
+    let provider_collision = ToolRuntime::new_with_tools(".", None, None, &provider_collision);
+    assert!(provider_collision.contains("provider_collision"));
+    assert!(!provider_collision.supports_parallel_tool_calls("provider_collision"));
+    let provider = provider_collision
+        .execute_tool(
+            "provider_collision",
+            ToolInput::Function(to_raw_value(&json!({})).unwrap()),
+            context,
+        )
+        .await;
+    assert_eq!(provider.code_mode_value(), json!("first"));
+}
+
+#[test]
+fn without_defaults_allows_replacing_a_standard_workspace_tool() {
+    assert!(Tools::builder().tool(ReplacementExec).build().is_err());
+
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(ReplacementExec)
+        .build()
+        .unwrap();
+    let runtime = ToolRuntime::new_with_tools(".", None, None, &tools);
+    let names = runtime
+        .registry
+        .entries()
+        .map(|(_, definition)| definition.name())
+        .collect::<Vec<_>>();
+
+    assert_eq!(names, ["exec_command"]);
+}
+
+#[test]
+fn model_description_is_stable_across_registration_order() {
+    let first = Tools::builder()
+        .without_defaults()
+        .tool(Fails)
+        .tool(Double)
+        .build()
+        .unwrap();
+    let second = Tools::builder()
+        .without_defaults()
+        .tool(Double)
+        .tool(Fails)
+        .build()
+        .unwrap();
+
+    let first = serde_json::to_vec(
+        &ToolRuntime::new_with_tools(".", None, None, &first).model_specs("test-session"),
+    )
+    .unwrap();
+    let second = serde_json::to_vec(
+        &ToolRuntime::new_with_tools(".", None, None, &second).model_specs("test-session"),
+    )
+    .unwrap();
+
+    assert_eq!(first, second);
+}
+
+#[test]
+fn tool_recipe_overrides_model_visible_environment_context() {
+    let tools = Tools::builder()
+        .without_defaults()
+        .working_directory("/workspace")
+        .default_shell("sh")
+        .build()
+        .unwrap();
+    let runtime = ToolRuntime::new_with_tools("/host/attempt", None, None, &tools);
+
+    assert_eq!(runtime.working_directory(), "/workspace");
+    assert_eq!(runtime.default_shell_name(), "sh");
+}
+
+#[test]
+fn session_binding_overrides_only_its_process_environment_clone() {
+    let tools = Tools::builder()
+        .process_environment([
+            ("OTHER_VARIABLE", "preserved"),
+            ("CODEX_THREAD_ID", "caller-spoof"),
+        ])
+        .build()
+        .unwrap();
+    let bound = tools.clone().for_session("session-1");
+
+    assert_eq!(
+        tools.process_environment().as_slice(),
+        [
+            (
+                OsString::from("OTHER_VARIABLE"),
+                OsString::from("preserved")
+            ),
+            (
+                OsString::from("CODEX_THREAD_ID"),
+                OsString::from("caller-spoof")
+            ),
+        ]
+    );
+    assert_eq!(
+        bound.process_environment().as_slice(),
+        [
+            (
+                OsString::from("OTHER_VARIABLE"),
+                OsString::from("preserved")
+            ),
+            (
+                OsString::from("CODEX_THREAD_ID"),
+                OsString::from("session-1")
+            ),
+        ]
+    );
+}
+
+#[test]
+fn tool_recipe_rejects_empty_environment_overrides() {
+    assert!(matches!(
+        Tools::builder().working_directory(" ").build(),
+        Err(super::ToolsBuildError::EmptyWorkingDirectory)
+    ));
+    assert!(matches!(
+        Tools::builder().default_shell("").build(),
+        Err(super::ToolsBuildError::EmptyDefaultShell)
+    ));
+}
+
+#[tokio::test]
+async fn registered_tool_is_described_and_callable_from_code_mode() {
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(Double)
+        .build()
+        .unwrap();
+    let runtime = ToolRuntime::new(".", None, None).with_tools(&tools);
+    let description = serde_json::to_value(runtime.model_specs("test-session")).unwrap();
+    assert!(
+        description[0]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains(
+                "declare const tools: { double(args: { value: number; }): Promise<unknown>; };"
+            ))
+    );
+
+    let execution = runtime
+        .execute_code(
+            r"
+const result = await tools.double({ value: 21 });
+text(result);
+",
+            ToolContext::new(
+                "test-model",
+                "test-session",
+                "test-call",
+                &[],
+                DEFAULT_TOOL_OUTPUT_TOKENS,
+            ),
+        )
+        .await;
+    assert!(execution.success);
+    assert_eq!(execution.nested_calls.len(), 1);
+    assert_eq!(execution.nested_calls[0].name, "double");
+    assert_eq!(execution.nested_calls[0].input, json!({ "value": 21 }));
+    let ToolOutputBody::Content(content) = execution.output else {
+        panic!("expected content output");
+    };
+    assert_eq!(
+        serde_json::to_value(content)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .last(),
+        Some(&json!({ "type": "input_text", "text": "42" }))
+    );
+}
+
+#[tokio::test]
+async fn handler_errors_become_failed_model_visible_results() {
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(Fails)
+        .build()
+        .unwrap();
+    let runtime = ToolRuntime::new(".", None, None).with_tools(&tools);
+    let execution = runtime
+        .registry
+        .execute_nested(
+            "fails",
+            json!({}),
+            ToolContext::new(
+                "test-model",
+                "test-session",
+                "test-call",
+                &[],
+                DEFAULT_TOOL_OUTPUT_TOKENS,
+            ),
+        )
+        .await;
+
+    assert!(!execution.success);
+    assert!(matches!(
+        execution.output,
+        ToolOutputBody::Text(output) if output == "intentional handler failure"
+    ));
+}
+
+#[tokio::test]
+async fn handler_panics_become_aborted_outputs_without_escaping_the_runtime() {
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(Panics)
+        .provider(PanickingProvider)
+        .build()
+        .unwrap();
+    let runtime = ToolRuntime::new(".", None, None).with_tools(&tools);
+    let context = ToolContext::new(
+        "test-model",
+        "test-session",
+        "test-call",
+        &[],
+        DEFAULT_TOOL_OUTPUT_TOKENS,
+    );
+
+    let registered = runtime
+        .registry
+        .execute_nested("panics", json!({}), context)
+        .await;
+    assert!(!registered.success);
+    assert!(matches!(
+        registered.output,
+        ToolOutputBody::Text(output) if output == "aborted"
+    ));
+
+    let provider = runtime
+        .execute_tool(
+            "provider_panic",
+            ToolInput::Function(to_raw_value(&json!({})).unwrap()),
+            context,
+        )
+        .await;
+    assert!(!provider.success);
+    assert!(matches!(
+        provider.output,
+        ToolOutputBody::Text(output) if output == "aborted"
+    ));
+}
+
+#[tokio::test]
+async fn direct_model_calls_reach_activated_dynamic_tools() {
+    let tools = Tools::builder()
+        .without_defaults()
+        .provider(DeferredProvider {
+            activated: Arc::new(AtomicBool::new(false)),
+            started: AtomicBool::new(false),
+        })
+        .build()
+        .unwrap();
+    tools.start_providers();
+    let runtime = ToolRuntime::new(".", None, None).with_tools(&tools);
+    let context = ToolContext::new(
+        "test-model",
+        "test-session",
+        "test-call",
+        &[],
+        DEFAULT_TOOL_OUTPUT_TOKENS,
+    );
+
+    let search = runtime
+        .execute_tool(
+            "tool_search",
+            ToolInput::Function(to_raw_value(&json!({ "query": "echo" })).unwrap()),
+            context,
+        )
+        .await;
+    assert!(search.success);
+
+    let execution = runtime
+        .execute_tool(
+            "deferred_echo",
+            ToolInput::Function(to_raw_value(&json!({ "value": 21 })).unwrap()),
+            context,
+        )
+        .await;
+    assert!(execution.success);
+    assert_eq!(execution.code_mode_value(), json!({ "value": 21 }));
+}
+
+#[tokio::test]
+async fn code_mode_can_search_and_call_a_deferred_tool_in_one_cell() {
+    let tools = Tools::builder()
+        .without_defaults()
+        .provider(DeferredProvider {
+            activated: Arc::new(AtomicBool::new(false)),
+            started: AtomicBool::new(false),
+        })
+        .build()
+        .unwrap();
+    tools.start_providers();
+    let runtime = ToolRuntime::new(".", None, None).with_tools(&tools);
+    let model_specs_before = serde_json::to_vec(&runtime.model_specs("test-session")).unwrap();
+    let model_specs_value = serde_json::to_value(runtime.model_specs("test-session")).unwrap();
+    assert!(
+        model_specs_value[0]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("Shared MCP Types:")),
+        "deferred MCP results need their stable shared type preamble before discovery"
+    );
+    let execution = runtime
+        .execute_code(
+            r#"
+const found = await tools.tool_search({ query: "echo" });
+const result = await tools[found.name]({ value: 21 });
+text(result.value);
+"#,
+            ToolContext::new(
+                "test-model",
+                "test-session",
+                "test-call",
+                &[],
+                DEFAULT_TOOL_OUTPUT_TOKENS,
+            ),
+        )
+        .await;
+
+    assert!(execution.success);
+    assert_eq!(
+        serde_json::to_vec(&runtime.model_specs("test-session")).unwrap(),
+        model_specs_before,
+        "activating deferred tools must not change the model request prefix"
+    );
+    assert_eq!(execution.nested_calls.len(), 2);
+    assert_eq!(execution.nested_calls[0].name, "tool_search");
+    assert_eq!(execution.nested_calls[1].name, "deferred_echo");
+    let ToolOutputBody::Content(content) = execution.output else {
+        panic!("expected content output");
+    };
+    assert_eq!(
+        serde_json::to_value(content)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .last(),
+        Some(&json!({ "type": "input_text", "text": "21" }))
+    );
+}

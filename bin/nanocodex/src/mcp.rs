@@ -12,7 +12,7 @@ use std::{
 use async_trait::async_trait;
 use clap::{ArgAction, Args};
 use eyre::{Result, WrapErr, bail, eyre};
-use nanocodex::{Mcp, McpHandle, McpOAuthCredentials, McpOAuthStore, McpServer};
+use nanocodex::tools::mcp::{Mcp, McpHandle, McpOAuthCredentials, McpOAuthStore, McpServer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -340,7 +340,7 @@ fn load_codex_mcp_servers(codex_home: &Path) -> Result<BTreeMap<String, Option<S
 }
 
 impl CodexOAuthStore {
-    fn new(codex_home: PathBuf) -> Self {
+    const fn new(codex_home: PathBuf) -> Self {
         Self { codex_home }
     }
 
@@ -570,8 +570,7 @@ fn codex_oauth_key(server_name: &str, server_url: &str) -> Result<String, String
         headers: BTreeMap::new(),
     })
     .map_err(|error| format!("failed to encode MCP OAuth credential key: {error}"))?;
-    let digest = Sha256::digest(encoded);
-    let prefix = format!("{digest:x}");
+    let prefix = hex::encode(Sha256::digest(encoded));
     Ok(format!("{server_name}|{}", &prefix[..16]))
 }
 
@@ -709,10 +708,12 @@ impl FromStr for NamedHeaderValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nanocodex::{MODEL, ToolContext};
+    use nanocodex::{oai::MODEL, tools::ToolContext};
     use nanocodex_observability::{LogFormat, LogOutput, ObservabilityBuilder};
     use nanocodex_tools::{
-        DEFAULT_TOOL_OUTPUT_TOKENS, DynamicToolProvider, ToolInput, ToolRuntime, Tools,
+        ToolInput, Tools,
+        contract::DEFAULT_TOOL_OUTPUT_TOKENS,
+        runtime::{DynamicToolProvider, ToolRuntime},
     };
     use serde_json::{Value, json, value::to_raw_value};
 
@@ -772,8 +773,8 @@ mod tests {
         assert!(args.build(Path::new("/missing")).is_err());
     }
 
-    #[test]
-    fn codex_servers_merge_between_explicit_entries_and_defaults() {
+    #[tokio::test]
+    async fn codex_servers_merge_between_explicit_entries_and_defaults() {
         let codex_home = tempfile::tempdir().unwrap();
         fs::write(
             codex_home.path().join("config.toml"),
@@ -804,7 +805,7 @@ enabled = false
         let mcp = args.build(codex_home.path()).unwrap().unwrap();
         let tools = Tools::builder().provider(mcp.provider).build().unwrap();
         let encoded = serde_json::to_string(
-            &ToolRuntime::new_with_tools(".", None, None, &tools).model_specs(),
+            &ToolRuntime::new_with_tools(".", None, None, &tools).model_specs("test-session"),
         )
         .unwrap();
 
@@ -959,12 +960,12 @@ tool_timeout_sec = 9.5
         let trace_guard = std::env::var_os("NANOCODEX_MCP_BENCH_TRACE").map(|path| {
             let mut builder =
                 ObservabilityBuilder::new("nanocodex-mcp-bench", env!("CARGO_PKG_VERSION"))
-                    .filter("warn,nanocodex_mcp=info")
+                    .filter("warn,nanocodex_tools=info")
                     .format(LogFormat::Json)
                     .output(LogOutput::File(PathBuf::from(path)));
             if let Ok(endpoint) = std::env::var("NANOCODEX_MCP_BENCH_OTEL") {
                 builder = builder
-                    .otel_filter("warn,nanocodex_mcp=info")
+                    .otel_filter("warn,nanocodex_tools=info")
                     .otlp_endpoint(endpoint);
             }
             builder.install().unwrap()
@@ -994,13 +995,13 @@ tool_timeout_sec = 9.5
             .into_iter()
             .next()
             .unwrap();
-        let context = ToolContext {
-            model: MODEL,
-            session_id: "mcp-lifecycle-benchmark",
-            call_id: "catalog-search",
-            history: &[],
-            output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
-        };
+        let context = ToolContext::new(
+            MODEL,
+            "mcp-lifecycle-benchmark",
+            "catalog-search",
+            &[],
+            DEFAULT_TOOL_OUTPUT_TOKENS,
+        );
         let input = to_raw_value(&json!({
             "query": "search tools domain ownership documentation"
         }))
@@ -1108,18 +1109,20 @@ tool_timeout_sec = 9.5
         })
     }
 
-    #[test]
-    fn defaults_add_only_deferred_search_to_the_initial_tool_context() {
+    #[tokio::test]
+    async fn defaults_add_only_deferred_search_to_the_initial_tool_context() {
         let baseline_tools = Tools::builder().build().unwrap();
         let baseline = serde_json::to_vec(
-            &ToolRuntime::new_with_tools(".", None, None, &baseline_tools).model_specs(),
+            &ToolRuntime::new_with_tools(".", None, None, &baseline_tools)
+                .model_specs("test-session"),
         )
         .unwrap();
 
         let mcp = args().build(Path::new("/missing")).unwrap().unwrap();
         let default_tools = Tools::builder().provider(mcp.provider).build().unwrap();
         let with_defaults = serde_json::to_vec(
-            &ToolRuntime::new_with_tools(".", None, None, &default_tools).model_specs(),
+            &ToolRuntime::new_with_tools(".", None, None, &default_tools)
+                .model_specs("test-session"),
         )
         .unwrap();
         let encoded = String::from_utf8(with_defaults.clone()).unwrap();

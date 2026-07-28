@@ -1,4 +1,5 @@
 name: Nightly Release
+run-name: "${{ inputs.pr && format('PR #{0} artifacts', inputs.pr) || 'Nightly Release' }}"
 
 permissions: {}
 
@@ -6,13 +7,18 @@ on:
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to build without publishing a release
+        required: false
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
 
 concurrency:
-  group: nightly-release
-  cancel-in-progress: false
+  group: ${{ inputs.pr && format('pr-artifacts-{0}', inputs.pr) || 'nightly-release' }}
+  cancel-in-progress: ${{ inputs.pr != '' }}
 
 jobs:
   build:
@@ -44,7 +50,11 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          ref: ${{ inputs.pr && format('refs/pull/{0}/head', inputs.pr) || github.sha }}
           persist-credentials: false
+      - name: Record exact source revision
+        shell: bash
+        run: echo "BUILD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
           toolchain: stable
@@ -55,9 +65,12 @@ jobs:
       - name: Build nightly binary
         shell: bash
         env:
-          TAG_NAME: nightly
-          VERGEN_GIT_SHA: ${{ github.sha }}
-        run: cargo build --locked --profile maxperf --package nanocodex-bin --target ${{ matrix.target }}
+          TAG_NAME: ${{ inputs.pr && format('pr-{0}', inputs.pr) || 'nightly' }}
+        run: |
+          VERGEN_GIT_SHA="$BUILD_SHA" \
+            cargo build --locked --profile maxperf \
+              --package nanocodex-bin --bin nanocodex --features tempo \
+              --target ${{ matrix.target }}
       - name: Stage Unix artifact
         if: runner.os != 'Windows'
         shell: bash
@@ -70,12 +83,28 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path dist
           Copy-Item "target/${{ matrix.target }}/maxperf/nanocodex.exe" "dist/${{ matrix.artifact }}"
+      - name: Stage PR provenance and checksum
+        if: github.event_name == 'workflow_dispatch' && inputs.pr != ''
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          PR_NUMBER: ${{ inputs.pr }}
+        run: |
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ARTIFACT" > "$ARTIFACT.sha256"
+          else
+            shasum -a 256 "$ARTIFACT" > "$ARTIFACT.sha256"
+          fi
+          printf '{"repository":"%s","pr":%s,"sha":"%s","artifact":"%s","run_id":%s}\n' \
+            "$GITHUB_REPOSITORY" "$PR_NUMBER" "$BUILD_SHA" "$ARTIFACT" \
+            "$GITHUB_RUN_ID" > PR_BUILD.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
           path: dist/*
           if-no-files-found: error
-          retention-days: 1
+          retention-days: ${{ inputs.pr && 7 || 1 }}
 
   build-harbor:
     if: github.repository == 'gakonst/nanocodex'
@@ -87,19 +116,22 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          ref: ${{ inputs.pr && format('refs/pull/{0}/head', inputs.pr) || github.sha }}
           persist-credentials: false
+      - name: Record exact source revision
+        shell: bash
+        run: echo "BUILD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       - name: Build static Harbor agent
         shell: bash
         env:
-          TAG_NAME: nightly
-          VERGEN_GIT_SHA: ${{ github.sha }}
+          TAG_NAME: ${{ inputs.pr && format('pr-{0}', inputs.pr) || 'nightly' }}
         run: |
           mkdir dist
           docker build \
             --platform linux/amd64 \
             --build-arg CARGO_PROFILE=maxperf \
             --build-arg TAG_NAME="$TAG_NAME" \
-            --build-arg VERGEN_GIT_SHA="$VERGEN_GIT_SHA" \
+            --build-arg VERGEN_GIT_SHA="$BUILD_SHA" \
             --file harbor_adapter/nanocodex.Dockerfile \
             --target artifact \
             --output type=local,dest=dist \
@@ -117,15 +149,29 @@ jobs:
             --volume "$PWD/dist:/dist:ro" \
             ubuntu:22.04 \
             /dist/nanocodex-x86_64-unknown-linux-musl --version
+      - name: Stage PR provenance and checksum
+        if: github.event_name == 'workflow_dispatch' && inputs.pr != ''
+        shell: bash
+        env:
+          ARTIFACT: nanocodex-x86_64-unknown-linux-musl
+          PR_NUMBER: ${{ inputs.pr }}
+        run: |
+          cd dist
+          sha256sum "$ARTIFACT" > "$ARTIFACT.sha256"
+          printf '{"repository":"%s","pr":%s,"sha":"%s","artifact":"%s","run_id":%s}\n' \
+            "$GITHUB_REPOSITORY" "$PR_NUMBER" "$BUILD_SHA" "$ARTIFACT" \
+            "$GITHUB_RUN_ID" > PR_BUILD.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nanocodex-x86_64-unknown-linux-musl
           path: dist/*
           if-no-files-found: error
-          retention-days: 1
+          retention-days: ${{ inputs.pr && 7 || 1 }}
 
   publish:
-    if: github.repository == 'gakonst/nanocodex'
+    if: >-
+      github.repository == 'gakonst/nanocodex' &&
+      (github.event_name != 'workflow_dispatch' || inputs.pr == '')
     name: publish immutable and rolling nightlies
     needs: [build, build-harbor]
     runs-on: ubuntu-22.04

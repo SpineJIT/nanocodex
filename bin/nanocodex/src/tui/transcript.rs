@@ -89,11 +89,27 @@ impl Clone for Transcript {
 
 impl Transcript {
     #[cfg(test)]
-    pub(super) fn is_empty(&self) -> bool {
+    pub(super) const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    pub(super) fn len(&self) -> usize {
+    #[cfg(test)]
+    pub(super) fn assistant_sources(&self) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                if !matches!(&entry.kind, EntryKind::Assistant) {
+                    return None;
+                }
+                let EntryContent::Markdown(markdown) = &entry.content else {
+                    return None;
+                };
+                Some(markdown.source.as_str())
+            })
+            .collect()
+    }
+
+    pub(super) const fn len(&self) -> usize {
         self.entries.len()
     }
 
@@ -387,7 +403,7 @@ impl Transcript {
         self.cached_total_height.store(0, Ordering::Relaxed);
     }
 
-    pub(super) fn widget<'a>(
+    pub(super) const fn widget<'a>(
         &'a self,
         scroll_from_bottom: usize,
         selected: Option<usize>,
@@ -791,7 +807,7 @@ struct ToolActivity {
     started_after_ns: Option<u64>,
     duration_ns: Option<u64>,
     result: Option<String>,
-    children: Vec<ToolActivity>,
+    children: Vec<Self>,
     patch: Option<PatchPresentation>,
     plain_detail: Option<StreamingText>,
     cached_layout: Mutex<Option<Box<CachedToolLayout>>>,
@@ -1551,7 +1567,7 @@ fn child_activity_groups(children: &[ToolActivity]) -> Vec<std::ops::Range<usize
     groups
 }
 
-fn activity_connector(
+const fn activity_connector(
     group_is_last: bool,
     parallel: bool,
     child_index: usize,
@@ -2269,7 +2285,7 @@ impl StreamingText {
 }
 
 impl StreamingLine {
-    fn new(content: String, style: Style) -> Self {
+    const fn new(content: String, style: Style) -> Self {
         Self {
             content,
             style,
@@ -2525,7 +2541,7 @@ fn indent_reasoning(source: &str) -> String {
     source.replace('\n', "\n  ")
 }
 
-fn tool_style(status: ToolStatus) -> (&'static str, Color) {
+const fn tool_style(status: ToolStatus) -> (&'static str, Color) {
     match status {
         ToolStatus::Running => ("◌", Color::Yellow),
         ToolStatus::Completed => ("✓", Color::Green),

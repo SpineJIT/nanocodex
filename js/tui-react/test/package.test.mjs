@@ -1,0 +1,8 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+import { NanocodexTui } from "nanocodex-tui-react";
+
+test("the installed ESM entry exports the TUI component", () => {
+  assert.equal(typeof NanocodexTui, "function");
+});

@@ -21,7 +21,7 @@ test("web-target WASM runs the shared model loop through the browser host", asyn
     module: wasm,
     websocketUrl: endpoint,
     thinking: "low",
-    sessionId: "web-session",
+    sessionId: "018f1f9a-7b3c-7a07-8000-000000000007",
   });
   const watch = agent.events.watch({ includeAllSessions: true });
   watch.onEvent((event) => events.push(event));
@@ -48,12 +48,27 @@ test("web-target WASM runs the shared model loop through the browser host", asyn
     });
   })();
 
-  assert.equal(await agent.turn.prompt({ input: "Reply with WEB_WASM_OK." }).result(), "WEB_WASM_OK");
+  assert.equal(
+    (await agent.turn.prompt({ input: "Reply with WEB_WASM_OK." }).result()).finalMessage,
+    "WEB_WASM_OK",
+  );
   await scenario;
 
   const branchConnection = new Promise((resolve) => server.once("connection", resolve));
   const branch = await agent.session.fork();
   assert.notEqual(branch.sessionId, agent.sessionId);
+  assert.throws(
+    () => branch.turn.prompt({
+      input: [{ type: "local_image", path: "/private/model-input.png" }],
+    }),
+    /cannot reference local filesystem paths/,
+  );
+  assert.throws(
+    () => branch.turn.prompt({
+      input: [{ type: "local_audio", path: "/private/model-input.wav" }],
+    }),
+    /cannot reference local filesystem paths/,
+  );
   const branchTurn = branch.turn.prompt({ input: [
     { type: "image", image_url: "data:image/png;base64,iVBORw0KGgo=" },
     { type: "text", text: "Reply with WEB_FORK_OK." },
@@ -61,9 +76,12 @@ test("web-target WASM runs the shared model loop through the browser host", asyn
   const branchSocket = await branchConnection;
   const branchReader = messageReader(branchSocket);
   const branchRequest = await branchReader.next();
-  assert.equal(branchRequest.previous_response_id, "web-final");
-  assert.match(JSON.stringify(branchRequest.input), /WEB_FORK_OK/);
-  assert.match(JSON.stringify(branchRequest.input), /input_image/);
+  assert.equal(branchRequest.previous_response_id, undefined);
+  const replay = JSON.stringify(branchRequest.input);
+  assert.match(replay, /Reply with WEB_WASM_OK/);
+  assert.match(replay, /WEB_WASM_OK/);
+  assert.match(replay, /WEB_FORK_OK/);
+  assert.match(replay, /input_image/);
   send(branchSocket, {
     type: "response.completed",
     response: {
@@ -77,7 +95,7 @@ test("web-target WASM runs the shared model loop through the browser host", asyn
       usage: null,
     },
   });
-  assert.equal(await branchTurn.result(), "WEB_FORK_OK");
+  assert.equal((await branchTurn.result()).finalMessage, "WEB_FORK_OK");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(events.filter((event) => event.type === "run.completed").length, 2);
 

@@ -1,9 +1,9 @@
 use std::{path::PathBuf, sync::Arc};
 
-use nanocodex_core::ToolDefinition;
+use nanocodex_oai_api::tools::ToolDefinition;
 use serde::Deserialize;
 
-use crate::{StandardTool, Tool, ToolContext, ToolExecution, ToolInput, ToolResult};
+use crate::{StandardTool, Tool, ToolContext, ToolInput, ToolOutput, ToolResult};
 
 use super::{ExecCommand, ShellSessions, WriteStdin};
 
@@ -13,7 +13,7 @@ pub(crate) struct ExecCommandHandler {
 }
 
 impl ExecCommandHandler {
-    pub(crate) fn new(workspace: PathBuf, sessions: Arc<ShellSessions>) -> Self {
+    pub(crate) const fn new(workspace: PathBuf, sessions: Arc<ShellSessions>) -> Self {
         Self {
             workspace,
             sessions,
@@ -23,12 +23,12 @@ impl ExecCommandHandler {
 
 #[async_trait::async_trait]
 impl Tool for ExecCommandHandler {
-    fn name(&self) -> &'static str {
-        "exec_command"
-    }
-
     fn definition(&self) -> ToolDefinition {
         StandardTool::ExecCommand.definition()
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
     }
 
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
@@ -52,19 +52,19 @@ pub(crate) struct WriteStdinHandler {
 }
 
 impl WriteStdinHandler {
-    pub(crate) fn new(sessions: Arc<ShellSessions>) -> Self {
+    pub(crate) const fn new(sessions: Arc<ShellSessions>) -> Self {
         Self { sessions }
     }
 }
 
 #[async_trait::async_trait]
 impl Tool for WriteStdinHandler {
-    fn name(&self) -> &'static str {
-        "write_stdin"
-    }
-
     fn definition(&self) -> ToolDefinition {
         StandardTool::WriteStdin.definition()
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
     }
 
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
@@ -80,8 +80,11 @@ impl Tool for WriteStdinHandler {
     }
 }
 
-fn shell_execution(result: &super::ExecCommandResult) -> ToolExecution {
-    ToolExecution::json(&result).with_process_trace(
+fn shell_execution(result: &super::ExecCommandResult) -> ToolOutput {
+    if let Some(error) = &result.error {
+        return ToolOutput::error(error);
+    }
+    ToolOutput::json(&result).with_process_trace(
         result.exit_code,
         result.session_id,
         result.original_token_count,

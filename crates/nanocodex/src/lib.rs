@@ -1,76 +1,59 @@
-extern crate self as nanocodex;
+#![doc = include_str!("../README.md")]
+#![deny(missing_docs, rustdoc::broken_intra_doc_links)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub use nanocodex_agent::{
+    AgentEvents, CostStatus, EstimatedUsdCost, Nanocodex, NanocodexBuilder, NanocodexError,
+    ServiceTier, Turn, TurnControl, TurnResult, TurnUsage, UsdAmount,
+};
+pub use nanocodex_oai_api::{OpenAi, ReasoningMode, Thinking};
 #[cfg(not(target_family = "wasm"))]
-mod agent;
-#[cfg(not(target_family = "wasm"))]
-mod auth;
-mod error;
-mod model;
-mod prompt_cache;
-#[cfg(not(target_family = "wasm"))]
-mod responses;
-#[cfg(not(target_family = "wasm"))]
-mod rollout;
-mod session;
-#[cfg(target_family = "wasm")]
-mod wasm;
+#[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+pub use nanocodex_tools::tool;
+pub use nanocodex_tools::{Tool, Tools};
 
-#[cfg(not(target_family = "wasm"))]
-pub use agent::{AgentHandle, Nanocodex, NanocodexBuilder, Turn, TurnControl, TurnResult};
-#[cfg(not(target_family = "wasm"))]
-pub use async_trait::async_trait;
-#[cfg(not(target_family = "wasm"))]
-pub use auth::{
-    ChatGptAuthError, ChatGptAuthStatus, ChatGptLogin, chatgpt_auth_status, load_chatgpt_auth,
-    logout_chatgpt,
-};
-pub use error::{NanocodexError, ResponsesError, Result};
-pub use nanocodex_core::responses::RequestProfile;
-pub use nanocodex_core::{
-    AgentEvent, AgentEventKind, AgentEventTiming, AgentEvents, AgentMessageContent, ContentItem,
-    CustomToolFormat, FunctionOutputBody, FunctionOutputContent, ImageDetail,
-    InternalMessageMetadata, ItemStatus, JsonSchema, JsonValue, LocalShellAction,
-    LocalShellExecAction, LocalShellStatus, MODEL, MessagePhase, MessageRole, OpenAiAuth,
-    OpenAiAuthError, OpenAiAuthMode, OutputTextAnnotation, OutputTextLogprob, OutputTextTopLogprob,
-    Prompt, PromptInput, ReasoningContent, ReasoningMode, ReasoningSummary, ResponseItem,
-    ResponseItemId, ResponsesHistory, ResponsesTransport, Thinking, TimedAgentEvent, ToolCaller,
-    ToolDefinition, Usage, UserInput, WebSearchAction, monotonic_now_ns,
-};
-#[cfg(not(target_family = "wasm"))]
-pub use nanocodex_macros::tool;
-#[cfg(not(target_family = "wasm"))]
-pub use nanocodex_mcp::{
-    Mcp, McpBuildError, McpBuilder, McpControlError, McpHandle, McpLogin, McpOAuthCredentials,
-    McpOAuthStore, McpServer,
-};
-pub use nanocodex_service::{
-    DefaultResponsesService, ResponsesAttempt, ResponsesAttemptKind, ResponsesClient,
-    ResponsesRetryPolicy, ResponsesService, ResponsesServiceError, ResponsesServiceResponse,
-};
-#[cfg(not(target_family = "wasm"))]
-pub use nanocodex_tools::{
-    DEFAULT_TOOL_OUTPUT_TOKENS, StandardTool, Tool, ToolContext, ToolError, ToolExecution,
-    ToolInput, ToolInputError, ToolOutputBody, ToolOutputContent, ToolResult, Tools,
-    ToolsBuildError, ToolsBuilder, UpdatePlanTool,
-};
-#[cfg(not(target_family = "wasm"))]
-#[doc(hidden)]
-pub use responses::{FactoryResponses, LayeredResponses, StandardResponses};
-#[cfg(not(target_family = "wasm"))]
-pub use responses::{Responses, ResponsesBuilder};
-#[cfg(not(target_family = "wasm"))]
-pub use rollout::{DurableSession, RolloutConfig, RolloutInfo, RolloutTranscriptItem};
-#[cfg(not(target_family = "wasm"))]
-pub use schemars::JsonSchema as ToolSchema;
-pub use session::SessionSnapshot;
-#[cfg(target_family = "wasm")]
-pub use wasm::{WasmNanocodex, WasmTurn};
+/// Owned agent lifecycle, builders, turns, branching, and snapshots.
+///
+/// Provider and tool-runtime APIs keep their canonical detailed paths under
+/// [`crate::oai`] and [`crate::tools`].
+pub mod agent {
+    #[cfg(not(target_family = "wasm"))]
+    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+    pub use nanocodex_agent::rollout;
+    pub use nanocodex_agent::{
+        AgentEvents, AgentHandle, CostStatus, EstimatedUsdCost, Nanocodex, NanocodexBuilder,
+        NanocodexError, Result, ServiceTier, Turn, TurnControl, TurnResult, TurnUsage, UsdAmount,
+        events, input, session, usage,
+    };
+}
+
+/// Tower-native OpenAI Responses client, sessions, protocol, and transport.
+#[doc(inline)]
+pub use nanocodex_oai_api as oai;
+
+/// Tool registry, built-ins, MCP, tool search, and Code Mode.
+#[doc(inline)]
+pub use nanocodex_tools as tools;
+
+/// Application-owned tracing and OpenTelemetry setup.
+#[cfg(all(not(target_family = "wasm"), feature = "observability"))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(all(not(target_family = "wasm"), feature = "observability")))
+)]
+#[doc(inline)]
+pub use nanocodex_observability as observability;
+
+/// Common imports for the golden owned-agent path.
+pub mod prelude {
+    #[cfg(not(target_family = "wasm"))]
+    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+    pub use crate::tool;
+    pub use crate::{Nanocodex, NanocodexBuilder, OpenAi, Tool, Tools};
+}
 
 #[cfg(not(target_family = "wasm"))]
 #[doc(hidden)]
 pub mod __private {
-    pub use async_trait::async_trait;
-    pub use nanocodex_tools::schema_for;
-    pub use schemars;
-    pub use serde;
+    pub use nanocodex_tools::__private::*;
 }

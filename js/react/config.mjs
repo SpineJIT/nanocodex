@@ -7,6 +7,7 @@ export function createConfig(options) {
   let snapshot = Object.freeze({ status: "idle", error: undefined });
   let worker;
   let mounts = 0;
+  let generation = 0;
 
   function setSnapshot(status, error) {
     if (snapshot.status === status && snapshot.error === error) return;
@@ -25,26 +26,42 @@ export function createConfig(options) {
   function connect(command = defaultStartCommand()) {
     if (worker || snapshot.status === "stopped") return;
     setSnapshot("starting");
+    const currentGeneration = ++generation;
+    let current;
     try {
-      const current = options.worker();
+      current = options.worker();
       worker = current;
       current.onmessage = ({ data }) => {
+        if (worker !== current || generation !== currentGeneration) return;
         if (data?.type === "ready") setSnapshot("ready");
         if (data?.type === "fatal") {
+          closeWorker();
           setSnapshot("error", typeof data.message === "string" ? data.message : "Agent worker failed");
         }
         for (const listener of messageListeners) listener(data);
       };
       current.postMessage(command);
     } catch (error) {
-      worker = undefined;
+      if (worker === current) closeWorker();
+      else {
+        current?.terminate();
+        generation += 1;
+      }
       setSnapshot("error", errorMessage(error));
     }
   }
 
-  function disconnect() {
-    worker?.terminate();
+  function closeWorker() {
+    const current = worker;
     worker = undefined;
+    generation += 1;
+    if (!current) return;
+    current.onmessage = null;
+    current.terminate();
+  }
+
+  function disconnect() {
+    closeWorker();
     if (snapshot.status !== "stopped") setSnapshot("idle");
   }
 
@@ -84,8 +101,8 @@ export function createConfig(options) {
     disconnect,
     stop() {
       if (snapshot.status === "stopped") return;
+      closeWorker();
       setSnapshot("stopped");
-      disconnect();
     },
   });
 }

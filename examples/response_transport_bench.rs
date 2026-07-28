@@ -138,7 +138,7 @@ struct Usage {
 }
 
 impl Usage {
-    fn add(&mut self, other: &Self) {
+    const fn add(&mut self, other: &Self) {
         self.input += other.input;
         self.cached += other.cached;
         self.cache_write += other.cache_write;
@@ -258,7 +258,7 @@ struct History {
 }
 
 struct HistorySegment {
-    previous: Option<Arc<HistorySegment>>,
+    previous: Option<Arc<Self>>,
     items: Arc<[Arc<Value>]>,
     len: usize,
 }
@@ -380,8 +380,6 @@ struct ClientMetadata<'a> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     let config = BenchConfig::from_env()?;
     let run_id = run_id()?;
     print_header(&config, &run_id);
@@ -1387,7 +1385,7 @@ fn duration_us(duration: Duration) -> f64 {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn usize_to_f64(value: usize) -> f64 {
+const fn usize_to_f64(value: usize) -> f64 {
     value as f64
 }
 

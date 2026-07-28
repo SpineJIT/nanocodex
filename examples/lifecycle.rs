@@ -1,8 +1,9 @@
-use std::{process, time::Duration};
+use std::time::Duration;
 
 use eyre::{Result, WrapErr};
 use nanocodex::{
-    AgentEventKind, AgentEvents, Nanocodex, NanocodexError, Responses, Thinking, Tools,
+    AgentEvents, Nanocodex, NanocodexError, OpenAi, Thinking, Tools,
+    agent::{events::AgentEventKind, session::SessionId},
 };
 use tokio::task::JoinHandle;
 use tower::timeout::TimeoutLayer;
@@ -19,23 +20,22 @@ async fn main() -> Result<()> {
     let api_key = std::env::var("OPENAI_API_KEY").wrap_err("OPENAI_API_KEY is required")?;
     let workspace = std::env::current_dir().wrap_err("failed to resolve the workspace")?;
 
-    // Layers wrap the standard persistent-WebSocket and retry service. A fully
-    // custom stack uses `Responses::builder().service(|| make_stack())` so
-    // cancellation, forks, and children always receive fresh mutable state.
-    let responses = Responses::builder()
+    // The OpenAI recipe owns transport and Tower policy. A fully custom stack
+    // uses `.service(|| make_stack())`, so cancellation replacements, forks,
+    // and children always receive fresh mutable state.
+    let openai = OpenAi::builder(api_key)
         .layer(TimeoutLayer::new(Duration::from_mins(2)))
-        .build();
+        .build()?;
 
     // `tools(tools)` is the normal path for shareable handlers. Agent-relative
     // subagent tools instead use `tools_factory(|handle| ...)`; see subagents.rs.
     let tools = Tools::builder().without_defaults().build()?;
-    let (agent, events) = Nanocodex::builder(api_key)
-        .session_id(format!("lifecycle-example-{}", process::id()))
+    let (agent, events) = Nanocodex::builder(openai)
+        .session_id(SessionId::new())
         .instructions(INSTRUCTIONS)
         .thinking(Thinking::Low)
         .workspace(workspace)
         .tools(tools)
-        .responses(responses)
         .build()?;
     let mut observers = vec![observe("root", events)];
 
@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
         .await?
         .result()
         .await?;
-    println!("checkpoint: {}", historical_checkpoint.final_message);
+    println!("checkpoint: {}", historical_checkpoint.final_message());
 
     // Turn is the direct control capability for unfinished work. TurnControl is
     // only needed when another task owns the single result receiver.
@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
         .steer("Also require zero-downtime database migrations.")
         .await?;
     let steered = result_task.await.wrap_err("steered result task failed")??;
-    println!("steered: {}", steered.final_message);
+    println!("steered: {}", steered.final_message());
 
     // Ordinary prompts are distinct FIFO turns. Cancellation targets the exact
     // accepted Turn whether it is still queued or has just become active.
@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
     assert!(matches!(cancelled, Err(NanocodexError::TurnCancelled)));
     println!(
         "completed ahead of cancelled turn: {}",
-        active.final_message
+        active.final_message()
     );
 
     // Fork commands remain responsive while a root turn runs. fork() samples
@@ -101,9 +101,9 @@ async fn main() -> Result<()> {
         latest_turn.result(),
     )?;
 
-    println!("mainline:   {}", mainline.final_message);
-    println!("historical: {}", historical_result.final_message);
-    println!("latest:     {}", latest_result.final_message);
+    println!("mainline:   {}", mainline.final_message());
+    println!("historical: {}", historical_result.final_message());
+    println!("latest:     {}", latest_result.final_message());
 
     // AgentEvents is independent from typed results. Dropping every command
     // handle stops its private driver and closes that agent's event stream.

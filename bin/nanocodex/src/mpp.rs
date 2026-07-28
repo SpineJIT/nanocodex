@@ -1,5 +1,9 @@
 use std::path::PathBuf;
 
+mod egress;
+mod resource;
+
+use self::egress::{EgressPolicy, MppEgress};
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Context, Result, eyre};
 use mpp::{
@@ -11,7 +15,6 @@ use mpp::{
         methods::tempo::{INTENT_CHARGE, METHOD_NAME},
     },
 };
-use mpp_egress::{EgressPolicy, MppEgress};
 use nanousd::{NANOUSD_ADDRESS, TEMPO_MAINNET_CHAIN_ID};
 
 const DEFAULT_MPP_API_BASE_URL: &str = "https://openai.mpp.tempo.xyz/v1";
@@ -100,6 +103,7 @@ impl MppArgs {
             return Ok(None);
         }
 
+        resource::ensure_mpp_file_descriptor_capacity()?;
         let provider = self.wallet_store.map_or_else(
             TempoAccountsProvider::from_default_store,
             TempoAccountsProvider::from_store,

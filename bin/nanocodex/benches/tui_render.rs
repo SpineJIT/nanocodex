@@ -4,7 +4,7 @@ mod tui {
     use std::{cell::Cell, fmt::Write as _, hint::black_box, rc::Rc, sync::Arc, time::Instant};
 
     use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
-    use nanocodex::{AgentEvent, AgentEventKind, AgentEventTiming, TimedAgentEvent};
+    use nanocodex::agent::events::{AgentEvent, AgentEventKind, AgentEventTiming, TimedAgentEvent};
     use ratatui::{
         Terminal, TerminalOptions, Viewport,
         backend::{CrosstermBackend, TestBackend},
@@ -551,6 +551,50 @@ mod tui {
         group.finish();
     }
 
+    pub(super) fn single_line_stream_batch_benchmark(criterion: &mut Criterion) {
+        const DELTAS: usize = 128;
+        const TAIL_CHARS: usize = 16 * 1_024;
+
+        fn cached_single_line_app() -> App {
+            let mut app = App::new("/workspace/nanocodex".into());
+            app.main.push_assistant_delta(&"x".repeat(TAIL_CHARS));
+            let mut terminal = Terminal::new(TestBackend::new(120, 40))
+                .expect("single-line stream benchmark terminal should initialize");
+            terminal
+                .draw(|frame| view::render(frame, &mut app))
+                .expect("initial single-line stream frame should render");
+            app
+        }
+
+        let mut group = criterion.benchmark_group("tui_single_line_stream_batch");
+        group.sample_size(20);
+        group.throughput(Throughput::Elements(DELTAS as u64));
+        group.bench_function("128_individual_deltas", |bencher| {
+            bencher.iter_batched(
+                cached_single_line_app,
+                |mut app| {
+                    for _ in 0..DELTAS {
+                        app.main.push_assistant_delta(black_box("x"));
+                    }
+                    black_box(app);
+                },
+                BatchSize::LargeInput,
+            );
+        });
+        group.bench_function("one_128_delta_batch", |bencher| {
+            let delta = "x".repeat(DELTAS);
+            bencher.iter_batched(
+                cached_single_line_app,
+                |mut app| {
+                    app.main.push_assistant_delta(black_box(&delta));
+                    black_box(app);
+                },
+                BatchSize::LargeInput,
+            );
+        });
+        group.finish();
+    }
+
     pub(super) fn smooth_follow_benchmark(criterion: &mut Criterion) {
         const DELTAS: usize = 128;
 
@@ -627,6 +671,10 @@ mod tui {
                             .expect("smooth-follow animation frame should render");
                         frames += 1;
                     }
+                    assert!(
+                        (1..=DELTAS as u64).contains(&frames),
+                        "draining {DELTAS} queued rows rendered {frames} animation frames"
+                    );
                     black_box(frames);
                 },
                 BatchSize::SmallInput,
@@ -656,27 +704,31 @@ mod tui {
         let (mut sample_app, mut sample_terminal, sample_bytes) = output_backlog_setup();
         let sample =
             draw_catch_up_frame(&mut sample_app, &mut sample_terminal, sample_bytes.as_ref());
+        assert!(
+            sample.changed_cells <= 2_400,
+            "catch-up frame changed {} cells",
+            sample.changed_cells
+        );
+        assert!(
+            sample.output_bytes <= 4_096,
+            "catch-up frame wrote {} bytes",
+            sample.output_bytes
+        );
         let mut group = criterion.benchmark_group("tui_terminal_output");
         group.sample_size(20);
         group.throughput(Throughput::Bytes(sample.output_bytes));
-        group.bench_function(
-            format!(
-                "catch_up_frame_{}cells_{}bytes/120x40",
-                sample.changed_cells, sample.output_bytes
-            ),
-            |bencher| {
-                bencher.iter_batched(
-                    output_backlog_setup,
-                    |(mut app, mut terminal, output_bytes)| {
-                        let metrics =
-                            draw_catch_up_frame(&mut app, &mut terminal, output_bytes.as_ref());
-                        black_box(metrics);
-                        (app, terminal, output_bytes)
-                    },
-                    BatchSize::LargeInput,
-                );
-            },
-        );
+        group.bench_function("catch_up_frame/120x40", |bencher| {
+            bencher.iter_batched(
+                output_backlog_setup,
+                |(mut app, mut terminal, output_bytes)| {
+                    let metrics =
+                        draw_catch_up_frame(&mut app, &mut terminal, output_bytes.as_ref());
+                    black_box(metrics);
+                    (app, terminal, output_bytes)
+                },
+                BatchSize::LargeInput,
+            );
+        });
 
         let (mut app, mut terminal, output_bytes) = fast_mode_toggle_setup();
         let sample = draw_fast_mode_toggle(&mut app, &mut terminal, output_bytes.as_ref());
@@ -690,25 +742,19 @@ mod tui {
             "footer wrote {} bytes",
             sample.output_bytes
         );
-        group.bench_function(
-            format!(
-                "fast_mode_toggle_{}cells_{}bytes/120x40",
-                sample.changed_cells, sample.output_bytes
-            ),
-            |bencher| {
-                bencher.iter_batched(
-                    fast_mode_toggle_setup,
-                    |(mut app, mut terminal, output_bytes)| {
-                        black_box(draw_fast_mode_toggle(
-                            &mut app,
-                            &mut terminal,
-                            output_bytes.as_ref(),
-                        ));
-                    },
-                    BatchSize::LargeInput,
-                );
-            },
-        );
+        group.bench_function("fast_mode_toggle/120x40", |bencher| {
+            bencher.iter_batched(
+                fast_mode_toggle_setup,
+                |(mut app, mut terminal, output_bytes)| {
+                    black_box(draw_fast_mode_toggle(
+                        &mut app,
+                        &mut terminal,
+                        output_bytes.as_ref(),
+                    ));
+                },
+                BatchSize::LargeInput,
+            );
+        });
         group.finish();
     }
 
@@ -787,10 +833,12 @@ mod tui {
                     request_id: Arc::from("benchmark-session"),
                     seq: index as u64 + 1,
                     kind,
-                    payload: serde_json::value::to_raw_value(&serde_json::json!({
-                        "text": "delta"
-                    }))
-                    .unwrap(),
+                    payload: Arc::from(
+                        serde_json::value::to_raw_value(&serde_json::json!({
+                            "text": "delta"
+                        }))
+                        .unwrap(),
+                    ),
                 },
                 timing: AgentEventTiming {
                     emitted_ns: 0,
@@ -1136,7 +1184,7 @@ mod tui {
             .map(|index| format!("Read reference {index}."))
             .collect::<Vec<_>>()
             .join("\n");
-        linked.push(TranscriptItem::Assistant(linked_source.clone()));
+        linked.push(TranscriptItem::Assistant(linked_source));
         criterion.bench_function("tui_markdown/semantic_link_copy_64", |bencher| {
             bencher.iter(|| linked.semanticize_copy(black_box(linked_copy.clone())));
         });
@@ -1148,6 +1196,16 @@ mod tui {
         criterion.bench_function("tui_markdown/image_placeholder_100k", |bencher| {
             bencher.iter(|| markdown::render_agent_markdown(black_box(&image), 120));
         });
+
+        let oversized_rust_line = format!("let value = \"{}\";", "x".repeat(1024 * 1024));
+        criterion.bench_function(
+            "tui_markdown/syntax_fallback_oversized_line_1m",
+            |bencher| {
+                bencher.iter(|| {
+                    markdown::highlighted_code_lines(Some("rust"), black_box(&oversized_rust_line))
+                });
+            },
+        );
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1578,6 +1636,7 @@ criterion_group!(
     tui::live_tail_render_benchmark,
     tui::live_tail_first_frame_benchmark,
     tui::scroll_anchor_benchmark,
+    tui::single_line_stream_batch_benchmark,
     tui::smooth_follow_benchmark,
     tui::terminal_output_benchmark,
     tui::mouse_selection_benchmark,

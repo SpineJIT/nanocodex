@@ -1,0 +1,64 @@
+[package]
+name = "nanocodex-oai-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+description = "Tower-native OpenAI Responses API and managed context for Nanocodex"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["-D", "warnings"]
+
+[dependencies]
+async-trait.workspace = true
+futures-util.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tower.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+web-time.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+base64.workspace = true
+getrandom.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-tungstenite.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+eyre.workspace = true
+simd-json.workspace = true
+sonic-rs.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber.workspace = true
+
+[[bench]]
+name = "fork_history"
+harness = false
+
+[[bench]]
+name = "tower_responses"
+harness = false
+
+[[bench]]
+name = "session_lifecycle"
+harness = false
+
+[lints]
+workspace = true

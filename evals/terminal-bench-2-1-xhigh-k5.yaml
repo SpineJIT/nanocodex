@@ -8,7 +8,6 @@ agents:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       NANOCODEX_RESPONSES_TRANSPORT: https
       NANOCODEX_STORE_RESPONSES: "false"
-      NANOCODEX_RESPONSES_HISTORY: full-replay
     kwargs:
       effort: xhigh
       web_search: false

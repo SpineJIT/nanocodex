@@ -4,8 +4,10 @@ export type {
   AgentActions,
   AgentEvent,
   AgentOptions,
+  CostStatus,
   DefaultAgent,
   EventWatcher,
+  EstimatedUsdCost,
   ForkOptions,
   PromptInput,
   PromptItem,
@@ -16,5 +18,7 @@ export type {
   ToolContext,
   ToolMap,
   Turn,
+  TurnResult,
+  TurnUsage,
   WatchEventsOptions,
 } from "./types.mjs";

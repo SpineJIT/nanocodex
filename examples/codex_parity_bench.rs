@@ -1,12 +1,15 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process,
     time::Instant,
 };
 
 use eyre::{Result, WrapErr, bail, eyre};
-use nanocodex::{AgentEventKind, AgentEvents, Nanocodex, Thinking, Tools, Turn, TurnResult, Usage};
+use nanocodex::{
+    AgentEvents, Nanocodex, OpenAi, Thinking, Tools, Turn, TurnResult,
+    agent::{events::AgentEventKind, session::SessionId},
+    oai::{MODEL, auth::load_chatgpt_auth, responses::Usage},
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize)]
@@ -97,19 +100,25 @@ struct Args {
     cwd: PathBuf,
     workload: PathBuf,
     source_commit: String,
+    auth_file: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let args = parse_args()?;
-    let api_key = env::var("OPENAI_API_KEY").wrap_err("OPENAI_API_KEY is required")?;
-    let workload_bytes = fs::read(&args.workload)
-        .wrap_err_with(|| format!("failed to read workload at {}", args.workload.display()))?;
-    let workload: Workload =
-        serde_json::from_slice(&workload_bytes).wrap_err("failed to decode parity workload")?;
-    validate_workload(&workload)?;
-
+    let openai = if let Some(auth_file) = &args.auth_file {
+        OpenAi::new(
+            load_chatgpt_auth(auth_file)
+                .wrap_err_with(|| format!("failed to load {}", auth_file.display()))?,
+        )?
+    } else {
+        let api_key = env::var("OPENAI_API_KEY").wrap_err(
+            "OPENAI_API_KEY is required unless --auth-file selects shared ChatGPT auth",
+        )?;
+        OpenAi::new(api_key)?
+    };
+    let (workload_bytes, workload) = load_workload(&args.workload)?;
     let agents_md = fs::read(args.cwd.join("AGENTS.md"))
         .wrap_err_with(|| format!("failed to read AGENTS.md from {}", args.cwd.display()))?;
     let prompts = prompts(&workload);
@@ -117,10 +126,10 @@ async fn main() -> Result<()> {
     if prompt_fnv1a64 != workload.prompt_fnv1a64 {
         bail!("generated prompts do not match the workload digest");
     }
-    let lineage = format!("codex-parity-{}-{}", process::id(), epoch_nanos()?);
+    let lineage = SessionId::new();
     let tools = Tools::builder().without_defaults().build()?;
     let agent_build_started = Instant::now();
-    let (agent, mut root_events) = Nanocodex::builder(api_key)
+    let (agent, mut root_events) = Nanocodex::builder(openai)
         .session_id(lineage)
         .instructions(workload.base_instructions.clone())
         .thinking(Thinking::Low)
@@ -209,6 +218,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn load_workload(path: &Path) -> Result<(Vec<u8>, Workload)> {
+    let bytes = fs::read(path)
+        .wrap_err_with(|| format!("failed to read workload at {}", path.display()))?;
+    let workload = serde_json::from_slice(&bytes).wrap_err("failed to decode parity workload")?;
+    validate_workload(&workload)?;
+    Ok((bytes, workload))
+}
+
 async fn measured_turn(
     agent: &Nanocodex,
     events: &mut AgentEvents,
@@ -246,10 +263,10 @@ async fn finish_measurement(
     latency_ms: f64,
     expected: &str,
 ) -> Result<TurnMeasurement> {
-    if result.final_message.trim() != expected {
+    if result.final_message().trim() != expected {
         bail!(
             "unexpected response: expected {expected:?}, got {:?}",
-            result.final_message
+            result.final_message()
         );
     }
     let calls = drain_turn(events).await?;
@@ -273,7 +290,7 @@ async fn finish_measurement(
         model_duration_ms: nanos_ms(model_duration_ns),
         time_to_first_event_ms: nanos_ms(time_to_first_event_ns),
         time_to_first_output_ms: time_to_first_output_ns.map(nanos_ms),
-        final_message: result.final_message.clone(),
+        final_message: result.final_message().to_owned(),
         usage,
     })
 }
@@ -390,6 +407,7 @@ fn parse_args() -> Result<Args> {
     let mut workload =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/codex_parity_workload.json");
     let mut source_commit = String::from("unknown");
+    let mut auth_file = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -405,6 +423,12 @@ fn parse_args() -> Result<Args> {
                     .next()
                     .ok_or_else(|| eyre!("--source-commit needs a value"))?;
             }
+            "--auth-file" => {
+                auth_file = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| eyre!("--auth-file needs a path"))?,
+                ));
+            }
             _ => bail!("unknown argument {arg:?}"),
         }
     }
@@ -416,12 +440,18 @@ fn parse_args() -> Result<Args> {
             .canonicalize()
             .wrap_err("failed to canonicalize --workload")?,
         source_commit,
+        auth_file: auth_file
+            .map(|path| {
+                path.canonicalize()
+                    .wrap_err("failed to canonicalize --auth-file")
+            })
+            .transpose()?,
     })
 }
 
 fn validate_workload(workload: &Workload) -> Result<()> {
     if workload.schema_version != 1
-        || workload.model != nanocodex::MODEL
+        || workload.model != MODEL
         || workload.reasoning_effort != "low"
         || workload.text_verbosity != "low"
         || workload.chain_turns != 10
@@ -469,11 +499,4 @@ fn median(sorted: &[f64]) -> f64 {
     } else {
         sorted[middle]
     }
-}
-
-fn epoch_nanos() -> Result<u128> {
-    Ok(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .wrap_err("system clock is before Unix epoch")?
-        .as_nanos())
 }

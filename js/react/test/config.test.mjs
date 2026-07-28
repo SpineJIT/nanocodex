@@ -1,7 +1,22 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import { createConfig } from "../config.mjs";
+
+test("the React consumer accepts the workspace Nanocodex package", () => {
+  const reactPackage = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url)),
+  );
+  const nanocodexPackage = JSON.parse(
+    readFileSync(new URL("../../bindings/package.json", import.meta.url)),
+  );
+
+  assert.equal(
+    reactPackage.peerDependencies.nanocodex,
+    `^${nanocodexPackage.version}`,
+  );
+});
 
 test("Nanocodex config owns worker lifecycle outside React", async () => {
   const commands = [];
@@ -95,4 +110,101 @@ test("deferred configs start and restart with application-owned commands", () =>
 
   unmount();
   assert.equal(workers[2].terminated, true);
+});
+
+test("multiple consumers share one Worker until the final unmount", () => {
+  const workers = [];
+  const config = createConfig({
+    worker() {
+      const worker = {
+        onmessage: null,
+        postMessage() {},
+        terminated: 0,
+        terminate() { worker.terminated += 1; },
+      };
+      workers.push(worker);
+      return worker;
+    },
+  });
+
+  const unmountFirst = config.mount();
+  const unmountSecond = config.mount();
+  assert.equal(workers.length, 1);
+
+  unmountFirst();
+  assert.equal(workers[0].terminated, 0);
+  assert.equal(config.getSnapshot().status, "starting");
+
+  unmountSecond();
+  assert.equal(workers[0].terminated, 1);
+  assert.equal(config.getSnapshot().status, "idle");
+});
+
+test("startup failure terminates the partial Worker and ignores its stale messages", () => {
+  let terminated = 0;
+  let staleHandler;
+  const worker = {
+    get onmessage() { return null; },
+    set onmessage(handler) {
+      if (handler) staleHandler = handler;
+    },
+    postMessage() { throw new Error("structured clone failed"); },
+    terminate() { terminated += 1; },
+  };
+  const messages = [];
+  const config = createConfig({ worker: () => worker });
+  config.subscribeMessages((message) => messages.push(message.type));
+
+  const unmount = config.mount();
+  assert.equal(terminated, 1);
+  assert.deepEqual(config.getSnapshot(), {
+    status: "error",
+    error: "structured clone failed",
+  });
+  assert.equal(worker.onmessage, null);
+
+  staleHandler?.({ data: { type: "ready" } });
+  assert.equal(config.getSnapshot().status, "error");
+  assert.deepEqual(messages, []);
+  unmount();
+});
+
+test("fatal and replacement Workers cannot mutate the current session", () => {
+  const workers = [];
+  const config = createConfig({
+    autoStart: false,
+    worker() {
+      const worker = {
+        onmessage: null,
+        postMessage() {},
+        terminated: 0,
+        terminate() { worker.terminated += 1; },
+      };
+      workers.push(worker);
+      return worker;
+    },
+  });
+  const messages = [];
+  config.subscribeMessages((message) => messages.push(message.type));
+  const unmount = config.mount();
+
+  config.start();
+  const firstHandler = workers[0].onmessage;
+  config.restart();
+  assert.equal(workers[0].terminated, 1);
+  assert.equal(workers[0].onmessage, null);
+  firstHandler({ data: { type: "fatal", message: "stale" } });
+  assert.equal(config.getSnapshot().status, "starting");
+  assert.deepEqual(messages, []);
+
+  workers[1].onmessage({ data: { type: "fatal", message: "current failure" } });
+  assert.equal(workers[1].terminated, 1);
+  assert.equal(workers[1].onmessage, null);
+  assert.deepEqual(config.getSnapshot(), {
+    status: "error",
+    error: "current failure",
+  });
+  assert.deepEqual(messages, ["fatal"]);
+  assert.throws(() => config.dispatch({ type: "prompt" }), /not running/);
+  unmount();
 });

@@ -1,2 +1,5 @@
-#[cfg(target_family = "wasm")]
-pub use nanocodex::{WasmNanocodex, WasmTurn};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod wasm;
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub use wasm::{WasmNanocodex, WasmTurn, WasmTurnResult};

@@ -11,3 +11,10 @@ ratatui = "ratatui"
 serde = "serde"
 wasm = "wasm"
 ba = "ba"
+# `caf` is the hexadecimal middle of the reviewed Codex commit
+# `312caf176a8f`, not prose.
+caf = "caf"
+# These are hexadecimal fragments in the reviewed commits `0c01a18ede`
+# and `ded4eacdbd`.
+ede = "ede"
+ded = "ded"

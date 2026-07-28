@@ -1,1 +1,1 @@
-export { NanocodexTui, type NanocodexTuiProps } from "./NanocodexTui";
+export { NanocodexTui, type NanocodexTuiProps } from "./NanocodexTui.js";

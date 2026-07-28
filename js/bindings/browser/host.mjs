@@ -3,26 +3,30 @@ import { createCodeRuntime } from "../runtime/code-runtime.mjs";
 const DEFAULT_MAX_QUEUED_MESSAGES = 4_096;
 const DEFAULT_MAX_QUEUED_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_BUFFERED_SEND_BYTES = 16 * 1024 * 1024;
+const WEBSOCKET_OPEN = 1;
 
 export function createBrowserHost(options = {}) {
-  const WebSocketImpl = options.WebSocketImpl || globalThis.WebSocket;
-  if (!WebSocketImpl) throw new Error("WebSocket is unavailable in this runtime");
+  const WebSocketImpl = options.WebSocketImpl ?? globalThis.WebSocket;
+  const createWebSocket = options.createWebSocket
+    ?? (WebSocketImpl && ((endpoint) => new WebSocketImpl(endpoint)));
+  if (!options.mpp && !createWebSocket) {
+    throw new Error("WebSocket is unavailable in this runtime");
+  }
   const connections = new Map();
   const code = createCodeRuntime(options.tools);
   const onEvent = options.onEvent || (() => {});
-  const createWebSocket = options.createWebSocket || ((endpoint) => new WebSocketImpl(endpoint));
   const maxQueuedMessages = options.maxQueuedMessages ?? DEFAULT_MAX_QUEUED_MESSAGES;
   const maxQueuedBytes = options.maxQueuedBytes ?? DEFAULT_MAX_QUEUED_BYTES;
   const maxBufferedSendBytes = options.maxBufferedSendBytes ?? DEFAULT_MAX_BUFFERED_SEND_BYTES;
   const encoder = new TextEncoder();
   let nextHandle = 1;
 
-  function connect(endpoint, _apiKey, sessionId) {
+  function connect(endpoint, _apiKey, sessionId, metadata = {}) {
     if (options.mpp) return connectMpp(endpoint);
     return new Promise((resolve, reject) => {
       let settled = false;
       const handle = nextHandle++;
-      const socket = createWebSocket(endpoint, sessionId);
+      const socket = createWebSocket(endpoint, sessionId, metadata);
       const connection = {
         socket,
         queue: [],
@@ -97,7 +101,7 @@ export function createBrowserHost(options = {}) {
 
   function send(handle, message) {
     const connection = connections.get(handle);
-    if (!connection || connection.socket.readyState !== WebSocketImpl.OPEN) {
+    if (!connection || connection.socket.readyState !== WEBSOCKET_OPEN) {
       return Promise.resolve(JSON.stringify({
         ok: false,
         reconnectable: true,
@@ -123,7 +127,7 @@ export function createBrowserHost(options = {}) {
     } catch (error) {
       return Promise.resolve(JSON.stringify({
         ok: false,
-        reconnectable: connection.socket.readyState !== WebSocketImpl.OPEN,
+        reconnectable: connection.socket.readyState !== WEBSOCKET_OPEN,
         error: error instanceof Error ? error.message : String(error),
       }));
     }

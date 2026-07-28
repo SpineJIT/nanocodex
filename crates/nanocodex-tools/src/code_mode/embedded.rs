@@ -8,7 +8,7 @@ use std::{
         mpsc as std_mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rquickjs::{
@@ -40,10 +40,6 @@ enum HostCommand {
         value: Value,
         success: bool,
     },
-    TimeoutFired {
-        execution_id: u64,
-        id: u32,
-    },
     Shutdown,
 }
 
@@ -57,7 +53,6 @@ struct StartExecution {
 struct ExecutionState {
     execution_id: u64,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
-    command_tx: std_mpsc::Sender<HostCommand>,
     pending_tools: HashMap<u64, (SavedFunction, SavedFunction)>,
     pending_timeouts: HashMap<u32, PendingTimeout>,
     next_tool_id: u64,
@@ -66,7 +61,13 @@ struct ExecutionState {
 
 struct PendingTimeout {
     callback: SavedFunction,
-    _cancel: std_mpsc::Sender<()>,
+    deadline: Option<Instant>,
+}
+
+enum CommandPoll {
+    Command(HostCommand),
+    TimerReady,
+    Disconnected,
 }
 
 #[derive(Deserialize)]
@@ -90,17 +91,10 @@ impl EmbeddedHost {
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let interrupted = Arc::new(AtomicBool::new(false));
         let worker_interrupted = Arc::clone(&interrupted);
-        let worker_command_tx = command_tx.clone();
         let worker = thread::Builder::new()
             .name("nanocodex-code-mode-quickjs".to_owned())
             .spawn(move || {
-                run_worker(
-                    &command_rx,
-                    &worker_command_tx,
-                    &event_tx,
-                    &ready_tx,
-                    &worker_interrupted,
-                );
+                run_worker(&command_rx, &event_tx, &ready_tx, &worker_interrupted);
             })
             .map_err(|error| format!("failed to start embedded QuickJS code-mode host: {error}"))?;
         ready_rx
@@ -175,7 +169,6 @@ impl Drop for EmbeddedHost {
 
 fn run_worker(
     command_rx: &std_mpsc::Receiver<HostCommand>,
-    command_tx: &std_mpsc::Sender<HostCommand>,
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ready_tx: &std_mpsc::SyncSender<Result<(), String>>,
     interrupted: &Arc<AtomicBool>,
@@ -223,20 +216,14 @@ fn run_worker(
                         return;
                     }
                 };
-                let result = run_execution(
-                    &context,
-                    start,
-                    command_rx,
-                    command_tx.clone(),
-                    event_tx.clone(),
-                );
+                let result = run_execution(&context, start, command_rx, event_tx.clone());
                 drop(context);
                 runtime.run_gc();
                 if result.is_err() {
                     return;
                 }
             }
-            Ok(HostCommand::TimeoutFired { .. } | HostCommand::ToolResult { .. }) => {}
+            Ok(HostCommand::ToolResult { .. }) => {}
             Ok(HostCommand::Shutdown) | Err(_) => return,
         }
     }
@@ -246,24 +233,21 @@ fn run_execution(
     context: &Context,
     start: StartExecution,
     command_rx: &std_mpsc::Receiver<HostCommand>,
-    command_tx: std_mpsc::Sender<HostCommand>,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
 ) -> Result<(), String> {
-    context.with(|ctx| run_execution_in_context(&ctx, start, command_rx, command_tx, event_tx))
+    context.with(|ctx| run_execution_in_context(&ctx, start, command_rx, event_tx))
 }
 
 fn run_execution_in_context<'js>(
     ctx: &Ctx<'js>,
     start: StartExecution,
     command_rx: &std_mpsc::Receiver<HostCommand>,
-    command_tx: std_mpsc::Sender<HostCommand>,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
 ) -> Result<(), String> {
     let execution_id = start.execution_id;
     let state = Rc::new(RefCell::new(ExecutionState {
         execution_id,
         event_tx,
-        command_tx,
         pending_tools: HashMap::new(),
         pending_timeouts: HashMap::new(),
         next_tool_id: 1,
@@ -291,8 +275,8 @@ fn run_execution_in_context<'js>(
             if let Some(terminal) = completed_terminal(ctx, &promise)? {
                 return send_terminal(&state, terminal);
             }
-            match command_rx.recv() {
-                Ok(HostCommand::ToolResult {
+            match receive_command(command_rx, next_timeout_wait(&state)) {
+                CommandPoll::Command(HostCommand::ToolResult {
                     execution_id: result_execution_id,
                     id,
                     value,
@@ -301,21 +285,16 @@ fn run_execution_in_context<'js>(
                     resolve_tool(ctx, &state, id, &value, success)?;
                     drain_jobs(ctx);
                 }
-                Ok(HostCommand::TimeoutFired {
-                    execution_id: timeout_execution_id,
-                    id,
-                }) if timeout_execution_id == execution_id => {
-                    invoke_timeout(ctx, &state, id)?;
-                    drain_jobs(ctx);
+                CommandPoll::TimerReady => {
+                    if let Some(id) = next_due_timeout(&state) {
+                        invoke_timeout(ctx, &state, id)?;
+                        drain_jobs(ctx);
+                    }
                 }
-                Ok(HostCommand::Shutdown) | Err(_) => {
+                CommandPoll::Command(HostCommand::Shutdown) | CommandPoll::Disconnected => {
                     return Err("embedded QuickJS host stopped".into());
                 }
-                Ok(
-                    HostCommand::Start(_)
-                    | HostCommand::ToolResult { .. }
-                    | HostCommand::TimeoutFired { .. },
-                ) => {}
+                CommandPoll::Command(HostCommand::Start(_) | HostCommand::ToolResult { .. }) => {}
             }
         }
     })();
@@ -431,24 +410,13 @@ fn install_native_functions<'js>(
                     let mut state = timeout_state.borrow_mut();
                     let id = state.next_timeout_id;
                     state.next_timeout_id = state.next_timeout_id.saturating_add(1);
-                    let execution_id = state.execution_id;
-                    let command_tx = state.command_tx.clone();
-                    let (cancel, cancelled) = std_mpsc::channel();
                     state.pending_timeouts.insert(
                         id,
                         PendingTimeout {
                             callback: Persistent::save(&ctx, callback),
-                            _cancel: cancel,
+                            deadline: Instant::now().checked_add(Duration::from_millis(delay_ms)),
                         },
                     );
-                    thread::spawn(move || {
-                        if matches!(
-                            cancelled.recv_timeout(Duration::from_millis(delay_ms)),
-                            Err(std_mpsc::RecvTimeoutError::Timeout)
-                        ) {
-                            let _ = command_tx.send(HostCommand::TimeoutFired { execution_id, id });
-                        }
-                    });
                     Ok(id)
                 },
             ),
@@ -588,6 +556,49 @@ fn invoke_timeout(
         .call::<_, ()>(())
         .catch(ctx)
         .map_err(|error| format!("embedded QuickJS timeout callback failed: {error}"))
+}
+
+fn next_timeout_wait(state: &Rc<RefCell<ExecutionState>>) -> Option<Duration> {
+    let now = Instant::now();
+    state
+        .borrow()
+        .pending_timeouts
+        .values()
+        .filter_map(|timeout| timeout.deadline)
+        .min()
+        .map(|deadline| deadline.saturating_duration_since(now))
+}
+
+fn next_due_timeout(state: &Rc<RefCell<ExecutionState>>) -> Option<u32> {
+    let now = Instant::now();
+    state
+        .borrow()
+        .pending_timeouts
+        .iter()
+        .filter_map(|(id, timeout)| {
+            timeout
+                .deadline
+                .filter(|deadline| *deadline <= now)
+                .map(|deadline| (*id, deadline))
+        })
+        .min_by_key(|(id, deadline)| (*deadline, *id))
+        .map(|(id, _)| id)
+}
+
+fn receive_command(
+    receiver: &std_mpsc::Receiver<HostCommand>,
+    timeout: Option<Duration>,
+) -> CommandPoll {
+    let Some(timeout) = timeout else {
+        return receiver
+            .recv()
+            .map_or(CommandPoll::Disconnected, CommandPoll::Command);
+    };
+    match receiver.recv_timeout(timeout) {
+        Ok(command) => CommandPoll::Command(command),
+        Err(std_mpsc::RecvTimeoutError::Timeout) => CommandPoll::TimerReady,
+        Err(std_mpsc::RecvTimeoutError::Disconnected) => CommandPoll::Disconnected,
+    }
 }
 
 fn drain_jobs(ctx: &Ctx<'_>) {

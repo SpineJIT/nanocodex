@@ -4,7 +4,7 @@ use std::{
     time::Instant,
 };
 
-use nanocodex::{AgentEventKind, TimedAgentEvent, monotonic_now_ns};
+use nanocodex::agent::events::{AgentEventKind, TimedAgentEvent, monotonic_now_ns};
 use tracing::{info, info_span};
 
 use super::{
@@ -65,7 +65,7 @@ pub(super) struct ViewTelemetry {
 }
 
 impl ViewTelemetry {
-    pub(super) fn new(main_session_id: Arc<str>) -> Self {
+    pub(super) const fn new(main_session_id: Arc<str>) -> Self {
         Self {
             main_session_id: Some(main_session_id),
             change_index: 0,
@@ -667,7 +667,7 @@ pub(super) fn elapsed_ns(start: Instant, end: Instant) -> u64 {
 mod tests {
     use std::{path::PathBuf, sync::Arc, time::Instant};
 
-    use nanocodex::AgentEventKind;
+    use nanocodex::agent::events::AgentEventKind;
 
     use crate::tui::{
         app::{App, PaneId},

@@ -1,6 +1,9 @@
 import type { Agent, DefaultAgent, ForkOptions, Thinking } from "../types.mjs";
 
-/** Forks the latest checkpoint, or the exact completed Turn supplied in `options.at`. */
+/** Compacts retained history immediately without fabricating a user prompt. */
+export function compact(agent: Agent<object>): Promise<void>;
+
+/** Forks the latest checkpoint, or the exact completed result supplied in `options.at`. */
 export function fork(agent: Agent<object>, options?: fork.Options): Promise<fork.ReturnType>;
 export declare namespace fork {
   type Options = ForkOptions;
@@ -18,3 +21,6 @@ export function setThinking(agent: Agent<object>, thinking: Thinking): Promise<v
 
 /** Enables or disables priority processing for subsequently accepted turns. */
 export function setFastMode(agent: Agent<object>, enabled: boolean): Promise<void>;
+
+/** Stops the driver and joins every resource owned by this Agent. */
+export function shutdown(agent: Agent<object>): Promise<void>;

@@ -13,6 +13,8 @@ use syntect::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+const MAX_HIGHLIGHT_LINE_BYTES: usize = 4 * 1024;
+
 pub(super) fn render_agent_markdown(source: &str, width: u16) -> Text<'static> {
     let mut writer = MarkdownWriter::new(width);
     let mut options = Options::empty();
@@ -292,6 +294,12 @@ pub(super) fn heal_streaming_markdown(source: &str) -> Cow<'_, str> {
 }
 
 pub(super) fn highlighted_code_lines(language: Option<&str>, source: &str) -> Vec<Line<'static>> {
+    if source
+        .lines()
+        .any(|line| line.len() > MAX_HIGHLIGHT_LINE_BYTES)
+    {
+        return plain_code_lines(source);
+    }
     let Some(language) = language.and_then(normalize_language) else {
         return plain_code_lines(source);
     };
@@ -1395,6 +1403,20 @@ mod tests {
         assert_eq!(fallback[0].spans[0].content, "opaque code");
         assert_eq!(
             fallback[0].spans[0].style.fg,
+            Some(ratatui::style::Color::Yellow)
+        );
+    }
+
+    #[test]
+    fn skips_highlighting_for_oversized_source_lines() {
+        let source = format!("let value = \"{}\";", "x".repeat(4 * 1024));
+        let highlighted = highlighted_code_lines(Some("rust"), &source);
+
+        assert_eq!(highlighted.len(), 1);
+        assert_eq!(highlighted[0].spans.len(), 1);
+        assert_eq!(highlighted[0].spans[0].content, source);
+        assert_eq!(
+            highlighted[0].spans[0].style.fg,
             Some(ratatui::style::Color::Yellow)
         );
     }

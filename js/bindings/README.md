@@ -9,22 +9,36 @@ import { Actions, Agent } from "nanocodex/node";
 
 const agent = await Agent.create({
   apiKey: process.env.OPENAI_API_KEY,
+  instructions: "You are a Rust coding agent. Preserve unrelated work and run relevant tests.",
   reasoningMode: "pro",
   thinking: "high",
   tools,
+  workspace: process.cwd(),
 });
 
 const turn = agent.turn.prompt({ input: "Build the thing." });
-console.log(await turn.result());
+const result = await turn.result();
+turn.dispose();
+console.log(result.finalMessage);
+console.log(result.usage);
+console.log(result.usage.estimated_cost?.usd);
+console.log(result.usage.cost_status);
 
 await agent.session.setThinking("high");
 await agent.session.setFastMode(true);
+await agent.session.compact();
 
-const branch = await agent.session.fork({ at: turn });
-console.log(await branch.turn.prompt({ input: "Try another approach." }).result());
+const branch = await agent.session.fork({ at: result });
+const branchTurn = branch.turn.prompt({ input: "Try another approach." });
+const branchResult = await branchTurn.result();
+branchTurn.dispose();
+console.log(branchResult.finalMessage);
 
 const followOn = Actions.turn.prompt(agent, { input: "Now explain it." });
-console.log(await Actions.turn.getResult(followOn));
+console.log((await Actions.turn.getResult(followOn)).finalMessage);
+followOn.dispose();
+await branch.session.shutdown();
+await agent.session.shutdown();
 ```
 
 Node and browser applications can instead pay through MPP without an OpenAI
@@ -77,13 +91,30 @@ const events = agent.events.watch();
 const unwatch = events.onEvent((event) => {
   process.stdout.write(`${JSON.stringify(event)}\n`);
 });
+let turn;
 try {
-  console.error(await agent.turn.prompt({ input: "Build the thing." }).result());
+  turn = agent.turn.prompt({ input: "Build the thing." });
+  const result = await turn.result();
+  console.error(result.finalMessage);
 } finally {
-  await mpp.close();
+  turn?.dispose();
   unwatch();
   events.off();
-  agent.dispose();
+  const cleanupErrors = [];
+  try {
+    await agent.session.shutdown();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  try {
+    await mpp.close();
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  if (cleanupErrors.length === 1) throw cleanupErrors[0];
+  if (cleanupErrors.length > 1) {
+    throw new AggregateError(cleanupErrors, "agent shutdown and MPP settlement both failed");
+  }
 }
 ```
 
@@ -93,17 +124,19 @@ across agents, and supply mppx `channelStore` for reuse after a process or page
 restart. Nanocodex never closes a caller-owned MPP session. `apiKey` and `mpp`
 are mutually exclusive.
 
-Completed turns can be persisted and resumed by a fresh Node or browser agent:
+Completed results can be persisted and resumed by a fresh Node or browser
+agent:
 
 ```js
-const snapshot = turn.snapshot();
-agent.dispose();
+const snapshot = result.snapshot;
+await agent.session.shutdown();
 
 const resumed = await Agent.create({
   apiKey: process.env.OPENAI_API_KEY,
   resume: snapshot,
   tools,
 });
+await resumed.session.shutdown();
 ```
 
 The snapshot contains authoritative typed history but no provider response ID,
@@ -130,12 +163,27 @@ context, and typed history.
 an owned client decorated with matching domain actions:
 
 - `agent.turn.prompt(...)` / `Actions.turn.prompt(agent, ...)`
-- `turn.snapshot()` / `Actions.turn.getSnapshot(turn)`
+- `turn.result()` / `Actions.turn.getResult(turn)`
+- `result.snapshot` / `Actions.turn.getSnapshot(result)`
+- `result.usage` / `Actions.turn.getUsage(result)`
 - `agent.session.fork(...)` / `Actions.session.fork(agent, ...)`
+- `agent.session.compact()` / `Actions.session.compact(agent)`
 - `agent.session.setThinking(...)` / `Actions.session.setThinking(agent, ...)`
 - `agent.session.setFastMode(...)` / `Actions.session.setFastMode(agent, ...)`
+- `agent.session.shutdown()` / `Actions.session.shutdown(agent)`
 - `agent.session.spawn()` / `Actions.session.spawn(agent)`
 - `agent.events.watch(...)` / `Actions.events.watch(agent, ...)`
+
+`turn.result()` resolves to a frozen completed `TurnResult`. Its
+`finalMessage` is eager; `usage` and `snapshot` cross the WASM boundary lazily
+once and are then cached. Historical `fork({ at })` accepts this completed
+result, never an unfinished turn or a provider response ID.
+
+`turn.dispose()` only releases the JavaScript/WASM handle; like dropping the
+Rust `Turn`, it does not cancel accepted work. Await `turn.cancel()` before
+disposing unfinished work. At an application or session boundary,
+`agent.session.shutdown()` cancels unfinished turns and joins driver, model,
+tool, and transport cleanup.
 
 Every action owns its types, for example `Actions.turn.prompt.Options`,
 `Actions.turn.prompt.ReturnType`, and `Actions.events.watch.Watcher`.
@@ -149,6 +197,10 @@ const unlisten = watch.onEvent(console.log);
 unlisten();
 watch.off();
 ```
+
+A throwing callback is reported through the host's `reportError` hook (or
+`console.error` when that hook is unavailable) without interrupting later
+listeners or the owned agent lifecycle.
 
 The same watcher can instead be consumed as an ordered async iterable; breaking
 the loop releases that iterator, while `watch.off()` terminates the whole watch.
@@ -195,9 +247,16 @@ manager or build step:
 
 ```html
 <script type="module">
-  import { Agent } from "https://cdn.jsdelivr.net/npm/nanocodex@0.1.0/browser/index.mjs";
+  import { Agent } from "https://cdn.jsdelivr.net/npm/nanocodex@0.2.0/browser/index.mjs";
   const agent = await Agent.create({ websocketUrl: "/api/responses" });
-  console.log(await agent.turn.prompt({ input: "Hello." }).result());
+  const turn = agent.turn.prompt({ input: "Hello." });
+  try {
+    const result = await turn.result();
+    console.log(result.finalMessage);
+  } finally {
+    turn.dispose();
+    await agent.session.shutdown();
+  }
 </script>
 ```
 
