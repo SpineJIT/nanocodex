@@ -151,6 +151,7 @@ jobs:
           npm test --prefix js/react
           npm test --prefix js/tui
           npm test --prefix js/tui-react
+          node --test examples/browser-cdn/*.test.mjs
           npm test --prefix examples/node
           npm test --prefix examples/react-vite
           npm run build --prefix examples/react-vite

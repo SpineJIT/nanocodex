@@ -26,20 +26,17 @@
       const prompt = document.querySelector("#prompt");
       const result = document.querySelector("#result");
       let agent;
+      let agentPromise;
+      let closing = false;
+      const releasedAgents = new WeakSet();
 
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
+        const input = prompt.value;
         result.textContent = "Running…";
         try {
-          agent ??= await Agent.create({
-            websocketUrl: websocketEndpoint(),
-            createWebSocket(endpoint, sessionId) {
-              const url = new URL(endpoint);
-              url.searchParams.set("session_id", sessionId);
-              return new WebSocket(url);
-            },
-          });
-          const turn = agent.turn.prompt({ input: prompt.value });
+          const current = await getAgent();
+          const turn = current.turn.prompt({ input });
           try {
             const completed = await turn.result();
             result.textContent = completed.finalMessage;
@@ -51,7 +48,77 @@
         }
       });
 
-      addEventListener("pagehide", () => agent?.dispose(), { once: true });
+      addEventListener("pagehide", () => {
+        closing = true;
+        const pending = agentPromise;
+        const current = agent;
+        agent = undefined;
+        agentPromise = undefined;
+        if (current) void releaseAgent(current);
+        else if (pending) void pending.then(releaseAgent, () => {});
+      }, { once: true });
+
+      async function getAgent() {
+        if (closing) throw new Error("The page is closing.");
+        if (agent) return agent;
+        if (!agentPromise) {
+          const pending = Promise.resolve()
+            .then(() => Agent.create({
+              websocketUrl: websocketEndpoint(),
+              createWebSocket(endpoint, sessionId) {
+                const url = new URL(endpoint);
+                url.searchParams.set("session_id", sessionId);
+                return new WebSocket(url);
+              },
+            }))
+            .then(async (created) => {
+              if (closing) {
+                await releaseAgent(created);
+                throw new Error("The page closed while the agent was starting.");
+              }
+              agent = created;
+              return created;
+            });
+          agentPromise = pending;
+          void pending.then(
+            () => {},
+            () => {
+              if (agentPromise === pending) agentPromise = undefined;
+            },
+          );
+        }
+        return agentPromise;
+      }
+
+      async function releaseAgent(current) {
+        if (releasedAgents.has(current)) return;
+        releasedAgents.add(current);
+        try {
+          if (typeof current.session?.shutdown === "function") {
+            await current.session.shutdown();
+          } else {
+            current.dispose();
+          }
+        } catch (error) {
+          // `pagehide` cannot reliably await asynchronous cleanup. Shutdown
+          // already releases the Nanocodex handle; dispose is the safe fallback
+          // for another runtime implementation.
+          reportCleanupError(error);
+          current.dispose();
+        }
+      }
+
+      function reportCleanupError(error) {
+        try {
+          if (typeof globalThis.reportError === "function") {
+            globalThis.reportError(error);
+          } else {
+            console.error("Nanocodex agent shutdown failed:", error);
+          }
+        } catch {
+          // Reporting must not prevent the idempotent cleanup fallback.
+        }
+      }
 
       function websocketEndpoint() {
         const override = new URL(location.href).searchParams.get("endpoint");
