@@ -57,8 +57,15 @@ let event_task = tokio::spawn(async move {
     }
 });
 
-// Alternative: keep the `Turn` returned by the first `await` and consume its
-// `Stream<Item = AgentEvent>` implementation to render output as it arrives.
+// Alternative: stream this turn's response as it arrives:
+// use futures_util::StreamExt;
+// use nanocodex::agent::events::{AgentEventData, AssistantEvent};
+// let mut turn = agent.prompt("Find and fix the failing parser test.").await?;
+// while let Some(event) = turn.next().await {
+//     if let AgentEventData::Assistant(AssistantEvent::Delta(delta)) = event.data()? {
+//         print!("{}", delta.text);
+//     }
+// }
 let result = agent
     .prompt("Find and fix the failing parser test.")
     .await?
