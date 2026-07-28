@@ -197,9 +197,12 @@ impl WasmNanocodex {
     ///
     /// Rejects if the turn is incomplete, unrelated, or the driver stopped.
     #[wasm_bindgen(js_name = forkFrom)]
-    pub async fn fork_from(&self, turn: &WasmTurn) -> Result<WasmNanocodex, JsValue> {
-        let completed = turn.completed_result().map_err(js_error)?;
-        let (inner, events) = self.inner.fork_from(&completed).await.map_err(js_error)?;
+    pub async fn fork_from(&self, result: &WasmTurnResult) -> Result<WasmNanocodex, JsValue> {
+        let (inner, events) = self
+            .inner
+            .fork_from(&result.inner)
+            .await
+            .map_err(js_error)?;
         Ok(Self::from_parts(inner, events))
     }
 
@@ -327,30 +330,11 @@ impl WasmTurn {
     /// # Errors
     ///
     /// Rejects when the model run or driver fails.
-    pub async fn result(&self) -> Result<String, JsValue> {
+    pub async fn result(&self) -> Result<WasmTurnResult, JsValue> {
         self.completion()
             .await
-            .map(TurnResult::into_final_message)
+            .map(|inner| WasmTurnResult { inner })
             .map_err(js_error)
-    }
-
-    /// Serializes the completed turn's resumable session snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Throws until the turn completes or serialization fails.
-    pub fn snapshot(&self) -> Result<String, JsValue> {
-        serde_json::to_string(&self.completed_result().map_err(js_error)?.snapshot())
-            .map_err(js_error)
-    }
-
-    /// Serializes exact aggregate usage for the completed logical turn.
-    ///
-    /// # Errors
-    ///
-    /// Throws until the turn completes or serialization fails.
-    pub fn usage(&self) -> Result<String, JsValue> {
-        serde_json::to_string(self.completed_result().map_err(js_error)?.usage()).map_err(js_error)
     }
 }
 
@@ -422,13 +406,39 @@ impl WasmTurn {
                 .map_err(|_| "the turn stopped before it completed".to_owned())?;
         }
     }
+}
 
-    fn completed_result(&self) -> Result<TurnResult, String> {
-        self.state
-            .borrow()
-            .completed
-            .clone()
-            .unwrap_or_else(|| Err("the turn has not completed".to_owned()))
+/// JavaScript binding over one completed Rust turn result.
+#[wasm_bindgen(js_name = TurnResult)]
+pub struct WasmTurnResult {
+    inner: TurnResult,
+}
+
+#[wasm_bindgen(js_class = TurnResult)]
+impl WasmTurnResult {
+    /// Returns the final assistant message.
+    #[wasm_bindgen(getter, js_name = finalMessage)]
+    #[must_use]
+    pub fn final_message(&self) -> String {
+        self.inner.final_message().to_owned()
+    }
+
+    /// Serializes this completed boundary's resumable session snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Throws when serialization fails.
+    pub fn snapshot(&self) -> Result<String, JsValue> {
+        serde_json::to_string(&self.inner.snapshot()).map_err(js_error)
+    }
+
+    /// Serializes exact aggregate usage for this completed logical turn.
+    ///
+    /// # Errors
+    ///
+    /// Throws when serialization fails.
+    pub fn usage(&self) -> Result<String, JsValue> {
+        serde_json::to_string(self.inner.usage()).map_err(js_error)
     }
 }
 

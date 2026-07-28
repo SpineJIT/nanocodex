@@ -15,12 +15,12 @@ export function getResult(turn) {
   return getTurnResult(turn);
 }
 
-export function getSnapshot(turn) {
-  return getTurnSnapshot(turn);
+export function getSnapshot(result) {
+  return getTurnSnapshot(result);
 }
 
-export function getUsage(turn) {
-  return getTurnUsage(turn);
+export function getUsage(result) {
+  return getTurnUsage(result);
 }
 
 export function steer(turn, options) {

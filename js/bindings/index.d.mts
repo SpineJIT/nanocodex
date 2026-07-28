@@ -18,6 +18,7 @@ export type {
   ToolContext,
   ToolMap,
   Turn,
+  TurnResult,
   TurnUsage,
   WatchEventsOptions,
 } from "./types.mjs";

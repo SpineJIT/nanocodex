@@ -1,4 +1,11 @@
-import type { Agent, PromptInput, SessionSnapshot, Turn, TurnUsage } from "../types.mjs";
+import type {
+  Agent,
+  PromptInput,
+  SessionSnapshot,
+  Turn,
+  TurnResult,
+  TurnUsage,
+} from "../types.mjs";
 
 /** Accepts a prompt on an owned Agent and returns its independently awaitable Turn. */
 export function prompt<const agent extends Agent<object>>(
@@ -10,20 +17,20 @@ export declare namespace prompt {
   type ReturnType<agent extends Agent<object> = Agent<object>> = Turn<agent>;
 }
 
-/** Waits for a Turn's final assistant message. */
+/** Waits for a Turn's typed completed result. */
 export function getResult(turn: Turn): Promise<getResult.ReturnType>;
 export declare namespace getResult {
-  type ReturnType = string;
+  type ReturnType = TurnResult;
 }
 
-/** Copies a completed Turn into a serializable session snapshot. */
-export function getSnapshot(turn: Turn): getSnapshot.ReturnType;
+/** Returns a completed result's serializable session snapshot. */
+export function getSnapshot(result: TurnResult): getSnapshot.ReturnType;
 export declare namespace getSnapshot {
   type ReturnType = SessionSnapshot;
 }
 
-/** Copies exact aggregate token usage from a completed Turn. */
-export function getUsage(turn: Turn): getUsage.ReturnType;
+/** Returns exact aggregate token usage from a completed result. */
+export function getUsage(result: TurnResult): getUsage.ReturnType;
 export declare namespace getUsage {
   type ReturnType = TurnUsage;
 }

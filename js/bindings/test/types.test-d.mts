@@ -4,6 +4,7 @@ import {
   type CostStatus,
   type SessionSnapshot,
   type Turn,
+  type TurnResult,
 } from "../node/index.mjs";
 import { Agent as BrowserAgent } from "../browser/index.mjs";
 
@@ -21,21 +22,28 @@ async function check() {
   const options: Actions.turn.prompt.Options = { input: "hello" };
   const turn: Turn = agent.turn.prompt(options);
   const sameTurn: Actions.turn.prompt.ReturnType = Actions.turn.prompt(agent, options);
-  const message: Actions.turn.getResult.ReturnType = await sameTurn.result();
-  const snapshot: SessionSnapshot = sameTurn.snapshot();
-  const usage: Actions.turn.getUsage.ReturnType = sameTurn.usage();
+  const completed: TurnResult = await sameTurn.result();
+  const sameResult: Actions.turn.getResult.ReturnType = completed;
+  const message: string = completed.finalMessage;
+  const snapshot: SessionSnapshot = completed.snapshot;
+  const usage: Actions.turn.getUsage.ReturnType = completed.usage;
   usage.estimated_cost?.usd;
   const costStatus: CostStatus = usage.cost_status;
-  Actions.turn.getSnapshot(sameTurn);
-  Actions.turn.getUsage(sameTurn);
+  Actions.turn.getSnapshot(completed);
+  Actions.turn.getUsage(completed);
   void message;
+  void sameResult;
   void usage;
   void costStatus;
 
   await Agent.create({ apiKey, resume: snapshot });
 
-  const fork = await Actions.session.fork(agent, { at: turn });
+  const fork = await Actions.session.fork(agent, { at: completed });
   fork.turn.prompt({ input: [{ type: "text", text: "continue" }] });
+  // @ts-expect-error historical forks require a completed typed result.
+  await Actions.session.fork(agent, { at: turn });
+  // @ts-expect-error snapshots belong to completed results, not active turns.
+  turn.snapshot();
 
   const watch: Actions.events.watch.Watcher = agent.events.watch();
   watch.onEvent((event) => event.payload);

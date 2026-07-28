@@ -62,7 +62,7 @@ export type TurnUsage = Readonly<{
   cost_status: CostStatus;
 }>;
 
-export type ForkOptions = { at?: Turn | undefined };
+export type ForkOptions = { at?: TurnResult | undefined };
 export type WatchEventsOptions = { includeAllSessions?: boolean | undefined };
 
 export type EventWatcher = Readonly<{
@@ -103,12 +103,16 @@ export type DefaultAgent = Agent<AgentActions>;
 
 export type Turn<agent extends Agent<object> = Agent<object>> = Readonly<{
   readonly agent: agent;
-  result(): Promise<string>;
-  snapshot(): SessionSnapshot;
-  usage(): TurnUsage;
+  result(): Promise<TurnResult>;
   steer(options: { input: PromptInput }): Promise<void>;
   cancel(): Promise<void>;
   dispose(): void;
+}>;
+
+export type TurnResult = Readonly<{
+  finalMessage: string;
+  snapshot: SessionSnapshot;
+  usage: TurnUsage;
 }>;
 
 export type ToolContext = {

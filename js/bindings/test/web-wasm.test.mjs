@@ -48,7 +48,10 @@ test("web-target WASM runs the shared model loop through the browser host", asyn
     });
   })();
 
-  assert.equal(await agent.turn.prompt({ input: "Reply with WEB_WASM_OK." }).result(), "WEB_WASM_OK");
+  assert.equal(
+    (await agent.turn.prompt({ input: "Reply with WEB_WASM_OK." }).result()).finalMessage,
+    "WEB_WASM_OK",
+  );
   await scenario;
 
   const branchConnection = new Promise((resolve) => server.once("connection", resolve));
@@ -92,7 +95,7 @@ test("web-target WASM runs the shared model loop through the browser host", asyn
       usage: null,
     },
   });
-  assert.equal(await branchTurn.result(), "WEB_FORK_OK");
+  assert.equal((await branchTurn.result()).finalMessage, "WEB_FORK_OK");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(events.filter((event) => event.type === "run.completed").length, 2);
 

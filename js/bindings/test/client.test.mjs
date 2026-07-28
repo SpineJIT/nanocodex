@@ -22,10 +22,20 @@ test("the headless client exposes matching direct and standalone actions", async
   });
   const agent = await createAgentClient(runtime);
 
-  const first = agent.turn.prompt({ input: "first" });
-  assert.equal(await first.result(), "session-1:first");
-  const second = Actions.turn.prompt(agent, { input: "second" });
-  assert.equal(await Actions.turn.getResult(second), "session-1:second");
+  const firstTurn = agent.turn.prompt({ input: "first" });
+  const first = await firstTurn.result();
+  assert.equal(first.finalMessage, "session-1:first");
+  assert.deepEqual(Object.getOwnPropertySymbols(agent), []);
+  assert.deepEqual(Object.getOwnPropertySymbols(firstTurn), []);
+  assert.deepEqual(Object.getOwnPropertySymbols(first), []);
+  assert.equal(Object.isFrozen(first), true);
+  assert.equal(Object.isFrozen(first.usage), true);
+  assert.equal(Object.isFrozen(first.snapshot), true);
+  assert.strictEqual(Actions.turn.getUsage(first), first.usage);
+  assert.strictEqual(Actions.turn.getSnapshot(first), first.snapshot);
+  const secondTurn = Actions.turn.prompt(agent, { input: "second" });
+  const second = await Actions.turn.getResult(secondTurn);
+  assert.equal(second.finalMessage, "session-1:second");
 
   const seen = [];
   const watch = agent.events.watch();
@@ -51,7 +61,10 @@ test("the headless client exposes matching direct and standalone actions", async
 
   const branch = await agent.session.fork({ at: first });
   assert.equal(branch.sessionId, "session-1-fork");
-  assert.equal(await branch.turn.prompt({ input: "branch" }).result(), "session-1-fork:branch");
+  assert.equal(
+    (await branch.turn.prompt({ input: "branch" }).result()).finalMessage,
+    "session-1-fork:branch",
+  );
 
   const fresh = await agent.session.spawn();
   assert.equal(fresh.sessionId, "session-1-spawn");
@@ -231,7 +244,35 @@ function rawAgent(sessionId) {
 
 function rawTurn(value) {
   return {
-    async result() { return value; },
+    async result() {
+      return {
+        finalMessage: value,
+        snapshot() {
+          return JSON.stringify({
+            version: 1,
+            model: "gpt-5.6-sol",
+            lineage_id: "test-lineage",
+            prompt_cache_key: "test-cache-key",
+            workspace: ".",
+            canonical_context: {},
+            history: [],
+          });
+        },
+        usage() {
+          return JSON.stringify({
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 0,
+            estimated_cost: null,
+            cost_status: "usage_not_reported",
+          });
+        },
+        free() {},
+      };
+    },
     async steer() {},
     async steerContent() {},
     async cancel() {},

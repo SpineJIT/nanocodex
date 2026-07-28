@@ -139,9 +139,10 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
     sendFinal(socket, "resp-second", "43");
   })();
 
-  const first = agent.turn.prompt({ input: "Use multiply for 6 × 7." });
-  assert.equal(await first.result(), "42");
-  assert.deepEqual(first.usage(), {
+  const firstTurn = agent.turn.prompt({ input: "Use multiply for 6 × 7." });
+  const first = await firstTurn.result();
+  assert.equal(first.finalMessage, "42");
+  assert.deepEqual(first.usage, {
     input_tokens: 20,
     cached_input_tokens: 10,
     cache_write_input_tokens: 0,
@@ -158,11 +159,13 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
     },
     cost_status: "estimated_from_usage",
   });
-  assert.deepEqual(Actions.turn.getUsage(first), first.usage());
+  assert.strictEqual(Actions.turn.getUsage(first), first.usage);
   await agent.session.setThinking("high");
   await agent.session.setFastMode(true);
-  const second = Actions.turn.prompt(agent, { input: "Add one to that result." });
-  assert.equal(await Actions.turn.getResult(second), "43");
+  const second = await Actions.turn.getResult(
+    Actions.turn.prompt(agent, { input: "Add one to that result." }),
+  );
+  assert.equal(second.finalMessage, "43");
   await scenario;
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -196,12 +199,12 @@ test("WASM snapshots resume authoritative history in a fresh agent", async () =>
     await reader.next();
     sendFinal(socket, "resp-first", "stored");
   })();
-  const first = original.turn.prompt({ input: "remember cobalt" });
-  assert.equal(await first.result(), "stored");
-  const snapshot = first.snapshot();
+  const first = await original.turn.prompt({ input: "remember cobalt" }).result();
+  assert.equal(first.finalMessage, "stored");
+  const snapshot = first.snapshot;
   assert.equal(snapshot.version, 1);
   assert.equal(snapshot.workspace, "/virtual/original-workspace");
-  assert.equal(Actions.turn.getSnapshot(first).model, snapshot.model);
+  assert.strictEqual(Actions.turn.getSnapshot(first), snapshot);
   await originalScenario;
   original.dispose();
   await originalServer.close();
@@ -226,7 +229,7 @@ test("WASM snapshots resume authoritative history in a fresh agent", async () =>
     sendFinal(socket, "resp-resumed", "cobalt");
   })();
   assert.equal(
-    await resumed.turn.prompt({ input: "what did I ask you to remember?" }).result(),
+    (await resumed.turn.prompt({ input: "what did I ask you to remember?" }).result()).finalMessage,
     "cobalt",
   );
   await resumedScenario;
@@ -247,7 +250,10 @@ test("WASM snapshots resume authoritative history in a fresh agent", async () =>
     await reader.next();
     sendFinal(socket, "resp-spawned", "fresh");
   })();
-  assert.equal(await spawned.turn.prompt({ input: "start fresh" }).result(), "fresh");
+  assert.equal(
+    (await spawned.turn.prompt({ input: "start fresh" }).result()).finalMessage,
+    "fresh",
+  );
   await spawnedScenario;
   spawned.dispose();
   resumed.dispose();
@@ -298,7 +304,8 @@ test("Node can load an application-owned web module and resume Codex rollout his
   })();
 
   assert.equal(
-    await agent.turn.prompt({ input: "what color did I ask you to remember?" }).result(),
+    (await agent.turn.prompt({ input: "what color did I ask you to remember?" }).result())
+      .finalMessage,
     "amber",
   );
   await scenario;
@@ -359,10 +366,10 @@ test("independent agents keep their host connections isolated", async () => {
 
   // Prompt the first agent only after the second factory has installed its
   // host. This regresses the old realm-global host overwrite.
-  const [leftResult, rightResult] = await Promise.all([
+  const [leftResult, rightResult] = (await Promise.all([
     left.turn.prompt({ input: "left" }).result(),
     right.turn.prompt({ input: "right" }).result(),
-  ]);
+  ])).map((result) => result.finalMessage);
   assert.equal(leftResult, "LEFT");
   assert.equal(rightResult, "RIGHT");
   await scenarios;

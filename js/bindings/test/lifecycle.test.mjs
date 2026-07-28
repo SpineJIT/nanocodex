@@ -72,9 +72,9 @@ test("prompt acceptance is separate from results and healthy follow-ons reuse on
     "pending",
   );
   releaseFirst.resolve();
-  assert.equal(await firstResult, "FIRST");
+  assert.equal((await firstResult).finalMessage, "FIRST");
   assert.equal(
-    await agent.turn.prompt({ input: "second owned prompt" }).result(),
+    (await agent.turn.prompt({ input: "second owned prompt" }).result()).finalMessage,
     "SECOND",
   );
   await scenario;
@@ -123,7 +123,7 @@ test("steering joins the active turn at the next model boundary", async () => {
   await initialSeen.promise;
   await turn.steer({ input: "use the safer path" });
   releaseInitial.resolve();
-  assert.equal(await turn.result(), "STEERED");
+  assert.equal((await turn.result()).finalMessage, "STEERED");
 
   await scenario;
   agent.dispose();
@@ -169,7 +169,7 @@ test("cancellation stops the active socket and replays only committed and aborte
   await cancelled.cancel();
   await assert.rejects(cancelled.result(), /turn was cancelled/);
   assert.equal(
-    await agent.turn.prompt({ input: "continue after cancellation" }).result(),
+    (await agent.turn.prompt({ input: "continue after cancellation" }).result()).finalMessage,
     "RECOVERED",
   );
 
@@ -209,12 +209,12 @@ test("a replacement socket drops the remote response ID and replays committed hi
   })();
 
   assert.equal(
-    await agent.turn.prompt({ input: "before replacement" }).result(),
+    (await agent.turn.prompt({ input: "before replacement" }).result()).finalMessage,
     "BEFORE",
   );
   await firstClosed.promise;
   assert.equal(
-    await agent.turn.prompt({ input: "after replacement" }).result(),
+    (await agent.turn.prompt({ input: "after replacement" }).result()).finalMessage,
     "AFTER",
   );
   await scenario;
@@ -269,21 +269,21 @@ test("manual compaction and historical forks preserve exact committed boundaries
     sendFinal(branch, "resp-historical", "BRANCHED");
   })();
 
-  const first = agent.turn.prompt({ input: "remember copper" });
-  assert.equal(await first.result(), "stored copper");
+  const first = await agent.turn.prompt({ input: "remember copper" }).result();
+  assert.equal(first.finalMessage, "stored copper");
   assert.equal(
-    await agent.turn.prompt({ input: "remember silver" }).result(),
+    (await agent.turn.prompt({ input: "remember silver" }).result()).finalMessage,
     "stored silver",
   );
   await agent.session.compact();
   assert.equal(
-    await agent.turn.prompt({ input: "after compaction" }).result(),
+    (await agent.turn.prompt({ input: "after compaction" }).result()).finalMessage,
     "COMPACTED",
   );
 
   const historical = await agent.session.fork({ at: first });
   assert.equal(
-    await historical.turn.prompt({ input: "historical branch" }).result(),
+    (await historical.turn.prompt({ input: "historical branch" }).result()).finalMessage,
     "BRANCHED",
   );
 

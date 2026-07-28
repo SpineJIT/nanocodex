@@ -12,6 +12,7 @@ export type {
   ToolContext,
   ToolMap,
   Turn,
+  TurnResult,
   TurnUsage,
 } from "../types.mjs";
 export * as Agent from "./Agent.mjs";

@@ -1,5 +1,6 @@
-const AGENT_STATE = Symbol("nanocodex.agent");
-const TURN_STATE = Symbol("nanocodex.turn");
+const agentStates = new WeakMap();
+const turnStates = new WeakMap();
+const resultStates = new WeakMap();
 const hostSessions = new Map();
 const hostConnections = new Map();
 let activeHost;
@@ -41,16 +42,18 @@ export function prompt(agent, options) {
 
 export function getTurnResult(turn) {
   const state = turnState(turn);
-  state.result ||= Promise.resolve().then(() => state.raw.result());
+  state.result ||= Promise.resolve()
+    .then(() => state.raw.result())
+    .then(createTurnResult);
   return state.result;
 }
 
-export function getTurnSnapshot(turn) {
-  return JSON.parse(turnState(turn).raw.snapshot());
+export function getTurnSnapshot(result) {
+  return resultState(result).snapshot();
 }
 
-export function getTurnUsage(turn) {
-  return JSON.parse(turnState(turn).raw.usage());
+export function getTurnUsage(result) {
+  return resultState(result).usage();
 }
 
 export function steer(turn, options) {
@@ -70,7 +73,7 @@ export async function fork(agent, options) {
   const at = options?.at;
   const raw = at === undefined
     ? await state.raw.fork()
-    : await state.raw.forkFrom(turnState(at).raw);
+    : await state.raw.forkFrom(resultState(at).raw);
   return createAgent(raw, state.runtime);
 }
 
@@ -265,7 +268,7 @@ function agentView(state, extensions) {
     },
   };
   agent = Object.assign(base, extensions);
-  Object.defineProperty(agent, AGENT_STATE, { value: state });
+  agentStates.set(agent, state);
   return agent;
 }
 
@@ -318,8 +321,6 @@ function createTurn(raw, agent) {
   const turn = {
     get agent() { return state.agent; },
     result: () => getTurnResult(turn),
-    snapshot: () => getTurnSnapshot(turn),
-    usage: () => getTurnUsage(turn),
     steer: (input) => steer(turn, input),
     cancel: () => cancel(turn),
     dispose() {
@@ -328,21 +329,59 @@ function createTurn(raw, agent) {
       state.raw.free();
     },
   };
-  Object.defineProperty(turn, TURN_STATE, { value: state });
+  turnStates.set(turn, state);
   return Object.freeze(turn);
 }
 
+function createTurnResult(raw) {
+  if (
+    !raw
+    || typeof raw.finalMessage !== "string"
+    || typeof raw.snapshot !== "function"
+    || typeof raw.usage !== "function"
+  ) {
+    raw?.free?.();
+    throw new TypeError("the runtime returned an invalid Nanocodex turn result");
+  }
+  const state = {
+    raw,
+    snapshotValue: undefined,
+    usageValue: undefined,
+    snapshot() {
+      state.snapshotValue ||= freezeJson(JSON.parse(raw.snapshot()));
+      return state.snapshotValue;
+    },
+    usage() {
+      state.usageValue ||= freezeJson(JSON.parse(raw.usage()));
+      return state.usageValue;
+    },
+  };
+  const result = {
+    finalMessage: raw.finalMessage,
+    get snapshot() { return state.snapshot(); },
+    get usage() { return state.usage(); },
+  };
+  resultStates.set(result, state);
+  return Object.freeze(result);
+}
+
 function agentState(agent) {
-  const state = agent?.[AGENT_STATE];
+  const state = agentStates.get(agent);
   if (!state) throw new TypeError("expected a Nanocodex agent");
   if (state.disposed) throw new Error("the Nanocodex agent has been disposed");
   return state;
 }
 
 function turnState(turn) {
-  const state = turn?.[TURN_STATE];
+  const state = turnStates.get(turn);
   if (!state) throw new TypeError("expected a Nanocodex turn");
   if (state.disposed) throw new Error("the Nanocodex turn has been disposed");
+  return state;
+}
+
+function resultState(result) {
+  const state = resultStates.get(result);
+  if (!state) throw new TypeError("expected a completed Nanocodex turn result");
   return state;
 }
 
@@ -370,4 +409,18 @@ function isObject(value) {
 
 function copy(target, key, value) {
   if (value !== undefined) target[key] = value;
+}
+
+function freezeJson(value) {
+  if (!value || typeof value !== "object") return value;
+  const pending = [value];
+  while (pending.length) {
+    const current = pending.pop();
+    if (Object.isFrozen(current)) continue;
+    for (const child of Object.values(current)) {
+      if (child && typeof child === "object" && !Object.isFrozen(child)) pending.push(child);
+    }
+    Object.freeze(current);
+  }
+  return value;
 }
