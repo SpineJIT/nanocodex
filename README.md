@@ -40,7 +40,7 @@ cargo add nanocodex
 use nanocodex::{Nanocodex, OpenAi};
 
 let openai = OpenAi::new(std::env::var("OPENAI_API_KEY")?)?;
-let (agent, _events) = Nanocodex::builder(openai)
+let (agent, mut events) = Nanocodex::builder(openai)
     .instructions(
         "You are a Rust coding agent. Make focused changes, preserve unrelated work, \
          and run relevant tests before finishing.",
@@ -48,11 +48,23 @@ let (agent, _events) = Nanocodex::builder(openai)
     .workspace(std::env::current_dir()?)
     .build()?;
 
+let event_task = tokio::spawn(async move {
+    while let Some(event) = events.recv().await {
+        eprintln!("event {}: {:?}", event.seq, event.kind);
+        if event.kind.is_terminal() {
+            break;
+        }
+    }
+});
+
+// Alternative: keep the `Turn` returned by the first `await` and consume its
+// `Stream<Item = AgentEvent>` implementation to render output as it arrives.
 let result = agent
     .prompt("Find and fix the failing parser test.")
     .await?
     .await?;
 
+event_task.await?;
 println!("{}", result.final_message());
 ```
 
@@ -60,7 +72,7 @@ The first `await` accepts and orders the prompt. The second waits for its typed
 `TurnResult`. Follow-on prompts automatically reuse the agent's retained
 history, WebSocket, tools, shell sessions, and prompt-cache identity.
 `agent.clone()` is a cheap handle to that same session; the independently
-returned `AgentEvents` stream is optional.
+returned `AgentEvents` stream is the session-wide event firehose.
 
 ## Thesis
 
