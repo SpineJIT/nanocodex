@@ -47,22 +47,15 @@ pub use session::{
     CompletedResponse, Response, ResponseError, ResponseTurn, Session, SessionBuildError,
     SessionBuilder,
 };
-#[doc(hidden)]
-pub use session::{compaction, context};
 pub(crate) use tools::ToolOutputBody;
 pub(crate) use tower::attempt::{
     ResponsesAttempt, ResponsesAttemptFactory, ResponsesOutput, ResponsesServiceResponse,
     TransportStats,
 };
 pub(crate) use tower::service::ResponsesService;
-pub(crate) use tower::stream::{CompactionOutput, GenerationOutput};
 pub(crate) use tower::{
     DefaultResponsesService, ResponsesClient, ResponsesRetryPolicy, ResponsesServiceError,
 };
-#[doc(hidden)]
-pub type CompactionResult = CompactionOutput;
-#[doc(hidden)]
-pub type TurnResult = GenerationOutput;
 pub(crate) use transport::EncodedRequest;
 pub(crate) use transport::{ResponsesError, ResponsesHistory, ResponsesTransport, RetryAdvice};
 
@@ -82,8 +75,20 @@ pub mod __private {
     pub use crate::{
         events::stream::EventSink,
         openai::{CallerServiceFactory, LayeredServiceFactory, MakeResponsesService, ModelConfig},
+        session::{
+            context::{ContextManager, assign_missing_response_item_id},
+            state::{ManagedSessionState, ManagedSessionStateError},
+        },
         tower::attempt::ResponsesAttemptFactory,
     };
+
+    /// Agent-owned context accounting and compaction policy primitives.
+    pub mod compaction {
+        pub use crate::session::compaction::{
+            auto_compact_token_limit, install_history, trigger,
+            trim_tool_outputs_to_fit_context_window,
+        };
+    }
 
     /// Decomposes a validated client recipe for the higher-level agent driver.
     pub fn into_openai_parts<F>(openai: crate::OpenAi<F>) -> (ModelConfig, F)

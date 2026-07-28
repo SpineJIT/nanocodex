@@ -11,7 +11,7 @@ use crate::{
 #[cfg(not(target_family = "wasm"))]
 use sha2::{Digest as _, Sha256};
 
-use crate::context::is_contextual_user_message;
+use super::context::is_contextual_user_message;
 #[cfg(not(target_family = "wasm"))]
 use crate::session::image_dimensions::dimensions_from_base64;
 

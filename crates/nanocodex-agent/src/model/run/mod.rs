@@ -19,19 +19,20 @@ use std::{
 
 use futures_util::{FutureExt, StreamExt, stream::FuturesOrdered};
 use nanocodex_oai_api::{
-    __private::{EventSink, ModelConfig, ResponsesAttemptFactory, with_code_mode_tool_names},
+    __private::{
+        EventSink, ManagedSessionState, ModelConfig, ResponsesAttemptFactory,
+        assign_missing_response_item_id, compaction, with_code_mode_tool_names,
+    },
     CONTEXT_WINDOW_TOKENS, MODEL, Prompt, Thinking,
     events::AgentEventKind,
     pricing::{ServiceTier, estimate},
     responses::{ContentItem, MessageRole, RequestProfile, ResponseItem, ToolDefinition, Usage},
-    session::ManagedSessionState,
     tower::{
         CodeCall, CodeCallKind, GenerationOutput as TurnResult, ResponsesAttempt, ResponsesClient,
         ResponsesOutput, ResponsesServiceResponse,
     },
     transport::{ResponsesError, ResponsesTransport, TransportStats},
 };
-use nanocodex_oai_api::{compaction, context::assign_missing_response_item_id};
 use serde::Serialize;
 use serde_json::{Value, value::RawValue};
 use tokio::sync::{RwLock, watch};

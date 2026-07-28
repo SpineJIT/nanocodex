@@ -2,10 +2,10 @@ use std::{hint::black_box, sync::Arc};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use nanocodex_oai_api::{
+    __private::{ContextManager, compaction},
     responses::{
         ContentItem, FunctionOutputBody, MessageRole, ResponseHistory, ResponseItem, Usage,
     },
-    session::{compaction, context::ContextManager},
 };
 
 fn history_item(index: usize) -> ResponseItem {

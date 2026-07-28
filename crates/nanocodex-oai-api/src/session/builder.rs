@@ -6,12 +6,12 @@ use tokio::sync::mpsc;
 use crate::{
     ContentItem, EventSink, MessageRole, OpenAi, ResponseItem, ResponsesAttempt, ResponsesClient,
     ResponsesServiceResponse, Thinking, ToolDefinition, TransportStats,
-    context::assign_missing_response_item_id,
     openai::{MakeResponsesService, StandardServiceFactory},
     responses::RequestProfile,
 };
 
 use super::{
+    context::assign_missing_response_item_id,
     response::{
         CompletedCompaction, Response, ResponseError, ResponseInput, run_compact, run_create,
     },

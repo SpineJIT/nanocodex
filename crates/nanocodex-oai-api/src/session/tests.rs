@@ -12,10 +12,12 @@ use ::tower::Service;
 use futures_util::TryStreamExt;
 
 use crate::{
-    CompactionOutput, GenerationOutput, ResponsesOutput, ResponsesServiceResponse,
     responses::{ContentItem, MessageRole},
     session::SessionId,
-    tower::{ResponsePipelineStats, ResponsesAttemptKind},
+    tower::{
+        CompactionOutput, GenerationOutput, ResponsePipelineStats, ResponsesAttemptKind,
+        ResponsesOutput, ResponsesServiceResponse,
+    },
 };
 
 use crate::{OpenAi, ResponseEvent};

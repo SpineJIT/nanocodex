@@ -5,7 +5,7 @@ use crate::{
     ResponseItemId, Usage, responses::ResponseHistory,
 };
 
-use crate::compaction;
+use super::compaction;
 
 const TOOL_OUTPUT_TOKEN_LIMIT: usize = 12_000;
 // Changing this value would change model-visible IDs and invalidate prompt caches.
