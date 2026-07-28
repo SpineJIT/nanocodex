@@ -9,7 +9,7 @@ use rmcp::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tracing::{Instrument, Span, info_span};
 
 use super::config::{McpServer, McpTransport, SecretSource};
@@ -17,6 +17,7 @@ use super::oauth::{McpOAuthStore, OAuthMetadataCache, OAuthRuntime, transport_fr
 use super::stdio::McpStdioTransport;
 
 const MCP_USER_AGENT: &str = concat!("nanocodex-mcp-client/", env!("CARGO_PKG_VERSION"));
+const MCP_STDERR_CHUNK_BYTES: usize = 8 * 1024;
 
 pub(crate) type Client = Arc<ClientInner>;
 
@@ -365,16 +366,35 @@ where
 
 fn drain_server_stderr(server_name: String, stderr: tokio::process::ChildStderr) {
     drop(tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
+        let mut stderr = stderr;
+        let mut chunk = [0_u8; MCP_STDERR_CHUNK_BYTES];
+        let mut chunk_index = 0_u64;
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => tracing::info!(
-                    target: "nanocodex_tools",
-                    server = %server_name,
-                    message = %line,
-                    "MCP server stderr"
-                ),
-                Ok(None) => break,
+            match stderr.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(size) => {
+                    let content = &chunk[..size];
+                    if let Ok(message) = std::str::from_utf8(content) {
+                        tracing::info!(
+                            target: "nanocodex_tools",
+                            server = %server_name,
+                            chunk.index = chunk_index,
+                            chunk.bytes = size,
+                            message,
+                            "MCP server stderr"
+                        );
+                    } else {
+                        tracing::info!(
+                            target: "nanocodex_tools",
+                            server = %server_name,
+                            chunk.index = chunk_index,
+                            chunk.bytes = size,
+                            message.bytes = ?content,
+                            "MCP server stderr"
+                        );
+                    }
+                    chunk_index = chunk_index.saturating_add(1);
+                }
                 Err(error) => {
                     tracing::warn!(
                         target: "nanocodex_tools",
@@ -449,8 +469,31 @@ fn startup_timeout(server: &McpServer, operation: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
     use super::*;
     use reqwest::header::USER_AGENT;
+    use tokio::process::Command;
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
+
+    #[derive(Clone)]
+    struct StderrEventCount(Arc<AtomicUsize>);
+
+    impl<S> Layer<S> for StderrEventCount
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            if event.metadata().target() == "nanocodex_tools" {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 
     #[test]
     fn streamable_http_headers_have_an_overridable_default_user_agent() {
@@ -486,6 +529,38 @@ mod tests {
                 .get(USER_AGENT)
                 .and_then(|value| value.to_str().ok()),
             Some("custom-agent/9.9")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stdio_stderr_is_emitted_before_a_long_line_reaches_eof() {
+        let events = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(StderrEventCount(Arc::clone(&events)));
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let mut child = Command::new("node")
+            .args([
+                "-e",
+                "process.stderr.write('x'.repeat(65536)); setTimeout(() => {}, 10000);",
+            ])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn stderr fixture");
+        let stderr = child.stderr.take().expect("fixture stderr");
+
+        drain_server_stderr("fixture".to_owned(), stderr);
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            while events.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        child.kill().await.expect("kill stderr fixture");
+        child.wait().await.expect("reap stderr fixture");
+
+        assert!(
+            observed.is_ok(),
+            "stderr reader retained an unterminated line until EOF"
         );
     }
 }
