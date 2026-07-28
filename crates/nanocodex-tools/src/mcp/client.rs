@@ -1,6 +1,6 @@
 use std::{collections::HashMap, process::Stdio, sync::Arc};
 
-use http::{HeaderName, HeaderValue};
+use http::{HeaderName, HeaderValue, header::USER_AGENT};
 use rmcp::{
     ServiceExt,
     model::{CallToolRequestParams, CallToolResult, Tool},
@@ -15,6 +15,8 @@ use tracing::{Instrument, Span, info_span};
 
 use super::config::{McpServer, McpTransport, SecretSource};
 use super::oauth::{McpOAuthStore, OAuthMetadataCache, OAuthRuntime, transport_from_credentials};
+
+const MCP_USER_AGENT: &str = concat!("nanocodex-mcp-client/", env!("CARGO_PKG_VERSION"));
 
 pub(crate) type Client = Arc<ClientInner>;
 
@@ -182,19 +184,7 @@ async fn connect_http(input: HttpConnect<'_>) -> Result<ConnectedServer, String>
     if url.trim().is_empty() {
         return Err("Streamable HTTP URL must not be empty".to_owned());
     }
-    let mut resolved_headers = HashMap::with_capacity(headers.len());
-    let mut default_headers = reqwest::header::HeaderMap::with_capacity(headers.len());
-    for (name, source) in headers {
-        let name = name
-            .parse::<HeaderName>()
-            .map_err(|error| format!("invalid HTTP header name `{name}`: {error}"))?;
-        let value = source.resolve()?;
-        let mut value = HeaderValue::from_str(&value)
-            .map_err(|error| format!("invalid value for HTTP header `{name}`: {error}"))?;
-        value.set_sensitive(true);
-        resolved_headers.insert(name.clone(), value.clone());
-        default_headers.insert(name, value);
-    }
+    let (resolved_headers, default_headers) = resolve_http_headers(headers)?;
     let http_client = reqwest::Client::builder()
         // Match RMCP's default: its streamed handshake responses are not always fully consumed
         // before the next request, so retaining them as idle connections can stall real peers.
@@ -231,6 +221,29 @@ async fn connect_http(input: HttpConnect<'_>) -> Result<ConnectedServer, String>
     let transport = StreamableHttpClientTransport::with_client(http_client, config);
     let client = connect_transport(server, transport, parent).await?;
     finish_startup(server, client, None, parent).await
+}
+
+fn resolve_http_headers(
+    headers: &std::collections::BTreeMap<String, SecretSource>,
+) -> Result<(HashMap<HeaderName, HeaderValue>, reqwest::header::HeaderMap), String> {
+    let mut resolved_headers = HashMap::with_capacity(headers.len().saturating_add(1));
+    let mut default_headers =
+        reqwest::header::HeaderMap::with_capacity(headers.len().saturating_add(1));
+    let user_agent = HeaderValue::from_static(MCP_USER_AGENT);
+    resolved_headers.insert(USER_AGENT, user_agent.clone());
+    default_headers.insert(USER_AGENT, user_agent);
+    for (name, source) in headers {
+        let name = name
+            .parse::<HeaderName>()
+            .map_err(|error| format!("invalid HTTP header name `{name}`: {error}"))?;
+        let value = source.resolve()?;
+        let mut value = HeaderValue::from_str(&value)
+            .map_err(|error| format!("invalid value for HTTP header `{name}`: {error}"))?;
+        value.set_sensitive(true);
+        resolved_headers.insert(name.clone(), value.clone());
+        default_headers.insert(name, value);
+    }
+    Ok((resolved_headers, default_headers))
 }
 
 async fn connect_stored_oauth(input: StoredOAuthConnect<'_>) -> Result<ConnectedServer, String> {
@@ -433,4 +446,47 @@ fn startup_timeout(server: &McpServer, operation: &str) -> String {
         "MCP {operation} exceeded {:.1} seconds",
         server.startup_timeout.as_secs_f64()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::USER_AGENT;
+
+    #[test]
+    fn streamable_http_headers_have_an_overridable_default_user_agent() {
+        let (resolved, defaults) =
+            resolve_http_headers(&std::collections::BTreeMap::new()).expect("default headers");
+        let expected = concat!("nanocodex-mcp-client/", env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            resolved
+                .get(&USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected)
+        );
+        assert_eq!(
+            defaults
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected)
+        );
+
+        let custom = std::collections::BTreeMap::from([(
+            "user-agent".to_owned(),
+            SecretSource::Value("custom-agent/9.9".to_owned()),
+        )]);
+        let (resolved, defaults) = resolve_http_headers(&custom).expect("custom headers");
+        assert_eq!(
+            resolved
+                .get(&USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some("custom-agent/9.9")
+        );
+        assert_eq!(
+            defaults
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some("custom-agent/9.9")
+        );
+    }
 }
