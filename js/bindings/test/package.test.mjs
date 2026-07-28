@@ -56,7 +56,8 @@ test("the packed package installs and runs every public entry point", async () =
       assert.equal(typeof Actions.turn.prompt, "function");
       const nodeAgent = await NodeAgent.create({ apiKey: "package-test" });
       assert.equal(nodeAgent.type, "node");
-      nodeAgent.dispose();
+      await nodeAgent.session.shutdown();
+      await nodeAgent.session.shutdown();
 
       const browserEntry = fileURLToPath(import.meta.resolve("nanocodex/browser"));
       const wasm = await readFile(resolve(
@@ -69,7 +70,7 @@ test("the packed package installs and runs every public entry point", async () =
         WebSocketImpl: class {},
       });
       assert.equal(browserAgent.type, "browser");
-      browserAgent.dispose();
+      await browserAgent.session.shutdown();
 
       await assert.rejects(
         import("nanocodex/internal.mjs"),

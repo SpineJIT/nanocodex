@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { setImmediate as immediate } from "node:timers/promises";
 import { test } from "node:test";
 
+import { Actions } from "../index.mjs";
 import { Agent } from "../node/index.mjs";
 import {
   deferred,
@@ -20,6 +21,7 @@ const SESSION_IDS = Object.freeze({
   compact: "018f1f9a-7b3c-7a14-8000-000000000014",
   fork: "018f1f9a-7b3c-7a15-8000-000000000015",
   reconnect: "018f1f9a-7b3c-7a16-8000-000000000016",
+  shutdown: "018f1f9a-7b3c-7a17-8000-000000000017",
 });
 
 test("prompt acceptance is separate from results and healthy follow-ons reuse one socket", async () => {
@@ -175,6 +177,54 @@ test("cancellation stops the active socket and replays only committed and aborte
 
   await scenario;
   agent.dispose();
+  await server.close();
+});
+
+test("graceful shutdown cancels active work and joins transport cleanup exactly once", async () => {
+  const server = await startResponsesServer();
+  const activeSeen = deferred();
+  const socketClosed = deferred();
+  const agent = await Agent.create({
+    apiKey: "test-key",
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: SESSION_IDS.shutdown,
+  });
+  const scenario = (async () => {
+    const socket = await server.nextConnection();
+    socket.once("close", socketClosed.resolve);
+    const reader = messageReader(socket);
+    await reader.next();
+    sendWarmup(socket, "resp-shutdown-warmup");
+    const active = await reader.next();
+    assert.match(JSON.stringify(active.input), /stop this session/);
+    activeSeen.resolve();
+    await socketClosed.promise;
+  })();
+
+  const turn = agent.turn.prompt({ input: "stop this session" });
+  await activeSeen.promise;
+  const first = agent.session.shutdown();
+  const second = Actions.session.shutdown(agent);
+  agent.dispose();
+
+  await Promise.all([first, second]);
+  await assert.rejects(turn.result(), /turn was cancelled/);
+  await scenario;
+  assert.throws(
+    () => agent.turn.prompt({ input: "too late" }),
+    /agent has been disposed/,
+  );
+  await agent.session.shutdown();
+  turn.dispose();
+
+  const replacement = await Agent.create({
+    apiKey: "test-key",
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: SESSION_IDS.shutdown,
+  });
+  replacement.dispose();
   await server.close();
 });
 

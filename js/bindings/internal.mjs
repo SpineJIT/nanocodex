@@ -94,7 +94,19 @@ export function compact(agent) {
   return agentState(agent).raw.compact();
 }
 
-export function subscribeAgentEvents(agent, listener, options = {}) {
+export async function shutdown(agent) {
+  const state = knownAgentState(agent);
+  if (state.shutdownPromise) return state.shutdownPromise;
+  if (state.disposed) throw new Error("the Nanocodex agent has been disposed");
+  if (typeof state.raw.shutdown !== "function") {
+    throw new Error("this Nanocodex runtime does not expose graceful shutdown");
+  }
+  state.disposed = true;
+  state.shutdownPromise = joinAgentShutdown(state);
+  return state.shutdownPromise;
+}
+
+export function subscribeAgentEvents(agent, listener, options = {}, onRelease) {
   const state = agentState(agent);
   if (typeof state.runtime.subscribe !== "function") {
     throw new Error("this Nanocodex runtime does not expose agent events");
@@ -102,11 +114,25 @@ export function subscribeAgentEvents(agent, listener, options = {}) {
   if (typeof listener !== "function") {
     throw new TypeError("watchAgentEvents requires a listener");
   }
-  return state.runtime.subscribe((event, encodedLength) => {
+  const unsubscribe = state.runtime.subscribe((event, encodedLength) => {
     if (options.includeAllSessions || !event?.request_id || event.request_id === agent.sessionId) {
       listener(event, encodedLength);
     }
   });
+  let active = true;
+  const subscription = {
+    close(notify) {
+      if (!active) return;
+      active = false;
+      state.subscriptions.delete(subscription);
+      const errors = [];
+      runCleanup(errors, () => unsubscribe?.());
+      if (notify) runCleanup(errors, () => onRelease?.());
+      throwCleanupErrors(errors);
+    },
+  };
+  state.subscriptions.add(subscription);
+  return () => subscription.close(false);
 }
 
 export function toWasmConfig(options = {}) {
@@ -229,6 +255,9 @@ function createAgent(raw, runtime) {
     raw,
     runtime,
     disposed: false,
+    released: false,
+    shutdownPromise: undefined,
+    subscriptions: new Set(),
     sessionId: raw.sessionId,
     uid: `agent-${nextAgentUid++}`,
   };
@@ -261,10 +290,8 @@ function agentView(state, extensions) {
       return agentView(state, deepMerge(extensions, extension));
     },
     dispose() {
-      if (state.disposed) return;
-      state.disposed = true;
-      state.runtime.release?.(state.raw);
-      state.runtime.dispose(state.raw);
+      if (state.shutdownPromise) return;
+      releaseAgentState(state);
     },
   };
   agent = Object.assign(base, extensions);
@@ -276,6 +303,52 @@ function requiredSessionHost(sessionId) {
   const host = hostSessions.get(sessionId);
   if (!host) throw new Error(`no Nanocodex host is active for session: ${sessionId}`);
   return host;
+}
+
+function releaseAgentState(state) {
+  if (state.released) return;
+  state.disposed = true;
+  state.released = true;
+  const errors = [];
+  for (const subscription of [...state.subscriptions]) {
+    runCleanup(errors, () => subscription.close(true));
+  }
+  runCleanup(errors, () => state.runtime.release?.(state.raw));
+  runCleanup(errors, () => state.runtime.dispose(state.raw));
+  throwCleanupErrors(errors);
+}
+
+async function joinAgentShutdown(state) {
+  await Promise.resolve();
+  let shutdownFailed = false;
+  let shutdownError;
+  try {
+    await state.raw.shutdown();
+  } catch (error) {
+    shutdownFailed = true;
+    shutdownError = error;
+  }
+
+  let cleanupFailed = false;
+  let cleanupError;
+  try {
+    releaseAgentState(state);
+  } catch (error) {
+    cleanupFailed = true;
+    cleanupError = error;
+  }
+
+  if (shutdownFailed && cleanupFailed) {
+    const cleanupErrors = cleanupError instanceof AggregateError
+      ? cleanupError.errors
+      : [cleanupError];
+    throw new AggregateError(
+      [shutdownError, ...cleanupErrors],
+      "Nanocodex driver shutdown and resource release both failed",
+    );
+  }
+  if (shutdownFailed) throw shutdownError;
+  if (cleanupFailed) throw cleanupError;
 }
 
 function requiredActiveHost() {
@@ -366,9 +439,14 @@ function createTurnResult(raw) {
 }
 
 function agentState(agent) {
+  const state = knownAgentState(agent);
+  if (state.disposed) throw new Error("the Nanocodex agent has been disposed");
+  return state;
+}
+
+function knownAgentState(agent) {
   const state = agentStates.get(agent);
   if (!state) throw new TypeError("expected a Nanocodex agent");
-  if (state.disposed) throw new Error("the Nanocodex agent has been disposed");
   return state;
 }
 
@@ -409,6 +487,21 @@ function isObject(value) {
 
 function copy(target, key, value) {
   if (value !== undefined) target[key] = value;
+}
+
+function runCleanup(errors, cleanup) {
+  try {
+    cleanup();
+  } catch (error) {
+    errors.push(error);
+  }
+}
+
+function throwCleanupErrors(errors) {
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "multiple Nanocodex resources failed to release");
+  }
 }
 
 function freezeJson(value) {

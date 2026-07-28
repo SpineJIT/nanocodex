@@ -3,6 +3,7 @@ import {
   fork as forkAgent,
   setFastMode as setAgentFastMode,
   setThinking as setAgentThinking,
+  shutdown as shutdownAgent,
   spawn as spawnAgent,
 } from "../internal.mjs";
 
@@ -24,4 +25,8 @@ export function setThinking(agent, thinking) {
 
 export function setFastMode(agent, enabled) {
   return setAgentFastMode(agent, enabled);
+}
+
+export function shutdown(agent) {
+  return shutdownAgent(agent);
 }

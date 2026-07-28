@@ -74,6 +74,155 @@ test("the headless client exposes matching direct and standalone actions", async
 
   const extended = agent.extend((client) => ({ inspect: { session: () => client.sessionId } }));
   assert.equal(extended.inspect.session(), "session-1");
+  branch.dispose();
+  fresh.dispose();
+  agent.dispose();
+});
+
+test("concurrent graceful shutdown defers exactly-once release until the join completes", async () => {
+  let shutdowns = 0;
+  let releases = 0;
+  let disposals = 0;
+  let resolveShutdown;
+  const shutdownGate = new Promise((resolve) => { resolveShutdown = resolve; });
+  const subscriptions = new Set();
+  const raw = rawAgent("session-shutdown");
+  raw.shutdown = async () => {
+    shutdowns += 1;
+    await shutdownGate;
+  };
+  const runtime = defineRuntime({
+    create: () => raw,
+    subscribe(listener) {
+      subscriptions.add(listener);
+      return () => subscriptions.delete(listener);
+    },
+    release() {
+      releases += 1;
+    },
+    dispose() {
+      disposals += 1;
+    },
+    decorate: (agent) => agent.extend(Actions.agentActions()),
+  });
+  const agent = await createAgentClient(runtime);
+  const extended = agent.extend(() => ({ inspect: true }));
+  const watcher = agent.events.watch();
+  const pendingEvent = watcher[Symbol.asyncIterator]().next();
+
+  const first = agent.session.shutdown();
+  const second = Actions.session.shutdown(extended);
+  const joined = Promise.all([first, second]);
+  void joined.catch(() => {});
+  agent.dispose();
+  await Promise.resolve();
+
+  assert.equal(shutdowns, 1);
+  assert.equal(releases, 0);
+  assert.equal(disposals, 0);
+  assert.equal(subscriptions.size, 1);
+  assert.throws(
+    () => extended.turn.prompt({ input: "too late" }),
+    /agent has been disposed/,
+  );
+
+  resolveShutdown();
+  await joined;
+  assert.deepEqual(await pendingEvent, { done: true, value: undefined });
+  assert.equal(subscriptions.size, 0);
+  assert.equal(releases, 1);
+  assert.equal(disposals, 1);
+
+  await agent.session.shutdown();
+  agent.dispose();
+  assert.equal(shutdowns, 1);
+  assert.equal(releases, 1);
+  assert.equal(disposals, 1);
+});
+
+test("a failing release hook still frees the raw agent exactly once", async () => {
+  const releaseError = new Error("release failed");
+  let shutdowns = 0;
+  let releases = 0;
+  let disposals = 0;
+  const raw = rawAgent("session-release-failure");
+  raw.shutdown = async () => {
+    shutdowns += 1;
+  };
+  const runtime = defineRuntime({
+    create: () => raw,
+    release() {
+      releases += 1;
+      throw releaseError;
+    },
+    dispose() {
+      disposals += 1;
+    },
+    decorate: (agent) => agent.extend(Actions.agentActions()),
+  });
+  const agent = await createAgentClient(runtime);
+
+  await assert.rejects(agent.session.shutdown(), releaseError);
+  agent.dispose();
+
+  assert.equal(shutdowns, 1);
+  assert.equal(releases, 1);
+  assert.equal(disposals, 1);
+});
+
+test("shutdown preserves driver and cleanup failures in causal order", async () => {
+  const shutdownError = new Error("driver shutdown failed");
+  const releaseError = new Error("release failed");
+  const disposeError = new Error("dispose failed");
+  const raw = rawAgent("session-multiple-shutdown-errors");
+  raw.shutdown = async () => {
+    throw shutdownError;
+  };
+  const runtime = defineRuntime({
+    create: () => raw,
+    release() {
+      throw releaseError;
+    },
+    dispose() {
+      throw disposeError;
+    },
+    decorate: (agent) => agent.extend(Actions.agentActions()),
+  });
+  const agent = await createAgentClient(runtime);
+
+  await assert.rejects(
+    agent.session.shutdown(),
+    (error) => {
+      assert.equal(error instanceof AggregateError, true);
+      assert.deepEqual(error.errors, [shutdownError, releaseError, disposeError]);
+      return true;
+    },
+  );
+});
+
+test("a lone driver shutdown failure retains its exact identity", async () => {
+  const shutdownError = new Error("driver shutdown failed");
+  let releases = 0;
+  let disposals = 0;
+  const raw = rawAgent("session-driver-shutdown-error");
+  raw.shutdown = async () => {
+    throw shutdownError;
+  };
+  const runtime = defineRuntime({
+    create: () => raw,
+    release() {
+      releases += 1;
+    },
+    dispose() {
+      disposals += 1;
+    },
+    decorate: (agent) => agent.extend(Actions.agentActions()),
+  });
+  const agent = await createAgentClient(runtime);
+
+  await assert.rejects(agent.session.shutdown(), (error) => error === shutdownError);
+  assert.equal(releases, 1);
+  assert.equal(disposals, 1);
 });
 
 test("the host bridge keeps retry timing and handshake detail session-scoped", async () => {

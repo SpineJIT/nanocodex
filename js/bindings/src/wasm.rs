@@ -247,6 +247,15 @@ impl WasmNanocodex {
     pub async fn compact(&self) -> Result<(), JsValue> {
         self.inner.compact().await.map_err(js_error)
     }
+
+    /// Gracefully stops the driver and joins every resource owned by this agent.
+    ///
+    /// # Errors
+    ///
+    /// Rejects when the driver had already stopped or cleanup fails.
+    pub async fn shutdown(&self) -> Result<(), JsValue> {
+        self.inner.shutdown().await.map_err(js_error)
+    }
 }
 
 impl WasmNanocodex {

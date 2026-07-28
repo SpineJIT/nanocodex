@@ -80,6 +80,7 @@ export type AgentActions = {
     fork(options?: ForkOptions): Promise<DefaultAgent>;
     setFastMode(enabled: boolean): Promise<void>;
     setThinking(thinking: Thinking): Promise<void>;
+    shutdown(): Promise<void>;
     spawn(): Promise<DefaultAgent>;
   };
   turn: {
@@ -96,6 +97,7 @@ export type Agent<extended extends object = {}> = {
   extend<const extension extends object>(
     decorator: (agent: Agent<extended>) => extension,
   ): Agent<extended & extension>;
+  /** Releases this JavaScript/WASM handle without joining unfinished turns. */
   dispose(): void;
 } & extended;
 
@@ -106,6 +108,7 @@ export type Turn<agent extends Agent<object> = Agent<object>> = Readonly<{
   result(): Promise<TurnResult>;
   steer(options: { input: PromptInput }): Promise<void>;
   cancel(): Promise<void>;
+  /** Releases this handle without cancelling its accepted turn. */
   dispose(): void;
 }>;
 

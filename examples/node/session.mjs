@@ -2,7 +2,7 @@
  * Runs two follow-on prompts and closes every owned lifecycle handle.
  *
  * Long-lived applications normally retain the agent. This short-lived example
- * disposes it after reading the typed result of each completed Turn.
+ * joins the agent after reading the typed result of each completed Turn.
  */
 export async function runOwnedSession(
   agent,
@@ -18,13 +18,20 @@ export async function runOwnedSession(
     }
   });
   const turns = [];
+  const unfinishedTurns = new Set();
 
   try {
     const first = agent.turn.prompt({
       input: "Use multiply to calculate 6 × 7. Return only the number.",
     });
     turns.push(first);
-    const firstResult = await first.result();
+    unfinishedTurns.add(first);
+    let firstResult;
+    try {
+      firstResult = await first.result();
+    } finally {
+      unfinishedTurns.delete(first);
+    }
     log("first:", firstResult.finalMessage);
 
     // Follow-on state, response IDs, and prompt-cache identity stay in Rust.
@@ -32,14 +39,21 @@ export async function runOwnedSession(
       input: "Add one to that result. Return only the number.",
     });
     turns.push(second);
-    const secondResult = await second.result();
+    unfinishedTurns.add(second);
+    let secondResult;
+    try {
+      secondResult = await second.result();
+    } finally {
+      unfinishedTurns.delete(second);
+    }
     log("second:", secondResult.finalMessage);
 
     return { first: firstResult, second: secondResult };
   } finally {
+    await Promise.allSettled([...unfinishedTurns].map((turn) => turn.cancel()));
     for (const turn of turns) turn.dispose();
     unwatch();
     watch.off();
-    agent.dispose();
+    await agent.session.shutdown();
   }
 }

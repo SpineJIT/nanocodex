@@ -54,6 +54,8 @@ async function check() {
     inspect: { session: () => client.sessionId },
   }));
   extended.inspect.session();
+  await agent.session.shutdown();
+  await Actions.session.shutdown(agent);
 
   await BrowserAgent.create({ websocketUrl: "wss://example.com" });
   await BrowserAgent.create({ apiKey });

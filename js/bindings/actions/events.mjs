@@ -22,7 +22,7 @@ export function watch(agent, options = {}) {
 
   const start = () => {
     if (closed || unsubscribe) return;
-    unsubscribe = subscribeAgentEvents(agent, emit, options);
+    unsubscribe = subscribeAgentEvents(agent, emit, options, () => watcher.off());
   };
 
   const stopIfIdle = () => {

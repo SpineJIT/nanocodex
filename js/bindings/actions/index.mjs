@@ -14,6 +14,7 @@ export function agentActions() {
       fork: (options) => session.fork(agent, options),
       setFastMode: (enabled) => session.setFastMode(agent, enabled),
       setThinking: (thinking) => session.setThinking(agent, thinking),
+      shutdown: () => session.shutdown(agent),
       spawn: () => session.spawn(agent),
     },
     turn: {

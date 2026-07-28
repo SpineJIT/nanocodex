@@ -21,3 +21,6 @@ export function setThinking(agent: Agent<object>, thinking: Thinking): Promise<v
 
 /** Enables or disables priority processing for subsequently accepted turns. */
 export function setFastMode(agent: Agent<object>, enabled: boolean): Promise<void>;
+
+/** Stops the driver and joins every resource owned by this Agent. */
+export function shutdown(agent: Agent<object>): Promise<void>;

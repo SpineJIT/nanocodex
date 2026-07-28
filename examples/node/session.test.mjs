@@ -28,7 +28,15 @@ test("the Node example reads typed results and releases every handle", async () 
   assert.deepEqual(harness.disposedTurns, [1, 1]);
   assert.equal(harness.unwatched, 1);
   assert.equal(harness.watchOffs, 1);
-  assert.equal(harness.agentDisposals, 1);
+  assert.equal(harness.agentShutdowns, 1);
+  assert.equal(harness.agentDisposals, 0);
+  assert.deepEqual(harness.cleanup, [
+    "turn:1",
+    "turn:2",
+    "unwatch",
+    "watch.off",
+    "shutdown",
+  ]);
 });
 
 test("a rejected result still releases the accepted Turn and agent", async () => {
@@ -45,15 +53,19 @@ test("a rejected result still releases the accepted Turn and agent", async () =>
   assert.deepEqual(harness.disposedTurns, [1]);
   assert.equal(harness.unwatched, 1);
   assert.equal(harness.watchOffs, 1);
-  assert.equal(harness.agentDisposals, 1);
+  assert.equal(harness.agentShutdowns, 1);
+  assert.equal(harness.agentDisposals, 0);
+  assert.deepEqual(harness.cleanup, ["turn:1", "unwatch", "watch.off", "shutdown"]);
 });
 
 function createHarness(outputs) {
   const prompts = [];
   const disposedTurns = [];
+  const cleanup = [];
   let unwatched = 0;
   let watchOffs = 0;
   let agentDisposals = 0;
+  let agentShutdowns = 0;
   const agent = {
     events: {
       watch() {
@@ -65,12 +77,20 @@ function createHarness(outputs) {
             });
             return () => {
               unwatched += 1;
+              cleanup.push("unwatch");
             };
           },
           off() {
             watchOffs += 1;
+            cleanup.push("watch.off");
           },
         };
+      },
+    },
+    session: {
+      async shutdown() {
+        agentShutdowns += 1;
+        cleanup.push("shutdown");
       },
     },
     turn: {
@@ -85,16 +105,19 @@ function createHarness(outputs) {
           },
           dispose() {
             disposedTurns[index] += 1;
+            cleanup.push(`turn:${index + 1}`);
           },
         };
       },
     },
     dispose() {
       agentDisposals += 1;
+      cleanup.push("dispose");
     },
   };
   return {
     agent,
+    cleanup,
     disposedTurns,
     prompts,
     get unwatched() {
@@ -105,6 +128,9 @@ function createHarness(outputs) {
     },
     get agentDisposals() {
       return agentDisposals;
+    },
+    get agentShutdowns() {
+      return agentShutdowns;
     },
   };
 }
