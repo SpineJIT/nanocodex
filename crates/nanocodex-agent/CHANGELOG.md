@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Stabilize observability and USD cost
 
+### Miscellaneous Tasks
+
+- [release] Prepare 0.3.0
+
 ### Other
 
 - Merge pull request [#50](https://github.com/gakonst/nanocodex/issues/50) from gakonst/refactor/05-observability

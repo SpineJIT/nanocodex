@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- [release] Support Ubuntu Python baseline
 - [release] Validate dynamic Python version
 - [ci] Satisfy strict Clippy checks
 - [ci] Build optimized Python wheels
@@ -81,6 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Miscellaneous Tasks
 
+- [release] Prepare 0.3.0
 - [consumers] Gate promoted language bindings
 - [js] Ship compiled tui entrypoints
 - Disable Python bindings on pull requests
