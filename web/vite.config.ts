@@ -11,6 +11,12 @@ export default defineConfig({
   // certificate keeps the development flow identical to production and lets
   // the hosted wallet perform cross-origin passkey ceremonies in the embed.
   plugins: [mkcert(), react(), cloudflare()],
+  build: {
+    // The production graph gate consumes this manifest so it measures complete
+    // static import closures instead of whichever output chunk happens to keep
+    // the entry-point name.
+    manifest: true,
+  },
   resolve: {
     preserveSymlinks: true,
     dedupe: [

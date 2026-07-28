@@ -253,7 +253,7 @@ jobs:
           npm ci --prefix web
       - name: Type-check and build the website
         working-directory: web
-        run: npm test && npm run typecheck && npx --no-install vite build
+        run: npm test && npm run typecheck && npx --no-install vite build && npm run check:bundle
 
   codeql:
     name: CodeQL actions
