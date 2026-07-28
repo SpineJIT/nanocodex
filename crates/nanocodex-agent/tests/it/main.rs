@@ -2,6 +2,5 @@
 
 mod lifecycle;
 mod model;
-mod tracing;
 
 const fn main() {}

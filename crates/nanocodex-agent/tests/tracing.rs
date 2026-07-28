@@ -1,3 +1,8 @@
+#![allow(missing_docs)]
+
+// Test-local dispatchers own process-wide callsite registration, so keep these
+// subscriber tests isolated from the unrelated parallel integration harness.
+
 use std::{
     collections::HashMap,
     future::{Pending, Ready, pending, ready},
@@ -203,15 +208,23 @@ fn final_generation() -> ResponsesOutput {
 }
 
 #[derive(Clone, Default)]
-struct TraceCapture(Arc<Mutex<HashMap<u64, CapturedSpan>>>);
+struct TraceCapture(Arc<Mutex<CapturedSpans>>);
 
 #[derive(Clone, Default)]
 struct TraceEventCapture(Arc<Mutex<Vec<CapturedTraceEvent>>>);
 
+#[derive(Default)]
+struct CapturedSpans {
+    // The registry pools raw IDs after close. Preserve completed spans while
+    // resolving records and parents through only the currently active IDs.
+    spans: Vec<CapturedSpan>,
+    active: HashMap<u64, usize>,
+}
+
 #[derive(Clone)]
 struct CapturedSpan {
     name: &'static str,
-    parent: Option<u64>,
+    parent: Option<usize>,
     opened: Instant,
     closed: Option<Instant>,
     fields: HashMap<String, String>,
@@ -262,28 +275,39 @@ where
                     .then(|| context.current_span().id().map(Id::into_u64))
                     .flatten()
             });
-        self.0.lock().unwrap().insert(
-            id.clone().into_u64(),
-            CapturedSpan {
-                name: attributes.metadata().name(),
-                parent,
-                opened: Instant::now(),
-                closed: None,
-                fields,
-            },
+        let mut captured = self.0.lock().unwrap();
+        let parent = parent.and_then(|parent| captured.active.get(&parent).copied());
+        let span_index = captured.spans.len();
+        captured.spans.push(CapturedSpan {
+            name: attributes.metadata().name(),
+            parent,
+            opened: Instant::now(),
+            closed: None,
+            fields,
+        });
+        assert!(
+            captured
+                .active
+                .insert(id.clone().into_u64(), span_index)
+                .is_none(),
+            "tracing registry reused an active span ID"
         );
     }
 
     fn on_record(&self, id: &Id, values: &Record<'_>, _context: LayerContext<'_, S>) {
-        if let Some(span) = self.0.lock().unwrap().get_mut(&id.clone().into_u64()) {
-            values.record(&mut FieldCapture(&mut span.fields));
-        }
+        let mut captured = self.0.lock().unwrap();
+        let Some(span_index) = captured.active.get(&id.clone().into_u64()).copied() else {
+            return;
+        };
+        values.record(&mut FieldCapture(&mut captured.spans[span_index].fields));
     }
 
     fn on_close(&self, id: Id, _context: LayerContext<'_, S>) {
-        if let Some(span) = self.0.lock().unwrap().get_mut(&id.into_u64()) {
-            span.closed = Some(Instant::now());
-        }
+        let mut captured = self.0.lock().unwrap();
+        let Some(span_index) = captured.active.remove(&id.into_u64()) else {
+            return;
+        };
+        captured.spans[span_index].closed = Some(Instant::now());
     }
 }
 
@@ -469,24 +493,25 @@ fn contextual_child_turns_preserve_parallel_orchestration_parentage() {
         });
     });
 
-    let spans = capture.0.lock().unwrap();
+    let capture = capture.0.lock().unwrap();
+    let spans = &capture.spans;
     let turns = spans
         .iter()
-        .filter(|(_, span)| span.name == "agent.turn")
+        .filter(|span| span.name == "agent.turn")
         .collect::<Vec<_>>();
     assert_eq!(turns.len(), 3);
 
     let child_turns = turns
         .iter()
-        .filter(|(_, span)| {
+        .filter(|span| {
             span.parent
-                .and_then(|parent| spans.get(&parent))
+                .and_then(|parent| spans.get(parent))
                 .is_some_and(|parent| parent.name == "test.spawn_agent")
         })
-        .map(|(_, span)| *span)
+        .copied()
         .collect::<Vec<_>>();
     assert_eq!(child_turns.len(), 2);
-    assert!(turns.iter().any(|(_, span)| span.parent.is_none()));
+    assert!(turns.iter().any(|span| span.parent.is_none()));
 
     let first = child_turns[0];
     let second = child_turns[1];
@@ -540,15 +565,21 @@ fn cancelled_tool_span_records_its_terminal_state_before_closing() {
         });
     });
 
-    let spans = capture.0.lock().unwrap();
+    let capture = capture.0.lock().unwrap();
+    let spans = &capture.spans;
     let tool = spans
-        .values()
+        .iter()
         .find(|span| span.name == "tool.call")
         .expect("tool span was not captured");
     let turn = spans
-        .values()
+        .iter()
         .find(|span| span.name == "agent.turn")
-        .expect("turn span was not captured");
+        .unwrap_or_else(|| {
+            panic!(
+                "turn span was not captured; observed: {:?}",
+                spans.iter().map(|span| span.name).collect::<Vec<_>>()
+            )
+        });
     assert_eq!(
         turn.fields.get("status").map(String::as_str),
         Some("cancelled")
