@@ -7,6 +7,9 @@ const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 
 export default defineConfig({
   plugins: [react(), cloudflare()],
+  build: {
+    manifest: true,
+  },
   worker: { format: "es" },
   server: {
     fs: {
