@@ -127,8 +127,10 @@ async fn configured_native_tool_search_round_trips_its_dedicated_items() -> Resu
 
         let continuation = next_json(&mut socket).await?;
         assert_eq!(continuation["previous_response_id"], "resp-search");
+        let mut input = continuation["input"].clone();
+        remove_client_item_id(&mut input[0], "tso");
         assert_eq!(
-            continuation["input"],
+            input,
             json!([{
                 "type": "tool_search_output",
                 "call_id": "search-1",
@@ -227,8 +229,10 @@ async fn mcp_tool_search_exposes_and_dispatches_a_native_namespace() -> Result<(
         .await?;
 
         let searched = next_json(&mut socket).await?;
+        let mut input = searched["input"].clone();
+        remove_client_item_id(&mut input[0], "tso");
         assert_eq!(
-            searched["input"],
+            input,
             json!([{
                 "type": "tool_search_output",
                 "call_id": "search-mcp",
@@ -448,14 +452,14 @@ async fn unsupported_direct_tools_return_failed_results_to_the_model() -> Result
             input[0]["output"],
             "unsupported custom tool call: missing_custom"
         );
-        assert!(input[0].get("id").is_none());
+        assert_client_item_id(&input[0], "ctco");
         assert_eq!(input[1]["type"], "function_call_output");
         assert_eq!(input[1]["call_id"], "call-function");
         assert_eq!(
             input[1]["output"],
             "unsupported call: example::missing_function"
         );
-        assert!(input[1].get("id").is_none());
+        assert_client_item_id(&input[1], "fco");
         send_final(&mut socket, "resp-final").await
     });
 

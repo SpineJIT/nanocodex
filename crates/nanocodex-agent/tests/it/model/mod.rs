@@ -135,6 +135,29 @@ fn assert_warmup_with_store(warmup: &Value, store: bool) {
     );
 }
 
+fn assert_client_item_id(item: &Value, expected_prefix: &str) {
+    let id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("client-authored response item should carry an ID");
+    let (prefix, suffix) = id
+        .split_once('_')
+        .expect("client-authored response item ID should be prefixed");
+    assert_eq!(prefix, expected_prefix, "unexpected response item ID: {id}");
+    assert!(
+        !suffix.is_empty(),
+        "response item ID suffix was empty: {id}"
+    );
+}
+
+fn remove_client_item_id(item: &mut Value, expected_prefix: &str) {
+    assert_client_item_id(item, expected_prefix);
+    item.as_object_mut()
+        .expect("response item should be an object")
+        .remove("id")
+        .expect("validated response item ID should be present");
+}
+
 async fn run_model(endpoint: &str, workspace: &Path, instruction: &str) -> Result<String> {
     let task = Prompt::new(instruction);
     let openai = OpenAi::builder("test-key")
