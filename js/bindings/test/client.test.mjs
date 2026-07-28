@@ -124,6 +124,41 @@ test("the host bridge keeps retry timing and handshake detail session-scoped", a
   releaseHostSession(right, "session-right");
 });
 
+test("event iterators release subscriptions and fail closed before buffering without bound", async () => {
+  const subscriptions = new Set();
+  const runtime = defineRuntime({
+    create: () => rawAgent("session-events"),
+    subscribe(listener) {
+      subscriptions.add(listener);
+      return () => subscriptions.delete(listener);
+    },
+    decorate: (agent) => agent.extend(Actions.agentActions()),
+  });
+  const agent = await createAgentClient(runtime);
+  const watch = agent.events.watch();
+  const iterator = watch[Symbol.asyncIterator]();
+
+  assert.equal(subscriptions.size, 1);
+  for (let seq = 1; seq <= 4_097; seq += 1) {
+    for (const listener of subscriptions) {
+      listener({ type: "api.event", request_id: agent.sessionId, seq });
+    }
+  }
+  for (let seq = 1; seq <= 4_096; seq += 1) {
+    assert.equal((await iterator.next()).value.seq, seq);
+  }
+  await assert.rejects(iterator.next(), /event iterator exceeded its private buffer/);
+  assert.equal(subscriptions.size, 0);
+
+  const restarted = watch[Symbol.asyncIterator]();
+  assert.equal(subscriptions.size, 1);
+  await restarted.return();
+  assert.equal(subscriptions.size, 0);
+
+  watch.off();
+  agent.dispose();
+});
+
 function rawAgent(sessionId) {
   return {
     sessionId,

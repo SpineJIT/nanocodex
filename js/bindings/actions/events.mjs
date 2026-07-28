@@ -1,19 +1,28 @@
 import { subscribeAgentEvents } from "../internal.mjs";
 
+const MAX_BUFFERED_EVENTS = 4_096;
+const MAX_BUFFERED_EVENT_CHARACTERS = 32 * 1024 * 1024;
+
 export function watch(agent, options = {}) {
   const listeners = new Set();
   const iterators = new Set();
   let unsubscribe;
   let closed = false;
 
-  const emit = (event) => {
+  const emit = (event, encodedLength) => {
     for (const listener of listeners) listener(event);
-    for (const iterator of iterators) iterator.push(event);
+    for (const iterator of iterators) iterator.push(event, encodedLength);
   };
 
   const start = () => {
     if (closed || unsubscribe) return;
     unsubscribe = subscribeAgentEvents(agent, emit, options);
+  };
+
+  const stopIfIdle = () => {
+    if (listeners.size || iterators.size) return;
+    unsubscribe?.();
+    unsubscribe = undefined;
   };
 
   const watcher = {
@@ -22,7 +31,10 @@ export function watch(agent, options = {}) {
       if (closed) return () => {};
       listeners.add(listener);
       start();
-      return () => listeners.delete(listener);
+      return () => {
+        listeners.delete(listener);
+        stopIfIdle();
+      };
     },
     off() {
       if (closed) return;
@@ -35,7 +47,10 @@ export function watch(agent, options = {}) {
     },
     [Symbol.asyncIterator]() {
       if (closed) return emptyIterator();
-      const iterator = eventIterator(() => iterators.delete(iterator));
+      const iterator = eventIterator(() => {
+        iterators.delete(iterator);
+        stopIfIdle();
+      });
       iterators.add(iterator);
       start();
       return iterator;
@@ -46,31 +61,69 @@ export function watch(agent, options = {}) {
 
 function eventIterator(onEnd) {
   const queue = [];
+  let head = 0;
+  let bufferedCharacters = 0;
   let pending;
-  let done = false;
+  let ended = false;
+  let failure;
+  let failureReported = false;
+  let detached = false;
+
+  const detach = () => {
+    if (detached) return;
+    detached = true;
+    onEnd();
+  };
 
   const iterator = {
-    push(event) {
-      if (done) return;
+    push(event, encodedLength) {
+      if (ended || failure) return;
       if (pending) {
         const resolve = pending;
         pending = undefined;
         resolve({ done: false, value: event });
       } else {
-        queue.push(event);
+        const characters = encodedLength ?? JSON.stringify(event).length;
+        if (
+          queue.length - head >= MAX_BUFFERED_EVENTS
+          || bufferedCharacters + characters > MAX_BUFFERED_EVENT_CHARACTERS
+        ) {
+          failure = new RangeError(
+            `event iterator exceeded its private buffer of ${MAX_BUFFERED_EVENTS} events or `
+              + `${MAX_BUFFERED_EVENT_CHARACTERS} serialized characters`,
+          );
+          detach();
+          return;
+        }
+        queue.push({ characters, event });
+        bufferedCharacters += characters;
       }
     },
     end() {
-      if (done) return;
-      done = true;
-      onEnd();
+      if (ended) return;
+      ended = true;
+      detach();
       pending?.({ done: true, value: undefined });
       pending = undefined;
       queue.length = 0;
+      head = 0;
+      bufferedCharacters = 0;
     },
     next() {
-      if (queue.length) return Promise.resolve({ done: false, value: queue.shift() });
-      if (done) return Promise.resolve({ done: true, value: undefined });
+      if (head < queue.length) {
+        const entry = queue[head++];
+        bufferedCharacters -= entry.characters;
+        if (head === queue.length) {
+          queue.length = 0;
+          head = 0;
+        }
+        return Promise.resolve({ done: false, value: entry.event });
+      }
+      if (failure && !failureReported) {
+        failureReported = true;
+        return Promise.reject(failure);
+      }
+      if (ended || failure) return Promise.resolve({ done: true, value: undefined });
       return new Promise((resolve) => { pending = resolve; });
     },
     return() {

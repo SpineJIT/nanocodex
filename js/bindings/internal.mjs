@@ -99,9 +99,9 @@ export function subscribeAgentEvents(agent, listener, options = {}) {
   if (typeof listener !== "function") {
     throw new TypeError("watchAgentEvents requires a listener");
   }
-  return state.runtime.subscribe((event) => {
+  return state.runtime.subscribe((event, encodedLength) => {
     if (options.includeAllSessions || !event?.request_id || event.request_id === agent.sessionId) {
-      listener(event);
+      listener(event, encodedLength);
     }
   });
 }
@@ -127,8 +127,10 @@ export function createEventChannel() {
   const listeners = new Set();
   return Object.freeze({
     emit(eventJson) {
+      if (!listeners.size) return;
       const event = typeof eventJson === "string" ? JSON.parse(eventJson) : eventJson;
-      for (const listener of listeners) listener(event);
+      const encodedLength = typeof eventJson === "string" ? eventJson.length : undefined;
+      for (const listener of listeners) listener(event, encodedLength);
     },
     subscribe(listener) {
       listeners.add(listener);
