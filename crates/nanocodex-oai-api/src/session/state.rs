@@ -248,7 +248,8 @@ impl ManagedSessionState {
 
     /// Installs a completed provider continuation checkpoint.
     pub fn set_previous_response_id(&mut self, response_id: impl Into<String>) {
-        self.previous_response_id = Some(response_id.into());
+        let response_id = response_id.into();
+        self.previous_response_id = (!response_id.is_empty()).then_some(response_id);
     }
 
     /// Excludes all currently retained items from the next healthy
@@ -338,4 +339,21 @@ pub enum ManagedSessionStateError {
     /// A completed response was missing its provider continuation identity.
     #[error("completed response did not have a response ID")]
     MissingResponseId,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ManagedSessionState, ManagedSessionStateError};
+
+    #[test]
+    fn empty_response_id_cannot_commit_an_incremental_checkpoint() {
+        let mut state = ManagedSessionState::new(Vec::new());
+        state.set_previous_response_id("");
+
+        assert!(matches!(
+            state.commit(),
+            Err(ManagedSessionStateError::MissingResponseId)
+        ));
+        assert_eq!(state.previous_response_id(), None);
+    }
 }
