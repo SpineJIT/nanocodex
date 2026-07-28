@@ -33,7 +33,7 @@ jobs:
           cache-on-failure: true
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
+          node-version: 22.13.0
           cache: npm
           cache-dependency-path: js/bindings/package-lock.json
       - uses: taiki-e/install-action@3522286d40783523f9c7880e33f785905b4c20d0 # v2

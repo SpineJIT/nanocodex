@@ -110,38 +110,114 @@ jobs:
           cache-on-failure: true
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
+          node-version: 22.13.0
           cache: npm
           cache-dependency-path: |
             js/bindings/package-lock.json
+            js/react/package-lock.json
+            js/tui/package-lock.json
+            js/tui-react/package-lock.json
+            examples/node/package-lock.json
             examples/react-vite/package-lock.json
       - uses: taiki-e/install-action@3522286d40783523f9c7880e33f785905b4c20d0 # v2
         with:
           tool: wasm-bindgen-cli@0.2.126
       - name: Build WASM consumers
         run: |
-          cargo check --locked --target wasm32-unknown-unknown \
+          cargo clippy --locked --target wasm32-unknown-unknown \
             --package nanocodex-oai-api \
             --package nanocodex-tools \
             --package nanocodex-agent \
-            --package nanocodex
+            --package nanocodex \
+            --package nanocodex-wasm \
+            -- -D warnings
           npm ci --prefix js/bindings
-          npm ci --prefix examples/react-vite
+          npm ci --prefix js/react
+          npm ci --prefix js/tui
+          npm run build --prefix js/tui
           ./scripts/build-js-package.sh
+          npm ci --prefix js/tui-react
+          npm ci --prefix examples/node
+          npm ci --prefix examples/react-vite
       - name: Test JS runtime
         working-directory: js/bindings
-        run: node --test --test-timeout=15000 test/*.test.mjs
+        run: |
+          node --test --test-timeout=15000 test/*.test.mjs
+          npm run test:performance
       - name: Check JS consumers
         run: |
           npm run test:typecheck --prefix js/bindings
           npm run check:package --prefix js/bindings
           npm test --prefix js/react
+          npm test --prefix js/tui
+          npm test --prefix js/tui-react
+          npm test --prefix examples/node
+          npm test --prefix examples/react-vite
           npm run build --prefix examples/react-vite
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nanocodex-web-wasm
           path: js/bindings/pkg-web
           if-no-files-found: error
+
+  python:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: true
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: py/bindings/pyproject.toml
+      - name: Build Python wheel
+        run: |
+          python -m pip install \
+            --disable-pip-version-check \
+            "maturin>=1.9,<2" \
+            "mypy==2.3.0"
+          maturin build \
+            --locked \
+            --manifest-path py/bindings/Cargo.toml \
+            --interpreter python \
+            --out dist/python
+      - name: Test installed Python package
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/nanocodex-python"
+          "$RUNNER_TEMP/nanocodex-python/bin/python" -m pip install \
+            --disable-pip-version-check \
+            dist/python/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/nanocodex-python/bin/python" -m unittest discover \
+            -s "$GITHUB_WORKSPACE/py/bindings/tests" \
+            -v
+          "$RUNNER_TEMP/nanocodex-python/bin/python" \
+            "$GITHUB_WORKSPACE/py/bindings/tests/typing_consumer.py"
+          python -m mypy \
+            --strict \
+            --python-executable "$RUNNER_TEMP/nanocodex-python/bin/python" \
+            "$GITHUB_WORKSPACE/py/bindings/tests/typing_consumer.py"
+          "$RUNNER_TEMP/nanocodex-python/bin/python" \
+            "$GITHUB_WORKSPACE/py/bindings/benchmarks/benchmark_binding.py" \
+            --check
+          "$RUNNER_TEMP/nanocodex-python/bin/python" -m compileall \
+            -q "$GITHUB_WORKSPACE/examples/python"
 
   web:
     name: website
@@ -156,17 +232,28 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
+          node-version: 22.13.0
           cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: |
+            js/react/package-lock.json
+            js/tui/package-lock.json
+            js/tui-react/package-lock.json
+            web/package-lock.json
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: nanocodex-web-wasm
           path: js/bindings/pkg-web
-      - run: npm ci --prefix web
+      - name: Build local website packages
+        run: |
+          npm ci --prefix js/react
+          npm ci --prefix js/tui
+          npm run build --prefix js/tui
+          npm ci --prefix js/tui-react
+          npm run build --prefix js/tui-react
+          npm ci --prefix web
       - name: Type-check and build the website
         working-directory: web
-        run: npm run typecheck && npx --no-install vite build
+        run: npm test && npm run typecheck && npx --no-install vite build
 
   codeql:
     name: CodeQL actions
@@ -191,7 +278,7 @@ jobs:
   ci-success:
     name: ci success
     if: always()
-    needs: [test, quality, policy, bindings, web, codeql]
+    needs: [test, quality, policy, bindings, python, web, codeql]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -201,6 +288,7 @@ jobs:
           QUALITY: ${{ needs.quality.result }}
           POLICY: ${{ needs.policy.result }}
           BINDINGS: ${{ needs.bindings.result }}
+          PYTHON: ${{ needs.python.result }}
           WEB: ${{ needs.web.result }}
           CODEQL: ${{ needs.codeql.result }}
         run: |
@@ -208,5 +296,6 @@ jobs:
           test "$QUALITY" = success
           test "$POLICY" = success
           test "$BINDINGS" = success
+          test "$PYTHON" = success
           test "$WEB" = success
           test "$CODEQL" = success
