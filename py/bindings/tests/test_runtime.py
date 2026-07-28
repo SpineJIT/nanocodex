@@ -77,6 +77,83 @@ for agent, _ in agents:
             counts,
         )
 
+    def test_fresh_process_post_io_thread_growth_is_absolutely_bounded(self) -> None:
+        with MockResponsesServer() as server:
+            script = f"""
+import json
+import os
+import subprocess
+import sys
+import threading
+from nanocodex import Nanocodex
+
+def threads():
+    if sys.platform.startswith("linux"):
+        return len(os.listdir("/proc/self/task"))
+    output = subprocess.check_output(
+        ["ps", "-M", "-p", str(os.getpid())],
+        text=True,
+    )
+    return max(0, len(output.splitlines()) - 1)
+
+before = threads()
+agents = [
+    Nanocodex(
+        "test-key",
+        thinking="none",
+        websocket_url={server.endpoint!r},
+    )[0]
+    for _ in range(8)
+]
+barrier = threading.Barrier(len(agents))
+errors = []
+
+def run(index):
+    try:
+        barrier.wait()
+        result = agents[index].prompt(f"agent {{index}}").result()
+        if result.final_message != f"agent {{index}}":
+            raise AssertionError("concurrent result did not match its prompt")
+    except Exception as error:
+        errors.append(error)
+
+workers = [
+    threading.Thread(target=run, args=(index,))
+    for index in range(len(agents))
+]
+for worker in workers:
+    worker.start()
+for worker in workers:
+    worker.join(5)
+if any(worker.is_alive() for worker in workers):
+    raise TimeoutError("concurrent binding audit did not finish")
+if errors:
+    raise errors[0]
+during = threads()
+for agent in agents:
+    agent.shutdown()
+after = threads()
+print(json.dumps({{"before": before, "during": during, "after": after}}))
+"""
+            completed = subprocess.run(
+                [sys.executable, "-I", "-c", script],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(server.connection_count, 8)
+        counts = json.loads(completed.stdout)
+        self.assertEqual(
+            counts["during"] - counts["after"],
+            8,
+            counts,
+        )
+        self.assertLessEqual(
+            counts["after"] - counts["before"],
+            5,
+            counts,
+        )
+
     def test_multiple_agents_complete_concurrently_on_the_shared_runtime(self) -> None:
         with MockResponsesServer() as server:
             agents = [

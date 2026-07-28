@@ -197,6 +197,8 @@ jobs:
             --manifest-path py/bindings/Cargo.toml \
             --interpreter python \
             --out dist/python
+          python py/bindings/benchmarks/check_package_size.py \
+            dist/python/*.whl
       - name: Test installed Python package
         shell: bash
         run: |

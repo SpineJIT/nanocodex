@@ -63,7 +63,6 @@ def fresh_import_times(rounds: int = 7) -> list[float]:
 
 
 def construction_metrics(rounds: int = 20) -> tuple[list[float], int, int]:
-    threads_before = native_thread_count()
     first, first_events = Nanocodex("benchmark-only", thinking="none")
     threads_after_first = native_thread_count()
     agents: list[tuple[Nanocodex, Any]] = []
@@ -72,13 +71,13 @@ def construction_metrics(rounds: int = 20) -> tuple[list[float], int, int]:
         started = time.perf_counter_ns()
         agents.append(Nanocodex("benchmark-only", thinking="none"))
         times.append(elapsed_ms(started))
-    thread_growth = native_thread_count() - threads_after_first
+    threads_after_all = native_thread_count()
     for agent, _ in agents:
         agent.shutdown()
     first.shutdown()
     while first_events.recv_json() is not None:
         pass
-    return times, threads_after_first - threads_before + thread_growth, thread_growth
+    return times, threads_after_first, threads_after_all
 
 
 def sequential_turn_metrics(
@@ -180,9 +179,12 @@ def concurrent_agent_wall_ms(agent_count: int = 8) -> float:
 
 
 def run() -> dict[str, Any]:
+    threads_before = native_thread_count()
     imports = fresh_import_times()
-    constructions, total_thread_growth, additional_thread_growth = (
-        construction_metrics()
+    constructions, threads_after_first, threads_after_all = construction_metrics()
+    shared_runtime_thread_growth = threads_after_first - threads_before
+    additional_agent_construction_thread_growth = (
+        threads_after_all - threads_after_first
     )
     (
         acceptance,
@@ -192,6 +194,8 @@ def run() -> dict[str, Any]:
         event_count,
     ) = sequential_turn_metrics()
     concurrent_wall = concurrent_agent_wall_ms()
+    threads_after_shutdown = native_thread_count()
+    retained_shared_thread_growth = threads_after_shutdown - threads_before
     return {
         "environment": {
             "python": sys.version.split()[0],
@@ -204,8 +208,12 @@ def run() -> dict[str, Any]:
             "fresh_import_ms_p95": percentile(imports, 0.95),
             "warm_agent_construction_ms_p50": median(constructions),
             "warm_agent_construction_ms_p95": percentile(constructions, 0.95),
-            "runtime_thread_growth_total": total_thread_growth,
-            "additional_runtime_threads": additional_thread_growth,
+            "shared_runtime_thread_growth_after_first_agent": (
+                shared_runtime_thread_growth
+            ),
+            "additional_agent_construction_thread_growth": (
+                additional_agent_construction_thread_growth
+            ),
             "prompt_acceptance_ms_p50": median(acceptance),
             "prompt_acceptance_ms_p95": percentile(acceptance, 0.95),
             "mock_turn_result_ms_p50": median(results),
@@ -214,6 +222,9 @@ def run() -> dict[str, Any]:
             "event_payload_decode_us_per_event": payload_decode_us,
             "delivered_events": event_count,
             "eight_agent_wall_ms": concurrent_wall,
+            "retained_shared_thread_growth_after_shutdown": (
+                retained_shared_thread_growth
+            ),
         },
     }
 

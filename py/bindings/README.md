@@ -89,6 +89,11 @@ sibling, sibling_events = agent.spawn()
 agent.compact()
 agent.set_thinking("high")
 agent.set_fast_mode(True)
+
+branch.shutdown()
+latest.shutdown()
+sibling.shutdown()
+agent.shutdown()
 ```
 
 - `steer()` adds input at the next safe model boundary.
@@ -137,6 +142,7 @@ Pass an API key positionally, or load subscription credentials created by
 
 ```python
 agent, events = Nanocodex(auth_file="/path/to/.codex/auth.json")
+agent.shutdown()
 ```
 
 GPT-5.6 Pro is an execution mode, not a model slug:
@@ -148,6 +154,7 @@ agent, events = Nanocodex(
     thinking="xhigh",  # none, low, medium, high, xhigh, or max
     fast_mode=True,
 )
+agent.shutdown()
 ```
 
 `session_id` accepts an explicit UUIDv7 identity. `prompt_cache_key` selects a
@@ -170,6 +177,12 @@ py/bindings/.venv/bin/python -m unittest discover \
 py/bindings/.venv/bin/python \
   py/bindings/benchmarks/benchmark_binding.py --check
 ```
+
+Python agents share one process-wide async runtime. Each driver lazily starts
+one intentional Code Mode worker after its first model I/O, reuses it while
+live, and joins it during `shutdown()`. CI separately gates import,
+construction, prompt-acceptance, and result p50/p95; retained shared threads;
+eight-agent concurrency; and packed and unpacked wheel size.
 
 Runnable live consumers are under
 [`examples/python`](../../examples/python).
