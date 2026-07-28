@@ -196,7 +196,8 @@ jobs:
             --locked \
             --manifest-path py/bindings/Cargo.toml \
             --interpreter python \
-            --out dist/python
+            --out dist/python \
+            --release
           python py/bindings/benchmarks/check_package_size.py \
             dist/python/*.whl
       - name: Test installed Python package
