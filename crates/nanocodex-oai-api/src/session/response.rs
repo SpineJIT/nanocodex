@@ -482,9 +482,7 @@ fn error_chain_responses_error<'a>(
         if let Some(error) = error.downcast_ref::<crate::ResponsesError>() {
             return Some(error);
         }
-        let Some(source) = error.source() else {
-            return None;
-        };
+        let source = error.source()?;
         error = source;
     }
 }

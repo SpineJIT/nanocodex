@@ -109,7 +109,7 @@ fn timed_openai() -> Result<OpenAi<TimedStandardFactory>, OpenAiError> {
         .build()
 }
 
-fn assert_nameable_factory<F>(_: &OpenAi<F>)
+const fn assert_nameable_factory<F>(_: &OpenAi<F>)
 where
     F: ResponsesServiceFactory,
 {

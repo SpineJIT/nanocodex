@@ -72,7 +72,7 @@ pub enum NanocodexError {
     /// Shared cleanup failure returned to every caller of an idempotent
     /// shutdown.
     #[error(transparent)]
-    Shutdown(Arc<NanocodexError>),
+    Shutdown(Arc<Self>),
 
     /// Steering targeted a queued or terminal turn.
     #[error("the targeted turn is queued, completed, or otherwise not active for steering")]
