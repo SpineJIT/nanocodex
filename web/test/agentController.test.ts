@@ -580,6 +580,9 @@ class FakeAgent {
       spawn: async () => this.harness.createAgent(
         `${this.sessionId}-spawn-${this.nextFork++}`,
       ),
+      shutdown: async () => {
+        this.dispose();
+      },
     };
     this.events = {
       watch: (options: unknown) => {

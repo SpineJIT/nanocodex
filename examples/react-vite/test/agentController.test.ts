@@ -350,6 +350,7 @@ class FakeAgent {
   private readonly harness: Harness;
   turn;
   events;
+  session;
 
   constructor(harness: Harness, sessionId: string) {
     this.harness = harness;
@@ -365,6 +366,11 @@ class FakeAgent {
         this.harness.resultError = undefined;
         this.harness.turns.push(turn);
         return turn;
+      },
+    };
+    this.session = {
+      shutdown: async () => {
+        this.dispose();
       },
     };
     this.events = {

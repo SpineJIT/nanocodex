@@ -294,7 +294,7 @@ export function createAgentController({
     });
     const agent = created.agent;
     if (disposed || startGeneration !== generation) {
-      agent.dispose();
+      await agent.session.shutdown();
       return;
     }
     payment = created.payment;
@@ -428,7 +428,7 @@ export function createAgentController({
     }
     branch.turns.clear();
     await Promise.all(releases);
-    branch.agent.dispose();
+    await branch.agent.session.shutdown();
   }
 
   async function reset(): Promise<number> {

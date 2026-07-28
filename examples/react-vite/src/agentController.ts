@@ -45,7 +45,7 @@ export function createExampleAgentController({
       const currentGeneration = await reset();
       const created = await createAgent(command);
       if (disposed || currentGeneration !== generation) {
-        created.agent.dispose();
+        await created.agent.session.shutdown();
         return;
       }
       agent = created.agent;
@@ -141,7 +141,7 @@ export function createExampleAgentController({
     agent = undefined;
     payment = undefined;
     await Promise.all(activeTurns.map(cancelAndReleaseTurn));
-    previousAgent?.dispose();
+    await previousAgent?.session.shutdown();
     return resetGeneration;
   }
 
