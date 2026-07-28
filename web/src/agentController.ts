@@ -95,7 +95,8 @@ export function createAgentController({
   let payment: AgentControllerPayment | undefined;
   let generation = 0;
   let disposed = false;
-  const releasedTurns = new WeakSet<Turn>();
+  let disposal: Promise<void> | undefined;
+  const turnReleases = new WeakMap<Turn, Promise<void>>();
 
   async function handle(message: WebTuiCommand): Promise<void> {
     if (disposed) throw new Error("Agent controller is disposed");
@@ -178,8 +179,9 @@ export function createAgentController({
       case "openBtw": {
         const main = branches.get(message.sourceBranchId);
         if (!main) throw new Error("Main branch is unavailable");
-        if (btw) disposeBranch(btw);
+        const previous = btw;
         btw = undefined;
+        if (previous) await disposeBranch(previous);
         try {
           const agent = await main.agent.session.fork();
           inheritSessionImages(main.agent.sessionId, agent.sessionId);
@@ -215,12 +217,14 @@ export function createAgentController({
         }
         return;
       }
-      case "closeBtw":
+      case "closeBtw": {
         if (btw?.id === message.id) {
-          disposeBranch(btw);
+          const closing = btw;
           btw = undefined;
+          await disposeBranch(closing);
         }
         return;
+      }
       case "historicalFork": {
         try {
           const source = branches.get(message.sourceBranchId);
@@ -281,8 +285,7 @@ export function createAgentController({
   }
 
   async function start(startOptions: AgentControllerStart): Promise<void> {
-    reset();
-    const startGeneration = generation;
+    const startGeneration = await reset();
     const created = await createAgent(startOptions, {
       recentImages(sessionId, count) {
         return (sessionImages.get(sessionId) ?? []).slice(-count);
@@ -410,48 +413,67 @@ export function createAgentController({
       || branches.get(branch.id) === branch;
   }
 
-  function disposeBranch(
+  async function disposeBranch(
     branch: Branch,
     disposedTurns = new Set<Turn>(),
-  ): void {
+  ): Promise<void> {
     routes.delete(branch.agent.sessionId);
     sessionImages.delete(branch.agent.sessionId);
+    const releases: Promise<void>[] = [];
     for (const record of branch.turns.values()) {
       if (!record.turn || disposedTurns.has(record.turn)) continue;
       disposedTurns.add(record.turn);
-      releaseTurn(record.turn);
+      releases.push(cancelAndReleaseTurn(record.turn));
       record.turn = undefined;
     }
     branch.turns.clear();
+    await Promise.all(releases);
     branch.agent.dispose();
   }
 
-  function reset(): void {
-    generation += 1;
+  async function reset(): Promise<number> {
+    const resetGeneration = ++generation;
     eventWatch?.off();
     eventWatch = undefined;
-    const disposedTurns = new Set<Turn>();
-    for (const branch of branches.values()) {
-      disposeBranch(branch, disposedTurns);
-    }
+    const ownedBranches = [...branches.values()];
+    const ownedBtw = btw;
     branches.clear();
-    if (btw) disposeBranch(btw, disposedTurns);
     btw = undefined;
     routes.clear();
     sessionImages.clear();
     payment = undefined;
+    const disposedTurns = new Set<Turn>();
+    await Promise.all([
+      ...ownedBranches.map((branch) => disposeBranch(branch, disposedTurns)),
+      ...(ownedBtw ? [disposeBranch(ownedBtw, disposedTurns)] : []),
+    ]);
+    return resetGeneration;
   }
 
   function releaseTurn(turn: Turn): void {
-    if (releasedTurns.has(turn)) return;
-    releasedTurns.add(turn);
+    if (turnReleases.has(turn)) return;
     turn.dispose();
+    turnReleases.set(turn, Promise.resolve());
   }
 
-  function dispose(): void {
-    if (disposed) return;
+  function cancelAndReleaseTurn(turn: Turn): Promise<void> {
+    const existing = turnReleases.get(turn);
+    if (existing) return existing;
+    const release = Promise.resolve()
+      .then(() => turn.cancel())
+      .catch(() => {})
+      .then(() => {
+        turn.dispose();
+      });
+    turnReleases.set(turn, release);
+    return release;
+  }
+
+  function dispose(): Promise<void> {
+    if (disposal) return disposal;
     disposed = true;
-    reset();
+    disposal = reset().then(() => {});
+    return disposal;
   }
 
   function post(

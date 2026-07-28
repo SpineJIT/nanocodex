@@ -35,14 +35,14 @@ export function createExampleAgentController({
   let payment: ExamplePayment | undefined;
   let generation = 0;
   let disposed = false;
+  let disposal: Promise<void> | undefined;
   const turns = new Set<Turn>();
-  const releasedTurns = new WeakSet<Turn>();
+  const turnReleases = new WeakMap<Turn, Promise<void>>();
 
   async function handle(command: AgentWorkerCommand): Promise<void> {
     if (disposed) throw new Error("Agent controller is disposed");
     if (command.type === "start") {
-      reset();
-      const currentGeneration = generation;
+      const currentGeneration = await reset();
       const created = await createAgent(command);
       if (disposed || currentGeneration !== generation) {
         created.agent.dispose();
@@ -131,27 +131,44 @@ export function createExampleAgentController({
       });
   }
 
-  function reset(): void {
-    generation += 1;
+  async function reset(): Promise<number> {
+    const resetGeneration = ++generation;
     eventWatch?.off();
     eventWatch = undefined;
-    for (const turn of turns) releaseTurn(turn);
+    const activeTurns = [...turns];
     turns.clear();
-    agent?.dispose();
+    const previousAgent = agent;
     agent = undefined;
     payment = undefined;
+    await Promise.all(activeTurns.map(cancelAndReleaseTurn));
+    previousAgent?.dispose();
+    return resetGeneration;
   }
 
   function releaseTurn(turn: Turn): void {
-    if (releasedTurns.has(turn)) return;
-    releasedTurns.add(turn);
+    if (turnReleases.has(turn)) return;
     turn.dispose();
+    turnReleases.set(turn, Promise.resolve());
   }
 
-  function dispose(): void {
-    if (disposed) return;
+  function cancelAndReleaseTurn(turn: Turn): Promise<void> {
+    const existing = turnReleases.get(turn);
+    if (existing) return existing;
+    const release = Promise.resolve()
+      .then(() => turn.cancel())
+      .catch(() => {})
+      .then(() => {
+        turn.dispose();
+      });
+    turnReleases.set(turn, release);
+    return release;
+  }
+
+  function dispose(): Promise<void> {
+    if (disposal) return disposal;
     disposed = true;
-    reset();
+    disposal = reset().then(() => {});
+    return disposal;
   }
 
   return Object.freeze({ handle, dispose });

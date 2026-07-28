@@ -111,7 +111,7 @@ test("the Worker controller owns prompts, steering, cancellation, events, and cl
     error: "model failed",
   });
 
-  controller.dispose();
+  await controller.dispose();
   assert.equal(harness.watchOffs, 1);
   assert.equal(harness.agents.get("root")?.disposed, 1);
   assert.equal(first.disposed, 1);
@@ -236,7 +236,7 @@ test("latest and historical forks use the completed Turn boundary", async () => 
     message: "branched",
   });
 
-  controller.dispose();
+  await controller.dispose();
   assert.equal(harness.turns[0]?.disposed, 1);
   assert.equal(harness.turns[1]?.disposed, 1);
   assert.equal(harness.turns[3]?.disposed, 1);
@@ -274,6 +274,7 @@ test("restart releases active Turns and suppresses stale results and routes", as
   const staleListener = harness.eventListeners.get("root-1");
   await controller.handle(start);
   assert.equal(harness.agents.get("root-1")?.disposed, 1);
+  assert.equal(staleTurn.cancelled, 1);
   assert.equal(harness.turns[0]?.disposed, 1);
   assert.equal(harness.watchOffs, 1);
   staleTurn.complete("late result");
@@ -284,7 +285,7 @@ test("restart releases active Turns and suppresses stale results and routes", as
     sessionId: "root-2",
   }]);
 
-  controller.dispose();
+  await controller.dispose();
 });
 
 test("an overtaken asynchronous start cannot replace the current session", async () => {
@@ -323,7 +324,7 @@ test("an overtaken asynchronous start cannot replace the current session", async
     type: "ready",
     sessionId: "current",
   }]);
-  controller.dispose();
+  await controller.dispose();
 });
 
 test("controller errors stay attached to their command instead of killing the Worker", async () => {
@@ -404,7 +405,7 @@ test("controller errors stay attached to their command instead of killing the Wo
     target: main,
     error: "No active or queued turn",
   });
-  controller.dispose();
+  await controller.dispose();
 });
 
 test("a large retained session releases every Turn with linear ownership", async () => {
@@ -435,7 +436,7 @@ test("a large retained session releases every Turn with linear ownership", async
     await settle();
     assert.equal(harness.turns.at(-1)?.disposed, 1);
   }
-  controller.dispose();
+  await controller.dispose();
 
   assert.equal(harness.turns.length, 2_000);
   assert.equal(

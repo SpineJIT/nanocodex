@@ -70,7 +70,7 @@ test("the example Worker owns follow-ons, optional events, results, and payment 
   ]);
   assert.equal(harness.turns[0]?.disposed, 1);
   assert.equal(harness.turns[1]?.disposed, 1);
-  controller.dispose();
+  await controller.dispose();
   assert.equal(harness.agents[0]?.disposed, 1);
   assert.equal(harness.watchOffs, 1);
 });
@@ -125,7 +125,7 @@ test("prompt failures are typed messages and always release accepted Turns", asy
     message: "model failed",
   });
   assert.equal(harness.turns[1]?.disposed, 1);
-  controller.dispose();
+  await controller.dispose();
 });
 
 test("restart releases active Turns and stale event listeners exactly once", async () => {
@@ -151,6 +151,7 @@ test("restart releases active Turns and stale event listeners exactly once", asy
   await controller.handle(start);
 
   assert.equal(harness.agents[0]?.disposed, 1);
+  assert.equal(harness.turns[0]?.cancelled, 1);
   assert.equal(harness.turns[0]?.disposed, 1);
   staleListener?.(event(9, "assistant.delta", { text: "stale" }));
   assert.deepEqual(messages, [{
@@ -162,7 +163,7 @@ test("restart releases active Turns and stale event listeners exactly once", asy
   await settle();
   assert.equal(harness.turns[0]?.disposed, 1);
   assert.deepEqual(messages, [{ type: "ready", transport: "openai" }]);
-  controller.dispose();
+  await controller.dispose();
 });
 
 test("a 2,000-turn burst has bounded live control ownership", async () => {
@@ -192,7 +193,7 @@ test("a 2,000-turn burst has bounded live control ownership", async () => {
     harness.turns.reduce((sum, turn) => sum + turn.disposed, 0),
     2_000,
   );
-  controller.dispose();
+  await controller.dispose();
 });
 
 test("one frame reduces 20,000 deltas into one bounded React update", () => {
@@ -330,6 +331,7 @@ class FakeAgent {
 }
 
 class FakeTurn {
+  cancelled = 0;
   disposed = 0;
   readonly input: string;
   private readonly resultError?: Error;
@@ -357,6 +359,10 @@ class FakeTurn {
 
   fail(error: unknown) {
     this.reject(error);
+  }
+
+  async cancel() {
+    this.cancelled += 1;
   }
 
   dispose() {
