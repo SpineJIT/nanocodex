@@ -11,6 +11,10 @@ repository.workspace = true
 description = "Daily-driver TUI and headless JSONL adapter for Nanocodex"
 build = "build.rs"
 
+[package.metadata.cargo-machete]
+# cargo-machete does not resolve imports from the package build script.
+ignored = ["chrono", "vergen"]
+
 [features]
 default = []
 # Keep paid-provider composition out of the direct-agent development graph.

@@ -77,7 +77,9 @@ embedding needs more control:
   `observability` feature is enabled
 - [`prelude`] — common imports for the owned-agent path
 
-Each component module carries the same guide as its independently usable crate.
+Detailed items retain the documentation from their owning crate. Each lower
+crate also includes its own focused guide and can be documented or consumed
+without the facade.
 
 ## Canonical imports
 

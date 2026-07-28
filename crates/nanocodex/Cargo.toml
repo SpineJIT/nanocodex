@@ -30,8 +30,6 @@ nanocodex-tools.workspace = true
 nanocodex-observability = { workspace = true, optional = true }
 
 [dev-dependencies]
-# The facade compiles the component READMEs as its own module doctests.
-futures-util.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 

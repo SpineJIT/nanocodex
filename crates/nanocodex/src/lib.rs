@@ -17,8 +17,6 @@ pub use nanocodex_tools::{Tool, Tools};
 /// Provider and tool-runtime APIs keep their canonical detailed paths under
 /// [`crate::oai`] and [`crate::tools`].
 pub mod agent {
-    #![doc = include_str!("../../nanocodex-agent/README.md")]
-
     #[cfg(not(target_family = "wasm"))]
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     pub use nanocodex_agent::rollout;
