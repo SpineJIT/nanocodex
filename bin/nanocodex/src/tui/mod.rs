@@ -28,7 +28,7 @@ use futures_util::StreamExt;
 use nanocodex::{
     AgentEvents, Nanocodex, NanocodexError, Thinking, TurnControl, TurnResult,
     agent::{
-        events::{AgentEvent, AgentEventKind, AssistantDelta, TimedAgentEvent},
+        events::{AgentEvent, TimedAgentEvent},
         rollout::DurableSession,
     },
     tools::mcp::McpHandle,
@@ -283,7 +283,6 @@ enum TerminalAction {
 enum UiAction {
     Terminal(Event),
     Agent(AgentEvent),
-    AssistantDeltas(String),
     AgentStreamClosed,
     Worker(WorkerEvent),
     WorkerStopped,
@@ -430,15 +429,6 @@ impl UiModel {
             }
             UiAction::Agent(event) => {
                 let updated = self.app.on_main_agent_event(0, &event);
-                request_navigated_branch_switch(&mut self.app, commands)?;
-                if updated {
-                    Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
-                } else {
-                    Ok(UiUpdate::Ignore)
-                }
-            }
-            UiAction::AssistantDeltas(delta) => {
-                let updated = self.app.push_main_assistant_delta(0, &delta);
                 request_navigated_branch_switch(&mut self.app, commands)?;
                 if updated {
                     Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
@@ -676,105 +666,42 @@ fn apply_main_agent_event_batch(
     agent_events: &mut AgentEvents,
     first: Option<TimedAgentEvent>,
 ) -> Result<bool> {
-    let Some(first) = first else {
-        let update = ui.update(UiAction::AgentStreamClosed, worker_tx)?;
-        return Ok(apply_update(update, scheduler));
-    };
-    // Drain only the already-queued burst. Applying one cached Markdown tail
-    // mutation per provider delta becomes quadratic for long unbroken lines.
-    let mut events = Vec::with_capacity(MAX_AGENT_EVENTS_PER_BATCH);
-    events.push(first);
+    if apply_main_agent_event(ui, worker_tx, stream_telemetry, scheduler, first)? {
+        return Ok(true);
+    }
     for _ in 1..MAX_AGENT_EVENTS_PER_BATCH {
+        if scheduler.is_due(Instant::now()) {
+            break;
+        }
         let Some(event) = agent_events.try_recv_timed() else {
             break;
         };
-        events.push(event);
+        if apply_main_agent_event(ui, worker_tx, stream_telemetry, scheduler, Some(event))? {
+            return Ok(true);
+        }
     }
-    apply_main_agent_events(ui, worker_tx, stream_telemetry, scheduler, events)
+    Ok(false)
 }
 
-fn apply_main_agent_events(
+fn apply_main_agent_event(
     ui: &mut UiModel,
     worker_tx: &mpsc::UnboundedSender<WorkerCommand>,
     stream_telemetry: &mut StreamTelemetry,
     scheduler: &mut RenderScheduler,
-    events: Vec<TimedAgentEvent>,
+    event: Option<TimedAgentEvent>,
 ) -> Result<bool> {
-    let events = events
-        .into_iter()
-        .map(|event| {
-            let received = stream_telemetry.event_received(PaneId::Main, &event);
-            (event.event, received)
-        })
-        .collect::<Vec<_>>();
-    let mut assistant_text = None::<String>;
-    let mut assistant_events = Vec::new();
-
-    for (event, received) in events {
-        if event.kind == AgentEventKind::AssistantDelta
-            && let Ok(delta) = event.decode_payload::<AssistantDelta>()
-        {
-            assistant_text
-                .get_or_insert_with(String::new)
-                .push_str(&delta.text);
-            assistant_events.push((received, true));
-            continue;
-        }
-        // The raw API frame is the lossless mirror of the normalized delta. It
-        // remains individually visible to telemetry but is not a UI barrier.
-        if event.kind == AgentEventKind::ApiEvent {
-            if assistant_text.is_some() {
-                assistant_events.push((received, false));
-            } else {
-                stream_telemetry.event_applied(received, false);
-            }
-            continue;
-        }
-        if flush_main_assistant_deltas(
-            ui,
-            worker_tx,
-            stream_telemetry,
-            scheduler,
-            &mut assistant_text,
-            &mut assistant_events,
-        )? {
-            return Ok(true);
-        }
-        let update = ui.update(UiAction::Agent(event), worker_tx)?;
+    let received = event
+        .as_ref()
+        .map(|event| stream_telemetry.event_received(PaneId::Main, event));
+    let action = event.map_or(UiAction::AgentStreamClosed, |event| {
+        UiAction::Agent(event.event)
+    });
+    let update = ui.update(action, worker_tx)?;
+    if let Some(received) = received {
         stream_telemetry.event_applied(
             received,
             matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming)),
         );
-        if apply_update(update, scheduler) {
-            return Ok(true);
-        }
-    }
-    flush_main_assistant_deltas(
-        ui,
-        worker_tx,
-        stream_telemetry,
-        scheduler,
-        &mut assistant_text,
-        &mut assistant_events,
-    )
-}
-
-fn flush_main_assistant_deltas(
-    ui: &mut UiModel,
-    worker_tx: &mpsc::UnboundedSender<WorkerCommand>,
-    stream_telemetry: &mut StreamTelemetry,
-    scheduler: &mut RenderScheduler,
-    assistant_text: &mut Option<String>,
-    assistant_events: &mut Vec<(telemetry::ReceivedEvent, bool)>,
-) -> Result<bool> {
-    let Some(text) = assistant_text.take() else {
-        debug_assert!(assistant_events.is_empty());
-        return Ok(false);
-    };
-    let update = ui.update(UiAction::AssistantDeltas(text), worker_tx)?;
-    let schedules_frame = matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming));
-    for (received, is_delta) in assistant_events.drain(..) {
-        stream_telemetry.event_applied(received, schedules_frame && is_delta);
     }
     Ok(apply_update(update, scheduler))
 }
@@ -2603,8 +2530,7 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use futures_util::{SinkExt, StreamExt};
     use nanocodex::{
-        Nanocodex, OpenAi, Thinking,
-        agent::events::{AgentEvent, AgentEventKind, AgentEventTiming, TimedAgentEvent},
+        Nanocodex, OpenAi, Thinking, agent::events::AgentEventKind, oai::__private::EventSink,
     };
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, sync::mpsc, time::timeout};
@@ -2612,7 +2538,7 @@ mod tests {
 
     use super::{
         BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
-        UiUpdate, WorkerCommand, WorkerEvent, active_session_id, apply_main_agent_events,
+        UiUpdate, WorkerCommand, WorkerEvent, active_session_id, apply_main_agent_event_batch,
         classify_submission, handle_key, handle_worker_update, paste_clipboard_image,
         prepare_btw_prompt, session_trace_url, spawn_agent_worker,
     };
@@ -2621,24 +2547,6 @@ mod tests {
         scheduler::{RenderScheduler, STREAM_FRAME_INTERVAL},
         telemetry::StreamTelemetry,
     };
-
-    fn timed_event(seq: u64, kind: AgentEventKind, payload: Value) -> TimedAgentEvent {
-        let event = serde_json::from_value::<AgentEvent>(json!({
-            "protocol_version": 1,
-            "request_id": "test",
-            "seq": seq,
-            "type": kind,
-            "payload": payload,
-        }))
-        .unwrap();
-        TimedAgentEvent {
-            event,
-            timing: AgentEventTiming {
-                emitted_ns: seq,
-                source_received_ns: Some(seq),
-            },
-        }
-    }
 
     fn mouse_scroll(kind: MouseEventKind) -> Event {
         Event::Mouse(MouseEvent {
@@ -2879,51 +2787,111 @@ mod tests {
     }
 
     #[test]
-    fn main_event_batches_coalesce_assistant_deltas_across_api_events_only() {
-        let events = vec![
-            timed_event(
-                1,
+    fn main_event_batches_apply_assistant_deltas_individually() {
+        let (events, mut agent_events) = EventSink::channel("test".to_owned());
+        events
+            .emit(
                 AgentEventKind::AssistantDelta,
                 json!({"model_call_index": 0, "text": "A"}),
-            ),
-            timed_event(2, AgentEventKind::ApiEvent, json!({})),
-            timed_event(
-                3,
+            )
+            .unwrap();
+        events.emit(AgentEventKind::ApiEvent, json!({})).unwrap();
+        events
+            .emit(
                 AgentEventKind::AssistantDelta,
                 json!({"model_call_index": 0, "text": "B"}),
-            ),
-            timed_event(
-                4,
+            )
+            .unwrap();
+        events
+            .emit(
                 AgentEventKind::ReasoningSummaryDelta,
                 json!({"model_call_index": 0, "text": "reasoning"}),
-            ),
-            timed_event(
-                5,
+            )
+            .unwrap();
+        events
+            .emit(
                 AgentEventKind::AssistantDelta,
                 json!({"model_call_index": 0, "text": "C"}),
-            ),
-            timed_event(
-                6,
-                AgentEventKind::AssistantDelta,
-                json!({"malformed": true}),
-            ),
-            timed_event(
-                7,
+            )
+            .unwrap();
+        events
+            .emit(AgentEventKind::AssistantDelta, json!({"malformed": true}))
+            .unwrap();
+        events
+            .emit(
                 AgentEventKind::AssistantDelta,
                 json!({"model_call_index": 0, "text": "D"}),
-            ),
-        ];
+            )
+            .unwrap();
+
         let (commands, _worker) = mpsc::unbounded_channel();
         let mut ui = UiModel::new(App::new("/workspace".into()), Arc::from("main-session"));
         let mut telemetry = StreamTelemetry::default();
-        let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
+        let now = Instant::now();
+        let mut scheduler = RenderScheduler::new(Duration::from_secs(1), now);
+        scheduler.presented(now);
+        let first = agent_events.try_recv_timed();
 
         assert!(
-            !apply_main_agent_events(&mut ui, &commands, &mut telemetry, &mut scheduler, events,)
-                .unwrap()
+            !apply_main_agent_event_batch(
+                &mut ui,
+                &commands,
+                &mut telemetry,
+                &mut scheduler,
+                &mut agent_events,
+                first,
+            )
+            .unwrap()
         );
-        assert_eq!(ui.app.main.assistant_delta_applications(), 3);
         assert_eq!(ui.app.main.transcript.assistant_sources(), ["AB", "CD"]);
+        assert!(agent_events.try_recv_timed().is_none());
+    }
+
+    #[test]
+    fn due_streaming_frame_stops_before_later_output_and_completion() {
+        let (events, mut agent_events) = EventSink::channel("test".to_owned());
+        events.emit(AgentEventKind::ApiEvent, json!({})).unwrap();
+        events
+            .emit(
+                AgentEventKind::ReasoningSummaryDelta,
+                json!({"model_call_index": 0, "text": "Inspecting"}),
+            )
+            .unwrap();
+        events.emit(AgentEventKind::ApiEvent, json!({})).unwrap();
+        events
+            .emit(
+                AgentEventKind::AssistantDelta,
+                json!({"model_call_index": 0, "text": "Answer"}),
+            )
+            .unwrap();
+        events
+            .emit(AgentEventKind::RunCompleted, json!({}))
+            .unwrap();
+
+        let (commands, _worker) = mpsc::unbounded_channel();
+        let mut ui = UiModel::new(App::new("/workspace".into()), Arc::from("main-session"));
+        let mut telemetry = StreamTelemetry::default();
+        let now = Instant::now();
+        let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, now);
+        scheduler.presented(now - STREAM_FRAME_INTERVAL);
+        let first = agent_events.try_recv_timed();
+
+        assert!(
+            !apply_main_agent_event_batch(
+                &mut ui,
+                &commands,
+                &mut telemetry,
+                &mut scheduler,
+                &mut agent_events,
+                first,
+            )
+            .unwrap()
+        );
+
+        assert!(scheduler.is_due(Instant::now()));
+        assert_eq!(ui.app.main.status, "Thinking...");
+        assert_eq!(ui.app.main.transcript.assistant_sources(), [] as [&str; 0]);
+        assert!(agent_events.try_recv_timed().is_some());
     }
 
     #[test]

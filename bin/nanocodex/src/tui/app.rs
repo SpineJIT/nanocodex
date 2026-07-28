@@ -242,8 +242,6 @@ pub(super) struct Conversation {
     run_generation: u64,
     applied_steer_runs_waiting_for_ack: VecDeque<u64>,
     interrupting_steers: Option<u64>,
-    #[cfg(test)]
-    assistant_delta_applications: usize,
 }
 
 impl Conversation {
@@ -277,8 +275,6 @@ impl Conversation {
             run_generation: 0,
             applied_steer_runs_waiting_for_ack: VecDeque::new(),
             interrupting_steers: None,
-            #[cfg(test)]
-            assistant_delta_applications: 0,
         }
     }
 
@@ -778,10 +774,6 @@ impl Conversation {
     }
 
     pub(super) fn push_assistant_delta(&mut self, delta: &str) {
-        #[cfg(test)]
-        {
-            self.assistant_delta_applications = self.assistant_delta_applications.saturating_add(1);
-        }
         let append_to_current = self.streamed_this_turn;
         self.streamed_this_turn = true;
         if append_to_current && self.transcript.tail_is_assistant() {
@@ -790,11 +782,6 @@ impl Conversation {
         } else {
             self.push_output(TranscriptItem::Assistant(delta.to_owned()));
         }
-    }
-
-    #[cfg(test)]
-    pub(super) const fn assistant_delta_applications(&self) -> usize {
-        self.assistant_delta_applications
     }
 
     fn push_reasoning_delta(&mut self, delta: &str) {
@@ -2317,20 +2304,6 @@ impl App {
             .iter_mut()
             .find(|branch| branch.id == branch_id)
             .is_some_and(|branch| branch.conversation.on_agent_event(event))
-    }
-
-    pub(super) fn push_main_assistant_delta(&mut self, branch_id: u64, delta: &str) -> bool {
-        if self.main_branch_id == branch_id {
-            self.main.push_assistant_delta(delta);
-            return true;
-        }
-        self.main_branches
-            .iter_mut()
-            .find(|branch| branch.id == branch_id)
-            .is_some_and(|branch| {
-                branch.conversation.push_assistant_delta(delta);
-                true
-            })
     }
 
     pub(super) fn main_branch_event_stream_closed(&mut self, branch_id: u64) {
