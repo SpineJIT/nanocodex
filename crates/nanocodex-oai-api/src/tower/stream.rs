@@ -603,7 +603,12 @@ fn code_calls(items: &[ResponseItem]) -> Vec<CodeCall> {
 
 fn final_message(items: &[ResponseItem]) -> Option<String> {
     items.iter().rev().find_map(|item| {
-        let ResponseItem::Message { content, .. } = item else {
+        let ResponseItem::Message {
+            role: MessageRole::Assistant,
+            content,
+            ..
+        } = item
+        else {
             return None;
         };
         Some(output_text(content))
@@ -627,7 +632,10 @@ mod tests {
     use serde_json::json;
     use web_time::Instant;
 
-    use super::{CodeCallKind, ResponseItem, StreamTiming, code_calls};
+    use super::{
+        CodeCallKind, ContentItem, MessageRole, ResponseItem, StreamTiming, code_calls,
+        final_message,
+    };
 
     #[test]
     fn display_delta_cadence_records_gaps_and_stalls() {
@@ -680,5 +688,21 @@ mod tests {
             json!({ "query": "calendar", "limit": 2 })
         );
         assert!(matches!(calls[0].kind, CodeCallKind::ToolSearch));
+    }
+
+    #[test]
+    fn final_message_skips_trailing_non_assistant_messages() {
+        let items = [
+            ResponseItem::message(
+                MessageRole::Assistant,
+                [ContentItem::output_text("answer")],
+            ),
+            ResponseItem::message(
+                MessageRole::User,
+                [ContentItem::input_text("trailing input")],
+            ),
+        ];
+
+        assert_eq!(final_message(&items).as_deref(), Some("answer"));
     }
 }
