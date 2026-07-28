@@ -693,10 +693,7 @@ mod tests {
     #[test]
     fn final_message_skips_trailing_non_assistant_messages() {
         let items = [
-            ResponseItem::message(
-                MessageRole::Assistant,
-                [ContentItem::output_text("answer")],
-            ),
+            ResponseItem::message(MessageRole::Assistant, [ContentItem::output_text("answer")]),
             ResponseItem::message(
                 MessageRole::User,
                 [ContentItem::input_text("trailing input")],
