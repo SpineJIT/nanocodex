@@ -1,17 +1,19 @@
 # Codex parity ledger
 
-This ledger records the review of all 316 commits in the exclusive local
+This ledger records the review of all 323 commits in the exclusive local
 checkout range
 
 ```text
 openai/codex@35eaf3ffb0bf2001486c68c47a3d946b34d16634
-    ..openai/codex@3418498f01422f5f650ea645d4bd19e05c3a9616
+    ..openai/codex@be2e4afcd7392339d6adbaf0d31b26316bcaa2ab
 ```
 
 The review used the clean local Codex checkout at the range head. The command
-`git rev-list --count <range>` returns `316`. The first 37 commits remain
-expanded below; the next 279 are classified individually in
-[`codex-parity/8431dc59-3418498f.md`](codex-parity/8431dc59-3418498f.md).
+`git rev-list --count <range>` returns `323`. The first 37 commits remain
+expanded below; the following 279 are classified individually in
+[`codex-parity/8431dc59-3418498f.md`](codex-parity/8431dc59-3418498f.md), and
+the final seven are classified in
+[`codex-parity/3418498f-be2e4afc.md`](codex-parity/3418498f-be2e4afc.md).
 
 The classifications mean:
 
@@ -30,11 +32,11 @@ claims.
 
 | Classification | Count |
 | --- | ---: |
-| `port` | 31 |
+| `port` | 33 |
 | `evaluate` | 21 |
 | `defer` | 2 |
-| `out-of-scope` | 262 |
-| Total | 316 |
+| `out-of-scope` | 267 |
+| Total | 323 |
 
 ## First range: `35eaf3ff..8431dc59`
 
@@ -193,10 +195,12 @@ continuation ordering.
 [`spawn_pipes`](../crates/nanocodex-tools/src/shell/process.rs) gives
 non-interactive children null stdin. The same module owns process-group
 termination on Unix and descendant termination on Windows; Code Mode and shell
-cancellation retain the guard until output drains. Shell/process and
-agent-cancellation regressions cover timeout, cancellation, continued
-sessions, and descendant cleanup. Codex's exact Windows job-object
-implementation is not treated as an API requirement.
+cancellation retain the guard until output drains. The established local MCP
+stdio transport reuses that guard and reaps its child on close. Shell/process,
+agent-cancellation, and `dropping_mcp_terminates_stdio_descendants` regressions
+cover timeout, cancellation, continued sessions, and descendant cleanup.
+Codex's exact Windows job-object implementation is not treated as an API
+requirement.
 
 ### P13 — stable response item IDs
 
@@ -318,6 +322,24 @@ The model-visible exec description, wait schema, parser, and runtime in
 ten-second default across platforms. Code Mode timing/parser tests cover the
 default and explicit override. Codex's experimental 30-second buffered-exec
 feature is intentionally outside the narrow runtime.
+
+### P29 — MCP credentials stay on their origin
+
+Both Streamable HTTP and OAuth MCP clients use
+[`same_origin_redirect_policy`](../crates/nanocodex-tools/src/mcp/mod.rs).
+Redirects retain custom secret headers only on the original origin and stop
+before a cross-origin target. The two-listener regression
+`oauth_headers_do_not_follow_cross_origin_redirects` proves that a custom API
+key never reaches the redirected server.
+
+### P30 — bounded local MCP messages
+
+[`McpStdioTransport`](../crates/nanocodex-tools/src/mcp/stdio.rs) decodes the
+established MCP JSONL stream with RMCP's compatibility codec while enforcing an
+8 MiB frame bound. `stdio_message_reader_rejects_an_oversized_frame` exercises
+the exact boundary without allocating a production-sized fixture. The newer
+MCP discovery protocol, pagination, and dual lifecycle mode from the upstream
+commit are not imported.
 
 ## Reviewed baseline behavior
 
