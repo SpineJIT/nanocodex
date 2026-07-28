@@ -1,4 +1,5 @@
 import { Agent } from "nanocodex/node";
+import { runOwnedSession } from "./session.mjs";
 
 const apiKey = process.env.OPENAI_API_KEY?.trim();
 if (!apiKey) {
@@ -21,26 +22,4 @@ const agent = await Agent.create({
     },
   },
 });
-const watch = agent.events.watch();
-const unwatch = watch.onEvent((event) => {
-  if (event.type === "tool.call") console.error(`tool: ${event.payload.tool}`);
-});
-const turns = [];
-
-try {
-  const first = agent.turn.prompt({ input: "Use multiply to calculate 6 × 7. Return only the number." });
-  turns.push(first);
-  console.log("first:", await first.result());
-
-  // Follow-on state, response IDs, and prompt-cache identity stay in the Rust agent.
-  const second = agent.turn.prompt({ input: "Add one to that result. Return only the number." });
-  turns.push(second);
-  console.log("second:", await second.result());
-} finally {
-  // Long-lived applications retain the agent; short-lived scripts close the
-  // Rust-owned WebSocket and driver explicitly.
-  for (const turn of turns) turn.dispose();
-  unwatch();
-  watch.off();
-  agent.dispose();
-}
+await runOwnedSession(agent);

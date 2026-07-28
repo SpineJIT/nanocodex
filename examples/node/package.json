@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node --env-file-if-exists=../../.env index.mjs",
     "smoke:mpp": "node mpp.mjs",
-    "test": "node --test mpp-support.test.mjs"
+    "test": "node --test *.test.mjs"
   },
   "dependencies": {
     "accounts": "^0.15.5",

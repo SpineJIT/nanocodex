@@ -107,7 +107,8 @@ try {
   const customPrompt = process.argv.slice(2).filter((argument) => argument !== "--close").join(" ").trim();
   const prompt = customPrompt || "Reply with exactly MPP_JS_OK and nothing else.";
   turn = agent.turn.prompt({ input: prompt });
-  const output = await turn.result();
+  const result = await turn.result();
+  const output = result.finalMessage;
   if (!customPrompt && output.trim() !== "MPP_JS_OK") {
     throw new Error(`unexpected model output: ${JSON.stringify(output)}`);
   }

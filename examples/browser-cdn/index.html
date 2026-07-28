@@ -39,11 +39,19 @@
               return new WebSocket(url);
             },
           });
-          result.textContent = await agent.turn.prompt({ input: prompt.value }).result();
+          const turn = agent.turn.prompt({ input: prompt.value });
+          try {
+            const completed = await turn.result();
+            result.textContent = completed.finalMessage;
+          } finally {
+            turn.dispose();
+          }
         } catch (error) {
           result.textContent = error instanceof Error ? error.message : String(error);
         }
       });
+
+      addEventListener("pagehide", () => agent?.dispose(), { once: true });
 
       function websocketEndpoint() {
         const override = new URL(location.href).searchParams.get("endpoint");

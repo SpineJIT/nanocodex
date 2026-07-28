@@ -4,6 +4,9 @@ This example consumes the publishable `nanocodex` package exactly like an
 external Node application. The Node host supplies the WebSocket, API key, and
 an ordinary JavaScript `multiply` tool; the Rust/WASM engine owns the agent
 lifecycle, tool loop, retained conversation, and follow-on response chain.
+Each accepted Turn resolves to a typed result containing `finalMessage`,
+`usage`, and a reusable session `snapshot`; this example prints only the final
+message.
 
 From this directory:
 
