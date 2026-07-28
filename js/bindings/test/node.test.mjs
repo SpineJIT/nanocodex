@@ -125,10 +125,13 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
     sendFinal(socket, "resp-first", "42");
 
     const followOn = await reader.next();
-    assert.equal(followOn.previous_response_id, "resp-first");
+    assert.equal(followOn.previous_response_id, undefined);
     assert.equal(followOn.reasoning.effort, "high");
     assert.equal(followOn.service_tier, "priority");
-    assert.match(JSON.stringify(followOn.input), /Add one/);
+    const replay = JSON.stringify(followOn.input);
+    assert.match(replay, /Use multiply/);
+    assert.match(replay, /42/);
+    assert.match(replay, /Add one/);
     sendFinal(socket, "resp-second", "43");
   })();
 

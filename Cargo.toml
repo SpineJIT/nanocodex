@@ -39,7 +39,7 @@ async-trait = "=0.1.89"
 alloy-primitives = { version = "1.6.1", default-features = false, features = ["std"] }
 axum = { version = "0.8.9", default-features = false, features = ["form", "http1", "json", "query", "tokio"] }
 bm25 = { version = "2.3.2", default-features = false }
-chrono = { version = "0.4.43", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4.43", default-features = false, features = ["clock", "std", "wasmbind"] }
 clap = { version = "4.5.54", features = ["derive", "env"] }
 crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"] }
 criterion = { version = "0.7.0", default-features = false, features = ["async_tokio", "cargo_bench_support"] }

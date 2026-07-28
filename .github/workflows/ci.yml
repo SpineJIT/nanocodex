@@ -128,10 +128,7 @@ jobs:
           npm ci --prefix js/bindings
           npm ci --prefix examples/react-vite
           ./scripts/build-js-package.sh
-      # Keep adapter validation visible without letting the currently hanging
-      # Node-hosted WASM turn block the Rust SDK.
-      - name: Test JS runtime (non-blocking)
-        continue-on-error: true
+      - name: Test JS runtime
         working-directory: js/bindings
         run: node --test --test-timeout=15000 test/*.test.mjs
       - name: Check JS consumers

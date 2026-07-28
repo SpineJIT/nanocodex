@@ -43,10 +43,7 @@ jobs:
         run: |
           npm ci --prefix js/bindings
           ./scripts/build-js-package.sh
-      # Keep adapter validation visible without blocking package previews while
-      # the Node-hosted WASM turn is being repaired.
-      - name: Test JS runtime (non-blocking)
-        continue-on-error: true
+      - name: Test JS runtime
         working-directory: js/bindings
         run: node --test --test-timeout=15000 test/*.test.mjs
       - name: Check package
