@@ -9,6 +9,7 @@ import {
   queuePrompt,
   queueSteer,
   steerAdmitted,
+  turnFinished,
   turnRejected,
   type AgentEvent,
 } from "../src/index.ts";
@@ -26,6 +27,20 @@ test("a prompt rejected before run start leaves no phantom queued work", () => {
   assert.equal(rejected.displayedQueuedPrompt, undefined);
   assert.equal(rejected.entries.at(-1)?.kind, "error");
   assert.equal(rejected.pendingSteers.length + rejected.queuedPrompts.length, 0);
+});
+
+test("a terminal failure is rendered once across event and result paths", () => {
+  const failed = applyAgentEvents(initialTerminalState(), [
+    event(1, "run.started", {}),
+    event(2, "run.error", { message: "model connection failed" }),
+    event(3, "run.failed", { status: "failed" }),
+  ]);
+  const settled = turnFinished(failed, "model connection failed");
+
+  assert.deepEqual(
+    settled.entries.filter((entry) => entry.kind === "error"),
+    [{ id: "error-1", kind: "error", text: "model connection failed" }],
+  );
 });
 
 test("a streaming burst remains one semantic transcript entry", () => {

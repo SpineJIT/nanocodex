@@ -168,7 +168,9 @@ export function turnFinished(state: TerminalState, error?: string): TerminalStat
     ...state,
     pendingTurns: Math.max(0, state.pendingTurns - 1),
   };
-  return error && error !== "the turn was cancelled" ? appendError(next, error) : next;
+  if (!error || error === "the turn was cancelled") return next;
+  const tail = next.entries.at(-1);
+  return tail?.kind === "error" && tail.text === error ? next : appendError(next, error);
 }
 
 /** Remove a prompt that was rejected before its run could start. */
