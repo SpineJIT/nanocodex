@@ -140,6 +140,55 @@ test("browser host passes session context and emits generated images", async () 
   assert.equal(execution.output[1].type, "input_image");
 });
 
+test("Code Mode snapshots definitions, inputs, outputs, and handlers at its boundary", async () => {
+  const parameters = {
+    type: "object",
+    properties: { value: { type: "integer" } },
+  };
+  const configuration = {
+    inspect: {
+      description: "Inspect without mutating the recorded call.",
+      parameters,
+      handler(input) {
+        input.value = 99;
+        return [{ type: "input_text", text: "original output" }];
+      },
+    },
+  };
+  const host = createBrowserHost({
+    WebSocketImpl: FakeWebSocket,
+    tools: configuration,
+  });
+
+  parameters.properties.value.type = "string";
+  configuration.inspect.handler = () => "replacement";
+  configuration.extra = {
+    description: "Added too late.",
+    parameters: { type: "object" },
+    handler: () => "extra",
+  };
+
+  const definitions = JSON.parse(host.toolDefinitions());
+  assert.equal(definitions.length, 1);
+  assert.equal(definitions[0].parameters.properties.value.type, "integer");
+
+  const execution = JSON.parse(await host.executeCode(
+    [
+      "const output = await tools.inspect({ value: 7 });",
+      "output[0].text = 'mutated after return';",
+      "text(output);",
+    ].join("\n"),
+    "session-snapshot",
+    "call-snapshot",
+  ));
+  assert.equal(execution.success, true);
+  assert.deepEqual(execution.nested_calls[0].input, { value: 7 });
+  assert.deepEqual(execution.nested_calls[0].output, [{
+    type: "input_text",
+    text: "original output",
+  }]);
+});
+
 class FakeWebSocket {
   static OPEN = 1;
   static instances = [];

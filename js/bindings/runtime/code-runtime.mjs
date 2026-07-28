@@ -2,23 +2,27 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
   const stores = new Map();
   let nextCallId = 1;
   const definitions = [];
+  const configuredTools = [];
 
   for (const [name, tool] of Object.entries(toolConfiguration)) {
     if (!tool || typeof tool.handler !== "function") {
       throw new TypeError(`tool ${name} requires a handler function`);
     }
-    definitions.push({
+    configuredTools.push(Object.freeze({ handler: tool.handler, name }));
+    definitions.push(deepFreeze({
       type: "function",
       name,
       description: tool.description || "Application-defined tool.",
       strict: false,
-      parameters: tool.parameters || {
+      parameters: jsonSnapshot(tool.parameters || {
         type: "object",
         additionalProperties: true,
-      },
-    });
+      }, `tool ${name} parameters`),
+    }));
   }
+  Object.freeze(configuredTools);
   Object.freeze(definitions);
+  const encodedDefinitions = JSON.stringify(definitions);
 
   async function executeCode(source, sessionId = "default", parentCallId = "exec") {
     const startedAt = performance.now();
@@ -27,7 +31,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     stores.set(sessionId, stored);
     const nestedCalls = [];
     const tools = Object.create(null);
-    for (const [name, tool] of Object.entries(toolConfiguration)) {
+    for (const { handler, name } of configuredTools) {
       tools[name] = async (input) => {
         const callId = `${parentCallId}/code-${nextCallId++}`;
         const toolStartedAt = performance.now();
@@ -35,14 +39,13 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
           0,
           Math.round((toolStartedAt - startedAt) * 1_000_000),
         );
+        const recordedInput = clone(input) ?? null;
         try {
-          const result = await tool.handler(input, { sessionId, parentCallId, callId });
+          const result = await handler(input, { sessionId, parentCallId, callId });
           nestedCalls.push({
             call_id: callId,
             name,
-            // JSON.stringify omits object fields whose value is undefined.
-            // Keep zero-argument calls wire-complete for Rust's typed event.
-            input: clone(input) ?? null,
+            input: recordedInput,
             output: outputBody(result),
             success: true,
             started_after_ns: startedAfterNs,
@@ -53,7 +56,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
           nestedCalls.push({
             call_id: callId,
             name,
-            input: clone(input) ?? null,
+            input: recordedInput,
             output: errorMessage(error),
             success: false,
             started_after_ns: startedAfterNs,
@@ -148,7 +151,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
 
   return Object.freeze({
     executeCode,
-    toolDefinitions: () => JSON.stringify(definitions),
+    toolDefinitions: () => encodedDefinitions,
     reset() {
       stores.clear();
     },
@@ -157,7 +160,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
 
 function outputBody(value) {
   if (Array.isArray(value) && value.every((item) => item?.type === "input_text" || item?.type === "input_image")) {
-    return value;
+    return clone(value);
   }
   return stringify(value);
 }
@@ -175,6 +178,20 @@ function stringify(value) {
 function clone(value) {
   if (typeof globalThis.structuredClone === "function") return structuredClone(value);
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function jsonSnapshot(value, label) {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (error) {
+    throw new TypeError(`${label} must be JSON-serializable`, { cause: error });
+  }
+}
+
+function deepFreeze(value) {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
 }
 
 function errorMessage(error) {
