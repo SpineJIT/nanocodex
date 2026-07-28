@@ -28,6 +28,7 @@ lines.on("line", (line) => {
       return {
         name: `echo${suffix}`,
         description: `Echo deterministic MCP fixture message ${index}.`,
+        annotations: { readOnlyHint: true },
         inputSchema: {
           type: "object",
           properties: {

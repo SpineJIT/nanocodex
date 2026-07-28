@@ -954,6 +954,12 @@ mod tests {
             .map(|definition| definition.name().to_owned())
             .collect::<Vec<_>>();
         assert_eq!(names.len(), SERVERS);
+        assert!(
+            names
+                .iter()
+                .all(|name| mcp.supports_parallel_tool_calls(name)),
+            "the read-only echo fixture must retain its parallel-safety hint"
+        );
 
         let calls = (0..CALLS).map(|index| {
             mcp.execute(
