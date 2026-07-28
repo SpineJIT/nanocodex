@@ -675,7 +675,10 @@ mod tests {
         assert_eq!(calls[0].call_id, "search-1");
         assert_eq!(calls[0].name, "tool_search");
         assert!(calls[0].namespace.is_none());
-        assert_eq!(calls[0].input, r#"{"limit":2,"query":"calendar"}"#);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].input).unwrap(),
+            json!({ "query": "calendar", "limit": 2 })
+        );
         assert!(matches!(calls[0].kind, CodeCallKind::ToolSearch));
     }
 }
