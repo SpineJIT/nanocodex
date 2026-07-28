@@ -2986,6 +2986,8 @@ mod tests {
             App::new("/workspace".into()),
             std::sync::Arc::from("main-session"),
         );
+        ui.app.input = "unfinished draft".to_owned();
+        ui.app.cursor = ui.app.input.len();
 
         ui.update(UiAction::Terminal(Event::FocusLost), &commands)
             .unwrap();
@@ -3009,6 +3011,8 @@ mod tests {
             UiUpdate::Redraw(RedrawPriority::Immediate)
         );
         assert!(ui.pending_notification.is_none());
+        assert_eq!(ui.app.input, "unfinished draft");
+        assert_eq!(ui.app.cursor, ui.app.input.len());
         ui.update(
             UiAction::Worker(WorkerEvent::TurnFinished {
                 target: PaneId::Main,
@@ -3019,6 +3023,57 @@ mod tests {
         )
         .unwrap();
         assert!(ui.pending_notification.is_none());
+    }
+
+    #[tokio::test]
+    async fn rejected_turns_do_not_stop_the_tui_worker() -> eyre::Result<()> {
+        let openai = OpenAi::builder("test-key")
+            .websocket_url("ws://127.0.0.1:1")
+            .build()?;
+        let session_id = nanocodex::agent::session::SessionId::new();
+        let (agent, events) = Nanocodex::builder(openai).session_id(session_id).build()?;
+        agent.shutdown().await?;
+        drop(events);
+
+        let (commands, worker_rx) = mpsc::unbounded_channel();
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        let worker = spawn_agent_worker(
+            agent,
+            Arc::from(session_id.to_string()),
+            None,
+            worker_rx,
+            updates,
+        );
+
+        for prompt_id in 1..=2 {
+            commands.send(WorkerCommand::Prompt {
+                target: PaneId::Main,
+                prompt_id,
+                prompt: format!("rejected prompt {prompt_id}").into(),
+            })?;
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let update = update_rx
+                        .recv()
+                        .await
+                        .ok_or_else(|| eyre::eyre!("TUI worker stopped after a rejected turn"))?;
+                    if let WorkerEvent::TurnFinished {
+                        target: PaneId::Main,
+                        main_branch_id: Some(0),
+                        error: Some(error),
+                    } = update
+                    {
+                        assert!(error.contains("agent stopped"));
+                        return Ok::<(), eyre::Report>(());
+                    }
+                }
+            })
+            .await??;
+        }
+
+        drop(commands);
+        worker.await?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
