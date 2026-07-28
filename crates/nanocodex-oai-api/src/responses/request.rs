@@ -1,8 +1,8 @@
 //! Byte-stable request profiles, persistent history, and wire serialization.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
-use serde::{Serialize, ser::SerializeSeq};
+use serde::{Serialize, Serializer, ser::SerializeSeq};
 
 use super::ResponseItem;
 use crate::{ModelConfig, Thinking};
@@ -13,6 +13,7 @@ pub struct RequestProfile {
     session_id: String,
     prompt_cache_key: String,
     prefix: Arc<[ResponseItem]>,
+    code_mode_tool_names: Arc<BTreeMap<String, CodeModeToolName>>,
 }
 
 impl RequestProfile {
@@ -27,6 +28,7 @@ impl RequestProfile {
             session_id: session_id.into(),
             prompt_cache_key: prompt_cache_key.into(),
             prefix,
+            code_mode_tool_names: Arc::default(),
         }
     }
 
@@ -53,6 +55,42 @@ impl RequestProfile {
     #[must_use]
     pub fn shared_prefix(&self) -> Arc<[ResponseItem]> {
         Arc::clone(&self.prefix)
+    }
+
+    pub(crate) fn with_code_mode_tool_names(
+        mut self,
+        names: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.code_mode_tool_names = Arc::new(
+            names
+                .into_iter()
+                .map(|(identifier, name)| (identifier, CodeModeToolName::from_flat_name(name)))
+                .collect(),
+        );
+        self
+    }
+}
+
+#[derive(Serialize)]
+struct CodeModeToolName {
+    name: Box<str>,
+    namespace: Option<Box<str>>,
+}
+
+impl CodeModeToolName {
+    fn from_flat_name(name: String) -> Self {
+        if let Some(namespaced) = name.strip_prefix("mcp__")
+            && let Some((server, tool)) = namespaced.split_once("__")
+        {
+            return Self {
+                name: tool.into(),
+                namespace: Some(format!("mcp__{server}").into()),
+            };
+        }
+        Self {
+            name: name.into(),
+            namespace: None,
+        }
     }
 }
 
@@ -594,6 +632,9 @@ impl<'a> ResponseCreate<'a> {
                 thread_id: profile.session_id(),
                 responses_lite: websocket.then_some("true"),
                 turn_state: websocket.then_some(turn_state).flatten(),
+                turn_metadata: (!profile.code_mode_tool_names.is_empty()).then_some(
+                    SerializedCodeModeTurnMetadata(&profile.code_mode_tool_names),
+                ),
             },
         }
     }
@@ -645,6 +686,30 @@ struct ClientMetadata<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "x-codex-turn-state")]
     turn_state: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "x-codex-turn-metadata")]
+    turn_metadata: Option<SerializedCodeModeTurnMetadata<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct SerializedCodeModeTurnMetadata<'a>(&'a BTreeMap<String, CodeModeToolName>);
+
+impl Serialize for SerializedCodeModeTurnMetadata<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct TurnMetadata<'a> {
+            code_mode_tool_names: &'a BTreeMap<String, CodeModeToolName>,
+        }
+
+        let value = serde_json::to_string(&TurnMetadata {
+            code_mode_tool_names: self.0,
+        })
+        .map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(&value)
+    }
 }
 
 #[cfg(test)]
@@ -681,6 +746,49 @@ mod tests {
         assert_eq!(request["reasoning"]["summary"], json!("auto"));
         assert!(request["reasoning"].get("mode").is_none());
         assert!(request.get("context_management").is_none());
+    }
+
+    #[test]
+    fn responses_lite_metadata_maps_plain_and_namespaced_code_mode_tools() {
+        let config = ModelConfig {
+            auth: crate::OpenAiAuth::api_key("test-key"),
+            responses_transport: crate::ResponsesTransport::Https,
+            ..ModelConfig::default()
+        };
+        let profile = RequestProfile::new("branch-a", "lineage-a", Arc::from([]))
+            .with_code_mode_tool_names([
+                ("exec_command".to_owned(), "exec_command".to_owned()),
+                (
+                    "mcp__calendar__lookup".to_owned(),
+                    "mcp__calendar__lookup".to_owned(),
+                ),
+            ]);
+        let request = serde_json::to_value(ResponseCreate::warmup(
+            &config,
+            Thinking::Low,
+            false,
+            &profile,
+            None,
+        ))
+        .expect("request should serialize");
+        let metadata = request["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+            .expect("turn metadata should be encoded as JSON");
+
+        assert_eq!(
+            metadata["code_mode_tool_names"]["exec_command"],
+            json!({"name": "exec_command", "namespace": null})
+        );
+        assert_eq!(
+            metadata["code_mode_tool_names"]["mcp__calendar__lookup"],
+            json!({"name": "lookup", "namespace": "mcp__calendar"})
+        );
+        assert!(
+            request["client_metadata"]
+                .get("ws_request_header_x_openai_internal_codex_responses_lite")
+                .is_none()
+        );
     }
 
     #[test]

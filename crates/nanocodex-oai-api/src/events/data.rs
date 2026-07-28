@@ -217,6 +217,8 @@ pub struct RunMetrics {
     pub retry_backoff_duration_ns: u64,
     /// Nanoseconds spent awaiting logical model work.
     pub model_duration_ns: u64,
+    /// Subset of model time spent awaiting context compaction.
+    pub compaction_duration_ns: u64,
     /// Nanoseconds spent warming the persistent connection.
     pub warmup_duration_ns: u64,
     /// Sum of top-level tool-handler execution durations after scheduler admission.

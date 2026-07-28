@@ -16,7 +16,7 @@ use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
 use nanocodex_agent::{
     AgentHandle, Nanocodex, NanocodexError, OpenAi, Thinking, Tools,
-    events::{AgentEventData, RunEvent},
+    events::{AgentEvent, AgentEventData, RunEvent},
     input::Prompt,
     rollout::RolloutConfig,
     session::SessionSnapshot,
@@ -114,6 +114,24 @@ fn assert_warmup_with_store(warmup: &Value, store: bool) {
     assert_eq!(
         warmup["client_metadata"]["ws_request_header_x_openai_internal_codex_responses_lite"],
         "true"
+    );
+    let turn_metadata = warmup["client_metadata"]["x-codex-turn-metadata"]
+        .as_str()
+        .and_then(|metadata| serde_json::from_str::<Value>(metadata).ok())
+        .expect("Responses Lite requests include typed Code Mode tool metadata");
+    assert_eq!(
+        turn_metadata["code_mode_tool_names"]["view_image"],
+        json!({
+            "name": "view_image",
+            "namespace": null,
+        })
+    );
+    assert_eq!(
+        turn_metadata["code_mode_tool_names"]["exec_command"],
+        json!({
+            "name": "exec_command",
+            "namespace": null,
+        })
     );
 }
 

@@ -172,6 +172,7 @@ pub(super) struct RunStats {
     pub(super) connection_duration_ns: u64,
     pub(super) retry_backoff_duration_ns: u64,
     pub(super) model_duration_ns: u64,
+    pub(super) compaction_duration_ns: u64,
     pub(super) warmup_duration_ns: u64,
     pub(super) tool_work_duration_ns: u64,
     pub(super) tool_wall_duration_ns: u64,

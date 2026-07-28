@@ -92,6 +92,14 @@ pub mod __private {
     {
         openai.into_parts()
     }
+
+    /// Installs the server-visible mapping for tools nested under Code Mode.
+    pub fn with_code_mode_tool_names(
+        profile: crate::responses::RequestProfile,
+        names: Vec<(String, String)>,
+    ) -> crate::responses::RequestProfile {
+        profile.with_code_mode_tool_names(names)
+    }
 }
 
 /// The single Responses model contract supported by this SDK.

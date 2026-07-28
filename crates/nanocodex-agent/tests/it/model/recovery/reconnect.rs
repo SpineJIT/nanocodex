@@ -239,6 +239,31 @@ async fn sol_compacts_with_the_session_agents_md_and_installs_the_returned_conte
     assert!(output.contains("\"model.compaction.started\""));
     assert!(output.contains("\"model.compaction.completed\""));
     assert!(output.contains("\"compactions\":1"));
+    let terminal = output
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<serde_json::Result<Vec<_>>>()?
+        .into_iter()
+        .find(|event| event["type"] == "run.completed")
+        .ok_or_else(|| eyre!("compaction run did not emit a terminal event"))?;
+    let compaction_duration_ns = terminal["payload"]["compaction_duration_ns"]
+        .as_u64()
+        .ok_or_else(|| eyre!("terminal event omitted compaction duration"))?;
+    assert!(compaction_duration_ns > 0);
+    assert!(
+        compaction_duration_ns
+            <= terminal["payload"]["model_duration_ns"]
+                .as_u64()
+                .ok_or_else(|| eyre!("terminal event omitted aggregate model duration"))?
+    );
+    let terminal = serde_json::from_value::<AgentEvent>(terminal)?;
+    let AgentEventData::Run(RunEvent::Completed(terminal)) = terminal.data()? else {
+        return Err(eyre!("terminal event did not decode as a completed run"));
+    };
+    assert_eq!(
+        terminal.metrics.compaction_duration_ns,
+        compaction_duration_ns
+    );
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
