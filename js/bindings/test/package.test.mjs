@@ -5,10 +5,20 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
+import { checkDocumentedBrowserVersion } from "../scripts/check-package.mjs";
 
 const exec = promisify(execFile);
 const packageRoot = new URL("../", import.meta.url);
 const packageJson = JSON.parse(await readFile(new URL("package.json", packageRoot), "utf8"));
+const readme = await readFile(new URL("README.md", packageRoot), "utf8");
+
+test("the package checker permits immutable previews without rewriting release docs", () => {
+  checkDocumentedBrowserVersion(readme, "0.0.0-preview-70ffd6b");
+  assert.throws(
+    () => checkDocumentedBrowserVersion(readme, "0.2.1"),
+    /Expected values to be strictly equal/,
+  );
+});
 
 test("the packed package installs and runs every public entry point", async () => {
   const temporary = await mkdtemp(join(tmpdir(), "nanocodex-package-"));
