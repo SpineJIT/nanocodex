@@ -69,6 +69,10 @@ async function check() {
     },
   });
   await Agent.create({ apiKey, module: new WebAssembly.Module(new Uint8Array()) });
+  // @ts-expect-error transport queue policy is private to the adapter.
+  await Agent.create({ apiKey, maxQueuedMessages: 1 });
+  // @ts-expect-error browser send-buffer policy is private to the adapter.
+  await BrowserAgent.create({ apiKey, maxBufferedSendBytes: 1 });
 
   const rolloutSnapshot: SessionSnapshot = {
     version: 1,

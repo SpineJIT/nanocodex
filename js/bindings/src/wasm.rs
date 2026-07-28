@@ -195,7 +195,7 @@ impl WasmNanocodex {
     ///
     /// # Errors
     ///
-    /// Rejects if the turn is incomplete, unrelated, or the driver stopped.
+    /// Rejects if the result belongs to another agent or the driver stopped.
     #[wasm_bindgen(js_name = forkFrom)]
     pub async fn fork_from(&self, result: &WasmTurnResult) -> Result<WasmNanocodex, JsValue> {
         let (inner, events) = self

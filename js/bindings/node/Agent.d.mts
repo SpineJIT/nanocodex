@@ -12,12 +12,7 @@ export function create(options: create.Options): Promise<create.ReturnType>;
 export declare namespace create {
   type Options = AgentOptions & ({ apiKey: string; mpp?: never } | { apiKey?: never; mpp: MppSession }) & {
     apiBaseUrl?: string | undefined;
-    connectTimeoutMs?: number | undefined;
-    maxFrameBytes?: number | undefined;
-    maxQueuedBytes?: number | undefined;
-    maxQueuedMessages?: number | undefined;
     module?: unknown;
-    sendTimeoutMs?: number | undefined;
     tools?: ToolMap | undefined;
     websocketUrl?: string | undefined;
   };

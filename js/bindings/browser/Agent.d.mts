@@ -17,9 +17,6 @@ export declare namespace create {
     WebSocketImpl?: typeof WebSocket | undefined;
     apiBaseUrl?: string | undefined;
     createWebSocket?(endpoint: string, sessionId: string): WebSocket;
-    maxBufferedSendBytes?: number | undefined;
-    maxQueuedBytes?: number | undefined;
-    maxQueuedMessages?: number | undefined;
     module?: unknown;
     tools?: ToolMap | undefined;
     websocketUrl?: string | undefined;

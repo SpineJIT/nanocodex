@@ -28,13 +28,21 @@ export function create(options = {}) {
     sessionId,
     workspace,
     resume,
-    ...hostOptions
+    WebSocketImpl,
+    createWebSocket,
+    tools,
   } = options;
   if (mpp !== undefined && apiKey !== undefined) {
     throw new TypeError("apiKey and mpp are mutually exclusive");
   }
   const events = createEventChannel();
-  const host = createBrowserHost({ ...hostOptions, mpp, onEvent: events.emit });
+  const host = createBrowserHost({
+    WebSocketImpl,
+    createWebSocket,
+    mpp,
+    onEvent: events.emit,
+    tools,
+  });
   activateHost(host);
   const runtime = defineRuntime({
     key: "browser-wasm",

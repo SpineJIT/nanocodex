@@ -30,16 +30,16 @@ export function create(options = {}) {
     websocketUrl,
     apiBaseUrl,
     module,
-    ...hostOptions
+    tools,
   } = options;
   const events = createEventChannel();
   if (mpp !== undefined && apiKey !== undefined) {
     throw new TypeError("apiKey and mpp are mutually exclusive");
   }
   const host = createNodeHost({
-    ...hostOptions,
     mpp,
     onEvent: events.emit,
+    tools,
     workspace: workspace ?? resume?.workspace,
   });
   activateHost(host);
