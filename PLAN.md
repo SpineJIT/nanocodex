@@ -77,18 +77,29 @@ migration, and it must be independently mergeable.
 ## Current execution order
 
 1. [x] Complete the [Codex parity ledger](docs/CODEX_PARITY.md) from the pinned
-   checkpoint through local `openai/codex@3418498f01422f5f650ea645d4bd19e05c3a9616`.
+   checkpoint through
+   `openai/codex@be2e4afcd7392339d6adbaf0d31b26316bcaa2ab`.
 2. [x] Finish the behavior-preserving rollout, model/run, tool/runtime, and
    driver module decompositions.
-3. [x] Audit stable public paths, crate docs, examples, dependencies, features,
-   cfgs, and crate boundaries.
-4. [x] Verify each parity contract and fix confirmed mismatches test-first.
-5. [x] Finish benchmark thresholds and full-fidelity observability verification.
-6. [x] Run all in-scope consumer, differential, and smoke gates. Terminal-Bench
-   milestone evaluation is delegated to the user's separate thread.
-7. [x] Commit and push coherent PR #50 slices, remediate CI, and verify at
-   `c82205d` that the pull request is `MERGEABLE`/`CLEAN` with green required
-   checks.
+3. [x] Verify the documented parity contracts and fix confirmed mismatches
+   test-first.
+4. [x] Establish 39 benchmark thresholds, retained-trace TUI gates, and the
+   full-fidelity observability path.
+5. [x] Run the in-scope consumer, differential, documentation, and smoke gates.
+   Terminal-Bench milestone evaluation remains delegated to the user's
+   separate thread.
+6. [x] Verify remote PR #50 head `c55293c` as `MERGEABLE`/`CLEAN` with all
+   required checks green before this documentation audit.
+7. [x] Correct stale public guides, add a `0.2.x` migration map, and rerun the
+   focused documentation checks.
+8. [ ] Classify the ten currently unreviewed local Codex commits from
+   `be2e4afc` through `bb1af235` before advancing the parity checkpoint.
+9. [x] Expose nameable generic Tower service-factory types and the standalone
+   session's protocol-level tool definitions and paired outputs. Keep
+   `nanocodex-tools::Tools` composition in the batteries-included agent rather
+   than adding `Session::tools`.
+10. [ ] Rerun required PR checks after the closeout changes and confirm the new
+    remote head is mergeable.
 
 ## Current non-goals
 

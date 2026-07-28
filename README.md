@@ -11,7 +11,7 @@
 
 **[Thesis](#thesis)** · **[Agent API](#the-agent-api)** ·
 **[Components](#components)** · **[Performance](#performance-is-a-contract)** ·
-**[Plan](PLAN.md)**
+**[Migration](docs/MIGRATING.md)** · **[Plan](PLAN.md)**
 
 [ci]: https://github.com/gakonst/nanocodex/actions/workflows/ci.yml
 [crates]: https://crates.io/crates/nanocodex
@@ -24,17 +24,15 @@
 
 Nanocodex is a Rust toolkit for building frontier OpenAI agents. It provides a
 Tower-native OpenAI Responses client, model-facing tool contracts, MCP and Code
-Mode, context management, and an owned agent lifecycle. The same repository is
-growing downward into isolated VMs, headed browser workers, policy-aware
-egress, and reproducible evaluations.
+Mode, context management, and an owned agent lifecycle.
 
 The components are designed to work together, but each implementation crate
 must also have a coherent API when used on its own. The top-level `nanocodex`
 crate is an intentionally thin, Alloy-style facade with a small prelude.
 
-> The repository is being reorganized around this API in a stack of reviewable
-> changes. [`PLAN.md`](PLAN.md) is the active execution plan;
-> [`REFACTOR.md`](REFACTOR.md) retains the design record that led to it.
+> [`PLAN.md`](PLAN.md) tracks the active delivery work.
+> [`REFACTOR.md`](REFACTOR.md) is the historical design record that led to the
+> current crate boundaries.
 
 ## Thesis
 
@@ -44,8 +42,8 @@ Nanocodex starts with three opinions.
 
 Agent infrastructure is easier to understand and improve when the pieces have
 sharp ownership and useful APIs. A Responses client should be usable without
-an agent loop. Tools should be usable without a CLI. A VM should not know what
-an evaluation is. The high-level agent should compose those parts rather than
+an agent loop. Tools should be usable without a CLI. A tool runtime should not
+own agent policy. The high-level agent should compose those parts rather than
 hide a second implementation of them.
 
 ### The model and harness are co-designed
@@ -90,14 +88,16 @@ let turn = agent
     .prompt("Find the cause of the failing test and explain it.")
     .await?;
 
-// Awaiting the turn drains its stream and returns the complete typed result.
+// Awaiting the turn waits for its result; event consumption is independent.
 let result = turn.await?;
 println!("{}", result.final_message());
 ```
 
 `Turn` is both a typed stream and a future for its completed `TurnResult`.
-Normal consumers can stream one turn directly; `AgentEvents` remains the
-session-wide firehose for adapters, tracing, JSONL, and durable recording.
+Polling it as a stream yields events for that turn. Awaiting it waits only for
+the result receiver and does not wait for that event stream to be consumed.
+`AgentEvents` remains the independent session-wide firehose for adapters,
+tracing, JSONL, and durable recording.
 
 Turns can be steered or cancelled without exposing internal IDs:
 
@@ -187,9 +187,9 @@ assert!(completed.output_text().contains("us-west-2"));
 
 `Session` is a client-side state machine, not a provider-side session resource.
 One `ResponseTurn` corresponds to one logical agent turn and retains
-turn-scoped protocol state across multiple Responses calls. Tool outputs and
-steering become subsequent `create(...)` calls on that same turn. The agent
-may explicitly call `turn.compact().await?` at a safe boundary.
+turn-scoped protocol state across multiple Responses calls. The higher-level
+agent retains that boundary across model, tool, and steering steps. A direct
+session consumer may call `turn.compact().await?` at a safe boundary.
 
 `Response` implements:
 
@@ -205,10 +205,10 @@ complete authoritative typed history.
 
 ## Tools
 
-The dependency-light tool contract lives with the Responses types in
+The shared tool contract lives with the Responses types in
 `nanocodex-oai-api`. `nanocodex-tools` supplies the heterogeneous registry,
-built-ins, shell and process lifecycle, MCP, `tool_search`, and Code Mode.
-MCP is part of the tools crate, not an optional public subsystem.
+built-ins, shell and process lifecycle, MCP, `tool_search`, and Code Mode. MCP
+is part of the tools crate on native targets, not an optional public subsystem.
 
 Application tools can implement the trait directly or use `#[tool]`:
 
@@ -257,22 +257,21 @@ bin/nanousd                       shared private credits protocol
 bin/nanousd-api                   credits service
 ```
 
-The monorepo also contains independently useful systems components:
+The repository's stable Rust packages are:
 
-| Component | Responsibility |
+| Package | Responsibility |
 | --- | --- |
-| `nanovm` | Typed VM lifecycle, immutable disks, networking, and shutdown |
-| VM image builder | OCI/Dockerfile inputs to cached, pre-snapshotted disks |
-| `nanocodex-vm` | Agent tools backed by one retained VM session tree |
-| Browser VM | A headed browser inside an isolated VM with a private CDP endpoint |
-| VM egress | Host-owned network, MPP payment, and secret-injection policy |
-| `nanocodex-eval` | Typed tasks, attempts, scheduling, results, and sweeps |
-| Harbor adapter | Canonical Harbor/ATIF import and export |
-| `nanocentaur` | A durable managed-agent service built from the same libraries |
+| `nanocodex` | Thin facade, named component modules, and prelude |
+| `nanocodex-agent` | Owned driver, lifecycle policy, branching, and snapshots |
+| `nanocodex-oai-api` | Responses sessions, context, transport, and Tower boundary |
+| `nanocodex-tools` | Registry, built-ins, Code Mode, MCP, and deferred search |
+| `nanocodex-tools-macros` | Native `#[tool]` procedural macro implementation |
+| `nanocodex-observability` | Application-owned tracing and OTLP setup |
 
-The CLI is a consumer of these libraries. Evaluation is exposed as
-`nanocodex eval ...`; it does not install Nanocodex into every task image or
-move model decisions into Python.
+The CLI, examples, Node/browser package, and Python package are consumers of
+that same library contract. VM, browser-worker, evaluation, proxy, and managed
+agent crates are outside the PR #50 delivery boundary; they are not presented
+here as implemented packages.
 
 ## Performance is a contract
 
@@ -288,28 +287,28 @@ Hard contracts include:
   effect;
 - event fanout shares raw payloads, preserves lossless monotonic order, and
   skips serialization as soon as every receiver is dropped;
-- VM images are prepared once and attempts start from cheap immutable
-  snapshots or reflinks;
-- browser and eval hot paths never rebuild unchanged images; and
-- cancellation terminates subprocess groups, VM work, and descendants.
+- cancellation terminates subprocess groups and descendants; and
+- changed TUI state and terminal output remain bounded during streaming bursts.
 
 Each owning crate carries benchmarks for its public hot paths. Retained trace
 fixtures cover realistic response streams, long conversations, tool bursts,
-VM startup, browser actions, and eval scheduling. Numeric regression gates are
-set only after the benchmark has a reproducible fixture and recorded baseline.
-Live model and network measurements remain trends with raw artifacts, not
-machine-independent unit-test thresholds.
+and long TUI histories. Numeric regression gates are set only after a benchmark
+has a reproducible fixture and recorded baseline. Live model and network
+measurements remain trends with raw artifacts, not machine-independent
+unit-test thresholds.
 
 The target for normal turns is simple: the model and network dominate the
 critical path. Traces separate provider wait from queueing, serialization,
 parsing, event delivery, and tool work, while independent work runs as bounded
 siblings under init4-style spans. Token usage and built-in OpenAI pricing also
 produce one consistent estimated USD cost for library results, the CLI, and
-evals.
+language bindings.
 
 Existing measurements and their methodology live under
-[`benchmarks/`](benchmarks/) and [`docs/`](docs/). The refactor ports them next
-to their new owners rather than discarding the evidence.
+[`benchmarks/`](benchmarks/) and [`docs/`](docs/). The
+[current PR #50 milestone](benchmarks/pr50_milestone_2026-07-28.md) records 39
+absolute latency gates plus a paired live run in which model work accounted for
+97.879% of measured turn time.
 
 ## Installation
 

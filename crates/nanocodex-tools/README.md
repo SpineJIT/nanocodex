@@ -5,8 +5,8 @@ Tool building blocks for `OpenAI` agents.
 `nanocodex-tools` is useful without the Nanocodex agent loop. It provides the
 caller-defined [`Tool`] contract, `tool` macro, heterogeneous [`Tools`]
 registry, Code Mode runtime, standard workspace tools, and native MCP clients.
-The dependency-light contract types are defined by `nanocodex-oai-api` and
-re-exported here so a tool implementation has one import surface.
+The shared contract types are defined by `nanocodex-oai-api` and re-exported
+here so a tool implementation has one import surface.
 
 ## Define and select tools
 

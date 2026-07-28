@@ -134,11 +134,21 @@ The higher-level `nanocodex-agent` crate decides *when* to compact and how to
 execute tools. This crate implements the provider operation and atomic history
 replacement without embedding agent policy.
 
+## Tools and managed sessions
+
+The [`tools`] module defines the model-visible tool contract shared with
+`nanocodex-tools`. A standalone [`Session`] does not run a tool loop or attach
+a `nanocodex-tools::Tools` registry automatically. Use `nanocodex-agent` for
+that batteries-included composition. Consumers implementing their own loop can
+install definitions with [`SessionBuilder::tool_definitions`] and return paired
+tool outputs with [`session::ResponseInput::items`].
+
 ## Going lower level
 
-The crate root intentionally contains only the normal conversation path:
+The crate root keeps the normal conversation path and shared input policy
+prominent:
 [`OpenAi`], [`Session`], [`ResponseTurn`], [`Response`],
-[`CompletedResponse`], and their errors.
+[`CompletedResponse`], [`Prompt`], [`Thinking`], and their errors.
 
 - [`session`] adds typed multimodal input, session identity, and explicit
   compaction results.
@@ -163,3 +173,9 @@ and reconnect policy; caller middleware should add deadlines, concurrency
 control, tracing, metrics, or error mapping rather than a second retry loop.
 Managed sessions own attempt construction and mutable transport state; callers
 do not construct the standard service or transport requests directly.
+
+Both methods change the builder's inferred concrete service-factory type.
+Ordinary inline call chains need no type annotation. Application wrappers can
+name or bound the generic result through [`tower::CallerServiceFactory`],
+[`tower::LayeredServiceFactory`], and [`tower::ResponsesServiceFactory`]
+without boxing the service stack.

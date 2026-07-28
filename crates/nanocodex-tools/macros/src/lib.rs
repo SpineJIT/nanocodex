@@ -1,8 +1,4 @@
-//! Procedural macro implementation of `nanocodex_tools::tool`.
-//!
-//! End users should import the macro from `nanocodex-tools` or the `nanocodex`
-//! facade. This crate contains only the expansion implementation.
-
+#![doc = include_str!("../README.md")]
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 
 use proc_macro::TokenStream;

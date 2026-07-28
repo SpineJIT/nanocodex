@@ -15,6 +15,12 @@ expanded below; the following 279 are classified individually in
 the final seven are classified in
 [`codex-parity/3418498f-be2e4afc.md`](codex-parity/3418498f-be2e4afc.md).
 
+This is the latest reviewed checkpoint, not a claim about every commit
+currently present in the local upstream checkout. Local `origin/main` is
+`bb1af235ea2822d7a40f75ef52e4d6a2cde84da2`, ten commits after this ledger.
+Those commits remain unclassified and the checkpoint must not advance until
+they receive the same port/evaluate/defer/out-of-scope review.
+
 The classifications mean:
 
 - `port`: the Nanocodex-relevant invariant is implemented and has concrete

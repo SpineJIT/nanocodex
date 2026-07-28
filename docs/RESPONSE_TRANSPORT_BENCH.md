@@ -61,22 +61,27 @@ Transport, storage, and history policy are selected when the agent is built and
 are inherited unchanged by every clean child and historical fork:
 
 ```rust
-use nanocodex::{Responses, ResponsesTransport};
+use nanocodex::{Nanocodex, OpenAi};
+use nanocodex::oai::transport::{ResponsesHistory, ResponsesTransport};
 
-let responses = Responses::builder()
+let openai = OpenAi::builder(std::env::var("OPENAI_API_KEY")?)
     .transport(ResponsesTransport::Https)
     .store(false)
-    .build();
-let (agent, events) = nanocodex::Nanocodex::builder(auth)
-    .responses(responses)
+    .history(ResponsesHistory::FullReplay)
+    .build()?;
+let (agent, events) = Nanocodex::builder(openai)
+    .instructions(
+        "Remember supplied deployment facts and preserve exact identifiers.",
+    )
     .build()?;
 ```
 
 HTTPS with `store: false` automatically selects full client-history replay.
 Callers can explicitly select
-`ResponsesHistory::{Incremental, FullReplay}` for the other supported
-combinations. The builder rejects `store: true` with ChatGPT subscription
-authentication and incremental HTTPS history with `store: false`.
+`ResponsesHistory::{Incremental, FullReplay}` with
+`OpenAiBuilder::history` for the other supported combinations. The builder
+rejects `store: true` with ChatGPT subscription authentication and incremental
+HTTPS history with `store: false`.
 
 The native CLI/TUI fixes transport and storage policy at startup with
 `--responses-transport` and `--store-responses`; history replay policy follows

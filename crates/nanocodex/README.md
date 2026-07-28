@@ -35,9 +35,10 @@ agent.shutdown().await?;
 ```
 
 Awaiting `prompt` means the private driver accepted and ordered the turn.
-Awaiting the returned [`Turn`] drains that turn and yields its complete
-[`TurnResult`]. Follow-on prompts reuse the same retained context and transport
-without asking the caller to manage response IDs or history.
+Awaiting the returned [`Turn`] waits for its complete [`TurnResult`]; it does
+not wait for the turn's optional event stream to be consumed. Follow-on prompts
+reuse the same retained context and transport without asking the caller to
+manage response IDs or history.
 
 ## Usage and USD estimates
 

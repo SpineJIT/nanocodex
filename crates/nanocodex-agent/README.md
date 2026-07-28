@@ -31,6 +31,10 @@ agent.shutdown().await?;
 # }
 ```
 
+The first `await` means the private driver accepted and ordered the prompt.
+[`Turn`] is both a per-turn event stream and a future for [`TurnResult`].
+Awaiting the turn waits only for its result; event consumption is independent.
+
 The private driver is the sole owner of mutable conversation, transport, tool,
 and process state. Cloning [`Nanocodex`] only clones its command capability;
 [`Nanocodex::spawn`] creates a clean sibling and [`Nanocodex::fork`] creates an
