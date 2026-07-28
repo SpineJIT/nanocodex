@@ -501,11 +501,7 @@ impl Serialize for RequestResponseItem<'_> {
     where
         S: serde::Serializer,
     {
-        if self
-            .item
-            .id()
-            .is_some_and(|id| !id.is_prefixed())
-        {
+        if self.item.id().is_some_and(|id| !id.is_prefixed()) {
             let mut item = self.item.clone();
             item.set_id(None);
             item.serialize(serializer)
