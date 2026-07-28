@@ -82,7 +82,7 @@ migration, and it must be independently mergeable.
    driver module decompositions.
 3. [x] Audit stable public paths, crate docs, examples, dependencies, features,
    cfgs, and crate boundaries.
-4. [ ] Verify each parity contract and fix confirmed mismatches test-first.
+4. [x] Verify each parity contract and fix confirmed mismatches test-first.
 5. [x] Finish benchmark thresholds and full-fidelity observability verification.
 6. [ ] Run all consumer, differential, smoke, and milestone eval gates.
 7. [ ] Commit and push coherent PR #50 slices, remediate CI, and verify the

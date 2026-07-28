@@ -468,10 +468,7 @@ impl Serialize for ResponsesInput<'_> {
     {
         let mut sequence = serializer.serialize_seq(Some(self.len()))?;
         for item in self.iter() {
-            sequence.serialize_element(&RequestResponseItem {
-                item,
-                retain_client_item_ids: true,
-            })?;
+            sequence.serialize_element(&RequestResponseItem { item })?;
         }
         sequence.end()
     }
@@ -480,7 +477,6 @@ impl Serialize for ResponsesInput<'_> {
 #[derive(Clone, Copy)]
 struct RequestInput<'a> {
     input: ResponsesInput<'a>,
-    retain_client_item_ids: bool,
 }
 
 impl Serialize for RequestInput<'_> {
@@ -490,10 +486,7 @@ impl Serialize for RequestInput<'_> {
     {
         let mut sequence = serializer.serialize_seq(Some(self.input.len()))?;
         for item in self.input.iter() {
-            sequence.serialize_element(&RequestResponseItem {
-                item,
-                retain_client_item_ids: self.retain_client_item_ids,
-            })?;
+            sequence.serialize_element(&RequestResponseItem { item })?;
         }
         sequence.end()
     }
@@ -501,7 +494,6 @@ impl Serialize for RequestInput<'_> {
 
 struct RequestResponseItem<'a> {
     item: &'a ResponseItem,
-    retain_client_item_ids: bool,
 }
 
 impl Serialize for RequestResponseItem<'_> {
@@ -512,7 +504,7 @@ impl Serialize for RequestResponseItem<'_> {
         if self
             .item
             .id()
-            .is_some_and(|id| !self.retain_client_item_ids || !id.is_prefixed())
+            .is_some_and(|id| !id.is_prefixed())
         {
             let mut item = self.item.clone();
             item.set_id(None);
@@ -605,10 +597,7 @@ impl<'a> ResponseCreate<'a> {
             kind: websocket.then_some("response.create"),
             model: crate::MODEL,
             previous_response_id,
-            input: RequestInput {
-                input,
-                retain_client_item_ids: config.store_responses,
-            },
+            input: RequestInput { input },
             tool_choice: "auto",
             // gpt-5.6-sol uses Responses Lite. Codex disables the provider
             // parallel-call request bit for Lite even though the client-side
@@ -851,7 +840,7 @@ mod tests {
         ))
         .expect("request should serialize");
 
-        assert!(ephemeral_request["input"][0].get("id").is_none());
+        assert_eq!(ephemeral_request["input"][0]["id"], "msg_stable");
         assert!(ephemeral_request["input"][1].get("id").is_none());
         assert_eq!(
             history

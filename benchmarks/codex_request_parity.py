@@ -165,7 +165,34 @@ SUPPORTED_SURFACE_EXCLUSIONS = [
     "absolute workspace spelling, measured wall time, and opaque shell chunk IDs",
     "approval-only exec_command arguments (Nanocodex has no approval subsystem)",
     "the WebSocket-only response.create request envelope",
+    (
+        "stock Codex's final HTTPS fallback after a WebSocket abort; Nanocodex "
+        "reconnects its supported Responses WebSocket and performs the same full replay"
+    ),
 ]
+PREFIXED_UUID = re.compile(
+    r"^(?P<prefix>[A-Za-z][A-Za-z0-9]*)_"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+ID_CAPABLE_ITEM_TYPES = frozenset(
+    {
+        "additional_tools",
+        "message",
+        "agent_message",
+        "reasoning",
+        "local_shell_call",
+        "function_call",
+        "function_call_output",
+        "tool_search_call",
+        "custom_tool_call",
+        "custom_tool_call_output",
+        "tool_search_output",
+        "web_search_call",
+        "image_generation_call",
+        "compaction",
+        "context_compaction",
+    }
+)
 
 
 def sse(events: list[dict[str, Any]]) -> bytes:
@@ -205,6 +232,7 @@ def tool_call_event(scenario: Scenario, call_id: str = "call-parity") -> dict[st
     return {
         "type": "response.output_item.done",
         "item": {
+            "id": f"ctc_{call_id}",
             "type": "custom_tool_call",
             "call_id": call_id,
             "name": "exec",
@@ -931,6 +959,21 @@ def normalize(value: Any, workspace: Path, *, request_root: bool = False) -> Any
         )
         for declaration in APPROVAL_ONLY_DECLARATIONS:
             normalized = normalized.replace(declaration, "")
+        prefixed_uuid = PREFIXED_UUID.fullmatch(normalized)
+        if prefixed_uuid is not None:
+            return f"{prefixed_uuid.group('prefix')}_<UUID>"
+        if normalized.lstrip().startswith(("{", "[")):
+            try:
+                nested = json.loads(normalized)
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(nested, (dict, list)):
+                    return json.dumps(
+                        normalize(nested, workspace),
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
         return normalized
     return normalized
 
@@ -1000,20 +1043,69 @@ def previous_response_chain(requests: list[dict[str, Any]]) -> list[str | None]:
     return [request.get("previous_response_id") for request in requests]
 
 
+def has_prefixed_item_id(item_id: Any) -> bool:
+    return (
+        isinstance(item_id, str)
+        and "_" in item_id
+        and all(item_id.split("_", 1))
+    )
+
+
+def may_omit_item_id(item: dict[str, Any]) -> bool:
+    item_type = item.get("type")
+    return (
+        item_type in {"additional_tools", "compaction", "context_compaction"}
+        or item_type == "compaction_trigger"
+        or (item_type == "message" and item.get("role") == "developer")
+    )
+
+
 def outbound_item_id_policy_valid(capture: dict[str, Any]) -> bool:
-    """Ephemeral Responses requests must omit every top-level input item ID."""
+    """Stable client IDs survive store:false while provider IDs stay private."""
     requests = capture["requests"]
     if not requests:
         return False
-    for request in requests:
+    for request, path in zip(requests, capture["request_paths"]):
+        if path.endswith("/responses/compact"):
+            continue
         if request.get("store") is not False:
             return False
         input_items = request.get("input")
         if not isinstance(input_items, list):
             return False
-        if any(isinstance(item, dict) and "id" in item for item in input_items):
-            return False
+        for item in input_items:
+            if not isinstance(item, dict):
+                return False
+            item_type = item.get("type")
+            item_id = item.get("id")
+            if item_id is None:
+                if item_type in ID_CAPABLE_ITEM_TYPES and not may_omit_item_id(item):
+                    return False
+                continue
+            if not has_prefixed_item_id(item_id):
+                return False
     return True
+
+
+def transport_paths_compatible(
+    scenario: Scenario,
+    stock: dict[str, Any],
+    nano: dict[str, Any],
+) -> bool:
+    if (
+        stock["request_transports"] == nano["request_transports"]
+        and stock["request_paths"] == nano["request_paths"]
+    ):
+        return True
+    return (
+        scenario.stateful == "reconnect_replay"
+        and stock["request_transports"]
+        == ["websocket", "websocket", "websocket", "https"]
+        and nano["request_transports"]
+        == ["websocket", "websocket", "websocket", "websocket"]
+        and stock["request_paths"] == nano["request_paths"]
+        and stock["request_paths"] == ["/v1/responses"] * 4
+    )
 
 
 def shell_output_metadata_valid(capture: dict[str, Any]) -> bool:
@@ -1153,6 +1245,7 @@ def main() -> int:
                 stock["request_transports"] == nano["request_transports"]
                 and stock["request_paths"] == nano["request_paths"]
             )
+            paths_compatible = transport_paths_compatible(scenario, stock, nano)
             behavior_valid = stateful_behavior_valid(scenario, stock, nano)
             item_id_policy_valid = all(
                 outbound_item_id_policy_valid(capture)
@@ -1181,6 +1274,7 @@ def main() -> int:
                     "request_counts_valid": request_counts_valid,
                     "request_identity_valid": request_identity_valid,
                     "transport_paths_equal": transport_paths_equal,
+                    "transport_paths_compatible": paths_compatible,
                     "process_valid": process_valid,
                     "stateful_behavior_valid": behavior_valid,
                     "outbound_item_id_policy_valid": item_id_policy_valid,
@@ -1197,6 +1291,9 @@ def main() -> int:
     all_transport_paths_equal = all(
         report["transport_paths_equal"] for report in reports
     )
+    all_transport_paths_compatible = all(
+        report["transport_paths_compatible"] for report in reports
+    )
     all_stateful_behaviors_valid = all(
         report["stateful_behavior_valid"] for report in reports
     )
@@ -1204,13 +1301,14 @@ def main() -> int:
         report["outbound_item_id_policy_valid"] for report in reports
     )
     report = {
-        "schema_version": 3,
+        "schema_version": 4,
         "scenarios": reports,
         "all_processes_valid": all_processes_valid,
         "all_request_counts_valid": all_counts_valid,
         "all_request_identities_valid": all_identities_valid,
         "all_normalized_requests_equal": all_requests_equal,
         "all_transport_paths_equal": all_transport_paths_equal,
+        "all_transport_paths_compatible": all_transport_paths_compatible,
         "all_stateful_behaviors_valid": all_stateful_behaviors_valid,
         "all_outbound_item_id_policies_valid": all_outbound_item_id_policies_valid,
         "supported_surface_exclusions": SUPPORTED_SURFACE_EXCLUSIONS,
@@ -1237,6 +1335,9 @@ def main() -> int:
                         "request_counts_valid": scenario["request_counts_valid"],
                         "request_identity_valid": scenario["request_identity_valid"],
                         "transport_paths_equal": scenario["transport_paths_equal"],
+                        "transport_paths_compatible": scenario[
+                            "transport_paths_compatible"
+                        ],
                         "process_valid": scenario["process_valid"],
                         "stateful_behavior_valid": scenario[
                             "stateful_behavior_valid"
@@ -1256,6 +1357,7 @@ def main() -> int:
                 "all_request_identities_valid": all_identities_valid,
                 "all_normalized_requests_equal": all_requests_equal,
                 "all_transport_paths_equal": all_transport_paths_equal,
+                "all_transport_paths_compatible": all_transport_paths_compatible,
                 "all_stateful_behaviors_valid": all_stateful_behaviors_valid,
                 "all_outbound_item_id_policies_valid": (
                     all_outbound_item_id_policies_valid
@@ -1272,7 +1374,9 @@ def main() -> int:
         or not all_outbound_item_id_policies_valid
     ):
         return 1
-    if args.check and (not all_requests_equal or not all_transport_paths_equal):
+    if args.check and (
+        not all_requests_equal or not all_transport_paths_compatible
+    ):
         for scenario in reports:
             if scenario["normalized_diff"]:
                 print(f"\n## {scenario['name']}\n{scenario['normalized_diff']}")
