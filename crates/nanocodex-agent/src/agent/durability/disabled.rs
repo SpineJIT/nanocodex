@@ -9,7 +9,7 @@ impl DurabilityConfig {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn start(
+    pub(crate) const fn start(
         &self,
         _session_id: &str,
         _workspace: Option<&str>,

@@ -6,7 +6,7 @@ use crate::Result;
 pub(crate) struct ContextSourceConfig;
 
 impl ContextSourceConfig {
-    pub(crate) fn build(&self) -> ContextSource {
+    pub(crate) const fn build(&self) -> ContextSource {
         ContextSource
     }
 }
@@ -19,11 +19,11 @@ impl ContextSource {
         Ok(requested.unwrap_or(".").to_owned())
     }
 
-    pub(crate) fn project_instructions(&self, _workspace: &str) -> Option<String> {
+    pub(crate) const fn project_instructions(&self, _workspace: &str) -> Option<String> {
         None
     }
 
-    pub(crate) fn global_instructions(&self) -> Option<Arc<str>> {
+    pub(crate) const fn global_instructions(&self) -> Option<Arc<str>> {
         None
     }
 

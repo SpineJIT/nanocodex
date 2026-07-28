@@ -109,7 +109,7 @@ impl WasmNanocodex {
     ///
     /// Throws when the JSON or agent policy is invalid.
     #[wasm_bindgen(constructor)]
-    pub fn new(config_json: &str) -> Result<WasmNanocodex, JsValue> {
+    pub fn new(config_json: &str) -> Result<Self, JsValue> {
         let config = serde_json::from_str::<WasmConfig>(config_json)
             .map_err(|error| js_error(format!("invalid Nanocodex configuration: {error}")))?;
         validate(&config)?;
@@ -186,7 +186,7 @@ impl WasmNanocodex {
     /// # Errors
     ///
     /// Rejects before the first safe boundary or after the driver stops.
-    pub async fn fork(&self) -> Result<WasmNanocodex, JsValue> {
+    pub async fn fork(&self) -> Result<Self, JsValue> {
         let (inner, events) = self.inner.fork().await.map_err(js_error)?;
         Ok(Self::from_parts(inner, events))
     }
@@ -197,7 +197,7 @@ impl WasmNanocodex {
     ///
     /// Rejects if the result belongs to another agent or the driver stopped.
     #[wasm_bindgen(js_name = forkFrom)]
-    pub async fn fork_from(&self, result: &WasmTurnResult) -> Result<WasmNanocodex, JsValue> {
+    pub async fn fork_from(&self, result: &WasmTurnResult) -> Result<Self, JsValue> {
         let (inner, events) = self
             .inner
             .fork_from(&result.inner)
@@ -211,7 +211,7 @@ impl WasmNanocodex {
     /// # Errors
     ///
     /// Rejects after the driver stops.
-    pub async fn spawn(&self) -> Result<WasmNanocodex, JsValue> {
+    pub async fn spawn(&self) -> Result<Self, JsValue> {
         let (inner, events) = self.inner.spawn().await.map_err(js_error)?;
         Ok(Self::from_parts(inner, events))
     }
