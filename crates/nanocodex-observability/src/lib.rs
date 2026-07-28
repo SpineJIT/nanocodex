@@ -418,6 +418,7 @@ mod tests {
             tracing::info!("test event");
         }
         guard.shutdown().unwrap();
+        guard.shutdown().unwrap();
         let request = request_received.recv_timeout(OTLP_TEST_TIMEOUT).unwrap();
         assert!(
             request.starts_with(b"POST ")

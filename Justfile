@@ -165,26 +165,26 @@ otel-stress turns="32" parallel_calls="16":
     NANOCODEX_STRESS_TURNS="{{turns}}" \
         NANOCODEX_STRESS_PARALLEL_CALLS="{{parallel_calls}}" \
         cargo test --locked --manifest-path bin/nanocodex/Cargo.toml \
-        --test observability_stress -- \
-        --ignored --exact retained_turns_and_hostile_tools_preserve_trace_topology \
+        --test it -- \
+        --ignored --exact observability_stress::retained_turns_and_hostile_tools_preserve_trace_topology \
         --nocapture --test-threads=1
 
 # Verify that attached child-agent turns share and overlap in their parent trace.
 otel-subagent-stress:
     @curl --fail --silent --show-error http://127.0.0.1:16686/ >/dev/null || { echo "run 'just otel-up' first" >&2; exit 2; }
     cargo test --locked --manifest-path bin/nanocodex/Cargo.toml \
-        --test observability_stress -- \
-        --ignored --exact attached_subagents_share_the_parent_trace_and_overlap \
+        --test it -- \
+        --ignored --exact observability_stress::attached_subagents_share_the_parent_trace_and_overlap \
         --nocapture --test-threads=1
 
 # Run the identical workload without installing the OTLP layer for comparison.
 otel-stress-baseline turns="32" parallel_calls="16":
     NANOCODEX_STRESS_EXPORT=false \
-        NANOCODEX_STRESS_TURNS="{{turns}}" \
+    NANOCODEX_STRESS_TURNS="{{turns}}" \
         NANOCODEX_STRESS_PARALLEL_CALLS="{{parallel_calls}}" \
         cargo test --locked --manifest-path bin/nanocodex/Cargo.toml \
-        --test observability_stress -- \
-        --ignored --exact retained_turns_and_hostile_tools_preserve_trace_topology \
+        --test it -- \
+        --ignored --exact observability_stress::retained_turns_and_hostile_tools_preserve_trace_topology \
         --nocapture --test-threads=1
 
 # Stop Jaeger and discard its in-memory trace data.

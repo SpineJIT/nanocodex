@@ -18,13 +18,13 @@ use nanocodex_oai_api::{
     tower::{CodeCall, CodeCallKind, GenerationOutput, ResponsePipelineStats, ResponsesOutput},
 };
 use nanocodex_tools::{
-    Tool, ToolContext, ToolDefinition, ToolInput, ToolResult, contract::async_trait,
+    Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult, contract::async_trait,
 };
 use serde_json::json;
 use tokio::sync::mpsc;
 use tower::Service;
 use tracing::{
-    Id, Instrument, Subscriber,
+    Event, Id, Instrument, Subscriber,
     field::{Field, Visit},
     info_span,
     span::{Attributes, Record},
@@ -55,6 +55,11 @@ struct PendingSpanTool {
     started: Arc<tokio::sync::Notify>,
 }
 
+struct SteeringBarrierTool {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
 #[async_trait]
 impl Tool for PendingSpanTool {
     fn definition(&self) -> ToolDefinition {
@@ -75,8 +80,34 @@ impl Tool for PendingSpanTool {
     }
 }
 
+#[async_trait]
+impl Tool for SteeringBarrierTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "trace__pending",
+            "Waits at a model boundary until the steering trace test releases it.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(ToolOutput::text("released"))
+    }
+}
+
 #[derive(Clone)]
 struct PendingToolService {
+    calls: Arc<AtomicU32>,
+}
+
+#[derive(Clone)]
+struct SteeringTraceService {
     calls: Arc<AtomicU32>,
 }
 
@@ -97,6 +128,30 @@ impl Service<ResponsesAttempt> for PendingToolService {
                 usage: None,
             }),
             (1, ResponsesAttemptKind::Generation) => pending_tool_generation(),
+            _ => panic!("unexpected attempt {call}: {:?}", request.kind()),
+        };
+        ready(Ok(ResponsesServiceResponse::new(output)))
+    }
+}
+
+impl Service<ResponsesAttempt> for SteeringTraceService {
+    type Response = ResponsesServiceResponse;
+    type Error = NanocodexError;
+    type Future = Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
+        let call = self.calls.fetch_add(1, Ordering::Relaxed);
+        let output = match (call, request.kind()) {
+            (0, ResponsesAttemptKind::Warmup) => ResponsesOutput::Warmup(WarmupResponse {
+                id: "resp-warmup".to_owned(),
+                usage: None,
+            }),
+            (1, ResponsesAttemptKind::Generation) => pending_tool_generation(),
+            (2, ResponsesAttemptKind::Generation) => final_generation(),
             _ => panic!("unexpected attempt {call}: {:?}", request.kind()),
         };
         ready(Ok(ResponsesServiceResponse::new(output)))
@@ -132,8 +187,26 @@ fn pending_tool_generation() -> ResponsesOutput {
     })
 }
 
+fn final_generation() -> ResponsesOutput {
+    ResponsesOutput::Generation(GenerationOutput {
+        id: "resp-final".to_owned(),
+        status: "completed".to_owned(),
+        end_turn: Some(true),
+        final_message: Some("steering recorded".to_owned()),
+        output_items: Vec::new(),
+        code_calls: Vec::new(),
+        usage: None,
+        time_to_first_event_ns: 0,
+        time_to_first_output_ns: Some(0),
+        pipeline_stats: ResponsePipelineStats::default(),
+    })
+}
+
 #[derive(Clone, Default)]
 struct TraceCapture(Arc<Mutex<HashMap<u64, CapturedSpan>>>);
+
+#[derive(Clone, Default)]
+struct TraceEventCapture(Arc<Mutex<Vec<CapturedTraceEvent>>>);
 
 #[derive(Clone)]
 struct CapturedSpan {
@@ -141,6 +214,11 @@ struct CapturedSpan {
     parent: Option<u64>,
     opened: Instant,
     closed: Option<Instant>,
+    fields: HashMap<String, String>,
+}
+
+struct CapturedTraceEvent {
+    scope: Vec<&'static str>,
     fields: HashMap<String, String>,
 }
 
@@ -207,6 +285,104 @@ where
             span.closed = Some(Instant::now());
         }
     }
+}
+
+impl<S> Layer<S> for TraceEventCapture
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_event(&self, event: &Event<'_>, context: LayerContext<'_, S>) {
+        let mut fields = HashMap::new();
+        event.record(&mut FieldCapture(&mut fields));
+        let scope = context.event_scope(event).map_or_else(Vec::new, |scope| {
+            scope
+                .from_root()
+                .map(|span| span.metadata().name())
+                .collect()
+        });
+        self.0
+            .lock()
+            .unwrap()
+            .push(CapturedTraceEvent { scope, fields });
+    }
+}
+
+#[test]
+fn steering_content_is_traced_in_prompt_order() {
+    const PROMPT: &str = "trace the initial prompt exactly";
+    const STEER: &str = "NANOCODEX_TRACE_STEER_SENTINEL";
+
+    let events_capture = TraceEventCapture::default();
+    let subscriber = tracing_subscriber::registry().with(events_capture.clone());
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async {
+            let calls = Arc::new(AtomicU32::new(0));
+            let started = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let service_calls = Arc::clone(&calls);
+            let openai = OpenAi::builder("test")
+                .service(move || SteeringTraceService {
+                    calls: Arc::clone(&service_calls),
+                })
+                .build()
+                .unwrap();
+            let tools = Tools::builder()
+                .without_defaults()
+                .tool(SteeringBarrierTool {
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                })
+                .build()
+                .unwrap();
+            let (agent, events) = Nanocodex::builder(openai).tools(tools).build().unwrap();
+            let turn = agent.prompt(PROMPT).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+                .await
+                .expect("steering barrier tool did not start");
+            turn.steer(STEER).await.unwrap();
+            release.notify_one();
+            assert_eq!(
+                turn.result().await.unwrap().into_final_message(),
+                "steering recorded"
+            );
+            agent.shutdown().await.unwrap();
+            drop((agent, events));
+            assert_eq!(calls.load(Ordering::Relaxed), 3);
+        });
+    });
+
+    let events = events_capture.0.lock().unwrap();
+    let prompt_index = events
+        .iter()
+        .position(|event| {
+            event.fields.get("content_kind").map(String::as_str) == Some("prompt")
+                && event
+                    .fields
+                    .get("content")
+                    .is_some_and(|content| content.contains(PROMPT))
+        })
+        .expect("prompt content event was not captured");
+    let steer_index = events
+        .iter()
+        .position(|event| {
+            event.fields.get("content_kind").map(String::as_str) == Some("steer")
+                && event
+                    .fields
+                    .get("content")
+                    .is_some_and(|content| content.contains(STEER))
+                && event.scope.contains(&"agent.turn")
+        })
+        .expect("steering content event was not captured under the turn");
+    assert!(
+        prompt_index < steer_index,
+        "steering content preceded the original prompt in the trace"
+    );
 }
 
 #[test]
@@ -369,6 +545,19 @@ fn cancelled_tool_span_records_its_terminal_state_before_closing() {
         .values()
         .find(|span| span.name == "tool.call")
         .expect("tool span was not captured");
+    let turn = spans
+        .values()
+        .find(|span| span.name == "agent.turn")
+        .expect("turn span was not captured");
+    assert_eq!(
+        turn.fields.get("status").map(String::as_str),
+        Some("cancelled")
+    );
+    assert_eq!(
+        turn.fields.get("otel.status_code").map(String::as_str),
+        Some("ERROR")
+    );
+    assert!(turn.closed.is_some(), "cancelled turn span did not close");
     assert_eq!(
         tool.fields.get("status").map(String::as_str),
         Some("cancelled")

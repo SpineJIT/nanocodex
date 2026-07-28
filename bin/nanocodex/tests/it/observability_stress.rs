@@ -59,15 +59,14 @@ async fn retained_turns_and_hostile_tools_preserve_trace_topology() -> Result<()
         .await
         .map_err(|_| eyre!("stress CLI exceeded {process_timeout:?}"))??;
 
-    timeout(Duration::from_secs(10), server)
-        .await
-        .map_err(|_| eyre!("mock Responses server did not finish"))???;
     let workload_elapsed = started.elapsed();
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
+    let server_result = timeout(Duration::from_secs(10), server).await;
     if !output.status.success() {
         bail!("stress CLI failed:\n{stderr}\n{stdout}");
     }
+    server_result.map_err(|_| eyre!("mock Responses server did not finish"))???;
     let events = stdout
         .lines()
         .map(serde_json::from_str::<Value>)
@@ -106,6 +105,7 @@ async fn retained_turns_and_hostile_tools_preserve_trace_topology() -> Result<()
         turns,
         "every yielded shell command must be resumed through write_stdin"
     );
+    validate_terminal_events(&events, turns)?;
 
     if export_traces {
         let traces = wait_for_traces(&jaeger_url, session_id, turns).await?;
@@ -139,14 +139,14 @@ async fn attached_subagents_share_the_parent_trace_and_overlap() -> Result<()> {
     let output = timeout(Duration::from_mins(1), command.output())
         .await
         .map_err(|_| eyre!("attached-subagent stress CLI timed out"))??;
-    timeout(Duration::from_secs(10), server)
-        .await
-        .map_err(|_| eyre!("attached-subagent mock Responses server did not finish"))???;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
+    let server_result = timeout(Duration::from_secs(10), server).await;
     if !output.status.success() {
         bail!("attached-subagent stress CLI failed:\n{stderr}\n{stdout}");
     }
+    server_result
+        .map_err(|_| eyre!("attached-subagent mock Responses server did not finish"))???;
     let events = stdout
         .lines()
         .map(serde_json::from_str::<Value>)
@@ -317,14 +317,42 @@ async fn serve_responses(listener: TcpListener, turns: usize, parallel_calls: us
     let mut socket = accept_async(stream).await?;
     let warmup = next_json(&mut socket).await?;
     assert!(warmup["input"].is_array());
-    assert_eq!(warmup["reasoning"]["summary"], "detailed");
+    assert_eq!(warmup["reasoning"]["summary"], "auto");
     send_completed(&mut socket, "response-warmup", &[]).await?;
 
     let mut previous_response = "response-warmup".to_owned();
     for turn in 0..turns {
         let generation = next_json(&mut socket).await?;
         assert_eq!(generation["previous_response_id"], previous_response);
-        assert_eq!(generation["reasoning"]["summary"], "detailed");
+        assert_eq!(generation["reasoning"]["summary"], "auto");
+        let search_response = format!("response-search-{turn}");
+        send_completed(
+            &mut socket,
+            &search_response,
+            &[json!({
+                "type": "tool_search_call",
+                "call_id": format!("call-search-{turn}"),
+                "execution": "client",
+                "arguments": {
+                    "query": "echo deterministic message",
+                    "limit": 1
+                }
+            })],
+        )
+        .await?;
+
+        let searched = next_json(&mut socket).await?;
+        assert_eq!(searched["previous_response_id"], search_response);
+        assert_eq!(searched["input"][0]["type"], "tool_search_output");
+        assert_eq!(
+            searched["input"][0]["call_id"],
+            format!("call-search-{turn}")
+        );
+        assert!(
+            searched["input"][0]["tools"]
+                .to_string()
+                .contains("mcp__fixture__")
+        );
         let tool_response = format!("response-tool-{turn}");
         send_completed(
             &mut socket,
@@ -341,12 +369,13 @@ async fn serve_responses(listener: TcpListener, turns: usize, parallel_calls: us
         let continuation = next_json(&mut socket).await?;
         assert_eq!(continuation["previous_response_id"], tool_response);
         assert_eq!(continuation["input"][0]["type"], "custom_tool_call_output");
-        assert_eq!(continuation["reasoning"]["summary"], "detailed");
+        assert_eq!(continuation["reasoning"]["summary"], "auto");
         previous_response = format!("response-final-{turn}");
         socket
             .send(Message::Text(
                 json!({
                     "type": "response.reasoning_summary_text.delta",
+                    "summary_index": 0,
                     "delta": format!("{REASONING_SENTINEL} turn {turn}")
                 })
                 .to_string()
@@ -384,8 +413,7 @@ async fn serve_responses(listener: TcpListener, turns: usize, parallel_calls: us
 fn stress_source(turn: usize, parallel_calls: usize) -> String {
     format!(
         r#"
-const found = await tools.tool_search({{ query: "echo message", limit: 8 }});
-const remote = found.tools[0].name;
+const remote = "mcp__fixture__echo";
 const successful = await Promise.all(Array.from({{ length: {parallel_calls} }}, (_, index) =>
   tools[remote]({{ message: "turn-{turn}-call-" + index, delay_ms: {PARALLEL_CALL_DELAY_MS} }})
 ));
@@ -491,6 +519,41 @@ fn validate_traces(traces: &[Value], turns: usize, parallel_calls: usize) -> Res
         assert!(has_tag(roots[0], "agent.origin", "root"));
         assert!(has_bool_tag(roots[0], "trace.parented", false));
         assert!(has_tag_key(roots[0], "session.lineage_id"));
+        assert!(roots[0]["duration"].as_u64().is_some_and(|value| value > 0));
+        let first_turn = has_u64_tag(roots[0], "turn.index", 1);
+        assert!(has_u64_tag(
+            roots[0],
+            "usage.input_tokens",
+            if first_turn { 40 } else { 30 }
+        ));
+        assert!(has_u64_tag(
+            roots[0],
+            "usage.cached_input_tokens",
+            if first_turn { 20 } else { 15 }
+        ));
+        assert!(has_u64_tag(roots[0], "usage.cache_write_input_tokens", 0));
+        assert!(has_u64_tag(
+            roots[0],
+            "usage.output_tokens",
+            if first_turn { 8 } else { 6 }
+        ));
+        assert!(has_u64_tag(
+            roots[0],
+            "usage.reasoning_output_tokens",
+            if first_turn { 4 } else { 3 }
+        ));
+        assert!(has_u64_tag(
+            roots[0],
+            "usage.total_tokens",
+            if first_turn { 48 } else { 36 }
+        ));
+        assert!(has_tag(roots[0], "cost.status", "estimated_from_usage"));
+        assert!(has_tag(
+            roots[0],
+            "cost.usd",
+            if first_turn { "0.00035" } else { "0.0002625" }
+        ));
+        assert!(has_tag(roots[0], "cost.service_tier", "standard"));
         for span in spans {
             let operation = span["operationName"]
                 .as_str()
@@ -502,6 +565,21 @@ fn validate_traces(traces: &[Value], turns: usize, parallel_calls: usize) -> Res
                 assert!(has_tag_key(span, "runtime.event_count"));
                 assert!(has_tag_key(span, "host.reused"));
                 assert!(has_tag_key(span, "host.wait_ns"));
+            }
+            if operation == "model.call" {
+                assert!(has_tag_key(span, "duration_ns"));
+                assert!(has_tag_key(span, "time_to_first_event_ns"));
+                assert!(has_u64_tag(span, "input_tokens", 10));
+                assert!(has_u64_tag(span, "cached_input_tokens", 5));
+                assert!(has_u64_tag(span, "cache_write_input_tokens", 0));
+                assert!(has_u64_tag(span, "output_tokens", 2));
+                assert!(has_u64_tag(span, "reasoning_output_tokens", 1));
+                assert!(has_u64_tag(span, "total_tokens", 12));
+                assert!(has_tag(span, "cost.usd", "0.0000875"));
+                assert!(has_tag(span, "cost.service_tier", "standard"));
+            }
+            if operation == "tool.call" {
+                assert!(has_tag_key(span, "duration_ns"));
             }
             if operation == "tool.execute"
                 && has_tag(span, "tool.name", "exec_command")
@@ -533,7 +611,8 @@ fn validate_traces(traces: &[Value], turns: usize, parallel_calls: usize) -> Res
         validate_parallel_code_mode_spans(trace_id, spans, parallel_calls)?;
     }
     assert_eq!(operation_count(&operations, "agent.turn"), turns);
-    assert_eq!(operation_count(&operations, "tool.call"), turns);
+    assert_eq!(operation_count(&operations, "model.call"), turns * 3);
+    assert_eq!(operation_count(&operations, "tool.call"), turns * 2);
     assert_eq!(operation_count(&operations, "code_mode.cell"), turns);
     assert_eq!(operation_count(&operations, "code_mode.host_spawn"), 1);
     assert_eq!(operation_count(&operations, "code_mode.cell_actor"), turns);
@@ -812,6 +891,76 @@ fn event_count(events: &[Value], event_type: &str, tool: Option<&str>) -> usize 
             event["type"] == event_type && tool.is_none_or(|tool| event["payload"]["tool"] == tool)
         })
         .count()
+}
+
+fn validate_terminal_events(events: &[Value], turns: usize) -> Result<()> {
+    let terminals = events
+        .iter()
+        .filter(|event| event["type"] == "run.completed")
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), turns);
+    for (turn_index, terminal) in terminals.into_iter().enumerate() {
+        let payload = &terminal["payload"];
+        assert_eq!(
+            payload["usage"],
+            json!({
+                "input_tokens": 30,
+                "cached_input_tokens": 15,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 6,
+                "reasoning_output_tokens": 3,
+                "total_tokens": 36
+            })
+        );
+        let (warmup_usage, estimated_cost, cost_usd) = if turn_index == 0 {
+            (
+                json!({
+                    "input_tokens": 10,
+                    "cached_input_tokens": 5,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 2,
+                    "reasoning_output_tokens": 1,
+                    "total_tokens": 12
+                }),
+                "0.00035",
+                0.00035,
+            )
+        } else {
+            (
+                json!({
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": 0
+                }),
+                "0.0002625",
+                0.0002625,
+            )
+        };
+        assert_eq!(payload["warmup_usage"], warmup_usage);
+        assert_eq!(payload["estimated_cost"]["usd"], estimated_cost);
+        assert_eq!(payload["estimated_cost"]["service_tier"], "standard");
+        assert_eq!(payload["cost_usd"], cost_usd);
+        assert_eq!(payload["cost_status"], "estimated_from_usage");
+        assert!(
+            payload["duration_ns"]
+                .as_u64()
+                .is_some_and(|value| value > 0)
+        );
+        assert!(
+            payload["model_duration_ns"]
+                .as_u64()
+                .is_some_and(|value| value > 0)
+        );
+        assert!(
+            payload["tool_wall_duration_ns"]
+                .as_u64()
+                .is_some_and(|value| value > 0)
+        );
+    }
+    Ok(())
 }
 
 fn bounded_env(name: &str, default: usize, minimum: usize, maximum: usize) -> Result<usize> {

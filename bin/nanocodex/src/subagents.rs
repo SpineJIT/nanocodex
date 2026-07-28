@@ -206,6 +206,10 @@ impl Tool for ChildAgent {
         )
     }
 
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
         let AgentTask { role, task } = input.decode_json()?;
         let agents = self
