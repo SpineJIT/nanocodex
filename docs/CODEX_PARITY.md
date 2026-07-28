@@ -1,14 +1,17 @@
 # Codex parity ledger
 
-This ledger records the review of the 37 commits in the exclusive range
+This ledger records the review of all 316 commits in the exclusive local
+checkout range
 
 ```text
 openai/codex@35eaf3ffb0bf2001486c68c47a3d946b34d16634
-    ..openai/codex@8431dc590a5bba9a1185d5579a5aabfbc469e50b
+    ..openai/codex@3418498f01422f5f650ea645d4bd19e05c3a9616
 ```
 
-The review used the local Codex checkout at the range head. The command
-`git rev-list --count <range>` returns `37`.
+The review used the clean local Codex checkout at the range head. The command
+`git rev-list --count <range>` returns `316`. The first 37 commits remain
+expanded below; the next 279 are classified individually in
+[`codex-parity/8431dc59-3418498f.md`](codex-parity/8431dc59-3418498f.md).
 
 The classifications mean:
 
@@ -21,19 +24,19 @@ The classifications mean:
 - `out-of-scope`: the change belongs to a surface Nanocodex deliberately does
   not own, or to an implementation pipeline it does not have.
 
-Classification is not implementation by analogy. In particular, the earlier
-supposed total of 12 ports cannot be substantiated from the current tree. Only
-the eight rows linked to `P1` through `P8` meet the evidence rule.
+Classification is not implementation by analogy. A `port` row must link to the
+concrete evidence below; `evaluate`, `defer`, and `out-of-scope` are not parity
+claims.
 
 | Classification | Count |
 | --- | ---: |
-| `port` | 8 |
-| `evaluate` | 10 |
-| `defer` | 1 |
-| `out-of-scope` | 18 |
-| Total | 37 |
+| `port` | 31 |
+| `evaluate` | 21 |
+| `defer` | 2 |
+| `out-of-scope` | 262 |
+| Total | 316 |
 
-## Commit-by-commit ledger
+## First range: `35eaf3ff..8431dc59`
 
 | # | Codex commit | Classification | Decision |
 | ---: | --- | --- | --- |
@@ -132,7 +135,7 @@ keeps the public frame path measured.
 
 ### P6 — canonical rollout history-mode validation
 
-[`materialize_rollout`](../crates/nanocodex-agent/src/rollout.rs) validates
+[`materialize_rollout`](../crates/nanocodex-agent/src/rollout/load.rs) validates
 `history_mode` only on the first canonical `session_meta`: missing or `legacy`
 is accepted, other strings return `io::ErrorKind::Unsupported`, and later
 copied metadata cannot become the canonical workspace record. The unit test
@@ -155,6 +158,166 @@ The integration test `prepares_images_and_stops_on_invalid_image_requests` in
 [`model/tools/mod.rs`](../crates/nanocodex-agent/tests/it/model/tools/mod.rs)
 serves one invalid-image failure and asserts the typed terminal error. There is
 no history mutation or fallback request that substitutes `Invalid image`.
+
+### P9 — borrowed Responses payloads
+
+[`ResponseCreate`](../crates/nanocodex-oai-api/src/responses/request.rs) borrows
+stable request-profile, configuration, history, and input state.
+[`EncodedRequest`](../crates/nanocodex-oai-api/src/transport/wire.rs) retains
+the serialized frame once for replayable Tower attempts. The
+[`tower_responses`](../crates/nanocodex-oai-api/benches/tower_responses.rs)
+benchmarks measure construction, serialization, and retry cloning separately.
+
+### P10 — copy-on-write typed history
+
+[`ResponseHistory`](../crates/nanocodex-oai-api/src/responses/request.rs) stores
+immutable shared segments and a copy-on-write tail. Compaction and fork
+snapshots share committed prefixes; suffix replacement copies only the
+affected boundary. Unit regressions cover cross-segment iteration and prefix
+sharing, and
+[`fork_history`](../crates/nanocodex-oai-api/benches/fork_history.rs) compares
+representative checkpoint sizes.
+
+### P11 — authoritative compaction installation
+
+[`ManagedSessionState::install_compaction`](../crates/nanocodex-oai-api/src/session/state.rs)
+is the single typed history replacement. The agent's pre-turn and mid-turn
+entry points in
+[`model/run/state.rs`](../crates/nanocodex-agent/src/model/run/state.rs) only
+supply the appropriate retained context. Session and agent compaction tests
+cover atomic replacement, failed-operation rollback, manual compaction, and
+continuation ordering.
+
+### P12 and P27 — detached subprocesses and tree cleanup
+
+[`spawn_pipes`](../crates/nanocodex-tools/src/shell/process.rs) gives
+non-interactive children null stdin. The same module owns process-group
+termination on Unix and descendant termination on Windows; Code Mode and shell
+cancellation retain the guard until output drains. Shell/process and
+agent-cancellation regressions cover timeout, cancellation, continued
+sessions, and descendant cleanup. Codex's exact Windows job-object
+implementation is not treated as an API requirement.
+
+### P13 — stable response item IDs
+
+[`assign_missing_response_item_ids`](../crates/nanocodex-oai-api/src/session/context.rs)
+assigns client IDs once and preserves server IDs. History construction,
+compaction, resume, and request serialization all pass through that invariant.
+The tests `history_assigns_ids_once_and_preserves_them_across_checkpoints` and
+`request_serialization_matches_codex_item_id_policy_without_mutating_history`
+cover retention and provider-facing filtering.
+
+### P14 — rejected turns do not close the TUI
+
+[`start_turn`](../bin/nanocodex/src/tui/mod.rs) converts prompt-admission
+failure into `TurnTraceRejected` and `TurnFinished` updates and returns control
+to the worker loop. `rejected_turns_do_not_stop_the_tui_worker` submits two
+consecutive rejected turns and proves the worker remains available.
+
+### P15 — missing checkpoint replay
+
+The typed retry policy in
+[`tower/middleware/retry.rs`](../crates/nanocodex-oai-api/src/tower/middleware/retry.rs)
+recognizes `previous_response_not_found`, removes the continuation checkpoint,
+and immediately retries the owned attempt with complete authoritative history.
+`missing_stored_checkpoint_replays_local_history_once` and
+`active_boundary_fork_sends_tool_and_steer_delta_then_replays_on_checkpoint_miss`
+cover ordinary and forked sessions.
+
+### P16 — provider-owned post-response accounting
+
+[`ContextManager`](../crates/nanocodex-oai-api/src/session/context.rs) updates
+its active token count from completed provider usage and estimates only
+unreported pending context. The model loop does not perform an additional
+whole-history estimate after sampling. Context and compaction regressions cover
+threshold crossings and missing-usage fallback.
+
+### P17 — bounded syntax highlighting
+
+[`highlighted_code_lines`](../bin/nanocodex/src/tui/markdown.rs) falls back to
+plain rendering when any source line exceeds 4 KiB.
+`skips_highlighting_for_oversized_source_lines` covers exact content and style,
+while
+[`tui_markdown/syntax_fallback_oversized_line_1m`](../bin/nanocodex/benches/tui_render.rs)
+keeps the pathological retained-trace shape measured.
+
+### P18 — shared request construction
+
+The request profiles and immutable prefixes in
+[`responses/request.rs`](../crates/nanocodex-oai-api/src/responses/request.rs)
+are shared, and generation/compaction builders borrow configuration and
+history. The request construction benchmarks distinguish full-history,
+incremental, and serialized retry costs so clone reductions remain measurable.
+
+### P19 — compaction time in turn profiles
+
+[`RunStats`](../crates/nanocodex-agent/src/model/telemetry.rs) accumulates
+`compaction_duration_ns` on both success and failure while retaining it as a
+subset of aggregate model time. The public typed
+[`RunMetrics`](../crates/nanocodex-oai-api/src/events/data.rs) and raw JSONL
+carry the same value. The automatic-compaction integration regression decodes
+and compares both projections.
+
+### P20 — MCP HTTP user agent
+
+[`resolve_http_headers`](../crates/nanocodex-tools/src/mcp/client.rs) installs
+`nanocodex-mcp-client/<version>` in both the HTTP client's defaults and RMCP's
+request headers; explicit caller configuration wins. The focused header test
+covers default and override behavior.
+
+### P21 — complete errors, separate retry advice
+
+[`ResponsesServiceError`](../crates/nanocodex-oai-api/src/tower/service_error.rs)
+retains the full typed source, failure phase, attempt, and connection
+generation. Retry class and optional server delay are separate advice fields,
+so scheduling metadata never replaces provider detail. Retry tests cover
+server delay, exhaustion, terminal errors, and checkpoint recovery.
+
+### P22 — nonblocking Ratatui interruption
+
+The terminal loop sends a cancellation command and redraws; the independent
+[`AgentWorker`](../bin/nanocodex/src/tui/mod.rs) awaits agent cancellation.
+`second_escape_sends_cancel_for_the_focused_turn` verifies that input handling
+only queues the command rather than awaiting lifecycle work.
+
+### P23 — forks use the active typed history
+
+[`prepare_checkpoint`](../crates/nanocodex-agent/src/model/run/mod.rs) captures
+committed typed history, active continuation policy, stable prefix, and opaque
+provider checkpoint together. Fork tests cover healthy incremental
+continuation and missing-checkpoint full replay without exposing a history
+mode or response ID to the caller.
+
+### P24 — bounded Responses Lite Code Mode metadata
+
+[`ToolRuntime::model_contract`](../crates/nanocodex-tools/src/runtime/execution.rs)
+builds the direct tool prefix and deterministic nested-name map from the same
+registry snapshot. Request serialization emits the structured
+`x-codex-turn-metadata` compatibility header, including MCP namespaces, while
+the WebSocket Responses Lite marker remains bounded. Unit and mock-server
+warmup regressions decode and assert the metadata.
+
+### P25 — idempotent OpenTelemetry shutdown
+
+[`ObservabilityGuard::shutdown`](../crates/nanocodex-observability/src/lib.rs)
+takes ownership of its provider before flushing and closing it. The combined
+formatting/OTLP regression calls shutdown twice, then drops the guard, while
+asserting one successful export.
+
+### P26 — focus does not replace input
+
+Focus events in [`UiModel`](../bin/nanocodex/src/tui/mod.rs) update terminal
+focus, notification, resize, and redraw state without touching the composer.
+`focus_gain_redraws_and_clears_an_unfocused_completion_notification` now also
+asserts that an unfinished draft and cursor survive the round trip.
+
+### P28 — stable ten-second Code Mode yield
+
+The model-visible exec description, wait schema, parser, and runtime in
+[`code_mode`](../crates/nanocodex-tools/src/code_mode/mod.rs) agree on the
+ten-second default across platforms. Code Mode timing/parser tests cover the
+default and explicit override. Codex's experimental 30-second buffered-exec
+feature is intentionally outside the narrow runtime.
 
 ## Reviewed baseline behavior
 
@@ -183,15 +346,20 @@ stopping the private driver.
 
 ## Open evaluation queue
 
-The ten `evaluate` rows are not checkpoint blockers, but they are also not
-parity claims. They should be resolved only through the existing representative
-TUI corpus and focused allocation/frame benchmarks:
+The 21 `evaluate` rows are not parity claims. The original ten should be
+resolved only through the existing representative TUI corpus and focused
+allocation/frame benchmarks:
 
 - ownership and retained allocations: rows 4, 8, 9, 15, and 32;
 - Markdown and layout algorithms: rows 10, 18, 26, and 28;
 - operator-owned metric histogram policy: row 35.
 
-The audio row remains deferred until the supported model contract includes the
-modality and there is a real embeddable consumer. No app-server, realtime,
-provider abstraction, approval, Guardian, exec-policy, shell-snapshot, or
-skills surface is implied by completing this review.
+The 11 later evaluations are named `E2` through `E11` in the
+[range appendix](codex-parity/8431dc59-3418498f.md): platform-specific terminal
+behavior, Codex-only live exec rendering, side-pane navigation, and exact item
+start timing require their corresponding workload before adoption.
+
+The two audio rows remain deferred until the supported model contract includes
+the modality and there is a real embeddable consumer. No app-server, realtime,
+provider abstraction, approval, Guardian, exec-policy, shell-snapshot, plugin,
+skills, or generic multi-agent surface is implied by completing this review.
