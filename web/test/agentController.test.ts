@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { performance } from "node:perf_hooks";
 import { test } from "node:test";
 
 import {
@@ -8,6 +9,8 @@ import {
 } from "../src/agentController.ts";
 
 const main = { pane: "main" as const, branchId: 0 };
+const LIFECYCLE_BUDGET_MS = 750;
+const RESET_BUDGET_MS = 500;
 
 test("the Worker controller owns prompts, steering, cancellation, events, and cleanup", async () => {
   const harness = new AgentHarness();
@@ -424,6 +427,7 @@ test("a large retained session releases every Turn with linear ownership", async
     transport: "openai",
   });
 
+  const startedAt = performance.now();
   for (let id = 1; id <= 2_000; id += 1) {
     await controller.handle({
       type: "prompt",
@@ -437,12 +441,70 @@ test("a large retained session releases every Turn with linear ownership", async
     assert.equal(harness.turns.at(-1)?.disposed, 1);
   }
   await controller.dispose();
+  const elapsed = performance.now() - startedAt;
 
   assert.equal(harness.turns.length, 2_000);
   assert.equal(
     harness.turns.reduce((sum, turn) => sum + turn.disposed, 0),
     2_000,
   );
+  assert.ok(
+    elapsed < LIFECYCLE_BUDGET_MS,
+    `2,000 completed browser turns took ${elapsed.toFixed(1)} ms`,
+  );
+});
+
+test("reset cancels and releases 2,000 active Turns within the lifecycle budget", async () => {
+  const harness = new AgentHarness();
+  let generation = 0;
+  const controller = createAgentController({
+    async createAgent(_start, tools) {
+      harness.tools = tools;
+      generation += 1;
+      return { agent: harness.createAgent(`root-${generation}`) as any };
+    },
+    postMessage() {},
+  });
+  const start = {
+    type: "start" as const,
+    thinking: "high" as const,
+    reasoningMode: "standard" as const,
+    transport: "openai" as const,
+  };
+  await controller.handle(start);
+  for (let id = 1; id <= 2_000; id += 1) {
+    await controller.handle({
+      type: "prompt",
+      target: main,
+      id,
+      prompt: `active turn ${id}`,
+      intent: "queue",
+    });
+  }
+
+  const startedAt = performance.now();
+  await controller.handle(start);
+  const elapsed = performance.now() - startedAt;
+
+  assert.equal(harness.turns.length, 2_000);
+  assert.equal(
+    harness.turns.reduce((sum, turn) => sum + turn.cancelled, 0),
+    2_000,
+  );
+  assert.equal(
+    harness.turns.reduce((sum, turn) => sum + turn.disposed, 0),
+    2_000,
+  );
+  assert.equal(harness.agents.get("root-1")?.disposed, 1);
+  assert.equal(harness.agents.get("root-2")?.disposed, 0);
+  assert.equal(harness.watchOffs, 1);
+  assert.ok(
+    elapsed < RESET_BUDGET_MS,
+    `resetting 2,000 active browser turns took ${elapsed.toFixed(1)} ms`,
+  );
+
+  await controller.dispose();
+  assert.equal(harness.agents.get("root-2")?.disposed, 1);
 });
 
 function event(
