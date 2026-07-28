@@ -1090,6 +1090,44 @@ text("done");
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pending_timeouts_do_not_spawn_one_thread_each() -> Result<()> {
+    let workspace = temporary_workspace("bounded-timeout-scheduler")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let threads_before = std::fs::read_dir("/proc/self/task")?.count();
+    let yielded = tools
+        .execute_code(
+            r#"
+for (let timer = 0; timer < 64; timer += 1) {
+  setTimeout(() => {}, 60_000);
+}
+yield_control();
+await new Promise(() => {});
+"#,
+            test_context(&history),
+        )
+        .await;
+    assert!(yielded.success, "{}", execution_output(&yielded));
+    let threads_with_timers = std::fs::read_dir("/proc/self/task")?.count();
+    let terminated = tools
+        .wait_for_code(
+            r#"{"cell_id":"1","terminate":true}"#,
+            test_context(&history),
+        )
+        .await;
+    std::fs::remove_dir_all(workspace)?;
+
+    assert!(terminated.success, "{}", execution_output(&terminated));
+    assert!(
+        threads_with_timers <= threads_before + 8,
+        "64 pending timers created {} additional OS threads",
+        threads_with_timers.saturating_sub(threads_before)
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn termination_returns_unobserved_output_since_the_last_yield() -> Result<()> {
     let workspace = temporary_workspace("terminated-cell-output")?;
