@@ -510,6 +510,7 @@ enum Submission {
 )]
 pub(crate) async fn run(
     config: AgentArgs,
+    vm: crate::vm::VmArgs,
     initial_prompt: Option<String>,
     resume: Option<DurableSession>,
 ) -> Result<()> {
@@ -523,9 +524,9 @@ pub(crate) async fn run(
         .map(|session| PathBuf::from(session.workspace()))
         .unwrap_or(resolve_cwd(&config)?);
     let configured = if let Some(session) = resume {
-        config.build_resumed(session).await?
+        config.build_resumed(session, vm).await?
     } else {
-        config.build().await?
+        config.build(vm).await?
     };
     let agent = configured.handle;
     let mut agent_events = configured.events;
@@ -533,6 +534,7 @@ pub(crate) async fn run(
     let child_agents = configured.child_agents;
     let mpp_adapter = configured.mpp_adapter;
     let mcp = configured.mcp;
+    let vm = configured.vm;
     let (worker_tx, worker_rx) = mpsc::unbounded_channel();
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
     let worker = spawn_agent_worker(
@@ -633,7 +635,7 @@ pub(crate) async fn run(
 
     // Restore the terminal before disconnecting the paid WebSocket session.
     drop((terminal, worker_tx, agent_events));
-    let shutdown_result = shutdown_runtime(worker, child_agents, mpp_adapter).await;
+    let shutdown_result = shutdown_runtime(worker, child_agents, mpp_adapter, vm).await;
     loop_result?;
     shutdown_result
 }
@@ -649,12 +651,18 @@ async fn shutdown_runtime(
     worker: tokio::task::JoinHandle<()>,
     child_agents: Option<std::sync::Arc<crate::subagents::ChildAgents>>,
     mpp_adapter: Option<crate::mpp::MppAdapter>,
+    vm: Option<crate::vm::ConfiguredVm>,
 ) -> Result<()> {
     worker.abort();
     let worker_result = worker.await;
     if let Some(child_agents) = child_agents {
         child_agents.shutdown().await;
     }
+    let vm_shutdown_result = if let Some(vm) = vm {
+        vm.shutdown().await
+    } else {
+        Ok(())
+    };
     let shutdown_result = if let Some(adapter) = mpp_adapter {
         adapter.shutdown().await
     } else {
@@ -665,6 +673,7 @@ async fn shutdown_runtime(
         Err(error) if error.is_cancelled() => {}
         Err(error) => return Err(error).wrap_err("TUI agent worker failed"),
     }
+    vm_shutdown_result?;
     shutdown_result
 }
 

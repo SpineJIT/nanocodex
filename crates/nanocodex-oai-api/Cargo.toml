@@ -17,6 +17,17 @@ description = "Tower-native OpenAI Responses API and managed context for Nanocod
 all-features = true
 rustdoc-args = ["-D", "warnings"]
 
+[features]
+default = ["client"]
+client = [
+    "dep:base64",
+    "dep:getrandom",
+    "dep:reqwest",
+    "dep:sha2",
+    "dep:tokio-tungstenite",
+    "dep:url",
+]
+
 [dependencies]
 async-trait.workspace = true
 futures-util.workspace = true
@@ -32,13 +43,13 @@ uuid.workspace = true
 web-time.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-base64.workspace = true
-getrandom.workspace = true
-reqwest.workspace = true
-sha2.workspace = true
+base64 = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
-tokio-tungstenite.workspace = true
-url.workspace = true
+tokio-tungstenite = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
@@ -51,14 +62,22 @@ tracing-subscriber.workspace = true
 [[bench]]
 name = "fork_history"
 harness = false
+required-features = ["client"]
 
 [[bench]]
 name = "tower_responses"
 harness = false
+required-features = ["client"]
 
 [[bench]]
 name = "session_lifecycle"
 harness = false
+required-features = ["client"]
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+required-features = ["client"]
 
 [lints]
 workspace = true

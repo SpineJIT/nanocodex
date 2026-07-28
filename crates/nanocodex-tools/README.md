@@ -119,6 +119,18 @@ the provider-native `tool_search` initially. Search results contain loadable MCP
 namespaces for direct model calls and also activate the matching definitions for
 Code Mode, keeping large catalogs out of the initial tool list.
 
+## Companion workspace runtimes
+
+The default `native` feature remains the complete tools crate: registry, Code
+Mode, MCP, web/image tools, macros, and standard workspace tools.
+
+The narrower `workspace-runtime` feature exists only for process companions
+such as `nanocodex-vm-guest`. With default features disabled, it exposes the
+canonical [`workspace_runtime::WorkspaceToolRuntime`], standard tool
+identities, and their shared contracts without linking OpenAI transports, Code
+Mode/QuickJS, MCP, or HTTP clients. This is artifact separation, not a second
+tool implementation or an alternate mode for normal native applications.
+
 ## Going lower level
 
 The crate root intentionally contains only the normal registry path:
@@ -135,4 +147,6 @@ types required by the `Tool` methods.
   and runtime control.
 - `standard` contains reusable standard-tool identities and the host-owned
   plan implementation.
+- [`workspace_runtime`] contains the retained canonical workspace-tool runtime
+  used by process companions.
 - [`image`] contains prompt-image preparation and tool-output normalization.

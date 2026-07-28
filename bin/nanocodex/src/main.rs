@@ -11,6 +11,7 @@ mod subagents;
 mod tui;
 mod update;
 mod version;
+mod vm;
 
 use std::path::PathBuf;
 
@@ -39,6 +40,9 @@ struct Cli {
     #[command(flatten)]
     observability: ObservabilityArgs,
 
+    #[command(flatten)]
+    vm: vm::VmArgs,
+
     /// Submit an initial prompt immediately after the TUI opens.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     prompt: Option<String>,
@@ -51,6 +55,9 @@ enum Command {
     /// Inspect or purchase Nanocodex NANOUSD credits.
     #[cfg(feature = "tempo")]
     Credits(credits::Credits),
+    /// Internal entrypoint for one dedicated libkrun VMM process.
+    #[command(hide = true)]
+    VmRunConfig(vm::VmRunConfig),
     /// Run one prompt and stream JSONL events to stdout.
     Run(Box<RunCommand>),
     /// Resume a Codex or Nanocodex thread in the interactive TUI.
@@ -69,6 +76,9 @@ struct RunCommand {
 
     #[command(flatten)]
     observability: ObservabilityArgs,
+
+    #[command(flatten)]
+    vm: vm::VmArgs,
 }
 
 #[derive(Args)]
@@ -83,25 +93,38 @@ struct ResumeCommand {
     #[command(flatten)]
     observability: ObservabilityArgs,
 
+    #[command(flatten)]
+    vm: vm::VmArgs,
+
     /// Submit an initial follow-on prompt immediately after the TUI opens.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     prompt: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Keep direct `cargo run` behavior consistent with the Justfile without
     // requiring shell-specific syntax to load the repository's `.env` file.
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();
+    if let Some(Command::VmRunConfig(command)) = &cli.command {
+        return command.run();
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(cli))
+}
+
+async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Auth(command)) => command.run().await,
         #[cfg(feature = "tempo")]
         Some(Command::Credits(command)) => command.run().await,
+        Some(Command::VmRunConfig(_)) => unreachable!("VMM commands run before Tokio starts"),
         Some(Command::Run(command)) => {
             let _observability = command.observability.install(false, command.agent.cwd())?;
-            command.run.run(command.agent).await
+            command.run.run(command.agent, command.vm).await
         }
         Some(Command::Resume(command)) => {
             let codex_home = config::default_codex_home()?;
@@ -110,12 +133,12 @@ async fn main() -> Result<()> {
                 .wrap_err_with(|| format!("failed to load Codex thread {}", command.thread_id))?;
             let workspace = PathBuf::from(session.workspace());
             let _observability = command.observability.install(true, &workspace)?;
-            tui::run(command.agent, command.prompt, Some(session)).await
+            tui::run(command.agent, command.vm, command.prompt, Some(session)).await
         }
         Some(Command::Update(command)) => command.run().await,
         None => {
             let _observability = cli.observability.install(true, cli.agent.cwd())?;
-            tui::run(cli.agent, cli.prompt, None).await
+            tui::run(cli.agent, cli.vm, cli.prompt, None).await
         }
     }
 }
@@ -175,6 +198,41 @@ mod tests {
         assert_eq!(
             cli.agent.responses_transport(),
             nanocodex::oai::transport::ResponsesTransport::WebSocket
+        );
+    }
+
+    #[test]
+    fn vm_tools_are_opt_in_for_tui_and_one_shot_runs() {
+        let tui = Cli::try_parse_from(["nanocodex"]).unwrap();
+        assert!(!tui.vm.is_enabled());
+
+        let tui = Cli::try_parse_from([
+            "nanocodex",
+            "--vm",
+            "/tmp/rootfs",
+            "--vm-workspace",
+            "/workspace",
+        ])
+        .unwrap();
+        assert!(tui.vm.is_enabled());
+
+        let run = Cli::try_parse_from(["nanocodex", "run", "reply with ok", "--vm", "/tmp/rootfs"])
+            .unwrap();
+        let Some(Command::Run(run)) = run.command else {
+            panic!("run command was not parsed");
+        };
+        assert!(run.vm.is_enabled());
+    }
+
+    #[test]
+    fn vm_tuning_requires_an_opted_in_rootfs() {
+        let error = Cli::try_parse_from(["nanocodex", "--vm-cpus", "4"])
+            .err()
+            .unwrap();
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
         );
     }
 

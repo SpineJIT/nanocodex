@@ -67,6 +67,11 @@
   CLI behavior into the library.
 - Tempo payment, egress, and `NanoUSD` support stay under `bin/`; public
   `nanocodex-*` library crates must not depend on them.
+- The unpublished experimental `nanocodex-vm` crate owns the complete VM
+  boundary: the audited libkrun interface, VM/process configuration, gvproxy
+  and provider-neutral egress, OCI/Dockerfile image preparation, and retained
+  host/guest workspace tools. Its guest reuses the canonical local
+  workspace-tool contracts rather than introducing a second tool runtime.
 - Each lower crate must remain useful without importing the higher orchestration
   crate. Avoid circular concepts and leaky socket/runtime types.
 - `scripts/check-crate-boundaries.sh` is the executable dependency policy.

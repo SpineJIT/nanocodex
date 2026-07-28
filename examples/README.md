@@ -24,6 +24,8 @@ cargo run -p nanocodex-examples --bin subagents -- \
   "Review the retry policy using whatever clean or context-bearing workers you need"
 NANOCODEX_SUBAGENT_JSONL=1 cargo run -p nanocodex-examples --bin subagents
 cargo run -p nanocodex-examples --bin mcp
+just build-vm-example
+target/debug/vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4]
 just smoke-python
 just smoke-wasm-node
 just build-react-example
@@ -32,6 +34,14 @@ just build-react-example
 The live programs require `OPENAI_API_KEY`. The browser example instead asks
 the embedding application for an already-authorized Responses WebSocket URL;
 standard browser WebSockets cannot attach the upgrade authorization header.
+
+`vm-tools` does not call the model. It proves all VM-backed standard workspace
+tools against one retained guest and accepts either a directory root containing
+`/usr/local/bin/nanocodex-vm-guest` or an ext4 root plus a guest-runtime ELF or
+read-only runtime image. A runtime ELF is packed into a temporary ext4 image,
+and a supplied ext4 root is reflinked or sparse-copied into a private per-run
+disk before boot. On macOS, `just build-vm-example` also applies the required
+Hypervisor entitlement.
 
 `subagents` exposes generic `spawn_agent`, `fork_agent`, and `prompt_agent` Code
 Mode tools; its Rust host contains no worker graph. The parent model decides the

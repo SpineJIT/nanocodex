@@ -87,6 +87,7 @@ jobs:
       - uses: taiki-e/install-action@3522286d40783523f9c7880e33f785905b4c20d0 # v2
         with:
           tool: cargo-deny
+      - run: ./scripts/check-experimental-boundary.sh
       - run: cargo deny check
       - run: ./scripts/check-crate-boundaries.sh
       - uses: crate-ci/typos@96d9af6217dc2855210655af7e1ff19d23d4e593 # v1
