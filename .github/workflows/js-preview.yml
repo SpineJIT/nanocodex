@@ -50,6 +50,7 @@ jobs:
         working-directory: js/bindings
         run: node --test --test-timeout=15000 test/*.test.mjs
       - name: Check package
+        working-directory: js/bindings
         run: |
           npm run test:typecheck
           npm run check:package
