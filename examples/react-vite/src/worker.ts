@@ -37,6 +37,7 @@ worker.onmessage = ({ data }: MessageEvent<AgentWorkerCommand>) => {
 };
 
 async function createAgent(data: StartMessage) {
+  await paymentSessions.clear();
   const common = {
     tools: {
       browserInfo: {
@@ -73,7 +74,6 @@ async function createAgent(data: StartMessage) {
       },
     );
   }
-  await paymentSessions.clear();
   return {
     agent: await Agent.create({
       ...common,

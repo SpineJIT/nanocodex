@@ -54,8 +54,37 @@ test("MPP session replacement and failed Agent creation close caller resources",
   }
 });
 
+test("clearing before pre-session setup failure closes the prior manager", async () => {
+  const owner = createPaymentSessionOwner<FakePaymentSession>();
+  const prior = simpleSession();
+
+  await owner.open(async () => prior, async () => "agent");
+  await owner.clear();
+  await assert.rejects(
+    async () => {
+      throw new Error("Tempo module import failed");
+    },
+    /module import failed/,
+  );
+
+  assert.equal(prior.closes, 1);
+});
+
 type FakePaymentSession = {
   name: string;
   closes: number;
   mpp: { close(): void };
 };
+
+function simpleSession(): FakePaymentSession {
+  const value: FakePaymentSession = {
+    closes: 0,
+    mpp: {
+      close() {
+        value.closes += 1;
+      },
+    },
+    name: "prior",
+  };
+  return value;
+}

@@ -41,6 +41,7 @@ async function createAgent(
   start: AgentControllerStart,
   tools: AgentControllerTools,
 ) {
+  await paymentSessions.clear();
   const common = {
     tools: {
       ...createBrowserTools({
@@ -88,7 +89,6 @@ async function createAgent(
       },
     );
   }
-  await paymentSessions.clear();
   return {
     agent: await Agent.create({
       ...common,
