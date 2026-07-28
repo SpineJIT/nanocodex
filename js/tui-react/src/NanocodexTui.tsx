@@ -42,7 +42,7 @@ import {
   useNanocodex,
   useNanocodexMessage,
 } from "nanocodex-react";
-import { SyntaxCode } from "./SyntaxCode";
+import { SyntaxCode } from "./SyntaxCode.js";
 
 type Target = TuiTarget;
 type Focus = "main" | "btw";

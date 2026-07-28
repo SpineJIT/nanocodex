@@ -20,8 +20,11 @@ py/bindings/python/nanocodex/*.so
 py/bindings/python/nanocodex/*.dylib
 py/bindings/python/nanocodex/*.pyd
 js/bindings/node_modules/
+js/react/node_modules/
 js/tui/node_modules/
+js/tui/dist/
 js/tui-react/node_modules/
+js/tui-react/dist/
 js/bindings/pkg-node/
 js/bindings/pkg-web/
 examples/node/node_modules/

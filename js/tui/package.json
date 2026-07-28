@@ -6,16 +6,23 @@
   "sideEffects": false,
   "exports": {
     ".": {
-      "types": "./src/index.ts",
-      "import": "./src/index.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     }
   },
   "files": [
-    "src",
+    "dist",
     "README.md"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types --test test/*.test.ts"
+    "build": "tsc -p tsconfig.json",
+    "check:pack": "node scripts/check-pack.mjs",
+    "check:package": "node scripts/check-package.mjs",
+    "prepack": "npm run build && npm run check:package",
+    "test": "npm run build && node --experimental-strip-types --test test/*.test.ts && npm run check:package && npm run check:pack"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
   },
   "engines": {
     "node": ">=22.13.0"

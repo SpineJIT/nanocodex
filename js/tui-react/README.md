@@ -6,10 +6,22 @@ branches, `/btw`, readline keys, image paste, and scroll-follow behavior—while
 letting the embedding application own its visual theme.
 
 ```tsx
-import { NanocodexProvider } from "nanocodex-react";
+import {
+  createConfig,
+  NanocodexProvider,
+} from "nanocodex-react";
 import { NanocodexTui } from "nanocodex-tui-react";
 import "nanocodex-tui-react/structure.css";
 import "nanocodex-tui-react/theme.css"; // optional default theme
+
+const config = createConfig({
+  worker: () => new Worker(
+    new URL("./agent.worker.ts", import.meta.url),
+    { type: "module" },
+  ),
+  reasoningMode: "standard",
+  thinking: "high",
+});
 
 <NanocodexProvider config={config}>
   <NanocodexTui className="my-agent" />
