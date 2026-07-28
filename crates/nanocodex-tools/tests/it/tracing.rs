@@ -73,6 +73,7 @@ fn spawned_cell_preserves_the_parent_span_for_nested_tools() {
         .enable_all()
         .build()
         .unwrap();
+    let _runtime_test = runtime.block_on(crate::TOOL_RUNTIME_TEST_LOCK.lock());
     let workspace = std::env::temp_dir().join(format!(
         "nanocodex-code-mode-trace-parent-{}",
         std::process::id()
@@ -113,6 +114,7 @@ fn direct_runtime_execution_emits_the_tools_owned_span() {
         .enable_all()
         .build()
         .unwrap();
+    let _runtime_test = runtime.block_on(crate::TOOL_RUNTIME_TEST_LOCK.lock());
     let workspace = std::env::temp_dir().join(format!(
         "nanocodex-direct-tool-trace-{}",
         std::process::id()

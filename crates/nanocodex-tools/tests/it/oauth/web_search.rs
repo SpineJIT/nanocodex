@@ -15,6 +15,7 @@ use crate::support::{
 
 #[tokio::test]
 async fn chatgpt_auth_recovers_for_web_search() -> Result<()> {
+    let _runtime_test = crate::TOOL_RUNTIME_TEST_LOCK.lock().await;
     let (endpoint, server) = spawn_search_server().await?;
     let (auth, auth_source) = RotatingChatGptAuth::shared();
     let mut headers = reqwest::header::HeaderMap::new();

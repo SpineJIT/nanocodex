@@ -23,6 +23,7 @@ const TINY_PNG: &[u8] = &[
 
 #[tokio::test]
 async fn chatgpt_auth_recovers_across_generation_and_edit_routes() -> Result<()> {
+    let _runtime_test = crate::TOOL_RUNTIME_TEST_LOCK.lock().await;
     let workspace = TestWorkspace::new("image-oauth")?;
     let source_image = workspace.path().join("source.png");
     tokio::fs::write(&source_image, TINY_PNG).await?;
