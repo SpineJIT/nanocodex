@@ -139,7 +139,7 @@ async fn execute_code_call(
 impl<S> ModelRun<S>
 where
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
-    S::Error: Into<NanocodexError>,
+    S::Error: Into<nanocodex_oai_api::ResponseError>,
     S::Future: AgentSend,
 {
     pub(super) async fn execute_model_tools(

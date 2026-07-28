@@ -11,7 +11,7 @@ use std::{
 
 use async_trait::async_trait;
 use nanocodex_agent::{
-    Nanocodex, NanocodexError, OpenAi, Tools,
+    Nanocodex, NanocodexError, OpenAi, ResponseError, Tools,
     rollout::RolloutConfig,
     session::SessionId,
     transport::{ResponsesAttempt, ResponsesServiceResponse},
@@ -31,7 +31,7 @@ struct NeverCalled;
 
 impl Service<ResponsesAttempt> for NeverCalled {
     type Response = ResponsesServiceResponse;
-    type Error = NanocodexError;
+    type Error = ResponseError;
     type Future = Ready<std::result::Result<Self::Response, Self::Error>>;
 
     fn poll_ready(
@@ -64,7 +64,7 @@ struct DropPendingFuture {
 }
 
 impl Future for DropPendingFuture {
-    type Output = std::result::Result<ResponsesServiceResponse, NanocodexError>;
+    type Output = std::result::Result<ResponsesServiceResponse, ResponseError>;
 
     fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
         Poll::Pending
@@ -79,7 +79,7 @@ impl Drop for DropPendingFuture {
 
 impl Service<ResponsesAttempt> for DropPendingService {
     type Response = ResponsesServiceResponse;
-    type Error = NanocodexError;
+    type Error = ResponseError;
     type Future = DropPendingFuture;
 
     fn poll_ready(
@@ -125,7 +125,7 @@ impl DynamicToolProvider for StartProbe {
 
 impl Service<ResponsesAttempt> for PendingService {
     type Response = ResponsesServiceResponse;
-    type Error = NanocodexError;
+    type Error = ResponseError;
     type Future = Pending<std::result::Result<Self::Response, Self::Error>>;
 
     fn poll_ready(
@@ -147,7 +147,7 @@ struct RetainingCompletedService {
 
 impl Service<ResponsesAttempt> for RetainingCompletedService {
     type Response = ResponsesServiceResponse;
-    type Error = NanocodexError;
+    type Error = ResponseError;
     type Future = Ready<std::result::Result<Self::Response, Self::Error>>;
 
     fn poll_ready(

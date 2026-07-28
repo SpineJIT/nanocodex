@@ -73,7 +73,7 @@ impl Nanocodex {
     #[must_use]
     pub fn builder<F>(openai: OpenAi<F>) -> NanocodexBuilder<F>
     where
-        F: MakeResponsesService,
+        F: ResponsesServiceFactory,
     {
         let (config, factory) = into_openai_parts(openai);
         NanocodexBuilder {
@@ -132,29 +132,22 @@ impl Nanocodex {
     ///
     /// # Errors
     ///
-    /// Returns the cleanup error, or [`NanocodexError::AgentStopped`] if the
-    /// driver had already stopped or another clone had begun shutdown before
-    /// accepting this request.
+    /// Returns the shared cleanup result. The first caller initiates shutdown;
+    /// concurrent and later callers on any clone await or reuse that same
+    /// result.
     pub async fn shutdown(&self) -> Result<()> {
-        let (result, receiver) = oneshot::channel();
-        if self
-            .commands
-            .send(Command::Shutdown { result })
-            .await
-            .is_err()
-        {
-            if self.shutdown.requested() {
-                return Err(NanocodexError::AgentStopped);
-            }
-            self.durability.shutdown().await?;
-            return Err(NanocodexError::AgentStopped);
+        let (initiate, receiver) = self.shutdown.request();
+        if initiate && self.commands.send(Command::Shutdown).await.is_err() {
+            let outcome = match self.durability.shutdown().await {
+                Ok(()) => Err(NanocodexError::AgentStopped),
+                Err(error) => Err(error),
+            };
+            self.shutdown.complete(outcome);
         }
         match receiver.await {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                self.durability.shutdown().await?;
-                Err(NanocodexError::AgentStopped)
-            }
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(NanocodexError::Shutdown(error)),
+            Err(_) => Err(NanocodexError::AgentStopped),
         }
     }
 

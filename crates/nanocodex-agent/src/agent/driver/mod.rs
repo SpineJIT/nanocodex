@@ -22,13 +22,12 @@ pub(super) struct AgentDriver<S> {
     pub(super) initial_model: Option<PreparedCheckpoint>,
     pub(super) origin: AgentOrigin,
     pub(super) durability: Durability,
-    pub(super) shutdown: DriverShutdown,
 }
 
 impl<S> AgentDriver<S>
 where
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
-    S::Error: Into<NanocodexError> + AgentSend + 'static,
+    S::Error: Into<ResponseError> + AgentSend + 'static,
     S::Future: AgentSend,
 {
     /// Drives queued turns until explicit shutdown or every command handle is dropped.
@@ -166,14 +165,12 @@ where
                         commands_open = false;
                         continue;
                     };
-                    if let Command::Shutdown { result } = command {
+                    if let Command::Shutdown = command {
                         begin_shutdown(
                             &mut self.commands,
                             &mut queued_turns,
                             default_thinking,
                             default_fast_mode,
-                            &self.shutdown,
-                            result,
                         )
                         .await;
                         commands_open = false;
@@ -295,7 +292,7 @@ where
                                         default_fast_mode = enabled;
                                         drop(result.send(Ok(())));
                                     }
-                                    Some(Command::Shutdown { result }) => {
+                                    Some(Command::Shutdown) => {
                                         if let Some(cancel) = cancel_compaction.take() {
                                             let _ = cancel.send(());
                                         }
@@ -304,8 +301,6 @@ where
                                             &mut queued_turns,
                                             default_thinking,
                                             default_fast_mode,
-                                            &self.shutdown,
-                                            result,
                                         )
                                         .await;
                                         commands_open = false;
@@ -577,7 +572,7 @@ where
                                 }
                                 break execution.as_mut().await;
                             }
-                            Some(Command::Shutdown { result }) => {
+                            Some(Command::Shutdown) => {
                                 if let Some(cancel) = cancel.take() {
                                     let _ = cancel.send(());
                                 }
@@ -586,8 +581,6 @@ where
                                     &mut queued_turns,
                                     default_thinking,
                                     default_fast_mode,
-                                    &self.shutdown,
-                                    result,
                                 )
                                 .await;
                                 commands_open = false;

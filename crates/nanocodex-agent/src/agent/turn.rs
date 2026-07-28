@@ -213,9 +213,7 @@ pub(super) enum Command {
         parent: Option<tracing::Span>,
         result: oneshot::Sender<Result<()>>,
     },
-    Shutdown {
-        result: oneshot::Sender<Result<()>>,
-    },
+    Shutdown,
 }
 
 pub(super) enum QueuedTurn {

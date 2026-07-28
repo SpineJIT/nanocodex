@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use crate::{
     ContentItem, EventSink, MessageRole, OpenAi, ResponseItem, ResponsesAttempt, ResponsesClient,
     ResponsesServiceResponse, Thinking, ToolDefinition, TransportStats,
-    openai::{MakeResponsesService, StandardServiceFactory},
+    openai::{ResponsesServiceFactory, StandardServiceFactory},
     responses::RequestProfile,
 };
 
@@ -32,7 +32,7 @@ pub struct SessionBuilder<F = StandardServiceFactory> {
 
 impl<F> SessionBuilder<F>
 where
-    F: MakeResponsesService,
+    F: ResponsesServiceFactory,
 {
     pub(crate) const fn new(openai: OpenAi<F>, instructions: Arc<str>) -> Self {
         Self {
@@ -59,11 +59,43 @@ where
         self
     }
 
-    /// Installs complete typed tool definitions.
+    /// Installs the complete tool definitions sent to the model.
     ///
-    /// This low-level constructor exists for transport implementers. Normal
-    /// callers register `Tool` implementations through `nanocodex-tools`.
-    #[doc(hidden)]
+    /// This is the protocol-level API for callers that execute tool calls
+    /// themselves. [`nanocodex-tools`](https://docs.rs/nanocodex-tools)
+    /// provides a registry and concrete runtimes for applications that want
+    /// Nanocodex to dispatch the calls.
+    ///
+    /// ```
+    /// use nanocodex_oai_api::{
+    ///     OpenAi,
+    ///     responses::JsonSchema,
+    ///     tools::ToolDefinition,
+    /// };
+    /// use serde_json::json;
+    ///
+    /// let openai = OpenAi::new("test-api-key")?;
+    /// let session = openai
+    ///     .instructions(
+    ///         "Use lookup_region for deployment questions. Preserve exact identifiers.",
+    ///     )
+    ///     .tool_definitions([ToolDefinition::function(
+    ///         "lookup_region",
+    ///         "Return deployment metadata for one exact region identifier.",
+    ///         JsonSchema::from(json!({
+    ///             "type": "object",
+    ///             "properties": {
+    ///                 "region": { "type": "string" }
+    ///             },
+    ///             "required": ["region"],
+    ///             "additionalProperties": false
+    ///         })),
+    ///     )])
+    ///     .build()?;
+    ///
+    /// assert_eq!(session.history_len(), 0);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[must_use]
     pub fn tool_definitions(mut self, tools: impl IntoIterator<Item = ToolDefinition>) -> Self {
         self.tools = tools.into_iter().collect();

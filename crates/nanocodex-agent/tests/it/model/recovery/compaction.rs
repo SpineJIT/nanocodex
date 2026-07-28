@@ -366,7 +366,7 @@ struct ReplaceableCompactionService {
 
 impl Service<ResponsesAttempt> for ReplaceableCompactionService {
     type Response = ResponsesServiceResponse;
-    type Error = NanocodexError;
+    type Error = ResponseError;
     type Future =
         Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
@@ -388,9 +388,9 @@ impl Service<ResponsesAttempt> for ReplaceableCompactionService {
                 unreachable!("the superseded compaction future must be dropped");
             }
             if call == 2 {
-                return Err(NanocodexError::InvalidAttemptState {
-                    detail: "injected standalone compaction failure",
-                });
+                return Err(ResponseError::service(std::io::Error::other(
+                    "injected standalone compaction failure",
+                )));
             }
             assert_eq!(call, 1, "unexpected standalone compaction attempt");
             Ok(ResponsesServiceResponse::new(ResponsesOutput::Compaction(
@@ -445,9 +445,8 @@ async fn a_later_manual_compaction_replaces_a_stuck_manual_compaction() -> Resul
     second.await??;
     assert!(matches!(
         agent.compact().await,
-        Err(NanocodexError::InvalidAttemptState {
-            detail: "injected standalone compaction failure"
-        })
+        Err(NanocodexError::Response(error))
+            if error.to_string() == "injected standalone compaction failure"
     ));
     assert_eq!(calls.load(Ordering::Relaxed), 3);
 
@@ -503,7 +502,7 @@ struct ActiveReplacementService {
 
 impl Service<ResponsesAttempt> for ActiveReplacementService {
     type Response = ResponsesServiceResponse;
-    type Error = NanocodexError;
+    type Error = ResponseError;
     type Future =
         Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
@@ -667,7 +666,7 @@ struct PreTurnCompactionService {
 
 impl Service<ResponsesAttempt> for PreTurnCompactionService {
     type Response = ResponsesServiceResponse;
-    type Error = NanocodexError;
+    type Error = ResponseError;
     type Future = Ready<std::result::Result<Self::Response, Self::Error>>;
 
     fn poll_ready(

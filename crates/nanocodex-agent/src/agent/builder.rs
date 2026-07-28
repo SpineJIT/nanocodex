@@ -36,22 +36,31 @@ impl<F> NanocodexBuilder<F> {
         self
     }
 
-    /// Sets the model thinking level. The default is [`Thinking::High`].
+    /// Overrides the `OpenAi` recipe's model thinking level for this agent.
+    ///
+    /// Without this call the agent inherits the client default. A later
+    /// [`Nanocodex::set_thinking`] call affects subsequently accepted turns.
     #[must_use]
     pub const fn thinking(mut self, thinking: Thinking) -> Self {
         self.config.thinking = thinking;
         self
     }
 
-    /// Enables priority processing. The default is disabled.
+    /// Overrides the `OpenAi` recipe's priority-processing policy for this
+    /// agent.
+    ///
+    /// Without this call the agent inherits the client default. A later
+    /// [`Nanocodex::set_fast_mode`] call affects subsequently accepted turns.
     #[must_use]
     pub const fn fast_mode(mut self, enabled: bool) -> Self {
         self.config.fast_mode = enabled;
         self
     }
 
-    /// Sets the Responses reasoning execution mode. The default is
-    /// [`ReasoningMode::Standard`].
+    /// Overrides the `OpenAi` recipe's Responses reasoning execution mode for
+    /// this agent.
+    ///
+    /// Without this call the agent inherits the client default.
     #[must_use]
     pub const fn reasoning_mode(mut self, reasoning_mode: ReasoningMode) -> Self {
         self.config.reasoning_mode = reasoning_mode;
@@ -167,9 +176,9 @@ impl<F> NanocodexBuilder<F> {
 #[cfg(not(target_family = "wasm"))]
 impl<F> NanocodexBuilder<F>
 where
-    F: MakeResponsesService + Send + Sync + 'static,
+    F: ResponsesServiceFactory + Send + Sync + 'static,
     F::Service: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + Send + 'static,
-    <F::Service as Service<ResponsesAttempt>>::Error: Into<NanocodexError> + Send + 'static,
+    <F::Service as Service<ResponsesAttempt>>::Error: Into<ResponseError> + Send + 'static,
     <F::Service as Service<ResponsesAttempt>>::Future: Send,
 {
     /// Builds an agent from the configured [`OpenAi`] client recipe.
@@ -189,9 +198,9 @@ where
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 impl<F> NanocodexBuilder<F>
 where
-    F: MakeResponsesService + 'static,
+    F: ResponsesServiceFactory + 'static,
     F::Service: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + 'static,
-    <F::Service as Service<ResponsesAttempt>>::Error: Into<NanocodexError> + 'static,
+    <F::Service as Service<ResponsesAttempt>>::Error: Into<ResponseError> + 'static,
 {
     /// Builds an agent from the configured [`OpenAi`] client recipe.
     ///
@@ -208,10 +217,10 @@ where
 
 fn build<F>(builder: NanocodexBuilder<F>) -> Result<(Nanocodex, AgentEvents)>
 where
-    F: MakeResponsesService + AgentFactory + 'static,
+    F: ResponsesServiceFactory + AgentFactory + 'static,
     F::Service:
         Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
-    <F::Service as Service<ResponsesAttempt>>::Error: Into<NanocodexError> + AgentSend + 'static,
+    <F::Service as Service<ResponsesAttempt>>::Error: Into<ResponseError> + AgentSend + 'static,
     <F::Service as Service<ResponsesAttempt>>::Future: AgentSend,
 {
     validate(&builder.config, builder.prompt_cache.key.as_deref())?;

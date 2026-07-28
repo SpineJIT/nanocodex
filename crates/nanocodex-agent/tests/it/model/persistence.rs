@@ -7,7 +7,7 @@ struct FailFirstWarmup {
 
 impl tower::Service<nanocodex_oai_api::tower::ResponsesAttempt> for FailFirstWarmup {
     type Response = nanocodex_oai_api::tower::ResponsesServiceResponse;
-    type Error = NanocodexError;
+    type Error = ResponseError;
     type Future = std::future::Ready<std::result::Result<Self::Response, Self::Error>>;
 
     fn poll_ready(
@@ -21,9 +21,9 @@ impl tower::Service<nanocodex_oai_api::tower::ResponsesAttempt> for FailFirstWar
         use std::sync::atomic::Ordering;
 
         if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
-            return std::future::ready(Err(NanocodexError::InvalidRequest(
-                "fatal warmup boundary".to_owned(),
-            )));
+            return std::future::ready(Err(ResponseError::service(std::io::Error::other(
+                "fatal warmup boundary",
+            ))));
         }
         assert!(matches!(
             request.kind(),

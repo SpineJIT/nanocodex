@@ -3,7 +3,7 @@ use super::*;
 impl<S> ModelRun<S>
 where
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
-    S::Error: Into<NanocodexError>,
+    S::Error: Into<nanocodex_oai_api::ResponseError>,
     S::Future: AgentSend,
 {
     pub(crate) async fn compact(

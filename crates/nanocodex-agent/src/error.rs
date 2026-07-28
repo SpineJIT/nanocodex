@@ -1,6 +1,6 @@
-use std::{error::Error, io, path::PathBuf};
+use std::{io, path::PathBuf, sync::Arc};
 
-use nanocodex_oai_api::tower::ResponsesServiceError;
+use nanocodex_oai_api::ResponseError;
 pub use nanocodex_oai_api::transport::ResponsesError;
 
 /// Error returned by the Nanocodex library boundary.
@@ -69,6 +69,11 @@ pub enum NanocodexError {
     #[error("the agent stopped before the turn completed")]
     TurnStopped,
 
+    /// Shared cleanup failure returned to every caller of an idempotent
+    /// shutdown.
+    #[error(transparent)]
+    Shutdown(Arc<NanocodexError>),
+
     /// Steering targeted a queued or terminal turn.
     #[error("the targeted turn is queued, completed, or otherwise not active for steering")]
     TurnNotSteerable,
@@ -125,22 +130,14 @@ pub enum NanocodexError {
     #[error(transparent)]
     Event(#[from] nanocodex_oai_api::events::EventError),
 
-    /// The provider protocol or transport failed.
+    /// A complete Responses operation failed.
     #[error(transparent)]
-    Responses(#[from] ResponsesError),
-
-    /// The Tower Responses service failed.
-    #[error(transparent)]
-    ResponsesService(#[from] nanocodex_oai_api::tower::ResponsesServiceError),
+    Response(#[from] ResponseError),
 
     /// The configured tool registry or runtime could not be built.
     #[cfg(not(target_family = "wasm"))]
     #[error("failed to build tools for an agent driver: {0}")]
     Tools(#[from] nanocodex_tools::ToolsBuildError),
-
-    /// Caller-composed Tower middleware failed outside the typed service error.
-    #[error("Responses service middleware failed: {0}")]
-    ResponsesMiddleware(#[from] tower::BoxError),
 }
 
 impl NanocodexError {
@@ -149,22 +146,10 @@ impl NanocodexError {
     #[must_use]
     pub fn responses_error(&self) -> Option<&ResponsesError> {
         match self {
-            Self::Responses(error) => return Some(error),
-            Self::ResponsesService(error) => return error.responses_error(),
-            _ => {}
+            Self::Response(error) => error.responses_error(),
+            Self::Shutdown(error) => error.responses_error(),
+            _ => None,
         }
-
-        let mut current = self.source();
-        while let Some(error) = current {
-            if let Some(service) = error.downcast_ref::<ResponsesServiceError>() {
-                return service.responses_error();
-            }
-            if let Some(responses) = error.downcast_ref::<ResponsesError>() {
-                return Some(responses);
-            }
-            current = error.source();
-        }
-        None
     }
 }
 
@@ -174,33 +159,28 @@ pub type Result<T> = std::result::Result<T, NanocodexError>;
 #[cfg(test)]
 mod tests {
     use super::{NanocodexError, ResponsesError};
-    use nanocodex_oai_api::tower::ResponsesServiceError;
+    use nanocodex_oai_api::{ResponseError, tower::ResponsesServiceError};
 
     #[test]
-    fn responses_classification_covers_every_service_boundary() {
-        let direct = NanocodexError::Responses(ResponsesError::UnexpectedEnd);
-        assert!(matches!(
-            direct.responses_error(),
-            Some(ResponsesError::UnexpectedEnd)
-        ));
-
-        let service = NanocodexError::ResponsesService(ResponsesServiceError::from(
+    fn response_error_is_the_single_provider_failure_boundary() {
+        let service = NanocodexError::Response(ResponseError::from(ResponsesServiceError::from(
             ResponsesError::UnexpectedEnd,
-        ));
+        )));
         assert!(matches!(
             service.responses_error(),
             Some(ResponsesError::UnexpectedEnd)
         ));
 
         let service = ResponsesServiceError::from(ResponsesError::UnexpectedEnd);
-        let error = NanocodexError::ResponsesMiddleware(Box::new(service));
+        let error =
+            NanocodexError::Response(ResponseError::from(Box::new(service) as tower::BoxError));
         assert!(matches!(
             error.responses_error(),
             Some(ResponsesError::UnexpectedEnd)
         ));
         assert_eq!(
             error.to_string(),
-            "Responses service middleware failed: Responses WebSocket closed without a close frame"
+            "Responses WebSocket closed without a close frame"
         );
     }
 }

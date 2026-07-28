@@ -1,41 +1,70 @@
 use super::*;
 
+type SharedShutdownResult = std::result::Result<(), Arc<NanocodexError>>;
+
+#[derive(Default)]
+enum ShutdownPhase {
+    #[default]
+    Running,
+    Requested,
+    Complete(SharedShutdownResult),
+}
+
+#[derive(Default)]
+struct ShutdownState {
+    phase: ShutdownPhase,
+    waiters: Vec<oneshot::Sender<SharedShutdownResult>>,
+}
+
 #[derive(Clone, Default)]
 pub(in crate::agent) struct DriverShutdown {
-    result: Arc<std::sync::Mutex<Option<oneshot::Sender<Result<()>>>>>,
+    state: Arc<std::sync::Mutex<ShutdownState>>,
 }
 
 impl DriverShutdown {
-    fn request(&self, result: oneshot::Sender<Result<()>>) -> bool {
-        let mut waiting = match self.result.lock() {
-            Ok(waiting) => waiting,
+    pub(in crate::agent) fn request(&self) -> (bool, oneshot::Receiver<SharedShutdownResult>) {
+        let (result, receiver) = oneshot::channel();
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if waiting.is_some() {
-            return false;
+        match &state.phase {
+            ShutdownPhase::Running => {
+                state.phase = ShutdownPhase::Requested;
+                state.waiters.push(result);
+                (true, receiver)
+            }
+            ShutdownPhase::Requested => {
+                state.waiters.push(result);
+                (false, receiver)
+            }
+            ShutdownPhase::Complete(outcome) => {
+                drop(result.send(outcome.clone()));
+                (false, receiver)
+            }
         }
-        *waiting = Some(result);
-        true
     }
 
     pub(in crate::agent) fn requested(&self) -> bool {
-        let waiting = match self.result.lock() {
-            Ok(waiting) => waiting,
+        let state = match self.state.lock() {
+            Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        waiting.is_some()
+        !matches!(state.phase, ShutdownPhase::Running)
     }
 
     pub(in crate::agent) fn complete(&self, outcome: Result<()>) {
-        let result = {
-            let mut waiting = match self.result.lock() {
-                Ok(waiting) => waiting,
+        let outcome = outcome.map_err(Arc::new);
+        let waiters = {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            waiting.take()
+            state.phase = ShutdownPhase::Complete(outcome.clone());
+            std::mem::take(&mut state.waiters)
         };
-        if let Some(result) = result {
-            drop(result.send(outcome));
+        for waiter in waiters {
+            drop(waiter.send(outcome.clone()));
         }
     }
 }
@@ -104,12 +133,7 @@ pub(super) async fn begin_shutdown(
     queued_turns: &mut VecDeque<QueuedTurn>,
     default_thinking: Thinking,
     default_fast_mode: bool,
-    shutdown: &DriverShutdown,
-    result: oneshot::Sender<Result<()>>,
 ) {
-    if !shutdown.request(result) {
-        return;
-    }
     commands.close();
     while let Some(command) = commands.recv().await {
         match command {
@@ -139,10 +163,10 @@ pub(super) async fn begin_shutdown(
             | Command::Cancel { result, .. }
             | Command::SetThinking { result, .. }
             | Command::SetFastMode { result, .. }
-            | Command::Compact { result, .. }
-            | Command::Shutdown { result } => {
+            | Command::Compact { result, .. } => {
                 drop(result.send(Err(NanocodexError::AgentStopped)));
             }
+            Command::Shutdown => {}
         }
     }
     mark_all_queued_turns_cancelled(queued_turns);
@@ -158,7 +182,7 @@ pub(super) fn handle_idle_command<S>(
     workspace: Option<Arc<str>>,
 ) where
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
-    S::Error: Into<NanocodexError> + AgentSend + 'static,
+    S::Error: Into<ResponseError> + AgentSend + 'static,
     S::Future: AgentSend,
 {
     match command {
@@ -183,9 +207,7 @@ pub(super) fn handle_idle_command<S>(
         Command::SetThinking { result, .. } | Command::SetFastMode { result, .. } => {
             drop(result.send(Ok(())));
         }
-        Command::Shutdown { result } => {
-            drop(result.send(Err(NanocodexError::AgentStopped)));
-        }
+        Command::Shutdown => {}
         Command::Compact { result, .. } => {
             drop(result.send(Err(NanocodexError::AgentStopped)));
         }

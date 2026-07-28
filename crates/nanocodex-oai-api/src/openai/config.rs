@@ -4,11 +4,13 @@ use crate::{OpenAiAuth, ReasoningMode, ResponsesHistory, ResponsesTransport, Thi
 
 const SYSTEM_PROMPT: &str = include_str!("../../prompts/system.md");
 
-/// Validated settings owned by an [`OpenAi`](super::OpenAi) recipe.
+/// Validated, read-only settings passed to a [`ResponsesServiceFactory`].
 ///
-/// This is orchestration plumbing shared with `nanocodex-agent`, not a
-/// caller-configurable policy surface. Public configuration remains on
-/// [`OpenAiBuilder`](super::OpenAiBuilder).
+/// Public policy is configured through [`OpenAiBuilder`]. A custom factory can
+/// inspect this snapshot while constructing an independent session service.
+///
+/// [`OpenAiBuilder`]: super::OpenAiBuilder
+/// [`ResponsesServiceFactory`]: super::ResponsesServiceFactory
 #[derive(Clone)]
 pub struct ModelConfig {
     /// Authentication source resolved for each transport connection.

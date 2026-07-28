@@ -187,6 +187,25 @@ async fn explicit_shutdown_joins_resources_and_flushes_the_rollout() {
 }
 
 #[tokio::test]
+async fn shutdown_is_idempotent_across_cloned_handles() {
+    let openai = OpenAi::builder("test")
+        .service(|| PendingService)
+        .build()
+        .unwrap();
+    let tools = Tools::builder().without_defaults().build().unwrap();
+    let (agent, events) = Nanocodex::builder(openai).tools(tools).build().unwrap();
+    let clone = agent.clone();
+
+    let (first, concurrent) = tokio::join!(agent.shutdown(), clone.shutdown());
+    first.unwrap();
+    concurrent.unwrap();
+    agent.shutdown().await.unwrap();
+    clone.shutdown().await.unwrap();
+
+    drop((agent, clone, events));
+}
+
+#[tokio::test]
 async fn implicit_shutdown_emits_one_terminal_event_for_every_accepted_turn() {
     let openai = OpenAi::builder("test")
         .service(|| PendingService)

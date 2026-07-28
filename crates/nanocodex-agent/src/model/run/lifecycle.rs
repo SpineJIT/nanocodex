@@ -32,7 +32,7 @@ pub(super) struct CompactionContext<'a> {
 impl<S> ModelRun<S>
 where
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
-    S::Error: Into<NanocodexError>,
+    S::Error: Into<nanocodex_oai_api::ResponseError>,
     S::Future: AgentSend,
 {
     pub(super) async fn maybe_compact(
@@ -187,7 +187,7 @@ where
             .execute(factory.warmup(self.thinking, self.fast_mode))
             .instrument(span.clone())
             .await
-            .map_err(Into::into)?;
+            .map_err(|error| NanocodexError::Response(error.into()))?;
         let attempt = success.attempt();
         let connection_generation = success.connection_generation();
         let server_reasoning_included = success.server_reasoning_included();
@@ -274,7 +274,11 @@ where
                 span.record("status", "failed");
                 span.record("otel.status_code", "ERROR");
                 span.record("duration_ns", elapsed_ns(started_at));
-                return self.compaction_failed(after_model_call_index, started_at, error.into());
+                return self.compaction_failed(
+                    after_model_call_index,
+                    started_at,
+                    NanocodexError::Response(error.into()),
+                );
             }
         };
         let attempt = success.attempt();

@@ -15,7 +15,7 @@ use std::{
 };
 
 use nanocodex_agent::{
-    Nanocodex, NanocodexError, OpenAi, Tools,
+    Nanocodex, NanocodexError, OpenAi, ResponseError, Tools,
     transport::{ResponsesAttempt, ResponsesAttemptKind, ResponsesServiceResponse},
 };
 use nanocodex_oai_api::{
@@ -41,7 +41,7 @@ struct PendingService;
 
 impl Service<ResponsesAttempt> for PendingService {
     type Response = ResponsesServiceResponse;
-    type Error = NanocodexError;
+    type Error = ResponseError;
     type Future = Pending<Result<Self::Response, Self::Error>>;
 
     fn poll_ready(
@@ -118,7 +118,7 @@ struct SteeringTraceService {
 
 impl Service<ResponsesAttempt> for PendingToolService {
     type Response = ResponsesServiceResponse;
-    type Error = NanocodexError;
+    type Error = ResponseError;
     type Future = Ready<Result<Self::Response, Self::Error>>;
 
     fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -141,7 +141,7 @@ impl Service<ResponsesAttempt> for PendingToolService {
 
 impl Service<ResponsesAttempt> for SteeringTraceService {
     type Response = ResponsesServiceResponse;
-    type Error = NanocodexError;
+    type Error = ResponseError;
     type Future = Ready<Result<Self::Response, Self::Error>>;
 
     fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {

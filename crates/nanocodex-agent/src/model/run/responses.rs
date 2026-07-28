@@ -3,7 +3,7 @@ use super::*;
 impl<S> ModelRun<S>
 where
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
-    S::Error: Into<NanocodexError>,
+    S::Error: Into<nanocodex_oai_api::ResponseError>,
     S::Future: AgentSend,
 {
     pub(super) async fn perform_model_call(
@@ -57,7 +57,11 @@ where
                 span.record("status", "failed");
                 span.record("otel.status_code", "ERROR");
                 span.record("duration_ns", elapsed_ns(started_at));
-                return self.model_call_failed(call_index, started_at, error.into());
+                return self.model_call_failed(
+                    call_index,
+                    started_at,
+                    NanocodexError::Response(error.into()),
+                );
             }
         };
         let attempt = success.attempt();

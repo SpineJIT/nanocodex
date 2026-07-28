@@ -80,7 +80,7 @@ struct NestedCancellationService {
 
 impl Service<ResponsesAttempt> for NestedCancellationService {
     type Response = ResponsesServiceResponse;
-    type Error = NanocodexError;
+    type Error = ResponseError;
     type Future =
         Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 

@@ -131,7 +131,7 @@ struct RetainedShellCancellationService {
 
 impl Service<ResponsesAttempt> for RetainedShellCancellationService {
     type Response = ResponsesServiceResponse;
-    type Error = NanocodexError;
+    type Error = ResponseError;
     type Future =
         Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 

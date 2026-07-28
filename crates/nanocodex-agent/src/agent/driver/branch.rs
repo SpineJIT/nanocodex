@@ -40,7 +40,7 @@ impl<S> Clone for BranchSpawner<S> {
 impl<S> BranchSpawner<S>
 where
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
-    S::Error: Into<NanocodexError> + AgentSend + 'static,
+    S::Error: Into<ResponseError> + AgentSend + 'static,
     S::Future: AgentSend,
 {
     pub(super) fn spawn_fork(

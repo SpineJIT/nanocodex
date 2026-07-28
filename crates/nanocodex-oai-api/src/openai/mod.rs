@@ -10,7 +10,9 @@ use crate::{
     ResponsesHistory, ResponsesRetryPolicy, ResponsesTransport, Thinking, session::SessionBuilder,
 };
 
+#[doc(hidden)]
 pub use config::ModelConfig;
+pub use config::ModelConfig as ResponsesServiceConfig;
 
 /// Configured, cloneable `OpenAI` client recipe.
 ///
@@ -53,7 +55,7 @@ impl OpenAi<StandardServiceFactory> {
 
 impl<F> OpenAi<F>
 where
-    F: MakeResponsesService,
+    F: ResponsesServiceFactory,
 {
     /// Starts a client-side managed session with stable developer
     /// instructions.
@@ -132,21 +134,30 @@ impl<F> OpenAiBuilder<F> {
         self
     }
 
-    /// Sets the reasoning effort captured by each new response.
+    /// Sets the default reasoning effort for new sessions and agents.
+    ///
+    /// A higher-level session or agent builder may override this reusable
+    /// client default without mutating the `OpenAi` recipe.
     #[must_use]
     pub const fn thinking(mut self, thinking: Thinking) -> Self {
         self.config.thinking = thinking;
         self
     }
 
-    /// Sets the reasoning execution mode.
+    /// Sets the default reasoning execution mode for new sessions and agents.
+    ///
+    /// A higher-level agent builder may override this reusable client default.
     #[must_use]
     pub const fn reasoning_mode(mut self, reasoning_mode: ReasoningMode) -> Self {
         self.config.reasoning_mode = reasoning_mode;
         self
     }
 
-    /// Selects priority processing for each new response.
+    /// Selects the default priority-processing policy for new sessions and
+    /// agents.
+    ///
+    /// A higher-level session or agent builder may override this reusable
+    /// client default without mutating the `OpenAi` recipe.
     #[must_use]
     pub const fn fast_mode(mut self, enabled: bool) -> Self {
         self.config.fast_mode = enabled;
@@ -303,7 +314,7 @@ impl OpenAiBuilder<StandardServiceFactory> {
 
 impl<F> OpenAiBuilder<F>
 where
-    F: MakeResponsesService,
+    F: ResponsesServiceFactory,
 {
     /// Validates the configuration and returns a cloneable client recipe.
     ///
@@ -338,7 +349,10 @@ impl Default for StandardServiceFactory {
     }
 }
 
-/// Caller-supplied fresh-service factory used by the private agent bridge.
+/// Factory produced by [`OpenAiBuilder::service`].
+///
+/// The callable is invoked once for each managed session, so every session
+/// owns independent mutable Tower service state.
 pub struct CallerServiceFactory<M> {
     make: Arc<M>,
 }
@@ -358,21 +372,26 @@ pub struct LayeredServiceFactory<F, L> {
     layer: L,
 }
 
-/// Generic construction boundary used by the private agent bridge.
-pub trait MakeResponsesService: Clone {
+/// Factory for the concrete Tower service owned by each managed session.
+///
+/// This trait makes the generic result of [`OpenAiBuilder::layer`] and
+/// [`OpenAiBuilder::service`] usable in named structs and function bounds.
+/// Most callers should obtain one of the provided implementations from those
+/// builder methods instead of implementing the construction boundary directly.
+pub trait ResponsesServiceFactory: Clone {
     /// Concrete service owned by each managed session.
     type Service;
 
     /// Validates service-specific client configuration.
-    fn validate_config(&self, _config: &ModelConfig) -> Result<(), OpenAiError> {
+    fn validate_config(&self, _config: &ResponsesServiceConfig) -> Result<(), OpenAiError> {
         Ok(())
     }
 
     /// Creates one independent service stack.
-    fn make(&self, config: Arc<ModelConfig>) -> Self::Service;
+    fn make(&self, config: Arc<ResponsesServiceConfig>) -> Self::Service;
 }
 
-impl MakeResponsesService for StandardServiceFactory {
+impl ResponsesServiceFactory for StandardServiceFactory {
     type Service = DefaultResponsesService;
 
     fn validate_config(&self, config: &ModelConfig) -> Result<(), OpenAiError> {
@@ -384,7 +403,7 @@ impl MakeResponsesService for StandardServiceFactory {
     }
 }
 
-impl<M, S> MakeResponsesService for CallerServiceFactory<M>
+impl<M, S> ResponsesServiceFactory for CallerServiceFactory<M>
 where
     M: Fn() -> S,
 {
@@ -395,9 +414,9 @@ where
     }
 }
 
-impl<F, L> MakeResponsesService for LayeredServiceFactory<F, L>
+impl<F, L> ResponsesServiceFactory for LayeredServiceFactory<F, L>
 where
-    F: MakeResponsesService,
+    F: ResponsesServiceFactory,
     L: Layer<F::Service> + Clone,
 {
     type Service = L::Service;

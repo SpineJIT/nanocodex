@@ -117,7 +117,7 @@ async fn websocket_full_replay_never_sends_a_previous_response_id() -> Result<()
 }
 
 #[tokio::test]
-async fn follow_on_prompts_can_change_turn_policy_without_restarting_the_session() -> Result<()> {
+async fn policy_precedence_is_client_then_agent_then_runtime_setter() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
     let server = tokio::spawn(async move {
@@ -160,10 +160,15 @@ async fn follow_on_prompts_can_change_turn_policy_without_restarting_the_session
     let workspace = temporary_workspace("follow-on")?;
     let openai = OpenAi::builder("test-key")
         .websocket_url(endpoint)
+        .thinking(Thinking::Medium)
+        .fast_mode(true)
+        .reasoning_mode(ReasoningMode::Pro)
         .build()?;
     let (agent, mut events) = Nanocodex::builder(openai)
         .instructions("custom prompt")
         .thinking(Thinking::Low)
+        .fast_mode(false)
+        .reasoning_mode(ReasoningMode::Standard)
         .workspace(&workspace)
         .session_id(test_session_id())
         .build()?;

@@ -15,7 +15,7 @@ use tokio::{
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
 use nanocodex_agent::{
-    AgentHandle, Nanocodex, NanocodexError, OpenAi, Thinking, Tools,
+    AgentHandle, Nanocodex, NanocodexError, OpenAi, ReasoningMode, ResponseError, Thinking, Tools,
     events::{AgentEvent, AgentEventData, RunEvent},
     input::Prompt,
     rollout::RolloutConfig,

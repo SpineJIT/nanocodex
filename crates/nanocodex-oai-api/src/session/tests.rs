@@ -22,7 +22,7 @@ use crate::{
 
 use crate::{OpenAi, ResponseEvent};
 
-use super::{ResponseError, response::estimate_cost};
+use super::{ResponseError, ResponseErrorKind, response::estimate_cost};
 
 #[derive(Clone)]
 struct Scripted {
@@ -769,6 +769,11 @@ fn boxed_tower_errors_preserve_context_window_classification() {
     let error = ResponseError::from(Box::new(service_error) as ::tower::BoxError);
 
     assert!(error.is_context_window_exceeded());
+    assert_eq!(error.kind(), ResponseErrorKind::ContextWindowExceeded);
+    assert!(matches!(
+        error.responses_error(),
+        Some(crate::ResponsesError::ContextWindowExceeded { .. })
+    ));
     assert!(error.source().is_some());
 }
 

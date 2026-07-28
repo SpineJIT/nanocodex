@@ -13,7 +13,7 @@ pub(super) fn build_agent<S>(
 ) -> Result<(Nanocodex, AgentEvents)>
 where
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
-    S::Error: Into<NanocodexError> + AgentSend + 'static,
+    S::Error: Into<ResponseError> + AgentSend + 'static,
     S::Future: AgentSend,
 {
     let session_id = session_id.unwrap_or_default();
@@ -136,7 +136,7 @@ pub(super) fn spawn_agent_driver<S>(
 ) -> Result<(Nanocodex, AgentEvents)>
 where
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
-    S::Error: Into<NanocodexError> + AgentSend + 'static,
+    S::Error: Into<ResponseError> + AgentSend + 'static,
     S::Future: AgentSend,
 {
     let session_id_text = session_id.to_string();
@@ -199,7 +199,6 @@ where
         initial_model,
         origin,
         durability: durability.clone(),
-        shutdown: shutdown.clone(),
     };
     let driver_task = async move {
         let outcome = driver.run().await;

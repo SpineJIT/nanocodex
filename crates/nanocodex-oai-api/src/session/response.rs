@@ -71,11 +71,27 @@ impl ResponseInput {
             .fold(0, u64::saturating_add)
     }
 
-    /// Creates low-level typed input items.
+    /// Creates ordered protocol-level input items.
     ///
-    /// The agent and tools crates use this for paired tool outputs. General
-    /// callers should prefer text conversion or `content`.
-    #[doc(hidden)]
+    /// Use this after a completed response contains tool calls and the
+    /// application executes those calls itself. The output item must retain
+    /// the exact call ID returned by the model.
+    ///
+    /// ```
+    /// use nanocodex_oai_api::{
+    ///     responses::{FunctionOutputBody, ResponseItem},
+    ///     session::ResponseInput,
+    /// };
+    ///
+    /// let input = ResponseInput::items([ResponseItem::function_call_output(
+    ///     "call_region_01".to_owned(),
+    ///     FunctionOutputBody::Text(
+    ///         r#"{"region":"iad","status":"healthy"}"#.into(),
+    ///     ),
+    /// )]);
+    ///
+    /// assert!(input.estimated_tokens() > 0);
+    /// ```
     #[must_use]
     pub fn items(items: impl IntoIterator<Item = ResponseItem>) -> Self {
         Self {
@@ -314,12 +330,27 @@ impl<'a> IntoFuture for Response<'a> {
 /// future.
 #[derive(Clone)]
 pub struct ResponseError {
-    kind: Arc<ResponseErrorKind>,
+    inner: Arc<ResponseErrorInner>,
 }
 
-enum ResponseErrorKind {
-    ContextWindowExceeded(Arc<dyn Error + Send + Sync>),
-    Service(Arc<dyn Error + Send + Sync>),
+/// Stable classification for one failed Responses operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ResponseErrorKind {
+    /// The provider rejected the request because its context window was
+    /// exceeded.
+    ContextWindowExceeded,
+    /// The configured Tower service, transport, or provider API failed.
+    Service,
+    /// A completed operation violated a Responses lifecycle invariant.
+    Protocol,
+}
+
+enum ResponseErrorInner {
+    Source {
+        kind: ResponseErrorKind,
+        error: Arc<dyn Error + Send + Sync>,
+    },
     Protocol(Arc<str>),
 }
 
@@ -327,59 +358,75 @@ impl ResponseError {
     /// Wraps a caller-composed Tower service error without erasing its source.
     #[must_use]
     pub fn service(error: impl Error + Send + Sync + 'static) -> Self {
-        let context_window_exceeded = error_chain_has_context_window(&error);
+        let kind = if error_chain_responses_error(&error)
+            .is_some_and(crate::ResponsesError::is_context_window_exceeded)
+        {
+            ResponseErrorKind::ContextWindowExceeded
+        } else {
+            ResponseErrorKind::Service
+        };
         let error: Arc<dyn Error + Send + Sync> = Arc::new(error);
         Self {
-            kind: Arc::new(if context_window_exceeded {
-                ResponseErrorKind::ContextWindowExceeded(error)
-            } else {
-                ResponseErrorKind::Service(error)
-            }),
+            inner: Arc::new(ResponseErrorInner::Source { kind, error }),
         }
     }
 
     fn protocol(detail: impl Into<Arc<str>>) -> Self {
         Self {
-            kind: Arc::new(ResponseErrorKind::Protocol(detail.into())),
+            inner: Arc::new(ResponseErrorInner::Protocol(detail.into())),
         }
+    }
+
+    /// Returns the stable operation-level error class.
+    #[must_use]
+    pub fn kind(&self) -> ResponseErrorKind {
+        match self.inner.as_ref() {
+            ResponseErrorInner::Source { kind, .. } => *kind,
+            ResponseErrorInner::Protocol(_) => ResponseErrorKind::Protocol,
+        }
+    }
+
+    /// Returns the underlying provider or transport error when one exists.
+    ///
+    /// This traverses caller middleware and the standard Tower service error,
+    /// so callers do not need to downcast each possible service boundary.
+    #[must_use]
+    pub fn responses_error(&self) -> Option<&crate::ResponsesError> {
+        self.source().and_then(error_chain_responses_error)
     }
 
     /// Returns whether the provider rejected the request for context-window
     /// exhaustion.
     #[must_use]
     pub fn is_context_window_exceeded(&self) -> bool {
-        matches!(
-            self.kind.as_ref(),
-            ResponseErrorKind::ContextWindowExceeded(_)
-        )
+        matches!(self.kind(), ResponseErrorKind::ContextWindowExceeded)
     }
 }
 
 impl From<ResponsesServiceError> for ResponseError {
     fn from(error: ResponsesServiceError) -> Self {
-        let context_window_exceeded = error.is_context_window_exceeded();
-        let error: Arc<dyn Error + Send + Sync> = Arc::new(error);
-        let kind = if context_window_exceeded {
-            ResponseErrorKind::ContextWindowExceeded(error)
-        } else {
-            ResponseErrorKind::Service(error)
-        };
-        Self {
-            kind: Arc::new(kind),
-        }
+        Self::service(error)
+    }
+}
+
+impl From<crate::ResponsesError> for ResponseError {
+    fn from(error: crate::ResponsesError) -> Self {
+        Self::service(error)
     }
 }
 
 impl From<::tower::BoxError> for ResponseError {
     fn from(error: ::tower::BoxError) -> Self {
-        let context_window_exceeded = error_chain_has_context_window(error.as_ref());
+        let kind = if error_chain_responses_error(error.as_ref())
+            .is_some_and(crate::ResponsesError::is_context_window_exceeded)
+        {
+            ResponseErrorKind::ContextWindowExceeded
+        } else {
+            ResponseErrorKind::Service
+        };
         let error: Arc<dyn Error + Send + Sync> = Arc::from(error);
         Self {
-            kind: Arc::new(if context_window_exceeded {
-                ResponseErrorKind::ContextWindowExceeded(error)
-            } else {
-                ResponseErrorKind::Service(error)
-            }),
+            inner: Arc::new(ResponseErrorInner::Source { kind, error }),
         }
     }
 }
@@ -392,12 +439,13 @@ impl From<Infallible> for ResponseError {
 
 impl fmt::Display for ResponseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.kind.as_ref() {
-            ResponseErrorKind::ContextWindowExceeded(_) => {
-                formatter.write_str("Responses input exceeded the model context window")
-            }
-            ResponseErrorKind::Service(error) => error.fmt(formatter),
-            ResponseErrorKind::Protocol(detail) => {
+        match self.inner.as_ref() {
+            ResponseErrorInner::Source {
+                kind: ResponseErrorKind::ContextWindowExceeded,
+                ..
+            } => formatter.write_str("Responses input exceeded the model context window"),
+            ResponseErrorInner::Source { error, .. } => error.fmt(formatter),
+            ResponseErrorInner::Protocol(detail) => {
                 write!(formatter, "invalid Responses state: {detail}")
             }
         }
@@ -415,25 +463,27 @@ impl fmt::Debug for ResponseError {
 
 impl Error for ResponseError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self.kind.as_ref() {
-            ResponseErrorKind::ContextWindowExceeded(error) | ResponseErrorKind::Service(error) => {
-                Some(error.as_ref())
-            }
-            ResponseErrorKind::Protocol(_) => None,
+        match self.inner.as_ref() {
+            ResponseErrorInner::Source { error, .. } => Some(error.as_ref()),
+            ResponseErrorInner::Protocol(_) => None,
         }
     }
 }
 
-fn error_chain_has_context_window(mut error: &(dyn Error + 'static)) -> bool {
+fn error_chain_responses_error<'a>(
+    mut error: &'a (dyn Error + 'static),
+) -> Option<&'a crate::ResponsesError> {
     loop {
-        if error
-            .downcast_ref::<ResponsesServiceError>()
-            .is_some_and(ResponsesServiceError::is_context_window_exceeded)
+        if let Some(service) = error.downcast_ref::<ResponsesServiceError>()
+            && let Some(error) = service.responses_error()
         {
-            return true;
+            return Some(error);
+        }
+        if let Some(error) = error.downcast_ref::<crate::ResponsesError>() {
+            return Some(error);
         }
         let Some(source) = error.source() else {
-            return false;
+            return None;
         };
         error = source;
     }
@@ -801,10 +851,10 @@ fn finish_response_span(span: &tracing::Span, started_at: Instant, error: Option
         u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
     );
     if let Some(error) = error {
-        let error_class = if error.is_context_window_exceeded() {
-            "context_window_exceeded"
-        } else {
-            "response_error"
+        let error_class = match error.kind() {
+            ResponseErrorKind::ContextWindowExceeded => "context_window_exceeded",
+            ResponseErrorKind::Service => "service",
+            ResponseErrorKind::Protocol => "protocol",
         };
         span.record("error.class", error_class);
         span.record("status", "failed");

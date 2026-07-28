@@ -6,7 +6,7 @@ use std::{
 };
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use nanocodex_agent::{Nanocodex, NanocodexError, OpenAi, Tools};
+use nanocodex_agent::{Nanocodex, OpenAi, ResponseError, Tools};
 use nanocodex_oai_api::{
     responses::{ContentItem, MessageRole, ResponseItem, Usage, WarmupResponse},
     tower::{
@@ -21,7 +21,7 @@ struct ImmediateResponses;
 
 impl Service<ResponsesAttempt> for ImmediateResponses {
     type Response = ResponsesServiceResponse;
-    type Error = NanocodexError;
+    type Error = ResponseError;
     type Future = Ready<Result<Self::Response, Self::Error>>;
 
     fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {

@@ -25,7 +25,9 @@ pub mod usage;
 
 pub use agent::{AgentHandle, Nanocodex, NanocodexBuilder, Turn, TurnControl, TurnResult};
 pub use error::{NanocodexError, Result};
-pub use nanocodex_oai_api::{OpenAi, ReasoningMode, Thinking, events::AgentEvents};
+pub use nanocodex_oai_api::{
+    OpenAi, ReasoningMode, ResponseError, ResponseErrorKind, Thinking, events::AgentEvents,
+};
 #[cfg(not(target_family = "wasm"))]
 #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
 pub use nanocodex_tools::tool;

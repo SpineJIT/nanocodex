@@ -58,7 +58,7 @@ struct PanicRecoveryService {
 
 impl Service<ResponsesAttempt> for PanicRecoveryService {
     type Response = ResponsesServiceResponse;
-    type Error = NanocodexError;
+    type Error = ResponseError;
     type Future = Ready<std::result::Result<Self::Response, Self::Error>>;
 
     fn poll_ready(

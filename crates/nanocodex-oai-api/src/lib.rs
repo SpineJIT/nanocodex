@@ -44,8 +44,8 @@ pub(crate) use responses::{
     ResponseItem, ResponseItemId, ToolDefinition, Usage,
 };
 pub use session::{
-    CompletedResponse, Response, ResponseError, ResponseTurn, Session, SessionBuildError,
-    SessionBuilder,
+    CompletedResponse, Response, ResponseError, ResponseErrorKind, ResponseTurn, Session,
+    SessionBuildError, SessionBuilder,
 };
 pub(crate) use tools::ToolOutputBody;
 pub(crate) use tower::attempt::{
@@ -74,7 +74,9 @@ pub(crate) use transport::{socket, telemetry};
 pub mod __private {
     pub use crate::{
         events::stream::EventSink,
-        openai::{CallerServiceFactory, LayeredServiceFactory, MakeResponsesService, ModelConfig},
+        openai::{
+            CallerServiceFactory, LayeredServiceFactory, ModelConfig, ResponsesServiceFactory,
+        },
         session::{
             context::{ContextManager, assign_missing_response_item_id},
             state::{ManagedSessionState, ManagedSessionStateError},
@@ -93,7 +95,7 @@ pub mod __private {
     /// Decomposes a validated client recipe for the higher-level agent driver.
     pub fn into_openai_parts<F>(openai: crate::OpenAi<F>) -> (ModelConfig, F)
     where
-        F: MakeResponsesService,
+        F: ResponsesServiceFactory,
     {
         openai.into_parts()
     }
