@@ -1,5 +1,6 @@
 import { Console } from "node:console";
 import { createRequire } from "node:module";
+import { resolve } from "node:path";
 import WebSocket from "ws";
 import packageMetadata from "../package.json" with { type: "json" };
 
@@ -14,7 +15,7 @@ const DEFAULT_MAX_FRAME_BYTES = 16 * 1024 * 1024;
 export function createNodeHost(options = {}) {
   const connections = new Map();
   const code = createCodeRuntime(options.tools, {
-    require: createRequire(`${process.cwd()}/`),
+    require: createRequire(resolve(options.workspace ?? process.cwd(), ".nanocodex-code-mode.cjs")),
     console: new Console({ stdout: process.stderr, stderr: process.stderr }),
   });
   const onEvent = options.onEvent || (() => {});

@@ -26,6 +26,7 @@ export function create(options = {}) {
     fastMode,
     instructions,
     sessionId,
+    workspace,
     resume,
     ...hostOptions
   } = options;
@@ -64,6 +65,7 @@ export function create(options = {}) {
     fastMode,
     instructions,
     sessionId,
+    workspace,
     resume,
   });
 }

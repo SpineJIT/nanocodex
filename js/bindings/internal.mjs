@@ -119,6 +119,7 @@ export function toWasmConfig(options = {}) {
   copy(config, "api_base_url", options.apiBaseUrl);
   copy(config, "instructions", options.instructions);
   copy(config, "session_id", options.sessionId);
+  copy(config, "workspace", options.workspace);
   copy(config, "resume", options.resume);
   return config;
 }

@@ -186,6 +186,7 @@ test("WASM snapshots resume authoritative history in a fresh agent", async () =>
     thinking: "none",
     instructions: "durable wasm instructions",
     sessionId: SESSION_IDS.original,
+    workspace: "/virtual/original-workspace",
   });
   const originalScenario = (async () => {
     const socket = await originalServer.connection;
@@ -199,6 +200,7 @@ test("WASM snapshots resume authoritative history in a fresh agent", async () =>
   assert.equal(await first.result(), "stored");
   const snapshot = first.snapshot();
   assert.equal(snapshot.version, 1);
+  assert.equal(snapshot.workspace, "/virtual/original-workspace");
   assert.equal(Actions.turn.getSnapshot(first).model, snapshot.model);
   await originalScenario;
   original.dispose();

@@ -22,6 +22,7 @@ export type AgentOptions = {
   fastMode?: boolean | undefined;
   sessionId?: string | undefined;
   thinking?: Thinking | undefined;
+  workspace?: string | undefined;
   resume?: SessionSnapshot | undefined;
 };
 

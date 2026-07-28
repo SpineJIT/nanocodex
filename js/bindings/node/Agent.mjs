@@ -23,6 +23,7 @@ export function create(options = {}) {
     fastMode,
     instructions,
     sessionId,
+    workspace,
     resume,
     apiKey,
     mpp,
@@ -35,7 +36,12 @@ export function create(options = {}) {
   if (mpp !== undefined && apiKey !== undefined) {
     throw new TypeError("apiKey and mpp are mutually exclusive");
   }
-  const host = createNodeHost({ ...hostOptions, mpp, onEvent: events.emit });
+  const host = createNodeHost({
+    ...hostOptions,
+    mpp,
+    onEvent: events.emit,
+    workspace: workspace ?? resume?.workspace,
+  });
   activateHost(host);
   const runtime = defineRuntime({
     key: "node-wasm",
@@ -67,6 +73,7 @@ export function create(options = {}) {
     fastMode,
     instructions,
     sessionId,
+    workspace,
     resume,
   });
 }

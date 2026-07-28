@@ -14,6 +14,7 @@ async function check() {
     apiKey,
     thinking: "high",
     fastMode: false,
+    workspace: "/workspace",
   });
   await agent.session.compact();
   await agent.session.setFastMode(true);
