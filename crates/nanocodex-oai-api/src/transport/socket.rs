@@ -26,6 +26,7 @@ const EVENT_IDLE_TIMEOUT: Duration = if cfg!(test) {
 } else {
     Duration::from_mins(5)
 };
+const SOCKET_MESSAGE_CAPACITY: usize = 32;
 const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
 const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 const TURN_STATE_HEADER: &str = "x-codex-turn-state";
@@ -53,7 +54,7 @@ pub(crate) struct ReceivedText {
 
 struct SocketPump {
     commands: mpsc::Sender<SocketCommand>,
-    messages: mpsc::UnboundedReceiver<PumpMessage>,
+    messages: mpsc::Receiver<PumpMessage>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -248,7 +249,7 @@ impl ResponsesSocket {
 impl SocketPump {
     fn new(mut socket: Socket) -> Self {
         let (commands, mut command_receiver) = mpsc::channel(32);
-        let (message_sender, messages) = mpsc::unbounded_channel();
+        let (message_sender, messages) = mpsc::channel(SOCKET_MESSAGE_CAPACITY);
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -277,7 +278,7 @@ impl SocketPump {
                                     drop(message_sender.send(PumpMessage {
                                         message: Err(error),
                                         received_ns: monotonic_now_ns(),
-                                    }));
+                                    }).await);
                                     break;
                                 }
                             }
@@ -287,7 +288,7 @@ impl SocketPump {
                                 if message_sender.send(PumpMessage {
                                     message: Ok(message),
                                     received_ns: monotonic_now_ns(),
-                                }).is_err() || should_stop {
+                                }).await.is_err() || should_stop {
                                     break;
                                 }
                             }
@@ -295,7 +296,7 @@ impl SocketPump {
                                 drop(message_sender.send(PumpMessage {
                                     message: Err(error),
                                     received_ns: monotonic_now_ns(),
-                                }));
+                                }).await);
                                 break;
                             }
                         }
@@ -407,11 +408,11 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use tokio::{net::TcpListener, time::timeout};
     use tokio_tungstenite::{
-        accept_hdr_async,
+        accept_async, accept_hdr_async,
         tungstenite::{Message, handshake::server::Request},
     };
 
-    use super::{ResponsesSocket, parse_raw_json, turn_state_from_event};
+    use super::{ResponsesSocket, SOCKET_MESSAGE_CAPACITY, parse_raw_json, turn_state_from_event};
 
     #[test]
     fn only_decodes_turn_state_metadata_events() {
@@ -701,6 +702,52 @@ mod tests {
             socket.next_text().await,
             Err(crate::ResponsesError::UnexpectedBinary)
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn response_socket_backlog_is_bounded_while_the_consumer_is_idle() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = accept_async(stream).await?;
+            for index in 0..SOCKET_MESSAGE_CAPACITY * 2 {
+                socket
+                    .send(Message::Text(format!(r#"{{"index":{index}}}"#).into()))
+                    .await?;
+            }
+            Result::<()>::Ok(())
+        });
+
+        let auth = crate::OpenAiAuthSnapshot::new(
+            crate::OpenAiAuthMode::ApiKey,
+            "test-key",
+            None::<&str>,
+            false,
+            0,
+        );
+        let (socket, _) =
+            ResponsesSocket::connect(&format!("ws://{address}"), &auth, "bounded-backlog", None)
+                .await?;
+        server.await??;
+
+        timeout(Duration::from_secs(1), async {
+            while socket.pump.messages.len() < SOCKET_MESSAGE_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| eyre!("socket pump did not receive the test backlog"))?;
+        for _ in 0..SOCKET_MESSAGE_CAPACITY {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            socket.pump.messages.len() <= SOCKET_MESSAGE_CAPACITY,
+            "idle response consumer accumulated {} frames",
+            socket.pump.messages.len()
+        );
         Ok(())
     }
 }
