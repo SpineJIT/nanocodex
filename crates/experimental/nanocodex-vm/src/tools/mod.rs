@@ -201,6 +201,13 @@ impl Tool for VmTool {
         self.standard.definition()
     }
 
+    fn supports_parallel_tool_calls(&self) -> bool {
+        matches!(
+            self.standard,
+            StandardTool::ExecCommand | StandardTool::WriteStdin | StandardTool::ViewImage
+        )
+    }
+
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
         self.client.execute(self.standard, input, context).await
     }
@@ -275,5 +282,15 @@ mod tests {
                 serde_json::to_value(standard.definition()).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn preserves_standard_workspace_tool_parallel_safety() {
+        let vm = VmTools::new(RecordingClient::default());
+
+        assert!(vm.exec_command_tool().supports_parallel_tool_calls());
+        assert!(vm.write_stdin_tool().supports_parallel_tool_calls());
+        assert!(vm.view_image_tool().supports_parallel_tool_calls());
+        assert!(!vm.apply_patch_tool().supports_parallel_tool_calls());
     }
 }
