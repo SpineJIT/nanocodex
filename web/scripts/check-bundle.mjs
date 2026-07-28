@@ -5,8 +5,10 @@ import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 
 const budgets = Object.freeze({
+  initialJavaScriptFiles: 2,
   initialJavaScript: 240_000,
   initialJavaScriptGzip: 78_000,
+  initialCssFiles: 2,
   initialCss: 70_000,
   initialCssGzip: 14_000,
   agentJavaScript: 850_000,
@@ -64,6 +66,11 @@ const initialCss = await fileStats(initialCssFiles);
 const agentJavaScript = await closureStats(agentStatic, "file");
 const mppJavaScript = await closureStats(importClosure(mppKey, false), "file");
 
+withinCount(
+  "initial JavaScript chunks",
+  initialJavaScript.fileCount,
+  budgets.initialJavaScriptFiles,
+);
 within(
   "initial JavaScript",
   initialJavaScript.bytes,
@@ -74,6 +81,7 @@ within(
   initialJavaScript.gzipBytes,
   budgets.initialJavaScriptGzip,
 );
+withinCount("initial CSS files", initialCss.fileCount, budgets.initialCssFiles);
 within("initial CSS", initialCss.bytes, budgets.initialCss);
 within("initial CSS gzip", initialCss.gzipBytes, budgets.initialCssGzip);
 within("Agent JavaScript", agentJavaScript.bytes, budgets.agentJavaScript);
@@ -146,8 +154,10 @@ within("Nanocodex WASM gzip", wasm.gzipBytes, budgets.wasmGzip);
 
 console.log(JSON.stringify({
   initial: {
+    javascriptFiles: initialJavaScript.fileCount,
     javascriptBytes: initialJavaScript.bytes,
     javascriptGzipBytes: initialJavaScript.gzipBytes,
+    cssFiles: initialCss.fileCount,
     cssBytes: initialCss.bytes,
     cssGzipBytes: initialCss.gzipBytes,
     staticChunks: [...initialStatic],
@@ -216,15 +226,16 @@ async function closureSource(keys) {
 }
 
 async function fileStats(files) {
+  const uniqueFiles = [...new Set(files)];
   const contents = await Promise.all(
-    [...new Set(files)].map((file) => readFile(join(clientDirectory, file))),
+    uniqueFiles.map((file) => readFile(join(clientDirectory, file))),
   );
   const bytes = contents.reduce((total, content) => total + content.byteLength, 0);
   const gzipBytes = contents.reduce(
     (total, content) => total + gzipSync(content, { level: 9 }).byteLength,
     0,
   );
-  return { bytes, gzipBytes };
+  return { bytes, fileCount: uniqueFiles.length, gzipBytes };
 }
 
 function byteStats(source) {
@@ -239,6 +250,13 @@ function within(name, actual, maximum) {
   assert(
     actual <= maximum,
     `${name} is ${actual.toLocaleString()} bytes; expected at most ${maximum.toLocaleString()}`,
+  );
+}
+
+function withinCount(name, actual, maximum) {
+  assert(
+    actual <= maximum,
+    `${name} is ${actual}; expected at most ${maximum}`,
   );
 }
 
