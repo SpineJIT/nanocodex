@@ -3,12 +3,18 @@ import { readFile, stat } from "node:fs/promises";
 
 const root = new URL("../", import.meta.url);
 const packageJson = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
+const readme = await readFile(new URL("README.md", root), "utf8");
 
 assert.equal(packageJson.name, "nanocodex");
 assert.equal(packageJson.type, "module");
+assert.equal(packageJson.engines?.node, ">=22.13.0");
 assert.equal(packageJson.publishConfig?.access, "public");
 assert.equal(packageJson.exports?.["./browser"]?.import, "./browser/index.mjs");
 assert.equal(packageJson.exports?.["./node"]?.import, "./node/index.mjs");
+assert.match(
+  readme,
+  new RegExp(`nanocodex@${packageJson.version.replaceAll(".", String.raw`\.`)}/browser`),
+);
 
 const requiredFiles = [
   "browser/index.mjs",

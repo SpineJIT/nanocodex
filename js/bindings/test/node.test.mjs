@@ -15,6 +15,9 @@ const SESSION_IDS = Object.freeze({
   left: "018f1f9a-7b3c-7a05-8000-000000000005",
   right: "018f1f9a-7b3c-7a06-8000-000000000006",
 });
+const PACKAGE_VERSION = JSON.parse(
+  await readFile(new URL("../package.json", import.meta.url), "utf8"),
+).version;
 
 test("Node host opens application sockets through MPP", async () => {
   const socket = new ManagedSocket();
@@ -96,6 +99,7 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
   const scenario = (async () => {
     const socket = await server.connection;
     assert.equal(socket.request.headers.authorization, "Bearer test-key");
+    assert.equal(socket.request.headers["user-agent"], `nanocodex-wasm/${PACKAGE_VERSION}`);
     assert.equal(socket.request.headers["session-id"], SESSION_IDS.primary);
     const reader = messageReader(socket);
 

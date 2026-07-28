@@ -1,10 +1,12 @@
 import { Console } from "node:console";
 import { createRequire } from "node:module";
 import WebSocket from "ws";
+import packageMetadata from "../package.json" with { type: "json" };
 
 import { createCodeRuntime } from "../runtime/code-runtime.mjs";
 
 const RESPONSES_WEBSOCKETS_BETA = "responses_websockets=2026-02-06";
+const USER_AGENT = `nanocodex-wasm/${packageMetadata.version}`;
 const DEFAULT_MAX_QUEUED_MESSAGES = 4_096;
 const DEFAULT_MAX_QUEUED_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_FRAME_BYTES = 16 * 1024 * 1024;
@@ -36,7 +38,7 @@ export function createNodeHost(options = {}) {
         "thread-id": sessionId,
         "x-client-request-id": sessionId,
         "x-responsesapi-include-timing-metrics": "true",
-        "User-Agent": "nanocodex-wasm/0.1.0",
+        "User-Agent": USER_AGENT,
       };
       if (metadata.accountId) headers["ChatGPT-Account-ID"] = metadata.accountId;
       if (metadata.fedramp) headers["X-OpenAI-Fedramp"] = "true";

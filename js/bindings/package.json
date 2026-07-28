@@ -25,7 +25,6 @@
     "pkg-node",
     "pkg-web",
     "runtime",
-    "scripts/check-package.mjs",
     "internal.mjs",
     "index.d.mts",
     "index.mjs",
