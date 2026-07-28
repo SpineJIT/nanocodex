@@ -89,14 +89,28 @@ pub use runtime::{ToolsBuildError, ToolsBuilder};
 #[cfg(not(target_family = "wasm"))]
 pub(crate) use standard::StandardTool;
 
-#[cfg(not(target_family = "wasm"))]
 #[doc(hidden)]
 pub mod __private {
+    #[cfg(not(target_family = "wasm"))]
     pub use async_trait::async_trait;
+    #[cfg(not(target_family = "wasm"))]
     pub use schemars;
+    #[cfg(not(target_family = "wasm"))]
     pub use serde;
 
+    #[cfg(not(target_family = "wasm"))]
     pub use crate::{
         Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult, runtime::schema_for,
     };
+
+    /// Builds the direct Responses tool prefix and the nested Code Mode name map together.
+    pub fn model_contract(
+        runtime: &crate::runtime::ToolRuntime,
+        session_id: &str,
+    ) -> (
+        Vec<nanocodex_oai_api::tools::ToolDefinition>,
+        Vec<(String, String)>,
+    ) {
+        runtime.model_contract(session_id)
+    }
 }

@@ -1,0 +1,425 @@
+use super::*;
+
+/// Stateful execution runtime for one agent driver.
+///
+/// A runtime retains Code Mode cells and shell sessions across calls. It is
+/// normally owned privately by the higher-level agent driver.
+pub struct ToolRuntime {
+    pub(super) registry: Arc<ToolRegistry>,
+    code_mode: code_mode::CodeModeRuntime,
+    sessions: Arc<ShellSessions>,
+    current_turn: Arc<AtomicU64>,
+    default_shell_name: Arc<str>,
+    working_directory: Arc<str>,
+}
+
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ToolRuntimeControl {
+    code_mode: code_mode::CodeModeControl,
+    sessions: Arc<ShellSessions>,
+    current_turn: Arc<AtomicU64>,
+}
+
+impl ToolRuntime {
+    /// Creates a runtime with the standard workspace tools enabled.
+    ///
+    /// Pass `None` for web search or image generation to omit that built-in
+    /// HTTP handler.
+    pub fn new(
+        workspace: impl Into<PathBuf>,
+        web_search: Option<WebSearchConfig>,
+        image_generation: Option<ImageGenerationConfig>,
+    ) -> Self {
+        Self::new_inner(
+            workspace,
+            web_search,
+            image_generation,
+            true,
+            Arc::new(Vec::new()),
+            None,
+        )
+    }
+
+    /// Builds the runtime from one complete declarative tool selection.
+    #[must_use]
+    pub fn new_with_tools(
+        workspace: impl Into<PathBuf>,
+        web_search: Option<WebSearchConfig>,
+        image_generation: Option<ImageGenerationConfig>,
+        tools: &Tools,
+    ) -> Self {
+        Self::new_inner(
+            workspace,
+            web_search,
+            image_generation,
+            tools.workspace_enabled(),
+            tools.process_environment(),
+            tools.remote_http_client(),
+        )
+        .with_tools(tools)
+    }
+
+    fn new_inner(
+        workspace: impl Into<PathBuf>,
+        web_search: Option<WebSearchConfig>,
+        image_generation: Option<ImageGenerationConfig>,
+        workspace_enabled: bool,
+        process_environment: Arc<Vec<(OsString, OsString)>>,
+        remote_http_client: Option<reqwest::Client>,
+    ) -> Self {
+        let workspace = workspace.into();
+        let current_turn = Arc::new(AtomicU64::new(0));
+        let sessions = Arc::new(ShellSessions::with_environment_and_turn(
+            process_environment,
+            Arc::clone(&current_turn),
+        ));
+        let default_shell_name = Arc::from(sessions.default_shell_name());
+        let working_directory = Arc::from(workspace.to_string_lossy().into_owned());
+        let code_mode_workspace = workspace.clone();
+        let mut handlers: Vec<Arc<dyn Tool>> = Vec::new();
+        if workspace_enabled {
+            handlers.extend([
+                Arc::new(apply_patch::ApplyPatchHandler::new(workspace.clone())) as Arc<dyn Tool>,
+                Arc::new(shell::ExecCommandHandler::new(
+                    workspace.clone(),
+                    Arc::clone(&sessions),
+                )),
+                Arc::new(plan::UpdatePlanTool::new()),
+                Arc::new(view_image::ViewImageHandler::new(workspace)),
+                Arc::new(shell::WriteStdinHandler::new(Arc::clone(&sessions))),
+            ]);
+        }
+        let remote_http_client = remote_http_client.unwrap_or_default();
+        if let Some(web_search) = web_search {
+            handlers.push(Arc::new(web_search::WebSearchHandler::with_client(
+                web_search,
+                remote_http_client.clone(),
+            )));
+        }
+        if let Some(image_generation) = image_generation {
+            handlers.push(Arc::new(
+                image_generation::ImageGenerationHandler::with_client(
+                    image_generation,
+                    remote_http_client,
+                ),
+            ));
+        }
+        Self {
+            registry: Arc::new(ToolRegistry::from_ordered(handlers)),
+            code_mode: code_mode::CodeModeRuntime::new_with_turn(
+                code_mode_workspace,
+                Arc::clone(&current_turn),
+            ),
+            sessions,
+            current_turn,
+            default_shell_name,
+            working_directory,
+        }
+    }
+
+    /// Extends this runtime with a validated declarative tool selection.
+    ///
+    /// Dynamic providers begin discovery immediately. Their [`DynamicToolProvider::start`]
+    /// implementations are required to be idempotent so callers may also start
+    /// discovery earlier during application think time.
+    #[must_use]
+    pub fn with_tools(mut self, tools: &Tools) -> Self {
+        tools.start_providers();
+        let registry = Arc::make_mut(&mut self.registry);
+        registry.extend(tools.registered.iter().cloned());
+        registry.providers.extend(tools.providers.iter().cloned());
+        if let Some(working_directory) = &tools.working_directory {
+            self.working_directory = Arc::clone(working_directory);
+        }
+        if let Some(default_shell) = &tools.default_shell {
+            self.default_shell_name = Arc::clone(default_shell);
+        }
+        self
+    }
+
+    /// Returns the shell name described to the model.
+    #[must_use]
+    pub fn default_shell_name(&self) -> &str {
+        &self.default_shell_name
+    }
+
+    /// Returns the working directory described to the model.
+    #[must_use]
+    pub fn working_directory(&self) -> &str {
+        &self.working_directory
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn control(&self) -> ToolRuntimeControl {
+        ToolRuntimeControl {
+            code_mode: self.code_mode.control(),
+            sessions: Arc::clone(&self.sessions),
+            current_turn: Arc::clone(&self.current_turn),
+        }
+    }
+
+    /// Returns the direct model-visible Code Mode tool definitions.
+    ///
+    /// Native definitions are session-independent. The session ID keeps this
+    /// method aligned with hosted runtimes whose available tools may vary by
+    /// session.
+    #[must_use]
+    pub fn model_specs(&self, _session_id: &str) -> Vec<ToolDefinition> {
+        let (mut native, mut nested): (Vec<_>, Vec<_>) = self
+            .registry
+            .definitions()
+            .iter()
+            .cloned()
+            .partition(|definition| matches!(definition, ToolDefinition::ToolSearch { .. }));
+        nested.sort_by(|left, right| left.name().cmp(right.name()));
+        native.extend([
+            code_mode::exec_spec(&nested, !self.registry.providers.is_empty()),
+            code_mode::wait_spec(),
+        ]);
+        native.sort_by(|left, right| left.name().cmp(right.name()));
+        native
+    }
+
+    pub(crate) fn model_contract(
+        &self,
+        session_id: &str,
+    ) -> (Vec<ToolDefinition>, Vec<(String, String)>) {
+        (
+            self.model_specs(session_id),
+            self.registry.code_mode_tool_names(),
+        )
+    }
+
+    /// Returns whether a model-visible tool explicitly permits parallel calls.
+    ///
+    /// Unknown tools and tools without an explicit opt-in return `false`.
+    #[must_use]
+    pub fn supports_parallel_tool_calls(&self, name: &str) -> bool {
+        self.registry.supports_parallel_tool_calls(name)
+    }
+
+    /// Returns whether a registered or dynamically activated tool is callable.
+    ///
+    /// Deferred provider tools become visible here only after activation.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.registry.contains(name)
+    }
+
+    /// Starts or resumes a Code Mode cell and observes its first terminal boundary.
+    pub async fn execute_code(&self, source: &str, context: ToolContext<'_>) -> CodeModeExecution {
+        self.code_mode
+            .execute(
+                source,
+                Arc::clone(&self.registry),
+                OwnedToolContext::from_context(context),
+            )
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn execute_code_with_updates(
+        &self,
+        source: &str,
+        context: ToolContext<'_>,
+        observer: &mut dyn CodeModeObserver,
+    ) -> CodeModeExecution {
+        self.code_mode
+            .execute_with_updates(
+                source,
+                Arc::clone(&self.registry),
+                OwnedToolContext::from_context(context),
+                observer,
+            )
+            .await
+    }
+
+    /// Executes Code Mode without copying an already-owned history snapshot.
+    #[doc(hidden)]
+    pub async fn execute_code_owned(
+        &self,
+        source: &str,
+        context: OwnedToolContext,
+    ) -> CodeModeExecution {
+        self.code_mode
+            .execute(source, Arc::clone(&self.registry), context)
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn execute_code_owned_with_updates(
+        &self,
+        source: &str,
+        context: OwnedToolContext,
+        observer: &mut dyn CodeModeObserver,
+    ) -> CodeModeExecution {
+        self.code_mode
+            .execute_with_updates(source, Arc::clone(&self.registry), context, observer)
+            .await
+    }
+
+    /// Waits for a previously yielded Code Mode cell.
+    pub async fn wait_for_code(&self, input: &str, context: ToolContext<'_>) -> CodeModeExecution {
+        self.code_mode.wait(input, context).await
+    }
+
+    #[doc(hidden)]
+    pub async fn wait_for_code_with_updates(
+        &self,
+        input: &str,
+        _context: ToolContext<'_>,
+        observer: &mut dyn CodeModeObserver,
+    ) -> CodeModeExecution {
+        self.code_mode.wait_with_updates(input, observer).await
+    }
+
+    /// Executes one registered or dynamically activated tool through this
+    /// runtime's retained state.
+    ///
+    /// Shell sessions created by `exec_command` remain available to later
+    /// `write_stdin` calls on the same runtime.
+    ///
+    /// Handler panics become failed `aborted` outputs and never unwind through
+    /// the runtime owner.
+    pub async fn execute_tool(
+        &self,
+        name: &str,
+        input: ToolInput,
+        context: ToolContext<'_>,
+    ) -> ToolOutput {
+        self.registry.execute_direct(name, input, context).await
+    }
+}
+
+impl ToolRuntimeControl {
+    #[doc(hidden)]
+    pub fn begin_turn(&self) {
+        let _ = self
+            .current_turn
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |turn| {
+                Some(turn.saturating_add(1))
+            });
+    }
+
+    #[doc(hidden)]
+    pub async fn cancel_turn(&self) {
+        let turn_id = self.current_turn.load(Ordering::Acquire);
+        tokio::join!(
+            self.code_mode.terminate_turn(turn_id),
+            self.sessions.terminate_turn(turn_id)
+        );
+    }
+
+    #[doc(hidden)]
+    pub async fn cancel(&self) {
+        tokio::join!(
+            self.code_mode.terminate_all(),
+            self.sessions.terminate_all()
+        );
+    }
+}
+
+pub(super) fn record_tool_content(span: &tracing::Span, kind: &'static str, content: &str) {
+    span.in_scope(|| {
+        info!(
+            target: "nanocodex_tools",
+            content_kind = kind,
+            content,
+            "tool content"
+        );
+    });
+}
+
+pub(super) fn panicked_tool_output(
+    span: &tracing::Span,
+    payload: Box<dyn Any + Send>,
+) -> ToolOutput {
+    let message = panic_payload(payload);
+    record_tool_content(span, "tool.panic", &message);
+    ToolOutput::error("aborted")
+}
+
+fn panic_payload(payload: Box<dyn Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => payload.downcast::<&'static str>().map_or_else(
+            |_| "non-string panic payload".to_owned(),
+            |message| (*message).to_owned(),
+        ),
+    }
+}
+
+pub(super) fn tool_execution_span(
+    name: &str,
+    context: ToolContext<'_>,
+    arguments_bytes: usize,
+    arguments_kind: &'static str,
+    arguments_count: usize,
+    argument_keys: &str,
+) -> tracing::Span {
+    info_span!(
+        target: "nanocodex_tools",
+        "tool.execute",
+        otel.kind = "internal",
+        otel.status_code = tracing::field::Empty,
+        tool.name = name,
+        session.id = context.session_id(),
+        tool.call_id = context.call_id(),
+        tool.arguments.bytes = arguments_bytes,
+        tool.arguments.kind = arguments_kind,
+        tool.arguments.count = arguments_count,
+        tool.arguments.keys = argument_keys,
+        process.exit.code = tracing::field::Empty,
+        process.running = tracing::field::Empty,
+        process.wall_time_ms = tracing::field::Empty,
+        shell.session.id = tracing::field::Empty,
+        tool.output.bytes = tracing::field::Empty,
+        tool.output.original_tokens = tracing::field::Empty,
+        status = tracing::field::Empty,
+        duration_ns = tracing::field::Empty,
+    )
+}
+
+pub(super) fn finish_tool_execution_span(
+    span: &tracing::Span,
+    started_at: std::time::Instant,
+    execution: &ToolOutput,
+    output_content: Option<&str>,
+) {
+    if let Some(output_content) = output_content {
+        record_tool_content(span, "tool.output", output_content);
+        span.record("tool.output.bytes", output_content.len());
+    }
+    span.record(
+        "status",
+        if execution.success {
+            "completed"
+        } else {
+            "failed"
+        },
+    );
+    span.record(
+        "otel.status_code",
+        if execution.success { "OK" } else { "ERROR" },
+    );
+    span.record(
+        "duration_ns",
+        u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+    );
+    if let Some(process) = execution.process_trace() {
+        if let Some(exit_code) = process.exit_code {
+            span.record("process.exit.code", exit_code);
+        }
+        span.record("process.running", process.session_id.is_some());
+        span.record("process.wall_time_ms", process.wall_time_seconds * 1_000.0);
+        if let Some(session_id) = process.session_id {
+            span.record("shell.session.id", session_id);
+        }
+        span.record("tool.output.bytes", process.output_bytes);
+        if let Some(original_token_count) = process.original_token_count {
+            span.record("tool.output.original_tokens", original_token_count);
+        }
+    }
+}

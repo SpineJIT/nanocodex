@@ -133,6 +133,13 @@ impl HostedToolRuntime {
     /// Builds the `exec` definition from the host's current tool definitions.
     #[must_use]
     pub fn model_specs(&self, session_id: &str) -> Vec<ToolDefinition> {
+        self.model_contract(session_id).0
+    }
+
+    pub(crate) fn model_contract(
+        &self,
+        session_id: &str,
+    ) -> (Vec<ToolDefinition>, Vec<(String, String)>) {
         let mut definitions = self.host.as_ref().map_or_else(Vec::new, |host| {
             match host.tool_definitions(session_id) {
                 Ok(definitions) => definitions,
@@ -147,6 +154,15 @@ impl HostedToolRuntime {
             }
         });
         definitions.sort_by(|left, right| left.name().cmp(right.name()));
+        let code_mode_tool_names = definitions
+            .iter()
+            .map(|definition| {
+                (
+                    normalize_identifier(definition.name()),
+                    definition.name().to_owned(),
+                )
+            })
+            .collect();
         let mut description = EXEC_DESCRIPTION.to_owned();
         for definition in definitions {
             description.push_str("\n\n- `tools.");
@@ -154,11 +170,14 @@ impl HostedToolRuntime {
             description.push_str("`: ");
             description.push_str(definition.description().trim());
         }
-        vec![ToolDefinition::custom(
-            "exec",
-            description,
-            CustomToolFormat::grammar("lark", EXEC_GRAMMAR),
-        )]
+        (
+            vec![ToolDefinition::custom(
+                "exec",
+                description,
+                CustomToolFormat::grammar("lark", EXEC_GRAMMAR),
+            )],
+            code_mode_tool_names,
+        )
     }
 
     /// Returns `false`; hosted definitions execute inside one Code Mode cell.
@@ -249,6 +268,23 @@ impl HostedToolRuntime {
         let execution = self.wait_for_code(input, context).await;
         replay_nested_updates(&execution, observer);
         execution
+    }
+}
+
+fn normalize_identifier(name: &str) -> String {
+    let mut identifier = String::new();
+    for (index, character) in name.chars().enumerate() {
+        let valid = if index == 0 {
+            character == '_' || character == '$' || character.is_ascii_alphabetic()
+        } else {
+            character == '_' || character == '$' || character.is_ascii_alphanumeric()
+        };
+        identifier.push(if valid { character } else { '_' });
+    }
+    if identifier.is_empty() {
+        "_".to_owned()
+    } else {
+        identifier
     }
 }
 
