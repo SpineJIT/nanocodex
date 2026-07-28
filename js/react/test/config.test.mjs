@@ -1,7 +1,22 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import { createConfig } from "../config.mjs";
+
+test("the React consumer accepts the workspace Nanocodex package", () => {
+  const reactPackage = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url)),
+  );
+  const nanocodexPackage = JSON.parse(
+    readFileSync(new URL("../../bindings/package.json", import.meta.url)),
+  );
+
+  assert.equal(
+    reactPackage.peerDependencies.nanocodex,
+    `^${nanocodexPackage.version}`,
+  );
+});
 
 test("Nanocodex config owns worker lifecycle outside React", async () => {
   const commands = [];
