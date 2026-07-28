@@ -60,6 +60,37 @@ fn benchmark_process_output(c: &mut Criterion) {
             std::hint::black_box(output);
         });
     });
+
+    let code_mode = ToolRuntime::new(".", None, None);
+    let warmup = runtime.block_on(code_mode.execute_code(
+        r#"text("warmup")"#,
+        ToolContext::new(
+            "benchmark-model",
+            "benchmark-session",
+            "benchmark-code-mode-warmup",
+            &[],
+            DEFAULT_TOOL_OUTPUT_TOKENS,
+        ),
+    ));
+    assert!(warmup.success);
+    c.bench_function("code_mode_exec/warm_text", |benchmark| {
+        benchmark.to_async(&runtime).iter(|| async {
+            let execution = code_mode
+                .execute_code(
+                    r#"text("benchmark")"#,
+                    ToolContext::new(
+                        "benchmark-model",
+                        "benchmark-session",
+                        "benchmark-code-mode",
+                        &[],
+                        DEFAULT_TOOL_OUTPUT_TOKENS,
+                    ),
+                )
+                .await;
+            assert!(execution.success);
+            std::hint::black_box(execution);
+        });
+    });
 }
 
 criterion_group!(benches, benchmark_process_output);

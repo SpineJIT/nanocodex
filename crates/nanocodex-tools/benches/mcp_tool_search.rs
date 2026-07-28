@@ -54,6 +54,47 @@ fn benchmark_search(c: &mut Criterion) {
         .enable_all()
         .build()
         .expect("benchmark Tokio runtime must initialize");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-stdio-server.mjs");
+    let mut discovery = c.benchmark_group("mcp_discovery/cold");
+    discovery.sample_size(10);
+    discovery.bench_function("1000_tools", |benchmark| {
+        benchmark.to_async(&runtime).iter(|| async {
+            let provider = Mcp::builder()
+                .server(
+                    "fixture",
+                    McpServer::stdio("node")
+                        .arg(fixture.to_string_lossy())
+                        .env("NANOCODEX_MCP_FIXTURE_TOOL_COUNT", "1000"),
+                )
+                .build()
+                .expect("benchmark MCP configuration must be valid");
+            provider.start();
+            let search = provider
+                .direct_tools()
+                .into_iter()
+                .next()
+                .expect("MCP must expose tool_search");
+            let input = to_raw_value(&json!({ "query": "deterministic echo message", "limit": 8 }))
+                .expect("benchmark input must serialize");
+            let result = search
+                .execute(
+                    ToolInput::Function(input),
+                    ToolContext::new(
+                        "benchmark-model",
+                        "benchmark-session",
+                        "benchmark-discovery",
+                        &[],
+                        DEFAULT_TOOL_OUTPUT_TOKENS,
+                    ),
+                )
+                .await
+                .expect("cold MCP discovery and search must execute");
+            assert!(result.success);
+            std::hint::black_box((provider, result));
+        });
+    });
+    discovery.finish();
+
     let mut group = c.benchmark_group("mcp_tool_search/warm");
     for tool_count in [1, 1_000] {
         let (_provider, search, input) = warm_provider(&runtime, tool_count);

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     hint::black_box,
     path::{Path, PathBuf},
@@ -43,6 +43,17 @@ struct ResponseCreate<'a> {
 struct InputMessage<'a> {
     role: &'static str,
     content: &'a str,
+}
+
+#[derive(Serialize)]
+struct CodeModeToolName {
+    name: String,
+    namespace: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CodeModeTurnMetadata<'a> {
+    code_mode_tool_names: &'a BTreeMap<String, CodeModeToolName>,
 }
 
 #[derive(Deserialize)]
@@ -250,6 +261,31 @@ fn request_encoding(criterion: &mut Criterion) {
         );
     }
     group.finish();
+}
+
+fn responses_lite_metadata_encoding(criterion: &mut Criterion) {
+    let names = (0..64)
+        .map(|index| {
+            (
+                format!("tool_{index:02}"),
+                CodeModeToolName {
+                    name: format!("tool_{index:02}"),
+                    namespace: (index % 4 == 0).then(|| "mcp__fixture".to_owned()),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    criterion.bench_function(
+        "responses_lite_metadata/code_mode_tool_names_64",
+        |bencher| {
+            bencher.iter(|| {
+                serde_json::to_string(black_box(&CodeModeTurnMetadata {
+                    code_mode_tool_names: &names,
+                }))
+                .unwrap()
+            });
+        },
+    );
 }
 
 fn event_decoding(criterion: &mut Criterion) {
@@ -860,6 +896,7 @@ fn tower_dispatch(criterion: &mut Criterion) {
 criterion_group!(
     benches,
     request_encoding,
+    responses_lite_metadata_encoding,
     event_decoding,
     agent_event_encoding,
     pricing_estimation,

@@ -129,6 +129,19 @@ bench-stream:
     cargo bench -p nanocodex-bin --bench tui_render -- tui_transcript_delta
     cargo bench -p nanocodex-bin --bench tui_render -- tui_trace_render
 
+# Rebuild every PR #50 hot-path estimate, then enforce the checked-in median
+# latency thresholds. TUI frame-count, changed-cell, and output-byte limits are
+# asserted inside the representative benchmark workloads themselves.
+bench-pr50:
+    cargo bench -p nanocodex-agent --bench agent_lifecycle
+    cargo bench -p nanocodex-oai-api --bench tower_responses -- '(responses_request_encoding/encoded_raw_value/131072|responses_lite_metadata/code_mode_tool_names_64|pricing_estimation/aggregate_turn_usage|timed_agent_event_delivery/emit_then_try_receive_mirrored_1024)'
+    cargo bench -p nanocodex-oai-api --bench fork_history -- '(fork_then_append/immutable_segments/10000|active_boundary_snapshot_then_append/immutable_boundary/10000|incremental_suffix_iteration/last_item/10000|code_mode_history_snapshot/flatten_into_shared_owner/10000|compaction_snapshot/shared_prefix_rewrite/10000|context_accounting_and_compaction/)'
+    cargo bench -p nanocodex-oai-api --bench session_lifecycle
+    cargo bench -p nanocodex-tools --bench tool_process_output
+    cargo bench -p nanocodex-tools --bench mcp_tool_search
+    cargo bench -p nanocodex-bin --bench tui_render -- '^(tui_trace_render/codex_long/tail/(80x24|120x40|200x60)|tui_transcript_delta/assistant_100k|tui_stream_telemetry/apply_1024_and_present|tui_branch_state/codex_long/switch_branch|tui_markdown/syntax_fallback_oversized_line_1m|tui_tool_tree/result_269k_cached_frame/120x40|tui_code_mode_stream/apply_16_out_of_order_completions|tui_trace_resize/codex_long/80x24_to_200x60|tui_live_tail_first_frame/assistant_1m_single_line/120x40|tui_smooth_follow/drain_128_row_backlog/120x40|tui_terminal_output/(catch_up_frame|fast_mode_toggle)/120x40|tui_composer_render/multiline_100k/120x40|tui_large_paste/ingest_100k)$'
+    ./scripts/check-benchmark-thresholds.sh
+
 # Run a tool-using turn and retain events and diagnostic logs independently.
 otel-demo:
     @test -n "${OPENAI_API_KEY:-}" || { echo "set OPENAI_API_KEY in .env or the environment" >&2; exit 2; }

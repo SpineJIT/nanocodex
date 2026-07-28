@@ -671,6 +671,10 @@ mod tui {
                             .expect("smooth-follow animation frame should render");
                         frames += 1;
                     }
+                    assert!(
+                        (1..=DELTAS as u64).contains(&frames),
+                        "draining {DELTAS} queued rows rendered {frames} animation frames"
+                    );
                     black_box(frames);
                 },
                 BatchSize::SmallInput,
@@ -700,27 +704,31 @@ mod tui {
         let (mut sample_app, mut sample_terminal, sample_bytes) = output_backlog_setup();
         let sample =
             draw_catch_up_frame(&mut sample_app, &mut sample_terminal, sample_bytes.as_ref());
+        assert!(
+            sample.changed_cells <= 2_400,
+            "catch-up frame changed {} cells",
+            sample.changed_cells
+        );
+        assert!(
+            sample.output_bytes <= 4_096,
+            "catch-up frame wrote {} bytes",
+            sample.output_bytes
+        );
         let mut group = criterion.benchmark_group("tui_terminal_output");
         group.sample_size(20);
         group.throughput(Throughput::Bytes(sample.output_bytes));
-        group.bench_function(
-            format!(
-                "catch_up_frame_{}cells_{}bytes/120x40",
-                sample.changed_cells, sample.output_bytes
-            ),
-            |bencher| {
-                bencher.iter_batched(
-                    output_backlog_setup,
-                    |(mut app, mut terminal, output_bytes)| {
-                        let metrics =
-                            draw_catch_up_frame(&mut app, &mut terminal, output_bytes.as_ref());
-                        black_box(metrics);
-                        (app, terminal, output_bytes)
-                    },
-                    BatchSize::LargeInput,
-                );
-            },
-        );
+        group.bench_function("catch_up_frame/120x40", |bencher| {
+            bencher.iter_batched(
+                output_backlog_setup,
+                |(mut app, mut terminal, output_bytes)| {
+                    let metrics =
+                        draw_catch_up_frame(&mut app, &mut terminal, output_bytes.as_ref());
+                    black_box(metrics);
+                    (app, terminal, output_bytes)
+                },
+                BatchSize::LargeInput,
+            );
+        });
 
         let (mut app, mut terminal, output_bytes) = fast_mode_toggle_setup();
         let sample = draw_fast_mode_toggle(&mut app, &mut terminal, output_bytes.as_ref());
@@ -734,25 +742,19 @@ mod tui {
             "footer wrote {} bytes",
             sample.output_bytes
         );
-        group.bench_function(
-            format!(
-                "fast_mode_toggle_{}cells_{}bytes/120x40",
-                sample.changed_cells, sample.output_bytes
-            ),
-            |bencher| {
-                bencher.iter_batched(
-                    fast_mode_toggle_setup,
-                    |(mut app, mut terminal, output_bytes)| {
-                        black_box(draw_fast_mode_toggle(
-                            &mut app,
-                            &mut terminal,
-                            output_bytes.as_ref(),
-                        ));
-                    },
-                    BatchSize::LargeInput,
-                );
-            },
-        );
+        group.bench_function("fast_mode_toggle/120x40", |bencher| {
+            bencher.iter_batched(
+                fast_mode_toggle_setup,
+                |(mut app, mut terminal, output_bytes)| {
+                    black_box(draw_fast_mode_toggle(
+                        &mut app,
+                        &mut terminal,
+                        output_bytes.as_ref(),
+                    ));
+                },
+                BatchSize::LargeInput,
+            );
+        });
         group.finish();
     }
 
@@ -1194,6 +1196,16 @@ mod tui {
         criterion.bench_function("tui_markdown/image_placeholder_100k", |bencher| {
             bencher.iter(|| markdown::render_agent_markdown(black_box(&image), 120));
         });
+
+        let oversized_rust_line = format!("let value = \"{}\";", "x".repeat(1024 * 1024));
+        criterion.bench_function(
+            "tui_markdown/syntax_fallback_oversized_line_1m",
+            |bencher| {
+                bencher.iter(|| {
+                    markdown::highlighted_code_lines(Some("rust"), black_box(&oversized_rust_line))
+                });
+            },
+        );
     }
 
     #[allow(clippy::too_many_lines)]

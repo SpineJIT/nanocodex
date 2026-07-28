@@ -1,8 +1,11 @@
 use std::{hint::black_box, sync::Arc};
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use nanocodex_oai_api::responses::{
-    ContentItem, FunctionOutputBody, MessageRole, ResponseHistory, ResponseItem,
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use nanocodex_oai_api::{
+    responses::{
+        ContentItem, FunctionOutputBody, MessageRole, ResponseHistory, ResponseItem, Usage,
+    },
+    session::{compaction, context::ContextManager},
 };
 
 fn history_item(index: usize) -> ResponseItem {
@@ -216,12 +219,76 @@ fn benchmark_compaction_snapshot(criterion: &mut Criterion) {
     group.finish();
 }
 
+fn benchmark_context_accounting_and_compaction(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("context_accounting_and_compaction");
+    group.sample_size(20);
+
+    let mut context = ContextManager::new((0..10_000).map(history_item).collect());
+    context.update_token_info(Some(&Usage {
+        total_tokens: 240_000,
+        ..Usage::default()
+    }));
+    group.bench_function("active_context_tokens_10000", |bencher| {
+        bencher.iter(|| black_box(context.active_context_tokens(false)));
+    });
+
+    let mut history = ResponseHistory::new((0..1_000).map(history_item).collect::<Vec<_>>());
+    for index in 0..4 {
+        history.push(ResponseItem::custom_tool_output(
+            format!("call-{index}"),
+            None,
+            FunctionOutputBody::Text("x".repeat(200_000).into_boxed_str()),
+        ));
+    }
+    history.commit_tail();
+    group.bench_function("trim_1000_items_plus_4x200k_outputs", |bencher| {
+        bencher.iter_batched(
+            || history.clone(),
+            |mut history| {
+                let rewritten =
+                    compaction::trim_tool_outputs_to_fit_context_window(&mut history, &[]);
+                assert!(rewritten > 0);
+                black_box(history)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    let retained = (0..10_000)
+        .map(|index| {
+            ResponseItem::message(
+                MessageRole::User,
+                [ContentItem::InputText {
+                    text: format!("retained-{index:05}-{}", "x".repeat(512)).into_boxed_str(),
+                }],
+            )
+        })
+        .collect::<Vec<_>>();
+    let compacted = ResponseItem::Compaction {
+        id: None,
+        encrypted_content: "opaque-compaction".into(),
+        created_by: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    group.bench_function("install_history_10000_user_messages", |bencher| {
+        bencher.iter(|| {
+            black_box(compaction::install_history(
+                black_box(&retained),
+                &[],
+                compacted.clone(),
+            ))
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     benchmark_fork_append,
     benchmark_active_boundary_snapshot,
     benchmark_incremental_suffix,
     benchmark_code_mode_history_snapshot,
-    benchmark_compaction_snapshot
+    benchmark_compaction_snapshot,
+    benchmark_context_accounting_and_compaction
 );
 criterion_main!(benches);
