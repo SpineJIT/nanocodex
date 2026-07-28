@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import statistics
 import sys
 import tempfile
@@ -331,17 +332,26 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
     chain_expected, main_expected, branch_expected = expected_outputs(workload)
     if digest_strings(all_prompts) != workload["prompt_fnv1a64"]:
         raise RuntimeError("generated prompts do not match the workload digest")
-    api_key = load_api_key(args.env_file)
     clean_home = tempfile.TemporaryDirectory(prefix="codex-parity-home-")
     auth_file = Path(clean_home.name) / "auth.json"
-    auth_file.write_text(json.dumps({"OPENAI_API_KEY": api_key}))
-    auth_file.chmod(0o600)
     process_env = os.environ.copy()
+    if args.auth_file is not None:
+        shutil.copyfile(args.auth_file.resolve(), auth_file)
+        process_env.pop("CODEX_API_KEY", None)
+        process_env.pop("OPENAI_API_KEY", None)
+    else:
+        api_key = load_api_key(args.env_file)
+        auth_file.write_text(json.dumps({"OPENAI_API_KEY": api_key}))
+        process_env.update(
+            {
+                "CODEX_API_KEY": api_key,
+                "OPENAI_API_KEY": api_key,
+            }
+        )
+    auth_file.chmod(0o600)
     process_env.update(
         {
             "CODEX_HOME": clean_home.name,
-            "CODEX_API_KEY": api_key,
-            "OPENAI_API_KEY": api_key,
             "RUST_LOG": "warn",
         }
     )
@@ -490,6 +500,11 @@ def parse_args() -> argparse.Namespace:
         default=Path(__file__).with_name("codex_parity_workload.json"),
     )
     parser.add_argument("--env-file", type=Path, default=Path.cwd() / ".env")
+    parser.add_argument(
+        "--auth-file",
+        type=Path,
+        help="shared Codex auth.json to copy into the isolated benchmark home",
+    )
     parser.add_argument("--source-commit", default="unknown")
     parser.add_argument("--codex-cli-version", default="unknown")
     return parser.parse_args()

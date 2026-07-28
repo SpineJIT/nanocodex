@@ -8,7 +8,7 @@ use eyre::{Result, WrapErr, bail, eyre};
 use nanocodex::{
     AgentEvents, Nanocodex, OpenAi, Thinking, Tools, Turn, TurnResult,
     agent::{events::AgentEventKind, session::SessionId},
-    oai::{MODEL, responses::Usage},
+    oai::{MODEL, auth::load_chatgpt_auth, responses::Usage},
 };
 use serde::{Deserialize, Serialize};
 
@@ -100,13 +100,24 @@ struct Args {
     cwd: PathBuf,
     workload: PathBuf,
     source_commit: String,
+    auth_file: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let args = parse_args()?;
-    let api_key = env::var("OPENAI_API_KEY").wrap_err("OPENAI_API_KEY is required")?;
+    let openai = if let Some(auth_file) = &args.auth_file {
+        OpenAi::new(
+            load_chatgpt_auth(auth_file)
+                .wrap_err_with(|| format!("failed to load {}", auth_file.display()))?,
+        )?
+    } else {
+        let api_key = env::var("OPENAI_API_KEY").wrap_err(
+            "OPENAI_API_KEY is required unless --auth-file selects shared ChatGPT auth",
+        )?;
+        OpenAi::new(api_key)?
+    };
     let (workload_bytes, workload) = load_workload(&args.workload)?;
     let agents_md = fs::read(args.cwd.join("AGENTS.md"))
         .wrap_err_with(|| format!("failed to read AGENTS.md from {}", args.cwd.display()))?;
@@ -117,7 +128,6 @@ async fn main() -> Result<()> {
     }
     let lineage = SessionId::new();
     let tools = Tools::builder().without_defaults().build()?;
-    let openai = OpenAi::new(api_key)?;
     let agent_build_started = Instant::now();
     let (agent, mut root_events) = Nanocodex::builder(openai)
         .session_id(lineage)
@@ -397,6 +407,7 @@ fn parse_args() -> Result<Args> {
     let mut workload =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../benchmarks/codex_parity_workload.json");
     let mut source_commit = String::from("unknown");
+    let mut auth_file = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -412,6 +423,12 @@ fn parse_args() -> Result<Args> {
                     .next()
                     .ok_or_else(|| eyre!("--source-commit needs a value"))?;
             }
+            "--auth-file" => {
+                auth_file = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| eyre!("--auth-file needs a path"))?,
+                ));
+            }
             _ => bail!("unknown argument {arg:?}"),
         }
     }
@@ -423,6 +440,12 @@ fn parse_args() -> Result<Args> {
             .canonicalize()
             .wrap_err("failed to canonicalize --workload")?,
         source_commit,
+        auth_file: auth_file
+            .map(|path| {
+                path.canonicalize()
+                    .wrap_err("failed to canonicalize --auth-file")
+            })
+            .transpose()?,
     })
 }
 
