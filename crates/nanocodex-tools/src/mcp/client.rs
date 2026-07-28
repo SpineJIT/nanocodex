@@ -1,4 +1,4 @@
-use std::{collections::HashMap, process::Stdio, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use http::{HeaderName, HeaderValue, header::USER_AGENT};
 use rmcp::{
@@ -6,8 +6,7 @@ use rmcp::{
     model::{CallToolRequestParams, CallToolResult, Tool},
     service::{RoleClient, RunningService},
     transport::{
-        StreamableHttpClientTransport, TokioChildProcess,
-        streamable_http_client::StreamableHttpClientTransportConfig,
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -15,6 +14,7 @@ use tracing::{Instrument, Span, info_span};
 
 use super::config::{McpServer, McpTransport, SecretSource};
 use super::oauth::{McpOAuthStore, OAuthMetadataCache, OAuthRuntime, transport_from_credentials};
+use super::stdio::McpStdioTransport;
 
 const MCP_USER_AGENT: &str = concat!("nanocodex-mcp-client/", env!("CARGO_PKG_VERSION"));
 
@@ -127,9 +127,7 @@ pub(crate) async fn connect(
             if let Some(cwd) = cwd {
                 command.current_dir(cwd);
             }
-            let (transport, stderr) = TokioChildProcess::builder(command)
-                .stderr(Stdio::piped())
-                .spawn()
+            let (transport, stderr) = McpStdioTransport::spawn(command)
                 .map_err(|error| format!("failed to launch stdio transport: {error}"))?;
             if let Some(stderr) = stderr {
                 drain_server_stderr(server_name.to_owned(), stderr);

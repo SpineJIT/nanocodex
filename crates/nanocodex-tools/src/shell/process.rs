@@ -255,7 +255,7 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
     status.code().unwrap_or(1)
 }
 
-pub(super) struct ProcessGroupGuard {
+pub(crate) struct ProcessGroupGuard {
     #[cfg(unix)]
     process_group: Option<Pid>,
     #[cfg(not(unix))]
@@ -263,7 +263,7 @@ pub(super) struct ProcessGroupGuard {
 }
 
 impl ProcessGroupGuard {
-    fn new(pid: u32) -> Self {
+    pub(crate) fn new(pid: u32) -> Self {
         #[cfg(unix)]
         let process_group = i32::try_from(pid).ok().map(Pid::from_raw);
         #[cfg(not(unix))]
@@ -324,10 +324,10 @@ impl ProcessGroupGuard {
         self.process_group = None;
     }
 
-    pub(super) fn terminate_and_disarm(&mut self) -> io::Result<()> {
-        let result = self.terminate();
+    pub(crate) fn terminate_and_disarm(&mut self) -> io::Result<()> {
+        self.terminate()?;
         self.disarm();
-        result
+        Ok(())
     }
 }
 

@@ -3,6 +3,7 @@ mod process;
 mod selection;
 mod tool;
 
+pub(crate) use process::ProcessGroupGuard;
 pub(crate) use tool::{ExecCommandHandler, WriteStdinHandler};
 
 use std::{

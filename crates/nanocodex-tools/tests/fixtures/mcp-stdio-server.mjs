@@ -1,10 +1,20 @@
 import readline from "node:readline";
+import { spawn } from "node:child_process";
 
 const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 const toolCount = Number.parseInt(
   process.env.NANOCODEX_MCP_FIXTURE_TOOL_COUNT ?? "1",
   10,
 );
+if (process.env.NANOCODEX_MCP_DESCENDANT_MARKER) {
+  spawn(process.execPath, [
+    "-e",
+    "setTimeout(() => require('node:fs').writeFileSync(process.env.NANOCODEX_MCP_DESCENDANT_MARKER, 'survived'), 750)",
+  ], {
+    env: process.env,
+    stdio: "ignore",
+  });
+}
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);

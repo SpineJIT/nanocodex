@@ -4,6 +4,7 @@ mod catalog;
 mod client;
 mod config;
 mod oauth;
+mod stdio;
 
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -887,6 +888,49 @@ mod tests {
             execution.output,
             ToolOutputBody::Text(output) if output.contains("fixture:hello")
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_mcp_terminates_stdio_descendants() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "nanocodex-mcp-descendant-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let marker = directory.join("survived");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mcp-stdio-server.mjs");
+        let mcp = Mcp::builder()
+            .server(
+                "fixture",
+                McpServer::stdio("node")
+                    .arg(fixture.to_string_lossy())
+                    .env("NANOCODEX_MCP_DESCENDANT_MARKER", marker.to_string_lossy()),
+            )
+            .build()
+            .unwrap();
+        mcp.start();
+        let search = mcp
+            .search
+            .execute(
+                ToolInput::Function(to_raw_value(&json!({ "query": "echo" })).unwrap()),
+                test_context("drop-session", "drop-call"),
+            )
+            .await
+            .unwrap();
+        assert!(search.success);
+
+        drop(mcp);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let escaped = marker.exists();
+        std::fs::remove_dir_all(directory).unwrap();
+
+        assert!(!escaped, "dropping MCP left a stdio descendant running");
     }
 
     #[tokio::test]
