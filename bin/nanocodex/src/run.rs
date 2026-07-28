@@ -1,7 +1,7 @@
-use std::io;
-
 use clap::{Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, eyre};
+use nanocodex::AgentEvents;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::config::AgentArgs;
 
@@ -21,12 +21,13 @@ impl Run {
         let configured = config.build().await?;
         let handle = configured.handle;
         let mut events = configured.events;
+        let mut stdout = tokio::io::stdout();
         let run_result: Result<()> = async {
             for _ in 0..self.repeat {
                 let turn = handle.prompt(self.prompt.clone()).await?;
                 let control = turn.control();
                 let completion = async {
-                    events.write_turn_jsonl(io::stdout()).await?;
+                    write_turn_jsonl(&mut events, &mut stdout).await?;
                     turn.result().await?;
                     Ok::<(), eyre::Report>(())
                 };
@@ -35,7 +36,10 @@ impl Run {
                     result = &mut completion => result?,
                     signal = tokio::signal::ctrl_c() => {
                         signal?;
-                        control.cancel().await?;
+                        // The driver may have completed while JSONL was still
+                        // backpressured. A late cancellation rejection must not
+                        // discard its already-produced terminal event.
+                        let _ = control.cancel().await;
                         let _ = completion.await;
                         return Err(eyre!("interrupted"));
                     }
@@ -60,4 +64,23 @@ impl Run {
         agent_shutdown?;
         shutdown_result
     }
+}
+
+async fn write_turn_jsonl(
+    events: &mut AgentEvents,
+    output: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
+    while let Some(event) = events.recv().await {
+        let terminal = event.kind.is_terminal();
+        let mut record = serde_json::to_vec(&event)?;
+        record.push(b'\n');
+        output.write_all(&record).await?;
+        output.flush().await?;
+        if terminal {
+            return Ok(());
+        }
+    }
+    Err(eyre!(
+        "agent event stream closed before the turn emitted a terminal event"
+    ))
 }

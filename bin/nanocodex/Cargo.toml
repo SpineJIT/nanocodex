@@ -63,7 +63,7 @@ shlex.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tempo-alloy = { workspace = true, optional = true }
 tracing.workspace = true
 unicode-segmentation.workspace = true
