@@ -78,8 +78,9 @@ Callers can explicitly select
 combinations. The builder rejects `store: true` with ChatGPT subscription
 authentication and incremental HTTPS history with `store: false`.
 
-The native CLI/TUI fixes the same policy at startup with
-`--responses-transport`, `--responses-history`, and `--store-responses`.
+The native CLI/TUI fixes transport and storage policy at startup with
+`--responses-transport` and `--store-responses`; history replay policy follows
+that supported combination automatically.
 
 ## Measurements
 

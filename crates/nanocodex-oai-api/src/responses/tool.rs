@@ -30,6 +30,15 @@ pub enum ToolDefinition {
         /// Free-form input grammar.
         format: CustomToolFormat,
     },
+    /// Provider-native deferred-tool search executed by the client.
+    ToolSearch {
+        /// Execution owner. Client-side handlers use `client`.
+        execution: Box<str>,
+        /// Concrete guidance for when and how to search deferred tools.
+        description: Box<str>,
+        /// JSON Schema accepted as search arguments.
+        parameters: JsonSchema,
+    },
 }
 
 impl ToolDefinition {
@@ -84,9 +93,47 @@ impl ToolDefinition {
         }
     }
 
+    /// Creates a provider-native deferred-tool search definition.
+    ///
+    /// ```
+    /// use nanocodex_oai_api::{
+    ///     responses::JsonSchema,
+    ///     tools::ToolDefinition,
+    /// };
+    /// use serde_json::json;
+    ///
+    /// let definition = ToolDefinition::tool_search(
+    ///     "client",
+    ///     "Search the application's deferred calendar tools.",
+    ///     JsonSchema::from(json!({
+    ///         "type": "object",
+    ///         "properties": {
+    ///             "query": { "type": "string" },
+    ///             "limit": { "type": "number" }
+    ///         },
+    ///         "required": ["query"],
+    ///         "additionalProperties": false
+    ///     })),
+    /// );
+    ///
+    /// assert_eq!(definition.name(), "tool_search");
+    /// ```
+    #[must_use]
+    pub fn tool_search(
+        execution: impl Into<Box<str>>,
+        description: impl Into<Box<str>>,
+        parameters: impl Into<JsonSchema>,
+    ) -> Self {
+        Self::ToolSearch {
+            execution: execution.into(),
+            description: description.into(),
+            parameters: parameters.into(),
+        }
+    }
+
     /// Adds an output schema to a function definition.
     ///
-    /// Custom tool definitions are returned unchanged.
+    /// Custom and provider-native tool definitions are returned unchanged.
     #[must_use]
     pub fn with_output_schema(mut self, output_schema: impl Into<JsonSchema>) -> Self {
         if let Self::Function {
@@ -104,6 +151,7 @@ impl ToolDefinition {
     pub fn name(&self) -> &str {
         match self {
             Self::Function { name, .. } | Self::Custom { name, .. } => name,
+            Self::ToolSearch { .. } => "tool_search",
         }
     }
 
@@ -112,14 +160,17 @@ impl ToolDefinition {
     pub fn description(&self) -> &str {
         match self {
             Self::Function { description, .. } | Self::Custom { description, .. } => description,
+            Self::ToolSearch { description, .. } => description,
         }
     }
 
-    /// Returns function parameters, or `None` for a custom tool.
+    /// Returns function or tool-search parameters, or `None` for a custom tool.
     #[must_use]
     pub const fn parameters(&self) -> Option<&JsonSchema> {
         match self {
-            Self::Function { parameters, .. } => Some(parameters),
+            Self::Function { parameters, .. } | Self::ToolSearch { parameters, .. } => {
+                Some(parameters)
+            }
             Self::Custom { .. } => None,
         }
     }
@@ -129,7 +180,7 @@ impl ToolDefinition {
     pub const fn output_schema(&self) -> Option<&JsonSchema> {
         match self {
             Self::Function { output_schema, .. } => output_schema.as_ref(),
-            Self::Custom { .. } => None,
+            Self::Custom { .. } | Self::ToolSearch { .. } => None,
         }
     }
 }
@@ -193,5 +244,64 @@ impl JsonValue {
 impl From<Value> for JsonValue {
     fn from(value: Value) -> Self {
         Self(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{JsonSchema, ToolDefinition};
+
+    #[test]
+    fn tool_search_serializes_the_provider_native_shape() {
+        let definition = ToolDefinition::tool_search(
+            "client",
+            "Search caller-configured deferred tools.",
+            JsonSchema::from(json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query for deferred tools."
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of tools to return."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            })),
+        );
+
+        assert_eq!(definition.name(), "tool_search");
+        assert_eq!(
+            definition.description(),
+            "Search caller-configured deferred tools."
+        );
+        assert_eq!(
+            serde_json::to_value(definition).unwrap(),
+            json!({
+                "type": "tool_search",
+                "execution": "client",
+                "description": "Search caller-configured deferred tools.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query for deferred tools."
+                        },
+                        "limit": {
+                            "type": "number",
+                            "description": "Maximum number of tools to return."
+                        }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }
+            })
+        );
     }
 }

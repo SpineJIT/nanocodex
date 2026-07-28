@@ -1,3 +1,4 @@
+pub(crate) mod context;
 mod input;
 pub(crate) mod run;
 mod telemetry;

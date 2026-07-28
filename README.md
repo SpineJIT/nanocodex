@@ -11,7 +11,7 @@
 
 **[Thesis](#thesis)** · **[Agent API](#the-agent-api)** ·
 **[Components](#components)** · **[Performance](#performance-is-a-contract)** ·
-**[Refactor](REFACTOR.md)**
+**[Plan](PLAN.md)**
 
 [ci]: https://github.com/gakonst/nanocodex/actions/workflows/ci.yml
 [crates]: https://crates.io/crates/nanocodex
@@ -33,8 +33,8 @@ must also have a coherent API when used on its own. The top-level `nanocodex`
 crate is an intentionally thin, Alloy-style facade with a small prelude.
 
 > The repository is being reorganized around this API in a stack of reviewable
-> changes. [`REFACTOR.md`](REFACTOR.md) records the exact decisions, migration
-> order, and acceptance gates.
+> changes. [`PLAN.md`](PLAN.md) is the active execution plan;
+> [`REFACTOR.md`](REFACTOR.md) retains the design record that led to it.
 
 ## Thesis
 

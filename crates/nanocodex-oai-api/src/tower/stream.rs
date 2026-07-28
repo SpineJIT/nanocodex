@@ -101,7 +101,7 @@ pub struct CodeCall {
     pub name: String,
     /// Optional tool namespace.
     pub namespace: Option<String>,
-    /// Complete function arguments or custom-tool input.
+    /// Complete function/search arguments or custom-tool input.
     pub input: String,
     /// Wire-level call representation.
     pub kind: CodeCallKind,
@@ -114,6 +114,8 @@ pub enum CodeCallKind {
     Custom,
     /// Function call with JSON arguments.
     Function,
+    /// Provider-native deferred-tool search with JSON arguments.
+    ToolSearch,
 }
 
 #[derive(Serialize)]
@@ -579,6 +581,20 @@ fn code_calls(items: &[ResponseItem]) -> Vec<CodeCall> {
                     kind: CodeCallKind::Function,
                 });
             }
+            ResponseItem::ToolSearchCall {
+                call_id: Some(call_id),
+                execution,
+                arguments,
+                ..
+            } if execution.as_ref() == "client" => {
+                calls.push(CodeCall {
+                    call_id: call_id.to_string(),
+                    name: "tool_search".to_owned(),
+                    namespace: None,
+                    input: arguments.as_value().to_string(),
+                    kind: CodeCallKind::ToolSearch,
+                });
+            }
             _ => {}
         }
     }
@@ -608,9 +624,10 @@ fn output_text(content: &[ContentItem]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use web_time::Instant;
 
-    use super::StreamTiming;
+    use super::{CodeCallKind, ResponseItem, StreamTiming, code_calls};
 
     #[test]
     fn display_delta_cadence_records_gaps_and_stalls() {
@@ -627,5 +644,38 @@ mod tests {
         assert_eq!(timing.pipeline.inter_delta_stall_50ms_count, 2);
         assert_eq!(timing.pipeline.inter_delta_stall_100ms_count, 1);
         assert_eq!(timing.pipeline.inter_delta_stall_250ms_count, 1);
+    }
+
+    #[test]
+    fn only_client_tool_search_calls_with_call_ids_are_callable() {
+        let items = serde_json::from_value::<Vec<ResponseItem>>(json!([
+            {
+                "type": "tool_search_call",
+                "call_id": "search-1",
+                "execution": "client",
+                "arguments": { "query": "calendar", "limit": 2 }
+            },
+            {
+                "type": "tool_search_call",
+                "call_id": "search-2",
+                "execution": "server",
+                "arguments": { "query": "ignored" }
+            },
+            {
+                "type": "tool_search_call",
+                "execution": "client",
+                "arguments": { "query": "missing call id" }
+            }
+        ]))
+        .unwrap();
+
+        let calls = code_calls(&items);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].call_id, "search-1");
+        assert_eq!(calls[0].name, "tool_search");
+        assert!(calls[0].namespace.is_none());
+        assert_eq!(calls[0].input, r#"{"limit":2,"query":"calendar"}"#);
+        assert!(matches!(calls[0].kind, CodeCallKind::ToolSearch));
     }
 }

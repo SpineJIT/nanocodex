@@ -235,6 +235,15 @@ impl WasmNanocodex {
     pub async fn set_fast_mode(&self, enabled: bool) -> Result<(), JsValue> {
         self.inner.set_fast_mode(enabled).await.map_err(js_error)
     }
+
+    /// Compacts retained history immediately without fabricating a user prompt.
+    ///
+    /// # Errors
+    ///
+    /// Throws when compaction or the agent driver fails.
+    pub async fn compact(&self) -> Result<(), JsValue> {
+        self.inner.compact().await.map_err(js_error)
+    }
 }
 
 impl WasmNanocodex {

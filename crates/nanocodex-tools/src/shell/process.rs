@@ -14,7 +14,7 @@ use nix::{
     unistd::Pid,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::task::JoinHandle;
 
 use super::selection::Shell;
@@ -54,34 +54,61 @@ pub(super) struct SpawnedProcess {
 }
 
 pub(super) enum ProcessChild {
-    Pipes(Child),
-    Pty(JoinHandle<io::Result<i32>>),
+    Pipes {
+        child: Child,
+        exit_code: Option<i32>,
+    },
+    Pty {
+        wait: Option<JoinHandle<io::Result<i32>>>,
+        exit_code: Option<i32>,
+    },
 }
 
 impl ProcessChild {
     pub(super) async fn wait(&mut self) -> io::Result<i32> {
         match self {
-            Self::Pipes(child) => child.wait().await.map(exit_code),
-            Self::Pty(wait) => wait
-                .await
-                .map_err(|error| io::Error::other(format!("PTY wait task failed: {error}")))?,
+            Self::Pipes {
+                child,
+                exit_code: cached,
+            } => {
+                if let Some(exit_code) = *cached {
+                    return Ok(exit_code);
+                }
+                let exit_code = child.wait().await.map(exit_code)?;
+                *cached = Some(exit_code);
+                Ok(exit_code)
+            }
+            Self::Pty {
+                wait,
+                exit_code: cached,
+            } => {
+                if let Some(exit_code) = *cached {
+                    return Ok(exit_code);
+                }
+                // Await by mutable reference so a yield timeout can cancel
+                // this wait without detaching and losing the sole join handle.
+                let result = wait
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("PTY wait result is unavailable"))?
+                    .await;
+                let exit_code = result.map_err(|error| {
+                    io::Error::other(format!("PTY wait task failed: {error}"))
+                })??;
+                *wait = None;
+                *cached = Some(exit_code);
+                Ok(exit_code)
+            }
         }
     }
 }
 
 pub(super) enum ProcessStdin {
-    Pipes(ChildStdin),
     Pty(Arc<StdMutex<Box<dyn Write + Send>>>),
 }
 
 impl ProcessStdin {
     pub(super) async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         match self {
-            Self::Pipes(stdin) => {
-                use tokio::io::AsyncWriteExt;
-                stdin.write_all(bytes).await?;
-                stdin.flush().await
-            }
             Self::Pty(writer) => {
                 let writer = Arc::clone(writer);
                 let bytes = bytes.to_vec();
@@ -135,7 +162,7 @@ fn spawn_pipes(
         .current_dir(workspace)
         .env_clear()
         .envs(environment.iter().cloned())
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -147,12 +174,15 @@ fn spawn_pipes(
         .id()
         .ok_or_else(|| io::Error::other("spawned shell without a process identifier"))?;
     Ok(SpawnedProcess {
-        stdin: child.stdin.take().map(ProcessStdin::Pipes),
+        stdin: None,
         output: ProcessOutput::Pipes {
             stdout: child.stdout.take(),
             stderr: child.stderr.take(),
         },
-        child: ProcessChild::Pipes(child),
+        child: ProcessChild::Pipes {
+            child,
+            exit_code: None,
+        },
         process_group: ProcessGroupGuard::new(pid),
     })
 }
@@ -196,7 +226,10 @@ fn spawn_pty(
     });
 
     Ok(SpawnedProcess {
-        child: ProcessChild::Pty(wait),
+        child: ProcessChild::Pty {
+            wait: Some(wait),
+            exit_code: None,
+        },
         stdin: Some(ProcessStdin::Pty(Arc::new(StdMutex::new(writer)))),
         output: ProcessOutput::Pty(reader),
         process_group: ProcessGroupGuard::new(pid),

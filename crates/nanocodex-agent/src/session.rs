@@ -7,7 +7,10 @@ use nanocodex_oai_api::{
 
 pub use nanocodex_oai_api::session::SessionId;
 
-use crate::{NanocodexError, Result, model::run::ModelCheckpoint};
+use crate::{
+    NanocodexError, Result,
+    model::{context::ContextBaseline, run::ModelCheckpoint},
+};
 
 const SESSION_SNAPSHOT_VERSION: u32 = 1;
 
@@ -41,6 +44,11 @@ impl CommittedSession {
         self.model.history_revision()
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) const fn context_baseline(&self) -> &ContextBaseline {
+        self.model.context_baseline()
+    }
+
     pub(crate) fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             version: SESSION_SNAPSHOT_VERSION,
@@ -52,6 +60,7 @@ impl CommittedSession {
             request_prefix: Some(self.model.request_prefix().to_vec()),
             canonical_context: self.model.canonical_context().clone(),
             history: self.model.snapshot_history(),
+            context_snapshot: Some(self.model.context_baseline().clone()),
         }
     }
 }
@@ -77,6 +86,8 @@ pub struct SessionSnapshot {
     request_prefix: Option<Vec<ResponseItem>>,
     canonical_context: ResponseItem,
     history: Vec<ResponseItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_snapshot: Option<ContextBaseline>,
 }
 
 impl fmt::Debug for SessionSnapshot {
@@ -97,6 +108,7 @@ impl SessionSnapshot {
         workspace: String,
         base_instructions: Option<String>,
         history: Vec<ResponseItem>,
+        context_snapshot: Option<ContextBaseline>,
     ) -> Result<Self> {
         let canonical_context = history
             .iter()
@@ -117,6 +129,7 @@ impl SessionSnapshot {
             request_prefix: None,
             canonical_context,
             history,
+            context_snapshot,
         })
     }
 
@@ -191,6 +204,7 @@ impl SessionSnapshot {
                     self.canonical_context.clone(),
                     self.history.clone(),
                     None,
+                    self.context_snapshot.clone(),
                 )
             })
             .transpose()?;
@@ -201,6 +215,7 @@ impl SessionSnapshot {
             base_instructions: self.base_instructions,
             canonical_context: self.canonical_context,
             history: self.history,
+            context_baseline: self.context_snapshot,
             checkpoint,
         })
     }
@@ -213,5 +228,6 @@ pub(crate) struct SessionResume {
     pub(crate) base_instructions: Option<String>,
     pub(crate) canonical_context: ResponseItem,
     pub(crate) history: Vec<ResponseItem>,
+    pub(crate) context_baseline: Option<ContextBaseline>,
     pub(crate) checkpoint: Option<ModelCheckpoint>,
 }

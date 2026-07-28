@@ -23,13 +23,15 @@ pub use error::{ResponsesError, RetryAdvice};
 pub use telemetry::TRANSPORT;
 pub use wire::EncodedRequest;
 
-/// Responses transport selected once when a managed session is built.
+/// Initial Responses transport policy for a managed session.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ResponsesTransport {
-    /// Persistent Responses WebSocket transport.
+    /// Prefer a persistent Responses WebSocket. On native targets, the
+    /// standard stack falls back one-way to HTTPS after exhausting the
+    /// WebSocket retry budget.
     #[default]
     WebSocket,
-    /// HTTPS request with a server-sent event response body.
+    /// Use HTTPS requests with server-sent event response bodies exclusively.
     Https,
 }
 

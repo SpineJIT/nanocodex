@@ -186,6 +186,24 @@ impl ManagedSessionState {
         self.context.prompt_items()
     }
 
+    /// Returns request-ready history and whether it differs from retained
+    /// authoritative history because incomplete tool calls were repaired.
+    ///
+    /// Higher orchestration layers use the flag to force a full replay and
+    /// adopt the repaired baseline only after provider completion.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn prompt_history_with_repair(&self) -> (ResponseHistory, bool) {
+        self.context.prompt_items_with_repair()
+    }
+
+    /// Replaces authoritative history with a successfully replayed repaired
+    /// prompt baseline.
+    #[doc(hidden)]
+    pub fn adopt_prompt_history(&mut self, history: ResponseHistory) {
+        self.context.adopt_prompt_items(history);
+    }
+
     /// Appends client- or provider-authored typed items to the active tail.
     ///
     /// Unsupported non-API items are ignored and bounded tool-output policy is

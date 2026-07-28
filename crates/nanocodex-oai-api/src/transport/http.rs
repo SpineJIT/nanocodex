@@ -13,6 +13,7 @@ const EVENT_IDLE_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_mins(5)
 };
 const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
+const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 
 #[derive(Clone)]
 pub(crate) struct ResponsesHttp {
@@ -27,6 +28,7 @@ pub(crate) struct ResponsesHttpStream {
 
 pub(crate) struct HttpMetadata {
     pub(crate) reasoning_included: bool,
+    pub(crate) turn_state: Option<String>,
 }
 
 impl ResponsesHttp {
@@ -39,6 +41,7 @@ impl ResponsesHttp {
         api_base_url: &str,
         auth: &OpenAiAuthSnapshot,
         session_id: &str,
+        turn_state: Option<&str>,
         request: &EncodedRequest,
     ) -> Result<(ResponsesHttpStream, HttpMetadata), ResponsesError> {
         let endpoint = format!("{}/responses", api_base_url.trim_end_matches('/'));
@@ -63,6 +66,11 @@ impl ResponsesHttp {
         if auth.is_fedramp() {
             builder = builder.header("X-OpenAI-Fedramp", "true");
         }
+        if let Some(turn_state) =
+            turn_state.and_then(|value| header::HeaderValue::from_bytes(value.as_bytes()).ok())
+        {
+            builder = builder.header(TURN_STATE_HEADER, turn_state);
+        }
         let response = builder.send().await.map_err(map_http_error)?;
         let status = response.status();
         if !status.is_success() {
@@ -76,6 +84,11 @@ impl ResponsesHttp {
         }
         let metadata = HttpMetadata {
             reasoning_included: response.headers().contains_key("x-reasoning-included"),
+            turn_state: response
+                .headers()
+                .get(TURN_STATE_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
         };
         Ok((
             ResponsesHttpStream {

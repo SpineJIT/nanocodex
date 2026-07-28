@@ -101,6 +101,14 @@ impl Nanocodex {
             .map_err(runtime_error)
     }
 
+    /// Compact retained history immediately without fabricating a user prompt.
+    fn compact(&self, py: Python<'_>) -> PyResult<()> {
+        let runtime = Arc::clone(&self.runtime);
+        let agent = self.agent.clone();
+        py.detach(move || runtime.block_on(agent.compact()))
+            .map_err(runtime_error)
+    }
+
     /// Start a clean sibling agent with the same private configuration.
     ///
     /// The sibling does not inherit conversation history.

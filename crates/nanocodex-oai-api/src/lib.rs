@@ -16,7 +16,7 @@ mod openai;
 pub mod pricing;
 /// Complete typed request, event, and item model for the Responses protocol.
 pub mod responses;
-/// Managed session identities, inputs, checkpoints, and compaction results.
+/// Managed session identities, inputs, and compaction results.
 pub mod session;
 /// Tool contracts shared by agent loops and concrete tool runtimes.
 pub mod tools;
@@ -25,15 +25,17 @@ pub mod tower;
 /// Responses transport policy, errors, and connection statistics.
 pub mod transport;
 
-use std::{fmt, path::PathBuf, str::FromStr, sync::Arc};
+use std::{fmt, path::PathBuf, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
 pub(crate) use auth::{OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, OpenAiAuthSnapshot};
+pub(crate) use events::stream::EventSink;
 pub(crate) use events::{
-    AgentEventData, AgentEventKind, AssistantEvent, ContextEvent, EventError, EventSink,
-    ModelEvent, ReasoningEvent, RunEvent, ToolEvent, TransportEvent, monotonic_now_ns,
+    AgentEventData, AgentEventKind, AssistantEvent, ContextEvent, EventError, ModelEvent,
+    ReasoningEvent, RunEvent, ToolEvent, TransportEvent, monotonic_now_ns,
 };
+pub(crate) use openai::ModelConfig;
 pub use openai::{OpenAi, OpenAiBuilder, OpenAiError};
 pub(crate) use pricing::{CostStatus, EstimatedUsdCost};
 pub use responses::ResponseEvent;
@@ -52,10 +54,10 @@ pub(crate) use tower::attempt::{
     ResponsesAttempt, ResponsesAttemptFactory, ResponsesOutput, ResponsesServiceResponse,
     TransportStats,
 };
+pub(crate) use tower::service::ResponsesService;
 pub(crate) use tower::stream::{CompactionOutput, GenerationOutput};
 pub(crate) use tower::{
-    DefaultResponsesService, ResponsesClient, ResponsesRetryPolicy, ResponsesService,
-    ResponsesServiceError,
+    DefaultResponsesService, ResponsesClient, ResponsesRetryPolicy, ResponsesServiceError,
 };
 #[doc(hidden)]
 pub type CompactionResult = CompactionOutput;
@@ -69,7 +71,28 @@ pub(crate) use tower::{attempt, middleware, service, service_error, stream};
 pub(crate) use transport::{connector, http};
 pub(crate) use transport::{socket, telemetry};
 
-const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
+/// Internal bridge for the higher-level `nanocodex-agent` crate.
+///
+/// This namespace is not a supported caller API. It keeps mutable model
+/// configuration, event emission authority, and attempt construction out of
+/// the normal rustdoc surface while allowing the separately versioned agent
+/// crate to compose this crate without duplicating those mechanics.
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::{
+        events::stream::EventSink,
+        openai::{CallerServiceFactory, LayeredServiceFactory, MakeResponsesService, ModelConfig},
+        tower::attempt::ResponsesAttemptFactory,
+    };
+
+    /// Decomposes a validated client recipe for the higher-level agent driver.
+    pub fn into_openai_parts<F>(openai: crate::OpenAi<F>) -> (ModelConfig, F)
+    where
+        F: MakeResponsesService,
+    {
+        openai.into_parts()
+    }
+}
 
 /// The single Responses model contract supported by this SDK.
 pub const MODEL: &str = "gpt-5.6-sol";
@@ -81,16 +104,33 @@ pub const CONTEXT_WINDOW_TOKENS: u64 = 272_000;
 ///
 /// Session policy such as the filesystem workspace belongs to the agent
 /// builder rather than an individual prompt.
-#[doc(hidden)]
-#[allow(missing_docs)]
+///
+/// # Examples
+///
+/// ```
+/// use nanocodex_oai_api::{ImageDetail, Prompt, UserInput};
+///
+/// let prompt = Prompt::content([
+///     UserInput::Text {
+///         text: "Describe the deployment diagram.".to_owned(),
+///     },
+///     UserInput::Image {
+///         image_url: "https://example.com/deployment.png".to_owned(),
+///         detail: Some(ImageDetail::High),
+///     },
+/// ]);
+///
+/// assert!(!prompt.instruction.is_empty());
+/// ```
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Prompt {
+    /// Ordered text and multimodal content for this turn.
     pub instruction: PromptInput,
 }
 
-#[allow(missing_docs)]
 impl Prompt {
+    /// Creates a text-only prompt.
     #[must_use]
     pub fn new(instruction: impl Into<String>) -> Self {
         Self {
@@ -98,7 +138,7 @@ impl Prompt {
         }
     }
 
-    /// Creates a prompt from ordered text, image, and audio input items.
+    /// Creates a prompt from ordered content items.
     #[must_use]
     pub fn content(input: impl IntoIterator<Item = UserInput>) -> Self {
         Self {
@@ -120,17 +160,17 @@ impl From<&str> for Prompt {
 }
 
 /// Ordered input for one agent turn.
-#[doc(hidden)]
-#[allow(missing_docs)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum PromptInput {
+    /// A text-only instruction.
     Text(String),
+    /// Ordered text and multimodal input items.
     Content(Vec<UserInput>),
 }
 
-#[allow(missing_docs)]
 impl PromptInput {
+    /// Returns the total UTF-8 byte length of text items.
     #[must_use]
     pub fn text_bytes(&self) -> usize {
         match self {
@@ -139,6 +179,7 @@ impl PromptInput {
         }
     }
 
+    /// Returns the total Unicode scalar-value count of text items.
     #[must_use]
     pub fn text_chars(&self) -> usize {
         match self {
@@ -147,6 +188,7 @@ impl PromptInput {
         }
     }
 
+    /// Returns whether this input contains no non-whitespace text or media.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         match self {
@@ -169,45 +211,58 @@ impl From<&str> for PromptInput {
 }
 
 /// One ordered user-supplied prompt item.
-#[doc(hidden)]
-#[allow(missing_docs)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UserInput {
+    /// Model-visible text.
     Text {
+        /// Text supplied by the user.
         text: String,
     },
+    /// An image supplied as a URL or data URL.
     Image {
+        /// Image URL visible to the model.
         image_url: String,
+        /// Optional image-detail policy.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<ImageDetail>,
     },
+    /// An image loaded from the local filesystem by a native runtime.
     LocalImage {
+        /// Path to the local image.
         path: PathBuf,
+        /// Optional image-detail policy.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<ImageDetail>,
     },
+    /// A reserved remote audio input.
     Audio {
+        /// Audio URL retained by the input contract.
         audio_url: String,
     },
+    /// A reserved local audio input.
     LocalAudio {
+        /// Path retained by the input contract.
         path: PathBuf,
     },
 }
 
-#[doc(hidden)]
-#[allow(missing_docs)]
+/// Image fidelity requested from the model.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageDetail {
+    /// Lets the provider select the detail level.
     Auto,
+    /// Requests lower-resolution image processing.
     Low,
+    /// Requests high-resolution image processing.
     High,
+    /// Requests original-resolution image processing.
     Original,
 }
 
-#[allow(missing_docs)]
 impl UserInput {
+    /// Returns the UTF-8 byte length when this is text, or zero for media.
     #[must_use]
     pub const fn text_bytes(&self) -> usize {
         match self {
@@ -219,6 +274,7 @@ impl UserInput {
         }
     }
 
+    /// Returns the Unicode scalar-value count when this is text, or zero for media.
     #[must_use]
     pub fn text_chars(&self) -> usize {
         match self {
@@ -230,6 +286,7 @@ impl UserInput {
         }
     }
 
+    /// Returns whether this item contains neither non-whitespace text nor media.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         match self {
@@ -238,74 +295,6 @@ impl UserInput {
             | Self::LocalImage { .. }
             | Self::Audio { .. }
             | Self::LocalAudio { .. } => false,
-        }
-    }
-}
-
-/// OpenAI-specific settings for the deliberately single-provider nanocodex.
-#[doc(hidden)]
-#[derive(Clone)]
-pub struct ModelConfig {
-    /// Authentication source resolved for each transport connection.
-    pub auth: OpenAiAuth,
-    /// Reasoning execution mode.
-    pub reasoning_mode: ReasoningMode,
-    /// Requested reasoning effort.
-    pub thinking: Thinking,
-    /// Whether requests use priority processing.
-    pub fast_mode: bool,
-    /// Selected streaming transport.
-    pub responses_transport: ResponsesTransport,
-    /// Selected healthy-call history strategy.
-    pub responses_history: ResponsesHistory,
-    /// Whether the provider may retain response checkpoints.
-    pub store_responses: bool,
-    /// Responses WebSocket endpoint.
-    pub websocket_url: String,
-    /// Base URL used for HTTPS Responses calls and related endpoints.
-    pub api_base_url: String,
-    /// Embedding-host transport used by the standard WebAssembly client.
-    #[cfg(any(target_family = "wasm", docsrs))]
-    pub host_transport: Option<Arc<dyn transport::host::HostTransport>>,
-    /// Immutable harness system prompt serialized before session instructions.
-    pub system_prompt: Arc<str>,
-}
-
-impl ModelConfig {
-    /// Returns the fixed orchestration mode sent to the supported model.
-    #[must_use]
-    pub const fn orchestration() -> &'static str {
-        "local_code_mode"
-    }
-
-    /// Returns the immutable harness system prompt.
-    #[must_use]
-    pub fn system_prompt(&self) -> &str {
-        &self.system_prompt
-    }
-
-    /// Returns the `OpenAI` tool-search endpoint derived from the base URL.
-    #[must_use]
-    pub fn search_endpoint(&self) -> String {
-        format!("{}/alpha/search", self.api_base_url.trim_end_matches('/'))
-    }
-}
-
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self {
-            auth: OpenAiAuth::api_key(String::new()),
-            reasoning_mode: ReasoningMode::default(),
-            thinking: Thinking::default(),
-            fast_mode: false,
-            responses_transport: ResponsesTransport::default(),
-            responses_history: ResponsesHistory::default(),
-            store_responses: false,
-            websocket_url: "wss://api.openai.com/v1/responses".to_owned(),
-            api_base_url: "https://api.openai.com/v1".to_owned(),
-            #[cfg(any(target_family = "wasm", docsrs))]
-            host_transport: None,
-            system_prompt: SYSTEM_PROMPT.into(),
         }
     }
 }

@@ -37,6 +37,9 @@ consume it from a normal Python thread.
 `agent.set_thinking("high")` changes the effort for subsequently accepted turns
 without replacing the session. `agent.set_fast_mode(True)` similarly enables
 priority service for subsequently accepted turns.
+`agent.compact()` immediately compacts retained history without fabricating a
+user prompt; the next `agent.prompt("Continue with the parser fix.")` receives
+the compacted session context automatically.
 
 Turn control matches the native SDK surface: `turn.steer(...)` injects input at
 the next safe model boundary, and `turn.cancel()` stops that exact unfinished

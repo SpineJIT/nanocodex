@@ -12,6 +12,47 @@ pub(super) struct AgentDriver<S> {
     pub(super) initial_model: Option<PreparedCheckpoint>,
     pub(super) origin: AgentOrigin,
     pub(super) durability: Durability,
+    pub(super) shutdown: DriverShutdown,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct DriverShutdown {
+    result: Arc<std::sync::Mutex<Option<oneshot::Sender<Result<()>>>>>,
+}
+
+impl DriverShutdown {
+    fn request(&self, result: oneshot::Sender<Result<()>>) -> bool {
+        let mut waiting = match self.result.lock() {
+            Ok(waiting) => waiting,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if waiting.is_some() {
+            return false;
+        }
+        *waiting = Some(result);
+        true
+    }
+
+    pub(super) fn requested(&self) -> bool {
+        let waiting = match self.result.lock() {
+            Ok(waiting) => waiting,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        waiting.is_some()
+    }
+
+    pub(super) fn complete(&self, outcome: Result<()>) {
+        let result = {
+            let mut waiting = match self.result.lock() {
+                Ok(waiting) => waiting,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            waiting.take()
+        };
+        if let Some(result) = result {
+            drop(result.send(outcome));
+        }
+    }
 }
 
 pub(super) struct BranchSpawner<S> {
@@ -57,7 +98,7 @@ where
     S::Error: Into<NanocodexError> + AgentSend + 'static,
     S::Future: AgentSend,
 {
-    /// Drives queued turns until every command handle is dropped.
+    /// Drives queued turns until explicit shutdown or every command handle is dropped.
     ///
     /// # Errors
     ///
@@ -102,11 +143,16 @@ where
             )
         };
         let mut turn_index = 0_u64;
+        let mut logical_turn_index = 0_u64;
         let mut latest_fork_checkpoint = inherited_checkpoint;
         let mut queued_turns = VecDeque::new();
+        let mut pending_compact = None;
         let mut commands_open = true;
         loop {
             let command = loop {
+                if let Some((parent, result)) = pending_compact.take() {
+                    break Command::Compact { parent, result };
+                }
                 if let Some(queued) = queued_turns.pop_front() {
                     match queued {
                         QueuedTurn::Pending {
@@ -187,6 +233,19 @@ where
                         commands_open = false;
                         continue;
                     };
+                    if let Command::Shutdown { result } = command {
+                        begin_shutdown(
+                            &mut self.commands,
+                            &mut queued_turns,
+                            default_thinking,
+                            default_fast_mode,
+                            &self.shutdown,
+                            result,
+                        )
+                        .await;
+                        commands_open = false;
+                        continue;
+                    }
                     break command;
                 }
                 model.shutdown().await;
@@ -212,6 +271,201 @@ where
                     drop(result.send(Ok(())));
                     continue;
                 }
+                if let Command::Compact { parent, result } = command {
+                    logical_turn_index = logical_turn_index.saturating_add(1);
+                    let span = agent_compact_span(
+                        parent.as_ref(),
+                        session_id.as_str(),
+                        self.spawner.lineage_id.as_ref(),
+                        &self.origin,
+                    );
+                    drop(parent);
+                    let compact_started = web_time::Instant::now();
+                    let durability_turn = self.durability.start_compaction();
+                    let mut compact_replaced = false;
+                    let (cancel_compaction, mut cancel_compaction_rx) = oneshot::channel();
+                    let mut cancel_compaction = Some(cancel_compaction);
+                    let mut execution = Box::pin(
+                        model
+                            .compact(
+                                self.workspace.clone(),
+                                default_thinking,
+                                default_fast_mode,
+                                logical_turn_index,
+                                &mut cancel_compaction_rx,
+                            )
+                            .instrument(span.clone()),
+                    );
+                    let completed = loop {
+                        if !commands_open {
+                            break execution.as_mut().await;
+                        }
+                        tokio::select! {
+                            biased;
+                            outcome = &mut execution => break outcome,
+                            command = self.commands.recv() => {
+                                match command {
+                                    Some(Command::Prompt {
+                                        key,
+                                        prompt,
+                                        thinking: _,
+                                        fast_mode: _,
+                                        parent,
+                                        events,
+                                        result,
+                                    }) => {
+                                        queued_turns.push_back(QueuedTurn::Pending {
+                                            key,
+                                            prompt,
+                                            thinking: default_thinking,
+                                            fast_mode: default_fast_mode,
+                                            parent,
+                                            events,
+                                            result,
+                                        });
+                                    }
+                                    Some(Command::Compact { parent, result }) => {
+                                        compact_replaced = true;
+                                        pending_compact = Some((parent, result));
+                                        if let Some(cancel) = cancel_compaction.take() {
+                                            let _ = cancel.send(());
+                                        }
+                                        break execution.as_mut().await;
+                                    }
+                                    Some(Command::Cancel { key, result }) => {
+                                        let outcome = if cancel_queued_turn(&mut queued_turns, key) {
+                                            Ok(())
+                                        } else {
+                                            Err(NanocodexError::TurnNotCancellable)
+                                        };
+                                        drop(result.send(outcome));
+                                    }
+                                    Some(Command::Steer { result, .. }) => {
+                                        drop(result.send(Err(NanocodexError::TurnNotSteerable)));
+                                    }
+                                    Some(command @ (Command::Fork { .. } | Command::Spawn { .. })) => {
+                                        handle_idle_command(
+                                            command,
+                                            latest_fork_checkpoint.as_ref(),
+                                            &self.spawner,
+                                            default_thinking,
+                                            default_fast_mode,
+                                            session_id.as_str(),
+                                            self.workspace.clone(),
+                                        );
+                                    }
+                                    Some(Command::SetThinking { thinking, result }) => {
+                                        default_thinking = thinking;
+                                        drop(result.send(Ok(())));
+                                    }
+                                    Some(Command::SetFastMode { enabled, result }) => {
+                                        default_fast_mode = enabled;
+                                        drop(result.send(Ok(())));
+                                    }
+                                    Some(Command::Shutdown { result }) => {
+                                        if let Some(cancel) = cancel_compaction.take() {
+                                            let _ = cancel.send(());
+                                        }
+                                        begin_shutdown(
+                                            &mut self.commands,
+                                            &mut queued_turns,
+                                            default_thinking,
+                                            default_fast_mode,
+                                            &self.shutdown,
+                                            result,
+                                        )
+                                        .await;
+                                        commands_open = false;
+                                        break execution.as_mut().await;
+                                    }
+                                    None => {
+                                        commands_open = false;
+                                        mark_all_queued_turns_cancelled(&mut queued_turns);
+                                        if let Some(cancel) = cancel_compaction.take() {
+                                            let _ = cancel.send(());
+                                        }
+                                        break execution.as_mut().await;
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    drop(execution);
+                    let outcome = match completed {
+                        Ok(ModelCompactOutcome::Completed(checkpoint)) => {
+                            let checkpoint = Arc::new(CommittedSession::new(
+                                Arc::clone(&self.spawner.lineage_id),
+                                checkpoint,
+                            ));
+                            // The installed in-memory boundary is authoritative.
+                            // Rollout writes follow the same retry-on-flush
+                            // contract as completed prompt turns and must not
+                            // roll back or hide the safe fork checkpoint.
+                            latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                            self.durability
+                                .persist_compaction(
+                                    &checkpoint,
+                                    durability_turn.completed_without_message(),
+                                )
+                                .await;
+                            Ok(())
+                        }
+                        Ok(ModelCompactOutcome::Cancelled(checkpoint)) => {
+                            let checkpoint = Arc::new(CommittedSession::new(
+                                Arc::clone(&self.spawner.lineage_id),
+                                checkpoint,
+                            ));
+                            latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                            let durability_turn = if compact_replaced {
+                                durability_turn.replaced()
+                            } else {
+                                durability_turn.interrupted()
+                            };
+                            self.durability
+                                .persist(&checkpoint, durability_turn)
+                                .instrument(span.clone())
+                                .await;
+                            model.replace_client(ResponsesClient::new((self
+                                .spawner
+                                .service_factory)(
+                            )));
+                            Err(NanocodexError::TurnCancelled)
+                        }
+                        Ok(ModelCompactOutcome::Failed { error, checkpoint }) => {
+                            let checkpoint = Arc::new(CommittedSession::new(
+                                Arc::clone(&self.spawner.lineage_id),
+                                checkpoint,
+                            ));
+                            latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                            self.durability
+                                .persist(&checkpoint, durability_turn.failed())
+                                .instrument(span.clone())
+                                .await;
+                            Err(error)
+                        }
+                        Err(error) => Err(error),
+                    };
+                    span.record(
+                        "status",
+                        if matches!(&outcome, Err(NanocodexError::TurnCancelled)) {
+                            "cancelled"
+                        } else if outcome.is_ok() {
+                            "completed"
+                        } else {
+                            "failed"
+                        },
+                    );
+                    span.record(
+                        "otel.status_code",
+                        if outcome.is_ok() { "OK" } else { "ERROR" },
+                    );
+                    span.record(
+                        "duration_ns",
+                        u64::try_from(compact_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    );
+                    drop(result.send(outcome));
+                    continue;
+                }
                 handle_idle_command(
                     command,
                     latest_fork_checkpoint.as_ref(),
@@ -226,6 +480,7 @@ where
             let thinking = thinking.unwrap_or(default_thinking);
             let fast_mode = fast_mode.unwrap_or(default_fast_mode);
             turn_index += 1;
+            logical_turn_index = logical_turn_index.saturating_add(1);
             let prompt_content = tracing::enabled!(
                 target: "nanocodex",
                 tracing::Level::INFO
@@ -270,6 +525,7 @@ where
                         self.workspace.clone(),
                         thinking,
                         fast_mode,
+                        logical_turn_index,
                         steer_rx,
                         cancel_rx,
                         fork_snapshots,
@@ -381,9 +637,31 @@ where
                                 default_fast_mode = enabled;
                                 drop(result.send(Ok(())));
                             }
+                            Some(Command::Compact { parent, result }) => {
+                                pending_compact = Some((parent, result));
+                                if let Some(cancel) = cancel.take() {
+                                    let _ = cancel.send(());
+                                }
+                                break execution.as_mut().await;
+                            }
+                            Some(Command::Shutdown { result }) => {
+                                if let Some(cancel) = cancel.take() {
+                                    let _ = cancel.send(());
+                                }
+                                begin_shutdown(
+                                    &mut self.commands,
+                                    &mut queued_turns,
+                                    default_thinking,
+                                    default_fast_mode,
+                                    &self.shutdown,
+                                    result,
+                                )
+                                .await;
+                                commands_open = false;
+                            }
                             None => {
                                 commands_open = false;
-                                queued_turns.clear();
+                                mark_all_queued_turns_cancelled(&mut queued_turns);
                                 if let Some(cancel) = cancel.take() {
                                     let _ = cancel.send(());
                                 }
@@ -431,22 +709,21 @@ where
                         .instrument(turn_span.clone())
                         .await;
                     latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
-                    let prepared = prepare_checkpoint(
-                        checkpoint.model().clone(),
-                        &self.spawner.config,
-                        &self.tools,
-                        self.spawner.context_source.clone(),
-                    );
-                    model = ModelRun::from_checkpoint(
-                        self.events.clone(),
-                        Arc::clone(&self.spawner.config),
-                        ResponsesClient::new((self.spawner.service_factory)()),
-                        Arc::clone(&self.transport_stats),
-                        self.tools.clone(),
-                        prompt_cache.clone(),
-                        prepared,
-                    );
+                    model.replace_client(ResponsesClient::new((self.spawner.service_factory)()));
                     (Err(NanocodexError::TurnCancelled), true)
+                }
+                Ok(ModelTurnOutcome::Failed { error, checkpoint }) => {
+                    let checkpoint = Arc::new(CommittedSession::new(
+                        Arc::clone(&self.spawner.lineage_id),
+                        checkpoint,
+                    ));
+                    let durability_turn = durability_turn.failed();
+                    self.durability
+                        .persist(&checkpoint, durability_turn)
+                        .instrument(turn_span.clone())
+                        .await;
+                    latest_fork_checkpoint = Some(checkpoint);
+                    (Err(error), false)
                 }
                 Err(error) => (Err(error), false),
             };
@@ -475,6 +752,29 @@ where
             }
         }
     }
+}
+
+fn agent_compact_span(
+    parent: Option<&tracing::Span>,
+    session_id: &str,
+    lineage_id: &str,
+    origin: &AgentOrigin,
+) -> tracing::Span {
+    let parent_id = parent.and_then(tracing::Span::id);
+    info_span!(
+        target: "nanocodex",
+        parent: parent_id,
+        "agent.compact",
+        otel.kind = "internal",
+        otel.status_code = tracing::field::Empty,
+        status = tracing::field::Empty,
+        duration_ns = tracing::field::Empty,
+        session.id = session_id,
+        session.lineage_id = lineage_id,
+        parent.session.id = tracing::field::Empty,
+        agent.origin = origin.kind,
+        agent.depth = origin.depth,
+    )
 }
 
 fn agent_turn_span(
@@ -565,6 +865,78 @@ fn cancel_queued_turn(queued_turns: &mut VecDeque<QueuedTurn>, target: TurnKey) 
     true
 }
 
+fn mark_all_queued_turns_cancelled(queued_turns: &mut VecDeque<QueuedTurn>) {
+    let accepted = std::mem::take(queued_turns);
+    queued_turns.extend(accepted.into_iter().map(|queued| match queued {
+        QueuedTurn::Pending {
+            prompt,
+            thinking,
+            fast_mode,
+            parent,
+            events,
+            result,
+            ..
+        } => QueuedTurn::Cancelled {
+            prompt,
+            thinking,
+            fast_mode,
+            parent,
+            events,
+            result,
+        },
+        queued @ QueuedTurn::Cancelled { .. } => queued,
+    }));
+}
+
+async fn begin_shutdown(
+    commands: &mut mpsc::Receiver<Command>,
+    queued_turns: &mut VecDeque<QueuedTurn>,
+    default_thinking: Thinking,
+    default_fast_mode: bool,
+    shutdown: &DriverShutdown,
+    result: oneshot::Sender<Result<()>>,
+) {
+    if !shutdown.request(result) {
+        return;
+    }
+    commands.close();
+    while let Some(command) = commands.recv().await {
+        match command {
+            Command::Prompt {
+                key,
+                prompt,
+                thinking,
+                fast_mode,
+                parent,
+                events,
+                result,
+            } => {
+                queued_turns.push_back(QueuedTurn::Pending {
+                    key,
+                    prompt,
+                    thinking: thinking.unwrap_or(default_thinking),
+                    fast_mode: fast_mode.unwrap_or(default_fast_mode),
+                    parent,
+                    events,
+                    result,
+                });
+            }
+            Command::Fork { result, .. } | Command::Spawn { result } => {
+                drop(result.send(Err(NanocodexError::AgentStopped)));
+            }
+            Command::Steer { result, .. }
+            | Command::Cancel { result, .. }
+            | Command::SetThinking { result, .. }
+            | Command::SetFastMode { result, .. }
+            | Command::Compact { result, .. }
+            | Command::Shutdown { result } => {
+                drop(result.send(Err(NanocodexError::AgentStopped)));
+            }
+        }
+    }
+    mark_all_queued_turns_cancelled(queued_turns);
+}
+
 fn handle_idle_command<S>(
     command: Command,
     latest: Option<&Arc<CommittedSession>>,
@@ -600,6 +972,12 @@ fn handle_idle_command<S>(
         Command::SetThinking { result, .. } | Command::SetFastMode { result, .. } => {
             drop(result.send(Ok(())));
         }
+        Command::Shutdown { result } => {
+            drop(result.send(Err(NanocodexError::AgentStopped)));
+        }
+        Command::Compact { result, .. } => {
+            drop(result.send(Err(NanocodexError::AgentStopped)));
+        }
         Command::Prompt { .. } => {}
     }
 }
@@ -620,6 +998,7 @@ where
         let session_id = SessionId::new();
         let workspace = Some(Arc::<str>::from(checkpoint.model().workspace()));
         let mut spawner = self.clone();
+        spawner.context_source = spawner.context_config.build();
         let mut config = (*spawner.config).clone();
         config.thinking = thinking;
         config.fast_mode = fast_mode;

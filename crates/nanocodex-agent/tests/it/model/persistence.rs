@@ -1,5 +1,64 @@
 use super::*;
 
+#[derive(Clone)]
+struct FailFirstWarmup {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl tower::Service<nanocodex_oai_api::tower::ResponsesAttempt> for FailFirstWarmup {
+    type Response = nanocodex_oai_api::tower::ResponsesServiceResponse;
+    type Error = NanocodexError;
+    type Future = std::future::Ready<std::result::Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: nanocodex_oai_api::tower::ResponsesAttempt) -> Self::Future {
+        use std::sync::atomic::Ordering;
+
+        if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            return std::future::ready(Err(NanocodexError::InvalidRequest(
+                "fatal warmup boundary".to_owned(),
+            )));
+        }
+        assert!(matches!(
+            request.kind(),
+            nanocodex_oai_api::tower::ResponsesAttemptKind::Generation
+        ));
+        let replay = request
+            .input_items()
+            .map(|item| serde_json::to_string(item).expect("request item serializes"))
+            .collect::<String>();
+        assert!(replay.contains("accepted before warmup failure"));
+        assert!(replay.contains("prompt after warmup failure"));
+        std::future::ready(Ok(nanocodex_oai_api::tower::ResponsesServiceResponse::new(
+            nanocodex_oai_api::tower::ResponsesOutput::Generation(
+                nanocodex_oai_api::tower::GenerationOutput {
+                    id: "resp-recovered".to_owned(),
+                    status: "completed".to_owned(),
+                    end_turn: Some(true),
+                    final_message: Some("done".to_owned()),
+                    output_items: vec![nanocodex_oai_api::responses::ResponseItem::message(
+                        nanocodex_oai_api::responses::MessageRole::Assistant,
+                        [nanocodex_oai_api::responses::ContentItem::output_text(
+                            "done",
+                        )],
+                    )],
+                    code_calls: Vec::new(),
+                    usage: None,
+                    time_to_first_event_ns: 0,
+                    time_to_first_output_ns: None,
+                    pipeline_stats: nanocodex_oai_api::tower::ResponsePipelineStats::default(),
+                },
+            ),
+        )))
+    }
+}
+
 #[tokio::test]
 async fn missing_stored_checkpoint_replays_local_history_once() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -156,6 +215,11 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
     let request_prefix = snapshot_json["request_prefix"]
         .as_array()
         .ok_or_else(|| eyre!("snapshot request prefix was not an array"))?;
+    assert_eq!(snapshot_json["context_snapshot"]["kind"], "known");
+    assert_eq!(
+        snapshot_json["context_snapshot"]["snapshot"]["environment"]["cwd"],
+        workspace.canonicalize()?.to_string_lossy().as_ref()
+    );
     assert_eq!(request_prefix[0]["type"], "additional_tools");
     assert!(request_prefix[0].get("id").is_none());
     assert!(request_prefix[1].get("id").is_none());
@@ -166,10 +230,19 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
                 item.get("id").is_some_and(Value::is_string) || item["type"] == "compaction_trigger"
             }))
     );
-    let rollout_history = std::fs::read_to_string(&rollout_path)?
+    let rollout_lines = std::fs::read_to_string(&rollout_path)?
         .lines()
         .map(serde_json::from_str::<Value>)
-        .collect::<serde_json::Result<Vec<_>>>()?
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    let persisted_context = rollout_lines
+        .iter()
+        .find(|line| line["type"] == "world_state")
+        .ok_or_else(|| eyre!("rollout omitted its typed context baseline"))?;
+    assert_eq!(
+        persisted_context["payload"]["state"]["nanocodex_context"],
+        snapshot_json["context_snapshot"]
+    );
+    let rollout_history = rollout_lines
         .into_iter()
         .filter(|line| line["type"] == "response_item")
         .map(|line| line["payload"].clone())
@@ -190,6 +263,7 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
             if message.contains("instructions do not match")
     ));
     let snapshot: SessionSnapshot = serde_json::from_slice(&encoded)?;
+    agent.shutdown().await?;
     drop((agent, events, first));
 
     let mut unsupported: Value = serde_json::from_slice(&encoded)?;
@@ -281,6 +355,7 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
         .count();
     assert_eq!(session_meta_count, 1);
 
+    resumed.shutdown().await?;
     drop((resumed, resumed_events));
     timeout(std::time::Duration::from_secs(5), server)
         .await
@@ -352,5 +427,153 @@ async fn serialized_session_resumes_over_ephemeral_https() -> Result<()> {
         .await
         .map_err(|_| eyre!("mock HTTPS Responses server did not finish"))???;
     std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_accepted_prompt_is_durable_without_partial_assistant_output() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut original = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut original).await?);
+        send_warmup(&mut original, "resp-warmup").await?;
+        let failed = next_json(&mut original).await?;
+        assert!(failed.to_string().contains("failed durable prompt"));
+        send_json(
+            &mut original,
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "partial assistant must not survive"
+            }),
+        )
+        .await?;
+        send_json(
+            &mut original,
+            json!({
+                "type": "error",
+                "error": {
+                    "code": "invalid_request_error",
+                    "message": "terminal provider failure"
+                }
+            }),
+        )
+        .await?;
+
+        let (stream, _) = listener.accept().await?;
+        let mut resumed = accept_async(stream).await?;
+        let replay = next_json(&mut resumed).await?;
+        assert!(replay.get("previous_response_id").is_none());
+        let replay = replay.to_string();
+        assert!(replay.contains("failed durable prompt"));
+        assert!(replay.contains("prompt after cold resume"));
+        assert!(!replay.contains("partial assistant must not survive"));
+        send_final(&mut resumed, "resp-resumed").await
+    });
+
+    let workspace = temporary_workspace("failed-turn-durability")?;
+    let rollout_home = temporary_workspace("failed-turn-durability-rollout")?;
+    let openai = || {
+        OpenAi::builder("test-key")
+            .websocket_url(endpoint.clone())
+            .build()
+    };
+    let (agent, events) = Nanocodex::builder(openai()?)
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .session_id(test_session_id())
+        .rollout(RolloutConfig::new(&rollout_home))
+        .build()?;
+    let error = agent
+        .prompt("failed durable prompt")
+        .await?
+        .result()
+        .await
+        .expect_err("the provider failure must fail the accepted turn");
+    assert!(error.to_string().contains("terminal provider failure"));
+    agent.shutdown().await?;
+    drop((agent, events));
+
+    let durable = RolloutConfig::new(&rollout_home).load_session(TEST_SESSION_ID)?;
+    let (thread_id, snapshot, rollout) = durable.into_parts();
+    let (resumed, resumed_events) = Nanocodex::builder(openai()?)
+        .thinking(Thinking::Low)
+        .session_id(thread_id.parse()?)
+        .resume(snapshot)
+        .rollout(rollout)
+        .build()?;
+    assert_eq!(
+        resumed
+            .prompt("prompt after cold resume")
+            .await?
+            .result()
+            .await?
+            .final_message(),
+        "done"
+    );
+    resumed.shutdown().await?;
+    drop((resumed, resumed_events));
+
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    std::fs::remove_dir_all(rollout_home)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn accepted_prompt_survives_a_fatal_warmup_boundary() -> Result<()> {
+    let workspace = temporary_workspace("fatal-warmup-durability")?;
+    let rollout_home = temporary_workspace("fatal-warmup-durability-rollout")?;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let openai = || {
+        let calls = Arc::clone(&calls);
+        OpenAi::builder("test-key")
+            .service(move || FailFirstWarmup {
+                calls: Arc::clone(&calls),
+            })
+            .build()
+    };
+    let (agent, events) = Nanocodex::builder(openai()?)
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .session_id(test_session_id())
+        .rollout(RolloutConfig::new(&rollout_home))
+        .build()?;
+    let error = agent
+        .prompt("accepted before warmup failure")
+        .await?
+        .result()
+        .await
+        .expect_err("the fatal warmup boundary must fail the turn");
+    assert!(error.to_string().contains("fatal warmup boundary"));
+    agent.shutdown().await?;
+    drop((agent, events));
+
+    let durable = RolloutConfig::new(&rollout_home).load_session(TEST_SESSION_ID)?;
+    assert!(serde_json::to_string(durable.snapshot())?.contains("accepted before warmup failure"));
+    let (thread_id, snapshot, rollout) = durable.into_parts();
+    let (resumed, resumed_events) = Nanocodex::builder(openai()?)
+        .thinking(Thinking::Low)
+        .session_id(thread_id.parse()?)
+        .resume(snapshot)
+        .rollout(rollout)
+        .build()?;
+    assert_eq!(
+        resumed
+            .prompt("prompt after warmup failure")
+            .await?
+            .result()
+            .await?
+            .final_message(),
+        "done"
+    );
+    resumed.shutdown().await?;
+    drop((resumed, resumed_events));
+
+    std::fs::remove_dir_all(workspace)?;
+    std::fs::remove_dir_all(rollout_home)?;
     Ok(())
 }

@@ -1,9 +1,14 @@
 import {
+  compact as compactAgent,
   fork as forkAgent,
   setFastMode as setAgentFastMode,
   setThinking as setAgentThinking,
   spawn as spawnAgent,
 } from "../internal.mjs";
+
+export function compact(agent) {
+  return compactAgent(agent);
+}
 
 export function fork(agent, options = {}) {
   return forkAgent(agent, options);

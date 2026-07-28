@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use nanocodex_oai_api::{ModelConfig, Thinking, responses::Usage, transport::TransportStatsDelta};
+use nanocodex_oai_api::{
+    __private::ModelConfig, Thinking, responses::Usage, transport::TransportStatsDelta,
+};
 use serde::Serialize;
 use serde_json::value::RawValue;
 use web_time::Instant;

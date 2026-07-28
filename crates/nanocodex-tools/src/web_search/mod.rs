@@ -261,6 +261,10 @@ impl Tool for WebSearchHandler {
         ToolDefinition::function("web__run", DESCRIPTION, commands_schema())
     }
 
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
         let input = input.function_json()?;
         Ok(self.run(input.get(), context).await)

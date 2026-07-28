@@ -11,6 +11,7 @@ pub struct Nanocodex {
     pub(super) lineage_id: Arc<str>,
     pub(super) session_id: SessionId,
     pub(super) durability: Durability,
+    pub(super) shutdown: DriverShutdown,
 }
 
 impl Clone for Nanocodex {
@@ -22,6 +23,7 @@ impl Clone for Nanocodex {
             lineage_id: Arc::clone(&self.lineage_id),
             session_id: self.session_id,
             durability: self.durability.clone(),
+            shutdown: self.shutdown.clone(),
         }
     }
 }
@@ -73,7 +75,7 @@ impl Nanocodex {
     where
         F: MakeResponsesService,
     {
-        let (config, factory) = openai.into_parts();
+        let (config, factory) = into_openai_parts(openai);
         NanocodexBuilder {
             config,
             tools: ToolsConfiguration::Shared(Tools::default()),
@@ -104,6 +106,8 @@ impl Nanocodex {
     ///
     /// This is a no-op when rollout recording is disabled. CLI consumers call
     /// it at completed turn boundaries so persistence failures are user-visible.
+    /// Flushing does not stop the live writer; call [`Self::shutdown`] at an
+    /// explicit application or session boundary.
     ///
     /// # Errors
     ///
@@ -112,6 +116,46 @@ impl Nanocodex {
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     pub async fn flush_rollout(&self) -> Result<()> {
         self.durability.flush().await
+    }
+
+    /// Gracefully stops this agent and waits for all owned resources to close.
+    ///
+    /// Shutdown globally invalidates this handle and every clone. It cancels an
+    /// active turn, terminalizes all other accepted turns in FIFO order, waits
+    /// for model and tool cleanup, and flushes and closes the rollout writer. A
+    /// returned `Ok(())` therefore establishes a durable boundary suitable for
+    /// an immediate same-process rollout resume.
+    ///
+    /// Dropping the final handle retains the existing implicit cancellation
+    /// behavior, but offers no future that can join resource cleanup. Use this
+    /// method at an explicit application or session boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the cleanup error, or [`NanocodexError::AgentStopped`] if the
+    /// driver had already stopped or another clone had begun shutdown before
+    /// accepting this request.
+    pub async fn shutdown(&self) -> Result<()> {
+        let (result, receiver) = oneshot::channel();
+        if self
+            .commands
+            .send(Command::Shutdown { result })
+            .await
+            .is_err()
+        {
+            if self.shutdown.requested() {
+                return Err(NanocodexError::AgentStopped);
+            }
+            self.durability.shutdown().await?;
+            return Err(NanocodexError::AgentStopped);
+        }
+        match receiver.await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.durability.shutdown().await?;
+                Err(NanocodexError::AgentStopped)
+            }
+        }
     }
 
     /// Accepts the agent's prompt and immediately returns its turn handle.
@@ -187,6 +231,43 @@ impl Nanocodex {
             result,
         })
         .await
+    }
+
+    /// Immediately compacts this agent's retained conversation.
+    ///
+    /// Compaction preserves the agent's cache identity, tools, transport, and
+    /// cached project instructions. The next prompt receives a full developer,
+    /// `AGENTS.md`, and environment-context reinjection before its user input.
+    /// If a turn is active, that turn is cancelled and compaction runs before
+    /// prompts that were queued behind it.
+    ///
+    /// ```
+    /// # use nanocodex_agent::{Nanocodex, Result};
+    /// # async fn compact_after_a_turn(agent: &Nanocodex) -> Result<()> {
+    /// agent
+    ///     .prompt("Inspect the parser and explain the failing test.")
+    ///     .await?
+    ///     .result()
+    ///     .await?;
+    /// agent.compact().await?;
+    /// let result = agent
+    ///     .prompt("Now implement the smallest correct parser fix.")
+    ///     .await?
+    ///     .result()
+    ///     .await?;
+    /// assert!(!result.final_message().is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns a model or driver-stopped error. Rollout writes follow the same
+    /// retry-on-[`Self::flush_rollout`] contract as prompt turns.
+    pub async fn compact(&self) -> Result<()> {
+        let parent = tracing::Span::current();
+        let parent = (!parent.is_disabled()).then_some(parent);
+        request_command(&self.commands, |result| Command::Compact { parent, result }).await
     }
 
     /// Starts a clean sibling agent with the same private configuration,

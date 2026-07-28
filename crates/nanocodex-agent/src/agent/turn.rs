@@ -2,6 +2,10 @@ use super::*;
 
 /// Completion handle for an accepted turn.
 ///
+/// A turn is both a [`Future`] for its final typed result and a [`Stream`] of
+/// optional per-turn events. Result readiness is independent from consuming or
+/// closing that event stream.
+///
 /// Dropping this handle does not cancel the accepted turn. Use [`Self::cancel`]
 /// before dropping it when the work should stop.
 #[must_use = "a turn continues running when dropped; await result(), control it, or explicitly drop it"]
@@ -45,9 +49,10 @@ impl Turn {
 
     /// Waits for and returns the final typed turn result.
     ///
-    /// This is equivalent to awaiting the turn directly. Any events not
-    /// already consumed through its [`Stream`] implementation are drained
-    /// before the result is returned.
+    /// This is equivalent to awaiting the turn directly. It does not wait for
+    /// the per-turn event stream to be consumed or closed. Applications that
+    /// need every event should consume the independently returned
+    /// [`AgentEvents`] stream.
     ///
     /// # Errors
     ///
@@ -69,17 +74,9 @@ impl Future for Turn {
     type Output = Result<TurnResult>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        loop {
-            match Pin::new(&mut self.events).poll_next(context) {
-                Poll::Ready(Some(_)) => {}
-                Poll::Ready(None) => {
-                    return Pin::new(&mut self.result)
-                        .poll(context)
-                        .map(|result| result.map_err(|_| NanocodexError::TurnStopped)?);
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+        Pin::new(&mut self.result)
+            .poll(context)
+            .map(|result| result.map_err(|_| NanocodexError::TurnStopped)?)
     }
 }
 
@@ -210,6 +207,13 @@ pub(super) enum Command {
     },
     SetFastMode {
         enabled: bool,
+        result: oneshot::Sender<Result<()>>,
+    },
+    Compact {
+        parent: Option<tracing::Span>,
+        result: oneshot::Sender<Result<()>>,
+    },
+    Shutdown {
         result: oneshot::Sender<Result<()>>,
     },
 }

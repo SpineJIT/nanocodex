@@ -8,7 +8,7 @@ use std::{
 use crate::OpenAiAuthMode;
 use crate::{
     AgentEventKind, ModelConfig, OpenAiAuthSnapshot, ResponsesHistory, ResponsesTransport,
-    responses::{ResponseCreate, WarmupResponse, WarmupServerEvent},
+    responses::{CreatePolicy, ResponseCreate, WarmupResponse, WarmupServerEvent},
 };
 use ::tower::{Service, retry::Retry};
 use tokio::sync::Mutex;
@@ -33,6 +33,8 @@ use crate::{
 
 struct ConnectionState {
     socket: Option<ResponsesSocket>,
+    // The first sticky-routing token observed from either transport. It is
+    // replayed unchanged within one logical turn and cleared at its boundary.
     turn_state: Option<String>,
     generation: u32,
     next_purpose: ConnectionPurpose,
@@ -60,8 +62,17 @@ impl ConnectionState {
     }
 
     fn capture_turn_state(&mut self) {
-        if let Some(turn_state) = self.socket.as_ref().and_then(ResponsesSocket::turn_state) {
-            self.turn_state = Some(turn_state.to_owned());
+        let turn_state = self
+            .socket
+            .as_ref()
+            .and_then(ResponsesSocket::turn_state)
+            .map(str::to_owned);
+        self.observe_turn_state(turn_state.as_deref());
+    }
+
+    fn observe_turn_state(&mut self, turn_state: Option<&str>) {
+        if self.turn_state.is_none() {
+            self.turn_state = turn_state.map(str::to_owned);
         }
     }
 
@@ -187,7 +198,7 @@ pub struct ResponsesService {
 impl ResponsesService {
     /// Builds a stateful transport service with default retry limits.
     #[must_use]
-    pub fn new(config: Arc<ModelConfig>) -> Self {
+    pub(crate) fn new(config: Arc<ModelConfig>) -> Self {
         let platform = platform::ServicePlatform::new(&config);
         Self {
             config,
@@ -202,7 +213,10 @@ impl ResponsesService {
     #[cfg(not(target_family = "wasm"))]
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     #[must_use]
-    pub fn new_with_http_client(config: Arc<ModelConfig>, http_client: reqwest::Client) -> Self {
+    pub(crate) fn new_with_http_client(
+        config: Arc<ModelConfig>,
+        http_client: reqwest::Client,
+    ) -> Self {
         let platform = platform::ServicePlatform::with_http_client(&config, http_client);
         Self {
             config,
@@ -217,36 +231,17 @@ impl ResponsesService {
         self
     }
 
-    /// Builds the configured standard Responses service with retry policy.
-    #[must_use]
-    pub fn standard(config: Arc<ModelConfig>) -> DefaultResponsesService {
-        Self::standard_with_max_attempts(config, ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS)
-    }
-
     /// Builds the configured standard Responses service with a fixed total
     /// attempt limit.
     #[must_use]
-    pub fn standard_with_max_attempts(
+    pub(crate) fn standard_with_max_attempts(
         config: Arc<ModelConfig>,
         max_attempts: NonZeroU32,
     ) -> DefaultResponsesService {
-        let retry = ResponsesRetryPolicy::for_config(max_attempts, &config);
-        Retry::new(retry, Self::new(config).with_max_attempts(max_attempts))
-    }
-
-    /// Builds the standard retry stack with a caller-configured HTTPS client.
-    #[cfg(not(target_family = "wasm"))]
-    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
-    #[must_use]
-    pub fn standard_with_http_client(
-        config: Arc<ModelConfig>,
-        http_client: reqwest::Client,
-    ) -> DefaultResponsesService {
-        Self::standard_with_http_client_and_max_attempts(
-            config,
-            http_client,
-            ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS,
-        )
+        let service = Self::new(Arc::clone(&config)).with_max_attempts(max_attempts);
+        let retry = ResponsesRetryPolicy::for_config(max_attempts, &config)
+            .with_standard_transport_fallback(config.responses_transport);
+        Retry::new(retry, service)
     }
 
     /// Builds the standard retry stack with a caller-configured HTTPS client
@@ -254,22 +249,23 @@ impl ResponsesService {
     #[cfg(not(target_family = "wasm"))]
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     #[must_use]
-    pub fn standard_with_http_client_and_max_attempts(
+    pub(crate) fn standard_with_http_client_and_max_attempts(
         config: Arc<ModelConfig>,
         http_client: reqwest::Client,
         max_attempts: NonZeroU32,
     ) -> DefaultResponsesService {
-        let retry = ResponsesRetryPolicy::for_config(max_attempts, &config);
-        Retry::new(
-            retry,
-            Self::new_with_http_client(config, http_client).with_max_attempts(max_attempts),
-        )
+        let service = Self::new_with_http_client(Arc::clone(&config), http_client)
+            .with_max_attempts(max_attempts);
+        let retry = ResponsesRetryPolicy::for_config(max_attempts, &config)
+            .with_standard_transport_fallback(config.responses_transport);
+        Retry::new(retry, service)
     }
 
     async fn run(
         &self,
         connection: &mut ConnectionState,
         request: &ResponsesAttempt,
+        transport: ResponsesTransport,
     ) -> Result<ResponsesServiceResponse, ResponsesServiceError> {
         request
             .observer
@@ -289,16 +285,16 @@ impl ResponsesService {
                 connection_generation: connection.generation,
             },
         )?;
-        let result = if matches!(
-            self.config.responses_transport,
-            ResponsesTransport::WebSocket
-        ) {
+        let result = if matches!(transport, ResponsesTransport::WebSocket) {
             let mut guard = WebSocketAttemptGuard::new(connection, request, started_at);
-            let result = self.run_inner(&mut guard, request, started_at).await;
+            let result = self
+                .run_inner(&mut guard, request, started_at, transport)
+                .await;
             guard.complete();
             result
         } else {
-            self.run_inner(connection, request, started_at).await
+            self.run_inner(connection, request, started_at, transport)
+                .await
         };
         tracing::Span::current().record(
             "status",
@@ -345,12 +341,13 @@ impl ResponsesService {
         connection: &mut ConnectionState,
         request: &ResponsesAttempt,
         started_at: Instant,
+        transport: ResponsesTransport,
     ) -> Result<ResponsesServiceResponse, ResponsesServiceError> {
-        match self.config.responses_transport {
+        match transport {
             ResponsesTransport::WebSocket => {
                 self.run_websocket(connection, request, started_at).await
             }
-            ResponsesTransport::Https => https::run(self, request, started_at).await,
+            ResponsesTransport::Https => https::run(self, connection, request, started_at).await,
         }
     }
 
@@ -365,7 +362,7 @@ impl ResponsesService {
         }
         let generation = connection.generation;
         let encode_started_at = Instant::now();
-        let encoded = self.encode_request(connection, request)?;
+        let encoded = self.encode_request(connection, request, ResponsesTransport::WebSocket)?;
         let encode_duration_ns = elapsed_ns(encode_started_at);
         let request_bytes = encoded.raw().get().len();
         let span = tracing::Span::current();
@@ -458,6 +455,7 @@ impl ResponsesService {
         &self,
         connection: &ConnectionState,
         request: &ResponsesAttempt,
+        transport: ResponsesTransport,
     ) -> Result<EncodedRequest, ResponsesServiceError> {
         let encoded = match request.kind {
             ResponsesAttemptKind::Warmup => EncodedRequest::new(&ResponseCreate::warmup(
@@ -468,10 +466,9 @@ impl ResponsesService {
                 connection.turn_state.as_deref(),
             )),
             ResponsesAttemptKind::Generation | ResponsesAttemptKind::Compaction => {
-                EncodedRequest::new(&ResponseCreate::generation(
+                EncodedRequest::new(&ResponseCreate::generation_with_policy(
                     &self.config,
-                    request.thinking(),
-                    request.fast_mode(),
+                    CreatePolicy::new(transport, request.thinking(), request.fast_mode()),
                     request.input(),
                     request.previous_response_id(),
                     &request.profile,
@@ -753,6 +750,7 @@ impl Service<ResponsesAttempt> for ResponsesService {
                 model.call_index = request.call_index,
                 attempt = request.attempt,
                 max_attempts = request.max_attempts,
+                transport = tracing::field::Empty,
                 replay.mode = tracing::field::Empty,
                 model.input.item_count = tracing::field::Empty,
                 request.queue.duration_ns = tracing::field::Empty,
@@ -780,17 +778,19 @@ impl Service<ResponsesAttempt> for ResponsesService {
                 let mut connection = service.connection.lock().await;
                 tracing::Span::current().record("request.queue.duration_ns", elapsed_ns(queued_at));
                 connection.enter_logical_turn(request.logical_turn);
+                let transport = request.effective_transport(service.config.responses_transport);
+                tracing::Span::current().record("transport", transport.as_str());
+                if matches!(transport, ResponsesTransport::Https) && connection.socket.is_some() {
+                    connection.capture_turn_state();
+                    connection.socket = None;
+                }
                 if matches!(
                     service.config.responses_history,
                     ResponsesHistory::FullReplay
-                ) || (matches!(
-                    service.config.responses_transport,
-                    ResponsesTransport::Https
-                ) && !service.config.store_responses)
-                    || (matches!(
-                        service.config.responses_transport,
-                        ResponsesTransport::WebSocket
-                    ) && !service.config.store_responses
+                ) || (matches!(transport, ResponsesTransport::Https)
+                    && !service.config.store_responses)
+                    || (matches!(transport, ResponsesTransport::WebSocket)
+                        && !service.config.store_responses
                         && connection.socket.is_none()
                         && request.previous_response_id().is_some())
                 {
@@ -799,7 +799,7 @@ impl Service<ResponsesAttempt> for ResponsesService {
                 tracing::Span::current().record("replay.mode", request.replay_mode());
                 tracing::Span::current()
                     .record("model.input.item_count", request.input_item_count());
-                service.run(&mut connection, &request).await
+                service.run(&mut connection, &request, transport).await
             }
             .instrument(span)
             .await

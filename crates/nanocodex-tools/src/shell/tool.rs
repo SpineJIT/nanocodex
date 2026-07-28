@@ -27,6 +27,10 @@ impl Tool for ExecCommandHandler {
         StandardTool::ExecCommand.definition()
     }
 
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
         let arguments = input.decode_json::<ExecCommandArguments>()?;
         let command = ExecCommand::new(
@@ -59,6 +63,10 @@ impl Tool for WriteStdinHandler {
         StandardTool::WriteStdin.definition()
     }
 
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
         let arguments = input.decode_json::<WriteStdinArguments>()?;
         let request = WriteStdin::new(
@@ -73,6 +81,9 @@ impl Tool for WriteStdinHandler {
 }
 
 fn shell_execution(result: &super::ExecCommandResult) -> ToolOutput {
+    if let Some(error) = &result.error {
+        return ToolOutput::error(error);
+    }
     ToolOutput::json(&result).with_process_trace(
         result.exit_code,
         result.session_id,

@@ -8,6 +8,9 @@ use crate::{
 use crate::compaction;
 
 const TOOL_OUTPUT_TOKEN_LIMIT: usize = 12_000;
+// Changing this value would change model-visible IDs and invalidate prompt caches.
+const SYNTHETIC_OUTPUT_ID_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 
 /// Typed model-visible transcript. The common prompt path shares its backing
 /// allocation; prompt-only repairs allocate only for incomplete call pairs.
@@ -26,6 +29,7 @@ struct CallIds {
     custom_outputs: HashSet<Box<str>>,
     tool_search_calls: HashSet<Box<str>>,
     tool_search_outputs: HashSet<Box<str>>,
+    non_server_tool_search_outputs: HashSet<Box<str>>,
 }
 
 impl ContextManager {
@@ -128,35 +132,44 @@ impl ContextManager {
     /// missing call outputs or orphan outputs.
     #[must_use]
     pub fn prompt_items(&self) -> ResponseHistory {
+        self.prompt_items_with_repair().0
+    }
+
+    pub(crate) fn prompt_items_with_repair(&self) -> (ResponseHistory, bool) {
         let needs_repair = !self.calls.is_balanced();
         if !needs_repair {
-            return self.items.clone();
+            return (self.items.clone(), false);
         }
 
         let mut repaired = Vec::with_capacity(self.items.len() + 2);
         for item in &self.items {
             match item {
-                ResponseItem::FunctionCall { call_id, .. }
+                ResponseItem::FunctionCall { id, call_id, .. }
                 | ResponseItem::LocalShellCall {
+                    id,
                     call_id: Some(call_id),
                     ..
                 } => {
                     repaired.push(item.clone());
                     if !self.calls.function_outputs.contains(call_id.as_ref()) {
-                        repaired.push(ResponseItem::function_call_output(
+                        let mut output = ResponseItem::function_call_output(
                             call_id.to_string(),
                             FunctionOutputBody::Text("aborted".into()),
-                        ));
+                        );
+                        output.set_id(synthetic_output_id("fco", id.as_ref()));
+                        repaired.push(output);
                     }
                 }
-                ResponseItem::CustomToolCall { call_id, .. } => {
+                ResponseItem::CustomToolCall { id, call_id, .. } => {
                     repaired.push(item.clone());
                     if !self.calls.custom_outputs.contains(call_id.as_ref()) {
-                        repaired.push(ResponseItem::custom_tool_output(
+                        let mut output = ResponseItem::custom_tool_output(
                             call_id.to_string(),
                             None,
                             FunctionOutputBody::Text("aborted".into()),
-                        ));
+                        );
+                        output.set_id(synthetic_output_id("ctco", id.as_ref()));
+                        repaired.push(output);
                     }
                 }
                 ResponseItem::FunctionCallOutput { call_id, .. }
@@ -164,13 +177,14 @@ impl ContextManager {
                 ResponseItem::CustomToolCallOutput { call_id, .. }
                     if !self.calls.custom_calls.contains(call_id.as_ref()) => {}
                 ResponseItem::ToolSearchCall {
+                    id,
                     call_id: Some(call_id),
                     ..
                 } => {
                     repaired.push(item.clone());
                     if !self.calls.tool_search_outputs.contains(call_id.as_ref()) {
                         repaired.push(ResponseItem::ToolSearchOutput {
-                            id: None,
+                            id: synthetic_output_id("tso", id.as_ref()),
                             call_id: Some(call_id.clone()),
                             status: "completed".into(),
                             execution: "client".into(),
@@ -188,7 +202,15 @@ impl ContextManager {
                 _ => repaired.push(item.clone()),
             }
         }
-        ResponseHistory::new(repaired)
+        (ResponseHistory::new(repaired), true)
+    }
+
+    pub(crate) fn adopt_prompt_items(&mut self, items: ResponseHistory) {
+        self.items = items;
+        self.calls.clear();
+        for item in self.items.iter() {
+            self.calls.track(item);
+        }
     }
 
     fn items_after_last_model_generated_tokens(&self) -> u64 {
@@ -228,7 +250,10 @@ impl CallIds {
     fn is_balanced(&self) -> bool {
         self.function_calls == self.function_outputs
             && self.custom_calls == self.custom_outputs
-            && self.tool_search_calls == self.tool_search_outputs
+            && self.tool_search_calls.is_subset(&self.tool_search_outputs)
+            && self
+                .non_server_tool_search_outputs
+                .is_subset(&self.tool_search_calls)
     }
 
     fn clear(&mut self) {
@@ -238,6 +263,7 @@ impl CallIds {
         self.custom_outputs.clear();
         self.tool_search_calls.clear();
         self.tool_search_outputs.clear();
+        self.non_server_tool_search_outputs.clear();
     }
 
     fn track(&mut self, item: &ResponseItem) {
@@ -266,9 +292,13 @@ impl CallIds {
             }
             ResponseItem::ToolSearchOutput {
                 call_id: Some(call_id),
+                execution,
                 ..
             } => {
                 self.tool_search_outputs.insert(call_id.clone());
+                if execution.as_ref() != "server" {
+                    self.non_server_tool_search_outputs.insert(call_id.clone());
+                }
             }
             _ => {}
         }
@@ -295,6 +325,15 @@ fn new_response_item_id(prefix: &str) -> ResponseItemId {
     ResponseItemId::with_suffix(prefix, uuid::Uuid::now_v7())
 }
 
+fn synthetic_output_id(prefix: &str, source_id: Option<&ResponseItemId>) -> Option<ResponseItemId> {
+    let source_id = source_id.filter(|id| !id.is_empty())?;
+    let name = format!("{prefix}:{}", source_id.as_str());
+    Some(ResponseItemId::with_suffix(
+        prefix,
+        uuid::Uuid::new_v5(&SYNTHETIC_OUTPUT_ID_NAMESPACE, name.as_bytes()),
+    ))
+}
+
 #[must_use]
 pub fn has_well_formed_tool_calls(items: &[ResponseItem]) -> bool {
     let mut function_calls = HashSet::new();
@@ -303,6 +342,7 @@ pub fn has_well_formed_tool_calls(items: &[ResponseItem]) -> bool {
     let mut custom_outputs = HashSet::new();
     let mut search_calls = HashSet::new();
     let mut search_outputs = HashSet::new();
+    let mut non_server_search_outputs = HashSet::new();
     for item in items {
         let valid = match item {
             ResponseItem::FunctionCall { call_id, .. }
@@ -324,8 +364,13 @@ pub fn has_well_formed_tool_calls(items: &[ResponseItem]) -> bool {
             } => search_calls.insert(call_id.as_ref()),
             ResponseItem::ToolSearchOutput {
                 call_id: Some(call_id),
+                execution,
                 ..
-            } => search_calls.contains(call_id.as_ref()) && search_outputs.insert(call_id.as_ref()),
+            } => {
+                search_outputs.insert(call_id.as_ref());
+                execution.as_ref() == "server" || non_server_search_outputs.insert(call_id.as_ref())
+            }
+            ResponseItem::ToolSearchCall { .. } | ResponseItem::ToolSearchOutput { .. } => true,
             _ => true,
         };
         if !valid {
@@ -334,7 +379,8 @@ pub fn has_well_formed_tool_calls(items: &[ResponseItem]) -> bool {
     }
     function_calls == function_outputs
         && custom_calls == custom_outputs
-        && search_calls == search_outputs
+        && search_calls.is_subset(&search_outputs)
+        && non_server_search_outputs.is_subset(&search_calls)
 }
 
 const fn is_model_generated_item(item: &ResponseItem) -> bool {
@@ -378,6 +424,27 @@ pub fn is_contextual_user_message(item: &ResponseItem) -> bool {
                 || matches_marked_text("<environment_context>", "</environment_context>", text)
                 || matches_marked_text("<turn_aborted>", "</turn_aborted>", text)
         })
+}
+
+pub(crate) fn is_canonical_context_item(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::Message {
+            role: MessageRole::Developer,
+            ..
+        } => true,
+        ResponseItem::Message {
+            role: MessageRole::User,
+            content,
+            ..
+        } => content.iter().any(|content| {
+            let ContentItem::InputText { text } = content else {
+                return false;
+            };
+            matches_marked_text("# AGENTS.md instructions", "</INSTRUCTIONS>", text)
+                || matches_marked_text("<environment_context>", "</environment_context>", text)
+        }),
+        _ => false,
+    }
 }
 
 fn matches_marked_text(start: &str, end: &str, text: &str) -> bool {
@@ -486,7 +553,7 @@ mod tests {
     #[test]
     fn prompt_repairs_do_not_mutate_raw_history() {
         let call: ResponseItem = serde_json::from_str(
-            r#"{"type":"custom_tool_call","call_id":"missing","name":"exec","input":"code"}"#,
+            r#"{"type":"custom_tool_call","id":"ctc_source","call_id":"missing","name":"exec","input":"code"}"#,
         )
         .unwrap();
         let orphan = ResponseItem::custom_tool_output(
@@ -501,9 +568,114 @@ mod tests {
         assert_eq!(prompt.len(), 2);
         assert!(matches!(
             &prompt[1],
-            ResponseItem::CustomToolCallOutput { call_id, output: FunctionOutputBody::Text(text), .. }
-                if call_id.as_ref() == "missing" && text.as_ref() == "aborted"
+            ResponseItem::CustomToolCallOutput {
+                id: Some(id),
+                call_id,
+                output: FunctionOutputBody::Text(text),
+                ..
+            } if id.as_str() == "ctco_e63f89e2-4637-5644-bf21-01718d2de15e"
+                && call_id.as_ref() == "missing"
+                && text.as_ref() == "aborted"
         ));
+    }
+
+    #[test]
+    fn orphan_server_tool_search_output_is_preserved_without_repeated_repair() {
+        let mut context = ContextManager::new(vec![tool_search_output("orphan", "server")]);
+
+        let (first, first_repaired) = context.prompt_items_with_repair();
+        assert!(!first_repaired);
+        assert_eq!(first.len(), 1);
+        assert!(has_well_formed_tool_calls(&context.flattened_items()));
+
+        context.commit_tail();
+        let (second, second_repaired) = context.prompt_items_with_repair();
+        assert!(!second_repaired);
+        assert_eq!(second.len(), 1);
+    }
+
+    #[test]
+    fn server_tool_search_call_gets_a_deterministic_client_output() {
+        let call = tool_search_call("missing", "server");
+        let orphan = tool_search_output("other", "server");
+        let mut context = ContextManager::new(vec![call, orphan]);
+
+        let (first, first_repaired) = context.prompt_items_with_repair();
+        assert!(first_repaired);
+        assert_eq!(first.len(), 3);
+        let synthetic_id = first
+            .iter()
+            .find_map(|item| match item {
+                ResponseItem::ToolSearchOutput {
+                    id,
+                    call_id: Some(call_id),
+                    execution,
+                    ..
+                } if call_id.as_ref() == "missing" && execution.as_ref() == "client" => id.as_ref(),
+                _ => None,
+            })
+            .expect("missing server call should receive a client output")
+            .clone();
+        assert!(synthetic_id.as_str().starts_with("tso_"));
+
+        let (repeated, repeated_repaired) = context.prompt_items_with_repair();
+        assert!(repeated_repaired);
+        assert_eq!(
+            repeated.iter().find_map(|item| match item {
+                ResponseItem::ToolSearchOutput {
+                    id,
+                    call_id: Some(call_id),
+                    ..
+                } if call_id.as_ref() == "missing" => id.as_ref(),
+                _ => None,
+            }),
+            Some(&synthetic_id)
+        );
+
+        context.adopt_prompt_items(first);
+        let (adopted, adopted_repaired) = context.prompt_items_with_repair();
+        assert!(!adopted_repaired);
+        assert_eq!(adopted.len(), 3);
+        assert!(has_well_formed_tool_calls(&context.flattened_items()));
+    }
+
+    #[test]
+    fn client_tool_search_call_can_be_paired_by_a_server_output() {
+        let context = ContextManager::new(vec![
+            tool_search_call("paired", "client"),
+            tool_search_output("paired", "server"),
+        ]);
+        let (prompt, repaired) = context.prompt_items_with_repair();
+        assert!(!repaired);
+        assert_eq!(prompt.len(), 2);
+        assert!(has_well_formed_tool_calls(&context.flattened_items()));
+    }
+
+    #[test]
+    fn server_tool_search_call_can_be_paired_by_a_client_output() {
+        let context = ContextManager::new(vec![
+            tool_search_call("paired", "server"),
+            tool_search_output("paired", "client"),
+        ]);
+        let (prompt, repaired) = context.prompt_items_with_repair();
+        assert!(!repaired);
+        assert_eq!(prompt.len(), 2);
+        assert!(has_well_formed_tool_calls(&context.flattened_items()));
+    }
+
+    #[test]
+    fn orphan_client_tool_search_output_is_removed() {
+        let mut context = ContextManager::new(vec![tool_search_output("orphan", "client")]);
+        assert!(!has_well_formed_tool_calls(&context.flattened_items()));
+
+        let (prompt, repaired) = context.prompt_items_with_repair();
+        assert!(repaired);
+        assert!(prompt.is_empty());
+
+        context.adopt_prompt_items(prompt);
+        let (adopted, adopted_repaired) = context.prompt_items_with_repair();
+        assert!(!adopted_repaired);
+        assert!(adopted.is_empty());
     }
 
     #[test]
@@ -546,15 +718,16 @@ mod tests {
 
     #[test]
     fn contextual_messages_require_start_and_end_markers() {
-        assert!(is_contextual_user_message(&message(
-            "  # agents.md instructions\n\n<INSTRUCTIONS>\nnew\n</instructions>\n"
-        )));
+        let agents =
+            message("  # agents.md instructions\n\n<INSTRUCTIONS>\nnew\n</instructions>\n");
+        assert!(is_contextual_user_message(&agents));
+        assert!(is_canonical_context_item(&agents));
         assert!(!is_contextual_user_message(&message(
             "# AGENTS.md instructions are useful"
         )));
-        assert!(is_contextual_user_message(&message(
-            "<turn_aborted>\ninterrupted\n</turn_aborted>"
-        )));
+        let aborted = message("<turn_aborted>\ninterrupted\n</turn_aborted>");
+        assert!(is_contextual_user_message(&aborted));
+        assert!(!is_canonical_context_item(&aborted));
     }
 
     fn message(text: &str) -> ResponseItem {
@@ -562,5 +735,27 @@ mod tests {
             MessageRole::User,
             [ContentItem::InputText { text: text.into() }],
         )
+    }
+
+    fn tool_search_call(call_id: &str, execution: &str) -> ResponseItem {
+        ResponseItem::ToolSearchCall {
+            id: Some(ResponseItemId::from_server(format!("tsc_{call_id}"))),
+            call_id: Some(call_id.into()),
+            status: Some("completed".into()),
+            execution: execution.into(),
+            arguments: serde_json::json!({ "query": "deferred" }).into(),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn tool_search_output(call_id: &str, execution: &str) -> ResponseItem {
+        ResponseItem::ToolSearchOutput {
+            id: Some(ResponseItemId::from_server(format!("tso_{call_id}"))),
+            call_id: Some(call_id.into()),
+            status: "completed".into(),
+            execution: execution.into(),
+            tools: Vec::new(),
+            internal_chat_message_metadata_passthrough: None,
+        }
     }
 }

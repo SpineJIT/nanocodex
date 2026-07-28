@@ -25,7 +25,10 @@ pub(crate) struct ToolEntry {
     pub canonical_name: String,
     pub server_name: String,
     pub remote_name: String,
+    namespace: String,
+    namespace_description: String,
     pub definition: ToolDefinition,
+    pub supports_parallel_tool_calls: bool,
     pub search_text: String,
     pub client: Client,
     pub timeout: Duration,
@@ -56,6 +59,8 @@ pub(crate) struct SearchResponse {
     tools: Vec<SearchTool>,
     pending_servers: usize,
     failed_servers: BTreeMap<String, String>,
+    #[serde(skip)]
+    loadable_tools: Vec<LoadableNamespace>,
 }
 
 impl SearchResponse {
@@ -66,6 +71,10 @@ impl SearchResponse {
     pub(crate) const fn pending_server_count(&self) -> usize {
         self.pending_servers
     }
+
+    pub(crate) fn loadable_tools(&self) -> Result<Value, serde_json::Error> {
+        serde_json::to_value(&self.loadable_tools)
+    }
 }
 
 #[derive(Serialize)]
@@ -75,6 +84,24 @@ struct SearchTool {
     tool: String,
     description: String,
     input_schema: Value,
+}
+
+#[derive(Serialize)]
+struct LoadableNamespace {
+    r#type: &'static str,
+    name: String,
+    description: String,
+    tools: Vec<LoadableFunction>,
+}
+
+#[derive(Serialize)]
+struct LoadableFunction {
+    r#type: &'static str,
+    name: String,
+    description: String,
+    strict: bool,
+    defer_loading: bool,
+    parameters: Value,
 }
 
 impl ProviderState {
@@ -216,6 +243,7 @@ impl ProviderState {
 
         let selected = index.search(query, limit.min(MAX_SEARCH_LIMIT));
         let tools = selected.iter().map(|entry| entry.summary()).collect();
+        let loadable_tools = coalesce_loadable_tools(&selected);
         let mut catalog = self.catalog();
         for entry in &selected {
             catalog.active.insert(entry.canonical_name.clone());
@@ -230,6 +258,7 @@ impl ProviderState {
             tools,
             pending_servers,
             failed_servers,
+            loadable_tools,
         })
     }
 
@@ -340,13 +369,23 @@ fn push_search_token(tokens: &mut Vec<String>, token: &mut String) {
 impl ToolEntry {
     pub(crate) fn new(
         server_name: &str,
+        server_description: Option<&str>,
         tool: &RmcpTool,
         client: Client,
         timeout: Duration,
+        server_supports_parallel_tool_calls: bool,
     ) -> Self {
         let remote_name = tool.name.to_string();
         let canonical_name = canonical_tool_name(server_name, &remote_name);
+        let namespace = canonical_namespace(server_name);
+        let namespace_description = server_description
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Tools in the {namespace} namespace."));
         let description = tool.description.as_deref().unwrap_or_default().to_owned();
+        let supports_parallel_tool_calls =
+            tool_supports_parallel_calls(tool, server_supports_parallel_tool_calls);
         let mut input_schema = tool.input_schema.as_ref().clone();
         if input_schema.get("properties").is_none_or(Value::is_null) {
             input_schema.insert("properties".to_owned(), Value::Object(Map::new()));
@@ -388,7 +427,10 @@ impl ToolEntry {
             canonical_name,
             server_name: server_name.to_owned(),
             remote_name,
+            namespace,
+            namespace_description,
             definition,
+            supports_parallel_tool_calls,
             search_text,
             client,
             timeout,
@@ -407,14 +449,42 @@ impl ToolEntry {
                 .map_or(Value::Null, |schema| schema.as_value().clone()),
         }
     }
+
+    fn loadable_function(&self) -> LoadableFunction {
+        LoadableFunction {
+            r#type: "function",
+            name: normalize_name(&self.remote_name),
+            description: self.definition.description().to_owned(),
+            strict: false,
+            defer_loading: true,
+            parameters: self
+                .definition
+                .parameters()
+                .map_or_else(|| json!({}), |schema| schema.as_value().clone()),
+        }
+    }
+}
+
+fn tool_is_read_only(tool: &RmcpTool) -> bool {
+    tool.annotations
+        .as_ref()
+        .is_some_and(|annotations| annotations.read_only_hint == Some(true))
+}
+
+fn tool_supports_parallel_calls(tool: &RmcpTool, server_opt_in: bool) -> bool {
+    server_opt_in || tool_is_read_only(tool)
 }
 
 fn canonical_tool_name(server_name: &str, tool_name: &str) -> String {
     format!(
-        "mcp__{}__{}",
-        normalize_name(server_name),
+        "{}{}",
+        canonical_namespace(server_name),
         normalize_name(tool_name)
     )
+}
+
+fn canonical_namespace(server_name: &str) -> String {
+    format!("mcp__{}__", normalize_name(server_name))
 }
 
 fn normalize_name(name: &str) -> String {
@@ -429,9 +499,30 @@ fn normalize_name(name: &str) -> String {
         .collect()
 }
 
+fn coalesce_loadable_tools(selected: &[Arc<ToolEntry>]) -> Vec<LoadableNamespace> {
+    let mut namespaces: Vec<LoadableNamespace> = Vec::new();
+    for entry in selected {
+        if let Some(namespace) = namespaces
+            .iter_mut()
+            .find(|namespace| namespace.name == entry.namespace)
+        {
+            namespace.tools.push(entry.loadable_function());
+        } else {
+            namespaces.push(LoadableNamespace {
+                r#type: "namespace",
+                name: entry.namespace.clone(),
+                description: entry.namespace_description.clone(),
+                tools: vec![entry.loadable_function()],
+            });
+        }
+    }
+    namespaces
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::model::ToolAnnotations;
 
     #[test]
     fn canonical_names_are_stable_and_javascript_safe() {
@@ -466,5 +557,19 @@ mod tests {
 
         let results = engine.search("github issues", 1);
         assert_eq!(results.first().map(|result| result.document.id), Some(0));
+    }
+
+    #[test]
+    fn parallel_safety_requires_server_opt_in_or_explicit_read_only_hint() {
+        let schema = Arc::new(Map::new());
+        let mut tool = RmcpTool::new("lookup", "Lookup", schema);
+        assert!(!tool_supports_parallel_calls(&tool, false));
+        assert!(tool_supports_parallel_calls(&tool, true));
+
+        tool.annotations = Some(ToolAnnotations::new().read_only(false));
+        assert!(!tool_supports_parallel_calls(&tool, false));
+
+        tool.annotations = Some(ToolAnnotations::new().read_only(true));
+        assert!(tool_supports_parallel_calls(&tool, false));
     }
 }

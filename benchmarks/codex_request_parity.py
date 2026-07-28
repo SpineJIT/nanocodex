@@ -1000,56 +1000,20 @@ def previous_response_chain(requests: list[dict[str, Any]]) -> list[str | None]:
     return [request.get("previous_response_id") for request in requests]
 
 
-def client_item_ids(request: dict[str, Any]) -> set[str]:
-    input_items = request.get("input")
-    if not isinstance(input_items, list):
-        return set()
-    return {
-        item_id
-        for item in input_items
-        if isinstance(item, dict)
-        and isinstance((item_id := item.get("id")), str)
-        and re.fullmatch(r"[a-z]+_[0-9a-f]{8}-[0-9a-f-]{27}", item_id)
-    }
-
-
-def prompt_item_id(request: dict[str, Any], prompt: str) -> str | None:
-    input_items = request.get("input")
-    if not isinstance(input_items, list):
-        return None
-    for item in input_items:
-        if not isinstance(item, dict) or item.get("type") != "message":
-            continue
-        if prompt in json.dumps(item, separators=(",", ":")):
-            item_id = item.get("id")
-            return item_id if isinstance(item_id, str) else None
-    return None
-
-
-def client_item_identity_valid(
-    scenario: Scenario,
-    capture: dict[str, Any],
-) -> bool:
+def outbound_item_id_policy_valid(capture: dict[str, Any]) -> bool:
+    """Ephemeral Responses requests must omit every top-level input item ID."""
     requests = capture["requests"]
-    if scenario.stateful == "cancellation":
-        return True
-    if scenario.stateful == "compaction":
-        if len(requests) != 4:
-            return False
-        initial_prompt_id = prompt_item_id(requests[1], scenario.prompt)
-        return (
-            initial_prompt_id is not None
-            and prompt_item_id(requests[3], scenario.prompt) == initial_prompt_id
-        )
-    if scenario.stateful == "reconnect_replay":
-        if len(requests) != 4:
-            return False
-        initial_ids = client_item_ids(requests[1])
-        return bool(initial_ids) and initial_ids <= client_item_ids(requests[3])
-    if len(requests) != 2:
+    if not requests:
         return False
-    initial_ids = client_item_ids(requests[0])
-    return bool(initial_ids) and initial_ids <= client_item_ids(requests[1])
+    for request in requests:
+        if request.get("store") is not False:
+            return False
+        input_items = request.get("input")
+        if not isinstance(input_items, list):
+            return False
+        if any(isinstance(item, dict) and "id" in item for item in input_items):
+            return False
+    return True
 
 
 def shell_output_metadata_valid(capture: dict[str, Any]) -> bool:
@@ -1190,8 +1154,8 @@ def main() -> int:
                 and stock["request_paths"] == nano["request_paths"]
             )
             behavior_valid = stateful_behavior_valid(scenario, stock, nano)
-            item_identity_valid = all(
-                client_item_identity_valid(scenario, capture)
+            item_id_policy_valid = all(
+                outbound_item_id_policy_valid(capture)
                 for capture in (stock, nano)
             )
             if scenario.stateful == "cancellation":
@@ -1219,7 +1183,7 @@ def main() -> int:
                     "transport_paths_equal": transport_paths_equal,
                     "process_valid": process_valid,
                     "stateful_behavior_valid": behavior_valid,
-                    "client_item_identity_valid": item_identity_valid,
+                    "outbound_item_id_policy_valid": item_id_policy_valid,
                     "normalized_diff": diff,
                 }
             )
@@ -1236,11 +1200,11 @@ def main() -> int:
     all_stateful_behaviors_valid = all(
         report["stateful_behavior_valid"] for report in reports
     )
-    all_client_item_identities_valid = all(
-        report["client_item_identity_valid"] for report in reports
+    all_outbound_item_id_policies_valid = all(
+        report["outbound_item_id_policy_valid"] for report in reports
     )
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "scenarios": reports,
         "all_processes_valid": all_processes_valid,
         "all_request_counts_valid": all_counts_valid,
@@ -1248,7 +1212,7 @@ def main() -> int:
         "all_normalized_requests_equal": all_requests_equal,
         "all_transport_paths_equal": all_transport_paths_equal,
         "all_stateful_behaviors_valid": all_stateful_behaviors_valid,
-        "all_client_item_identities_valid": all_client_item_identities_valid,
+        "all_outbound_item_id_policies_valid": all_outbound_item_id_policies_valid,
         "supported_surface_exclusions": SUPPORTED_SURFACE_EXCLUSIONS,
     }
     if args.output:
@@ -1277,8 +1241,8 @@ def main() -> int:
                         "stateful_behavior_valid": scenario[
                             "stateful_behavior_valid"
                         ],
-                        "client_item_identity_valid": scenario[
-                            "client_item_identity_valid"
+                        "outbound_item_id_policy_valid": scenario[
+                            "outbound_item_id_policy_valid"
                         ],
                         "stock_cancellation": scenario["stock"]["cancellation"],
                         "nanocodex_cancellation": scenario["nanocodex"][
@@ -1293,8 +1257,8 @@ def main() -> int:
                 "all_normalized_requests_equal": all_requests_equal,
                 "all_transport_paths_equal": all_transport_paths_equal,
                 "all_stateful_behaviors_valid": all_stateful_behaviors_valid,
-                "all_client_item_identities_valid": (
-                    all_client_item_identities_valid
+                "all_outbound_item_id_policies_valid": (
+                    all_outbound_item_id_policies_valid
                 ),
             },
             indent=2,
@@ -1305,7 +1269,7 @@ def main() -> int:
         or not all_counts_valid
         or not all_identities_valid
         or not all_stateful_behaviors_valid
-        or not all_client_item_identities_valid
+        or not all_outbound_item_id_policies_valid
     ):
         return 1
     if args.check and (not all_requests_equal or not all_transport_paths_equal):

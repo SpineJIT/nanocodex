@@ -87,8 +87,11 @@ println!("{}", completed.output_text());
 ```
 
 Keep the credential file outside source control and reuse the same path on
-later runs. [`auth::load_chatgpt_auth`] refreshes expiring credentials and
-recovers an unauthorized request once with the refreshed authorization.
+later runs. It uses Codex's `auth.json` format, so Codex and multiple Nanocodex
+processes can safely share the same path. [`auth::load_chatgpt_auth`] adopts a
+same-account rotation from disk before refreshing, refreshes expiring
+credentials, and recovers an unauthorized request once with the refreshed
+authorization.
 [`auth::chatgpt_auth_status`] inspects the selected account without exposing
 tokens, and [`auth::logout_chatgpt`] removes the stored credentials.
 
@@ -137,8 +140,8 @@ The crate root intentionally contains only the normal conversation path:
 [`OpenAi`], [`Session`], [`ResponseTurn`], [`Response`],
 [`CompletedResponse`], and their errors.
 
-- [`session`] adds typed multimodal input, opaque checkpoints, session
-  identity, and explicit compaction results.
+- [`session`] adds typed multimodal input, session identity, and explicit
+  compaction results.
 - [`responses`] contains the complete typed `OpenAI` Responses protocol.
 - [`tools`] defines the shared tool contract; `nanocodex-tools` supplies the
   batteries-included runtime and implementations.
@@ -146,7 +149,7 @@ The crate root intentionally contains only the normal conversation path:
   persistence, refresh, and logout.
 - [`pricing`] and [`events`] expose automatic `gpt-5.6-sol` cost estimates and
   lifecycle-event components.
-- [`tower`] contains the generic attempt and service contracts.
+- [`tower`] contains the generic attempt, response, and retry contracts.
 - [`transport`] contains WebSocket/HTTPS selection, replay policy, transport
   failures, and connection statistics.
 
@@ -158,3 +161,5 @@ it. [`OpenAiBuilder::service`] installs a fresh caller-defined
 deterministic tests, and controlled replay. The standard stack owns its retry
 and reconnect policy; caller middleware should add deadlines, concurrency
 control, tracing, metrics, or error mapping rather than a second retry loop.
+Managed sessions own attempt construction and mutable transport state; callers
+do not construct the standard service or transport requests directly.

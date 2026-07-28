@@ -55,6 +55,54 @@ async fn caller_service_factory_supports_cancellation() {
 }
 
 #[tokio::test]
+async fn turn_result_does_not_wait_for_attempt_event_producers_to_close() {
+    let (retained, mut retained_attempts) = mpsc::unbounded_channel();
+    let openai = OpenAi::builder("test")
+        .service(move || RetainingCompletedService {
+            retained: retained.clone(),
+        })
+        .build()
+        .unwrap();
+    let tools = Tools::builder().without_defaults().build().unwrap();
+    let (agent, mut events) = Nanocodex::builder(openai).tools(tools).build().unwrap();
+    let turn = agent.prompt("reply with done").await.unwrap();
+    let retained_attempt = tokio::time::timeout(Duration::from_secs(1), retained_attempts.recv())
+        .await
+        .expect("the generation attempt should start")
+        .expect("the service should retain its generation attempt clone");
+
+    let result = tokio::time::timeout(Duration::from_secs(1), turn.result())
+        .await
+        .expect("a completed result must not wait for event producers to close")
+        .unwrap();
+    assert_eq!(result.final_message(), "done");
+    assert!(matches!(
+        retained_attempt.kind(),
+        nanocodex_agent::transport::ResponsesAttemptKind::Generation
+    ));
+
+    let mut observed_start = false;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("root events should remain independently consumable")
+            .expect("the root stream should remain open");
+        match event.kind {
+            nanocodex_agent::events::AgentEventKind::RunStarted => observed_start = true,
+            nanocodex_agent::events::AgentEventKind::RunCompleted => {
+                assert!(
+                    observed_start,
+                    "the terminal event must follow the turn's start event"
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop((retained_attempt, agent, events));
+}
+
+#[tokio::test]
 async fn dropping_every_command_handle_cancels_an_in_flight_attempt() {
     let started = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicBool::new(false));

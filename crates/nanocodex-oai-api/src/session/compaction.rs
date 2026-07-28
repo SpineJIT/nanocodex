@@ -145,6 +145,22 @@ fn rewritten_tool_output(item: &ResponseItem) -> Option<ResponseItem> {
             internal_chat_message_metadata_passthrough: internal_chat_message_metadata_passthrough
                 .clone(),
         }),
+        ResponseItem::ToolSearchOutput {
+            id,
+            call_id,
+            status,
+            execution,
+            internal_chat_message_metadata_passthrough,
+            ..
+        } => Some(ResponseItem::ToolSearchOutput {
+            id: id.clone(),
+            call_id: call_id.clone(),
+            status: status.clone(),
+            execution: execution.clone(),
+            tools: Vec::new(),
+            internal_chat_message_metadata_passthrough: internal_chat_message_metadata_passthrough
+                .clone(),
+        }),
         _ => None,
     }
 }
@@ -539,6 +555,47 @@ mod tests {
                 ..
             } if text.as_ref() == CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE
         ));
+    }
+
+    #[test]
+    fn over_window_history_rewrites_tool_search_output_without_losing_metadata() {
+        let mut history = ResponseHistory::new(vec![ResponseItem::ToolSearchOutput {
+            id: Some(crate::ResponseItemId::from("tso_search")),
+            call_id: Some("call_search".into()),
+            status: "completed".into(),
+            execution: "client".into(),
+            tools: vec![
+                serde_json::json!({
+                    "name": "large_tool",
+                    "description": "x".repeat(272_001 * APPROX_BYTES_PER_TOKEN),
+                })
+                .into(),
+            ],
+            internal_chat_message_metadata_passthrough: Some(
+                crate::responses::InternalMessageMetadata {
+                    turn_id: Some("turn_search".into()),
+                },
+            ),
+        }]);
+
+        assert_eq!(
+            trim_tool_outputs_to_fit_context_window(&mut history, &[]),
+            1
+        );
+        assert_eq!(
+            serde_json::to_value(history.iter().next().unwrap()).unwrap(),
+            serde_json::json!({
+                "type": "tool_search_output",
+                "id": "tso_search",
+                "call_id": "call_search",
+                "status": "completed",
+                "execution": "client",
+                "tools": [],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "turn_search",
+                },
+            })
+        );
     }
 
     #[test]

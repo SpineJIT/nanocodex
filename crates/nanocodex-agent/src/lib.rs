@@ -63,8 +63,7 @@ pub mod transport {
         responses::RequestProfile,
         tower::{
             DefaultResponsesService, ResponsesAttempt, ResponsesAttemptKind, ResponsesClient,
-            ResponsesRetryPolicy, ResponsesService, ResponsesServiceError,
-            ResponsesServiceResponse,
+            ResponsesRetryPolicy, ResponsesServiceError, ResponsesServiceResponse,
         },
         transport::{ResponsesHistory, ResponsesTransport},
     };

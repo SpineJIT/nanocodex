@@ -17,6 +17,7 @@ use syn::{
 struct ToolArgs {
     description: LitStr,
     name: Option<LitStr>,
+    parallel: bool,
 }
 
 /// Defines a typed JSON function tool from an async Rust function.
@@ -24,7 +25,8 @@ struct ToolArgs {
 /// The function must return `Result<T, E>`. Function arguments become a
 /// strict JSON object schema and `T` becomes the output schema. The required
 /// `description = "..."` argument is model-visible; `name = "..."` is
-/// optional and defaults to the Rust function name.
+/// optional and defaults to the Rust function name. `parallel = true`
+/// explicitly permits overlapping local execution and defaults to `false`.
 #[proc_macro_attribute]
 pub fn tool(attributes: TokenStream, item: TokenStream) -> TokenStream {
     expand_tool(attributes.into(), item.into())
@@ -45,6 +47,7 @@ fn expand_tool(
     let input_ident = format_ident!("__NanocodexTool{}Input", pascal_case(original_ident));
     let visibility = &function.vis;
     let description = arguments.description;
+    let parallel = arguments.parallel;
     let tool_name = arguments
         .name
         .unwrap_or_else(|| LitStr::new(&original_ident.to_string(), original_ident.span()));
@@ -95,6 +98,10 @@ fn expand_tool(
                     #nanocodex::__private::schema_for::<#input_ident>(),
                 )
                 .with_output_schema(#nanocodex::__private::schema_for::<#output>())
+            }
+
+            fn supports_parallel_tool_calls(&self) -> bool {
+                #parallel
             }
 
             async fn execute(
@@ -161,6 +168,7 @@ fn parse_args(attributes: proc_macro2::TokenStream) -> syn::Result<ToolArgs> {
         Punctuated::<syn::MetaNameValue, Token![,]>::parse_terminated.parse2(attributes)?;
     let mut description = None;
     let mut name = None;
+    let mut parallel = None;
     for entry in entries {
         let Some(ident) = entry.path.get_ident() else {
             return Err(Error::new_spanned(
@@ -168,20 +176,24 @@ fn parse_args(attributes: proc_macro2::TokenStream) -> syn::Result<ToolArgs> {
                 "unsupported #[tool] argument",
             ));
         };
-        let syn::Expr::Lit(expression) = entry.value else {
-            return Err(Error::new_spanned(entry.value, "expected a string literal"));
-        };
-        let syn::Lit::Str(value) = expression.lit else {
-            return Err(Error::new_spanned(
-                expression.lit,
-                "expected a string literal",
-            ));
-        };
         match ident.to_string().as_str() {
-            "description" if description.is_none() => description = Some(value),
-            "name" if name.is_none() => name = Some(value),
-            "description" | "name" => {
-                return Err(Error::new_spanned(ident, "duplicate #[tool] argument"));
+            "description" => {
+                if description.is_some() {
+                    return Err(Error::new_spanned(ident, "duplicate #[tool] argument"));
+                }
+                description = Some(parse_string_literal(entry.value)?);
+            }
+            "name" => {
+                if name.is_some() {
+                    return Err(Error::new_spanned(ident, "duplicate #[tool] argument"));
+                }
+                name = Some(parse_string_literal(entry.value)?);
+            }
+            "parallel" => {
+                if parallel.is_some() {
+                    return Err(Error::new_spanned(ident, "duplicate #[tool] argument"));
+                }
+                parallel = Some(parse_bool_literal(entry.value)?);
             }
             _ => return Err(Error::new_spanned(ident, "unsupported #[tool] argument")),
         }
@@ -192,7 +204,37 @@ fn parse_args(attributes: proc_macro2::TokenStream) -> syn::Result<ToolArgs> {
             "#[tool] requires description = \"...\"",
         ));
     };
-    Ok(ToolArgs { description, name })
+    Ok(ToolArgs {
+        description,
+        name,
+        parallel: parallel.unwrap_or(false),
+    })
+}
+
+fn parse_string_literal(expression: syn::Expr) -> syn::Result<LitStr> {
+    let syn::Expr::Lit(expression) = expression else {
+        return Err(Error::new_spanned(expression, "expected a string literal"));
+    };
+    let syn::Lit::Str(value) = expression.lit else {
+        return Err(Error::new_spanned(
+            expression.lit,
+            "expected a string literal",
+        ));
+    };
+    Ok(value)
+}
+
+fn parse_bool_literal(expression: syn::Expr) -> syn::Result<bool> {
+    let syn::Expr::Lit(expression) = expression else {
+        return Err(Error::new_spanned(expression, "expected a boolean literal"));
+    };
+    let syn::Lit::Bool(value) = expression.lit else {
+        return Err(Error::new_spanned(
+            expression.lit,
+            "expected a boolean literal",
+        ));
+    };
+    Ok(value.value)
 }
 
 fn result_output(output: &ReturnType) -> syn::Result<&Type> {
@@ -253,4 +295,40 @@ fn pascal_case(ident: &syn::Ident) -> String {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use quote::quote;
+
+    use super::parse_args;
+
+    #[test]
+    fn parallel_defaults_false_and_accepts_explicit_true() {
+        let default = parse_args(quote!(description = "Runs serially.")).unwrap();
+        assert!(!default.parallel);
+
+        let parallel = parse_args(quote!(description = "May overlap.", parallel = true)).unwrap();
+        assert!(parallel.parallel);
+    }
+
+    #[test]
+    fn parallel_requires_a_boolean_literal() {
+        let error = parse_args(quote!(description = "Invalid.", parallel = "true"))
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "expected a boolean literal");
+    }
+
+    #[test]
+    fn duplicate_parallel_argument_is_rejected() {
+        let error = parse_args(quote!(
+            description = "Invalid.",
+            parallel = true,
+            parallel = false
+        ))
+        .err()
+        .unwrap();
+        assert_eq!(error.to_string(), "duplicate #[tool] argument");
+    }
 }

@@ -10,7 +10,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -19,7 +19,7 @@ use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnord
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
-    sync::{Mutex, OwnedMutexGuard, Semaphore, mpsc, oneshot},
+    sync::{Mutex, OwnedMutexGuard, RwLock, Semaphore, mpsc, oneshot},
     task::JoinHandle,
     time::Duration,
 };
@@ -54,6 +54,7 @@ pub(crate) struct CodeModeRuntime {
     cells: Arc<Mutex<CellRegistry>>,
     stored: Arc<Mutex<HashMap<String, Value>>>,
     host: Arc<Mutex<SharedJsHost>>,
+    current_turn: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -120,6 +121,7 @@ struct CellRegistry {
 
 struct LiveCell {
     id: u64,
+    turn_id: AtomicU64,
     output_token_budget: usize,
     observation: Arc<Mutex<CellObservationState>>,
     lifecycle: Arc<CellLifecycle>,
@@ -245,7 +247,12 @@ struct HostFailure {
 }
 
 impl CodeModeRuntime {
-    pub(super) fn new(_workspace: PathBuf) -> Self {
+    #[cfg(test)]
+    pub(super) fn new(workspace: PathBuf) -> Self {
+        Self::new_with_turn(workspace, Arc::new(AtomicU64::new(0)))
+    }
+
+    pub(super) fn new_with_turn(_workspace: PathBuf, current_turn: Arc<AtomicU64>) -> Self {
         Self {
             cells: Arc::new(Mutex::new(CellRegistry {
                 next_cell_id: 1,
@@ -253,6 +260,7 @@ impl CodeModeRuntime {
             })),
             stored: Arc::new(Mutex::new(HashMap::new())),
             host: Arc::new(Mutex::new(SharedJsHost::prewarmed())),
+            current_turn,
         }
     }
 
@@ -345,6 +353,7 @@ impl CodeModeRuntime {
             tracing::Span::current().record("cell.id", cell_id);
             let cell = Arc::new(LiveCell::spawn(
                 cell_id,
+                self.current_turn.load(Ordering::Acquire),
                 source.code,
                 tools,
                 context,
@@ -416,6 +425,8 @@ impl CodeModeRuntime {
                 Vec::new(),
             );
         };
+        cell.turn_id
+            .store(self.current_turn.load(Ordering::Acquire), Ordering::Release);
         let observation = match cell.begin_observation() {
             Ok(observation) => observation,
             Err(CellError::Busy) => {
@@ -494,6 +505,28 @@ fn observer_yield_timeout(yield_time: Duration) -> Duration {
 }
 
 impl CodeModeControl {
+    pub(super) async fn terminate_turn(&self, turn_id: u64) {
+        let cells = {
+            let mut registry = self.cells.lock().await;
+            let ids = registry
+                .live_cells
+                .iter()
+                .filter_map(|(id, cell)| {
+                    (cell.turn_id.load(Ordering::Acquire) == turn_id).then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| registry.live_cells.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        for cell in &cells {
+            cell.request_terminate();
+        }
+        for cell in cells {
+            cell.join().await;
+        }
+    }
+
     pub(super) async fn terminate_all(&self) {
         let cells = {
             let mut registry = self.cells.lock().await;
@@ -629,6 +662,7 @@ impl LiveCell {
     #[allow(clippy::too_many_arguments)]
     fn spawn(
         id: u64,
+        turn_id: u64,
         source: String,
         tools: Arc<ToolRegistry>,
         context: OwnedToolContext,
@@ -671,6 +705,7 @@ impl LiveCell {
         );
         Self {
             id,
+            turn_id: AtomicU64::new(turn_id),
             output_token_budget,
             observation: Arc::new(Mutex::new(CellObservationState {
                 updates,
@@ -1064,6 +1099,7 @@ impl EmbeddedHost {
         let mut pending_calls: FuturesUnordered<BoxFuture<'_, CompletedNestedCall>> =
             FuturesUnordered::new();
         let nested_call_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_NESTED_CALLS));
+        let parallel_execution = Arc::new(RwLock::new(()));
         let mut event_count = 0_u64;
         loop {
             tokio::select! {
@@ -1104,17 +1140,33 @@ impl EmbeddedHost {
                                 yield_after,
                             });
                             let permit = Arc::clone(&nested_call_permits);
+                            let supports_parallel = tools.supports_parallel_tool_calls(&name);
+                            let parallel_execution = Arc::clone(&parallel_execution);
                             let nested_call = async move {
                                 let _permit = permit.acquire_owned().await;
-                                execute_nested_call(
-                                    tools,
-                                    id,
-                                    name,
-                                    input,
-                                    context,
-                                    actor_started_at,
-                                )
-                                .await
+                                if supports_parallel {
+                                    let _guard = parallel_execution.read().await;
+                                    execute_nested_call(
+                                        tools,
+                                        id,
+                                        name,
+                                        input,
+                                        context,
+                                        actor_started_at,
+                                    )
+                                    .await
+                                } else {
+                                    let _guard = parallel_execution.write().await;
+                                    execute_nested_call(
+                                        tools,
+                                        id,
+                                        name,
+                                        input,
+                                        context,
+                                        actor_started_at,
+                                    )
+                                    .await
+                                }
                             };
                             pending_calls.push(nested_call.boxed());
                         }

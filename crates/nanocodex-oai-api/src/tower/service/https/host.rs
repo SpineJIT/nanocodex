@@ -4,10 +4,11 @@ use crate::tower::{
     ResponsesAttempt, ResponsesServiceError, ResponsesServiceResponse, service_error::FailurePhase,
 };
 
-use super::super::ResponsesService;
+use super::super::{ConnectionState, ResponsesService};
 
 pub(crate) async fn run(
     _service: &ResponsesService,
+    _connection: &mut ConnectionState,
     _request: &ResponsesAttempt,
     _started_at: Instant,
 ) -> Result<ResponsesServiceResponse, ResponsesServiceError> {

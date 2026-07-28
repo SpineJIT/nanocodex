@@ -87,6 +87,10 @@ export function setFastMode(agent, enabled) {
   return agentState(agent).raw.setFastMode(enabled);
 }
 
+export function compact(agent) {
+  return agentState(agent).raw.compact();
+}
+
 export function subscribeAgentEvents(agent, listener, options = {}) {
   const state = agentState(agent);
   if (typeof state.runtime.subscribe !== "function") {

@@ -18,7 +18,10 @@ use tokio::{
 };
 use tracing::error;
 
-use crate::session::{CommittedSession, SessionSnapshot};
+use crate::{
+    model::context::ContextBaseline,
+    session::{CommittedSession, SessionSnapshot},
+};
 
 const COMMAND_CAPACITY: usize = 8;
 
@@ -99,6 +102,7 @@ impl DurableSession {
             materialized.workspace,
             materialized.base_instructions,
             materialized.history,
+            materialized.context_baseline,
         )
         .map_err(io::Error::other)?;
         Ok(Self {
@@ -222,6 +226,7 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
     let mut base_instructions = None;
     let mut history = Vec::new();
     let mut transcript = Vec::new();
+    let mut context_baseline = None;
     for (index, line) in BufReader::new(File::open(path)?).lines().enumerate() {
         let line = line?;
         let value: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
@@ -288,6 +293,22 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
                         ),
                     )
                 })?;
+                context_baseline = None;
+            }
+            Some("world_state") => {
+                if let Some(state) = value["payload"]["state"].get("nanocodex_context") {
+                    context_baseline =
+                        Some(serde_json::from_value(state.clone()).map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "failed to decode context snapshot at {} line {}: {error}",
+                                    path.display(),
+                                    index + 1
+                                ),
+                            )
+                        })?);
+                }
             }
             Some("event_msg") => {
                 if let Some(item) = visible_rollout_event(&value["payload"]) {
@@ -318,6 +339,7 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
         base_instructions,
         history,
         transcript,
+        context_baseline,
     })
 }
 
@@ -326,6 +348,7 @@ struct MaterializedRollout {
     base_instructions: Option<String>,
     history: Vec<ResponseItem>,
     transcript: Vec<RolloutTranscriptItem>,
+    context_baseline: Option<ContextBaseline>,
 }
 
 fn visible_rollout_event(payload: &serde_json::Value) -> Option<RolloutTranscriptItem> {
@@ -435,12 +458,16 @@ enum RolloutCommand {
     Flush {
         result: oneshot::Sender<io::Result<()>>,
     },
+    Shutdown {
+        result: oneshot::Sender<io::Result<()>>,
+    },
 }
 
 struct RolloutCommit {
     history: ResponseHistory,
     revision: u64,
     turn: RolloutTurn,
+    context_baseline: ContextBaseline,
 }
 
 impl RolloutCommit {
@@ -449,6 +476,16 @@ impl RolloutCommit {
             history: session.rollout_history(),
             revision: session.history_revision(),
             turn,
+            context_baseline: session.context_baseline().clone(),
+        }
+    }
+
+    fn compaction(session: &CommittedSession, turn: RolloutTurn) -> Self {
+        Self {
+            history: session.rollout_history(),
+            revision: session.history_revision(),
+            turn,
+            context_baseline: session.context_baseline().clone(),
         }
     }
 
@@ -458,6 +495,7 @@ impl RolloutCommit {
             history,
             revision,
             turn,
+            context_baseline: ContextBaseline::Missing,
         }
     }
 }
@@ -465,7 +503,7 @@ impl RolloutCommit {
 #[derive(Clone)]
 pub(crate) struct RolloutTurn {
     turn_id: String,
-    user_message: UserMessage,
+    user_message: Option<UserMessage>,
     final_message: Option<String>,
     started_at: i64,
     completed_at: Option<i64>,
@@ -479,13 +517,28 @@ enum RolloutTurnStatus {
     InProgress,
     Completed,
     Interrupted,
+    Replaced,
+    Failed,
 }
 
 impl RolloutTurn {
     pub(crate) fn started(prompt: &Prompt) -> Self {
         Self {
             turn_id: uuid::Uuid::now_v7().to_string(),
-            user_message: UserMessage::from_prompt(prompt),
+            user_message: Some(UserMessage::from_prompt(prompt)),
+            final_message: None,
+            started_at: Utc::now().timestamp(),
+            completed_at: None,
+            duration_ms: None,
+            status: RolloutTurnStatus::InProgress,
+            timer: Some(Instant::now()),
+        }
+    }
+
+    pub(crate) fn compaction_started() -> Self {
+        Self {
+            turn_id: uuid::Uuid::now_v7().to_string(),
+            user_message: None,
             final_message: None,
             started_at: Utc::now().timestamp(),
             completed_at: None,
@@ -501,8 +554,23 @@ impl RolloutTurn {
         self
     }
 
+    pub(crate) fn completed_without_message(mut self) -> Self {
+        self.finish(RolloutTurnStatus::Completed);
+        self
+    }
+
     pub(crate) fn interrupted(mut self) -> Self {
         self.finish(RolloutTurnStatus::Interrupted);
+        self
+    }
+
+    pub(crate) fn replaced(mut self) -> Self {
+        self.finish(RolloutTurnStatus::Replaced);
+        self
+    }
+
+    pub(crate) fn failed(mut self) -> Self {
+        self.finish(RolloutTurnStatus::Failed);
         self
     }
 
@@ -607,13 +675,17 @@ impl RolloutRecorder {
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let writer_path = path.clone();
         drop(runtime.spawn(async move {
-            if let Err(source) = writer.run(receiver).await {
+            let (outcome, shutdown) = writer.run(receiver).await;
+            if let Err(source) = &outcome {
                 error!(
                     target: "nanocodex",
                     rollout_path = %writer_path.display(),
                     error = %source,
                     "Codex rollout writer stopped"
                 );
+            }
+            if let Some(result) = shutdown {
+                drop(result.send(outcome));
             }
         }));
         Self {
@@ -635,6 +707,15 @@ impl RolloutRecorder {
         turn: RolloutTurn,
     ) -> io::Result<()> {
         self.persist_commit(RolloutCommit::from_session(session, turn))
+            .await
+    }
+
+    pub(crate) async fn persist_compaction(
+        &self,
+        session: &CommittedSession,
+        turn: RolloutTurn,
+    ) -> io::Result<()> {
+        self.persist_commit(RolloutCommit::compaction(session, turn))
             .await
     }
 
@@ -673,6 +754,21 @@ impl RolloutRecorder {
             .await
             .map_err(|_| io::Error::other("Codex rollout writer stopped"))?
     }
+
+    pub(crate) async fn shutdown(&self) -> io::Result<()> {
+        let (result, receiver) = oneshot::channel();
+        if self
+            .commands
+            .send(RolloutCommand::Shutdown { result })
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+        receiver
+            .await
+            .map_err(|_| io::Error::other("Codex rollout writer stopped during shutdown"))?
+    }
 }
 
 struct RolloutWriter {
@@ -680,6 +776,7 @@ struct RolloutWriter {
     pending: Option<RolloutCommit>,
     written_revision: Option<u64>,
     written_len: usize,
+    written_context_baseline: Option<ContextBaseline>,
     window_number: u64,
     first_window_id: String,
     current_window_id: String,
@@ -694,6 +791,7 @@ impl RolloutWriter {
             pending: None,
             written_revision: None,
             written_len: 0,
+            written_context_baseline: None,
             window_number: 0,
             first_window_id: initial_window_id.clone(),
             current_window_id: initial_window_id,
@@ -708,6 +806,7 @@ impl RolloutWriter {
             pending: None,
             written_revision: Some(0),
             written_len: state.written_len,
+            written_context_baseline: state.context_baseline,
             window_number: state.window_number,
             first_window_id: state.first_window_id,
             current_window_id: state.current_window_id,
@@ -716,7 +815,10 @@ impl RolloutWriter {
         }
     }
 
-    async fn run(mut self, mut commands: mpsc::Receiver<RolloutCommand>) -> io::Result<()> {
+    async fn run(
+        mut self,
+        mut commands: mpsc::Receiver<RolloutCommand>,
+    ) -> (io::Result<()>, Option<oneshot::Sender<io::Result<()>>>) {
         while let Some(command) = commands.recv().await {
             match command {
                 RolloutCommand::Commit { commit, result } => {
@@ -726,9 +828,13 @@ impl RolloutWriter {
                 RolloutCommand::Flush { result } => {
                     drop(result.send(self.flush().await));
                 }
+                RolloutCommand::Shutdown { result } => {
+                    commands.close();
+                    return (self.flush().await, Some(result));
+                }
             }
         }
-        self.flush().await
+        (self.flush().await, None)
     }
 
     async fn flush(&mut self) -> io::Result<()> {
@@ -786,6 +892,29 @@ impl RolloutWriter {
     fn prepare_append(&self, commit: &RolloutCommit) -> io::Result<PreparedAppend> {
         let len = commit.history.len();
         match self.written_revision {
+            None if commit.revision > 0 => {
+                let window_number = self.window_number.saturating_add(1);
+                let window_id = uuid::Uuid::now_v7().to_string();
+                Ok(PreparedAppend {
+                    records: PreparedRecords::Compacted(CompactedItem {
+                        message: String::new(),
+                        replacement_history: commit.history.iter().cloned().collect(),
+                        window_number,
+                        first_window_id: self.first_window_id.clone(),
+                        previous_window_id: self.current_window_id.clone(),
+                        window_id: window_id.clone(),
+                    }),
+                    revision: commit.revision,
+                    len,
+                    window: Some(WindowAdvance {
+                        number: window_number,
+                        id: window_id,
+                    }),
+                    turn: commit.turn.clone(),
+                    context_baseline: commit.context_baseline.clone(),
+                    write_context: true,
+                })
+            }
             None => Ok(PreparedAppend {
                 records: PreparedRecords::Items {
                     history: commit.history.clone(),
@@ -795,6 +924,9 @@ impl RolloutWriter {
                 len,
                 window: None,
                 turn: commit.turn.clone(),
+                context_baseline: commit.context_baseline.clone(),
+                write_context: self.written_context_baseline.as_ref()
+                    != Some(&commit.context_baseline),
             }),
             Some(revision) if revision == commit.revision => {
                 if len < self.written_len {
@@ -812,6 +944,9 @@ impl RolloutWriter {
                     len,
                     window: None,
                     turn: commit.turn.clone(),
+                    context_baseline: commit.context_baseline.clone(),
+                    write_context: self.written_context_baseline.as_ref()
+                        != Some(&commit.context_baseline),
                 })
             }
             Some(_) => {
@@ -833,6 +968,10 @@ impl RolloutWriter {
                         id: window_id,
                     }),
                     turn: commit.turn.clone(),
+                    context_baseline: commit.context_baseline.clone(),
+                    // A compaction starts a new history window, whose context
+                    // baseline must be independently reconstructable.
+                    write_context: true,
                 })
             }
         }
@@ -844,15 +983,18 @@ impl RolloutWriter {
             self.injected_write_failures -= 1;
             return Err(io::Error::other("injected rollout write failure"));
         }
+        let turn = &prepared.turn;
         self.write_event(CodexEvent::TaskStarted {
-            turn_id: &prepared.turn.turn_id,
-            started_at: prepared.turn.started_at,
+            turn_id: &turn.turn_id,
+            started_at: turn.started_at,
             model_context_window: None,
             collaboration_mode_kind: "default",
         })
         .await?;
-        self.write_event(CodexEvent::UserMessage(&prepared.turn.user_message))
-            .await?;
+        if let Some(user_message) = &turn.user_message {
+            self.write_event(CodexEvent::UserMessage(user_message))
+                .await?;
+        }
 
         match &prepared.records {
             PreparedRecords::Items { history, start } => {
@@ -878,7 +1020,22 @@ impl RolloutWriter {
                 .await?;
             }
         }
-        if let Some(message) = prepared.turn.final_message.as_deref() {
+        if prepared.write_context {
+            write_async_line(
+                &mut self.file,
+                &RolloutLine {
+                    timestamp: timestamp(),
+                    item: RolloutItem::WorldState(&WorldStateItem {
+                        full: true,
+                        state: PersistedContextState {
+                            nanocodex_context: &prepared.context_baseline,
+                        },
+                    }),
+                },
+            )
+            .await?;
+        }
+        if let Some(message) = turn.final_message.as_deref() {
             self.write_event(CodexEvent::AgentMessage {
                 message,
                 phase: "final_answer",
@@ -886,25 +1043,46 @@ impl RolloutWriter {
             })
             .await?;
         }
-        match prepared.turn.status {
+        match turn.status {
             RolloutTurnStatus::Completed => {
                 self.write_event(CodexEvent::TaskComplete {
-                    turn_id: &prepared.turn.turn_id,
-                    last_agent_message: prepared.turn.final_message.as_deref(),
-                    started_at: prepared.turn.started_at,
-                    completed_at: prepared.turn.completed_at,
-                    duration_ms: prepared.turn.duration_ms,
+                    turn_id: &turn.turn_id,
+                    last_agent_message: turn.final_message.as_deref(),
+                    started_at: turn.started_at,
+                    completed_at: turn.completed_at,
+                    duration_ms: turn.duration_ms,
                     time_to_first_token_ms: None,
                 })
                 .await?;
             }
             RolloutTurnStatus::Interrupted => {
                 self.write_event(CodexEvent::TurnAborted {
-                    turn_id: &prepared.turn.turn_id,
+                    turn_id: &turn.turn_id,
                     reason: "interrupted",
-                    started_at: prepared.turn.started_at,
-                    completed_at: prepared.turn.completed_at,
-                    duration_ms: prepared.turn.duration_ms,
+                    started_at: turn.started_at,
+                    completed_at: turn.completed_at,
+                    duration_ms: turn.duration_ms,
+                })
+                .await?;
+            }
+            RolloutTurnStatus::Replaced => {
+                self.write_event(CodexEvent::TurnAborted {
+                    turn_id: &turn.turn_id,
+                    reason: "replaced",
+                    started_at: turn.started_at,
+                    completed_at: turn.completed_at,
+                    duration_ms: turn.duration_ms,
+                })
+                .await?;
+            }
+            RolloutTurnStatus::Failed => {
+                self.write_event(CodexEvent::TaskComplete {
+                    turn_id: &turn.turn_id,
+                    last_agent_message: None,
+                    started_at: turn.started_at,
+                    completed_at: turn.completed_at,
+                    duration_ms: turn.duration_ms,
+                    time_to_first_token_ms: None,
                 })
                 .await?;
             }
@@ -933,6 +1111,9 @@ impl RolloutWriter {
     fn apply_prepared(&mut self, prepared: PreparedAppend) {
         self.written_revision = Some(prepared.revision);
         self.written_len = prepared.len;
+        if prepared.write_context {
+            self.written_context_baseline = Some(prepared.context_baseline);
+        }
         if let Some(window) = prepared.window {
             self.window_number = window.number;
             self.current_window_id = window.id;
@@ -957,6 +1138,8 @@ struct PreparedAppend {
     len: usize,
     window: Option<WindowAdvance>,
     turn: RolloutTurn,
+    context_baseline: ContextBaseline,
+    write_context: bool,
 }
 
 enum PreparedRecords {
@@ -974,6 +1157,7 @@ struct WindowAdvance {
 
 struct ResumeWriterState {
     written_len: usize,
+    context_baseline: Option<ContextBaseline>,
     window_number: u64,
     first_window_id: String,
     current_window_id: String,
@@ -993,6 +1177,7 @@ enum RolloutItem<'a> {
     #[serde(rename = "event_msg")]
     Event(&'a CodexEvent<'a>),
     ResponseItem(&'a ResponseItem),
+    WorldState(&'a WorldStateItem<'a>),
     Compacted(&'a CompactedItem),
 }
 
@@ -1126,11 +1311,23 @@ struct CompactedItem {
     window_id: String,
 }
 
+#[derive(Serialize)]
+struct WorldStateItem<'a> {
+    full: bool,
+    state: PersistedContextState<'a>,
+}
+
+#[derive(Serialize)]
+struct PersistedContextState<'a> {
+    nanocodex_context: &'a ContextBaseline,
+}
+
 fn read_resume_writer_state(path: &Path, thread_id: &str) -> io::Result<ResumeWriterState> {
     let mut first_window_id = None;
     let mut current_window_id = None;
     let mut window_number = 0;
     let mut written_len = 0;
+    let mut context_baseline = None;
     for line in BufReader::new(File::open(path)?).lines() {
         let line = line?;
         let value: serde_json::Value = serde_json::from_str(&line).map_err(io::Error::other)?;
@@ -1184,8 +1381,15 @@ fn read_resume_writer_state(path: &Path, thread_id: &str) -> io::Result<ResumeWr
                         })?
                         .to_owned(),
                 );
+                context_baseline = None;
             }
             Some("response_item") => written_len = written_len.saturating_add(1),
+            Some("world_state") => {
+                if let Some(state) = value["payload"]["state"].get("nanocodex_context") {
+                    context_baseline =
+                        Some(serde_json::from_value(state.clone()).map_err(io::Error::other)?);
+                }
+            }
             _ => {}
         }
     }
@@ -1197,6 +1401,7 @@ fn read_resume_writer_state(path: &Path, thread_id: &str) -> io::Result<ResumeWr
     })?;
     Ok(ResumeWriterState {
         written_len,
+        context_baseline,
         window_number,
         current_window_id: current_window_id.unwrap_or_else(|| first_window_id.clone()),
         first_window_id,
@@ -1480,7 +1685,7 @@ mod tests {
             .expect("persist rollout");
 
         let lines = lines(&recorder);
-        assert_eq!(lines.len(), 6);
+        assert_eq!(lines.len(), 7);
         assert_eq!(lines[0]["type"], "session_meta");
         assert_eq!(
             lines[0]["payload"]["id"],
@@ -1496,12 +1701,17 @@ mod tests {
         assert_eq!(lines[3]["type"], "response_item");
         assert_eq!(lines[3]["payload"]["type"], "message");
         assert_eq!(lines[3]["payload"]["role"], "user");
-        assert_eq!(lines[4]["payload"]["type"], "agent_message");
-        assert_eq!(lines[4]["payload"]["message"], "stored");
-        assert_eq!(lines[4]["payload"]["phase"], "final_answer");
-        assert_eq!(lines[5]["payload"]["type"], "task_complete");
+        assert_eq!(lines[4]["type"], "world_state");
         assert_eq!(
-            lines[5]["payload"]["turn_id"],
+            lines[4]["payload"]["state"]["nanocodex_context"]["kind"],
+            "missing"
+        );
+        assert_eq!(lines[5]["payload"]["type"], "agent_message");
+        assert_eq!(lines[5]["payload"]["message"], "stored");
+        assert_eq!(lines[5]["payload"]["phase"], "final_answer");
+        assert_eq!(lines[6]["payload"]["type"], "task_complete");
+        assert_eq!(
+            lines[6]["payload"]["turn_id"],
             lines[1]["payload"]["turn_id"]
         );
     }
@@ -1540,10 +1750,18 @@ mod tests {
             .expect("read complete rollout");
         assert!(complete.starts_with(&prefix));
         let lines = lines(&recorder);
-        assert_eq!(lines.len(), 11);
-        assert_eq!(lines[7]["payload"]["message"], "two");
-        assert_eq!(lines[8]["type"], "response_item");
-        assert_eq!(lines[9]["payload"]["message"], "second");
+        assert_eq!(lines.len(), 12);
+        assert_eq!(lines[8]["payload"]["message"], "two");
+        assert_eq!(lines[9]["type"], "response_item");
+        assert_eq!(lines[10]["payload"]["message"], "second");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line["type"] == "world_state")
+                .count(),
+            1,
+            "an unchanged context baseline must not add rollout churn"
+        );
     }
 
     #[tokio::test]
@@ -1560,7 +1778,10 @@ mod tests {
             .expect("persist first turn");
         original.flush().await.expect("flush first turn");
         let path = original.info().path().to_path_buf();
-        drop(original);
+        original
+            .shutdown()
+            .await
+            .expect("close the original rollout writer");
 
         let config = RolloutConfig::new(home.path()).resumed(path.clone());
         let resumed = RolloutRecorder::create(
@@ -1629,7 +1850,7 @@ mod tests {
             .iter()
             .find(|line| line["type"] == "compacted")
             .expect("compacted record");
-        assert_eq!(lines.len(), 12);
+        assert_eq!(lines.len(), 14);
         assert_eq!(compacted["payload"]["window_number"], 1);
         assert_eq!(
             compacted["payload"]["replacement_history"][0]["content"][0]["text"],
@@ -1685,6 +1906,6 @@ mod tests {
             .lines()
             .collect::<io::Result<Vec<_>>>()
             .expect("read retried rollout");
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 6);
     }
 }

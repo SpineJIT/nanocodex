@@ -29,6 +29,7 @@ where
             base_instructions,
             canonical_context,
             history,
+            context_baseline,
             checkpoint,
         } = snapshot.into_resume()?;
         if base_instructions
@@ -54,6 +55,7 @@ where
                     canonical_context,
                     history,
                     prompt_cache_key: Arc::clone(&restored_cache_key),
+                    context_baseline,
                 }))
             },
             |checkpoint| InitialResume::Exact(Box::new(checkpoint)),
@@ -173,6 +175,7 @@ where
         })
         .transpose()?;
     let transport_stats = Arc::new(TransportStats::default());
+    let shutdown = DriverShutdown::default();
     let agent = Nanocodex {
         commands,
         events: events.clone(),
@@ -180,6 +183,7 @@ where
         lineage_id: Arc::clone(&spawner.lineage_id),
         session_id,
         durability: durability.clone(),
+        shutdown: shutdown.clone(),
     };
     // Start discovery before returning the handle so an idle CLI or TUI immediately
     // contributes its human think time to provider prewarming.
@@ -194,10 +198,15 @@ where
         spawner,
         initial_model,
         origin,
-        durability,
+        durability: durability.clone(),
+        shutdown: shutdown.clone(),
     };
     let driver_task = async move {
-        if let Err(error) = driver.run().await {
+        let outcome = driver.run().await;
+        if shutdown.requested() {
+            let outcome = outcome.and(durability.shutdown().await);
+            shutdown.complete(outcome);
+        } else if let Err(error) = outcome {
             tracing::error!(
                 target: "nanocodex",
                 error = %error,

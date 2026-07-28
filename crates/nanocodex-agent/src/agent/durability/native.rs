@@ -83,6 +83,14 @@ impl Durability {
         DurabilityTurn(self.recorder.as_ref().map(|_| RolloutTurn::started(prompt)))
     }
 
+    pub(crate) fn start_compaction(&self) -> DurabilityTurn {
+        DurabilityTurn(
+            self.recorder
+                .as_ref()
+                .map(|_| RolloutTurn::compaction_started()),
+        )
+    }
+
     pub(crate) async fn persist(&self, checkpoint: &CommittedSession, turn: DurabilityTurn) {
         let (Some(recorder), Some(turn)) = (&self.recorder, turn.0) else {
             return;
@@ -93,6 +101,24 @@ impl Durability {
                 rollout_path = %recorder.info().path().display(),
                 error = %source,
                 "failed to persist Codex rollout"
+            );
+        }
+    }
+
+    pub(crate) async fn persist_compaction(
+        &self,
+        checkpoint: &CommittedSession,
+        turn: DurabilityTurn,
+    ) {
+        let (Some(recorder), Some(turn)) = (&self.recorder, turn.0) else {
+            return;
+        };
+        if let Err(source) = recorder.persist_compaction(checkpoint, turn).await {
+            error!(
+                target: "nanocodex",
+                rollout_path = %recorder.info().path().display(),
+                error = %source,
+                "failed to persist Codex compaction boundary"
             );
         }
     }
@@ -109,6 +135,19 @@ impl Durability {
                 source,
             })
     }
+
+    pub(crate) async fn shutdown(&self) -> Result<()> {
+        let Some(recorder) = &self.recorder else {
+            return Ok(());
+        };
+        recorder
+            .shutdown()
+            .await
+            .map_err(|source| NanocodexError::PersistRollout {
+                path: recorder.info().path().to_path_buf(),
+                source,
+            })
+    }
 }
 
 pub(crate) struct DurabilityTurn(Option<RolloutTurn>);
@@ -118,8 +157,20 @@ impl DurabilityTurn {
         Self(self.0.map(|turn| turn.completed(final_message)))
     }
 
+    pub(crate) fn completed_without_message(self) -> Self {
+        Self(self.0.map(RolloutTurn::completed_without_message))
+    }
+
     pub(crate) fn interrupted(self) -> Self {
         Self(self.0.map(RolloutTurn::interrupted))
+    }
+
+    pub(crate) fn replaced(self) -> Self {
+        Self(self.0.map(RolloutTurn::replaced))
+    }
+
+    pub(crate) fn failed(self) -> Self {
+        Self(self.0.map(RolloutTurn::failed))
     }
 }
 

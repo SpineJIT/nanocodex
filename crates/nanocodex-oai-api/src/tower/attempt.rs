@@ -7,8 +7,10 @@ use std::{
 };
 
 use crate::{
-    AgentEventKind, EventError, EventSink, ResponseEvent, ResponseItem, Thinking,
+    AgentEventKind, EventError, EventSink, ResponseEvent, ResponseItem, ResponsesTransport,
+    Thinking,
     responses::{RequestProfile, ResponseHistory, ResponsesInput, WarmupResponse},
+    tower::transport_policy::SessionTransport,
 };
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -161,6 +163,7 @@ pub struct ResponsesAttempt {
     pub(crate) max_attempts: u32,
     full_replay: bool,
     pub(crate) logical_turn: u64,
+    session_transport: Arc<SessionTransport>,
 }
 
 impl ResponsesAttempt {
@@ -169,6 +172,7 @@ impl ResponsesAttempt {
         fast_mode: bool,
         profile: Arc<RequestProfile>,
         observer: ResponsesObserver,
+        session_transport: Arc<SessionTransport>,
     ) -> Self {
         Self {
             kind: ResponsesAttemptKind::Warmup,
@@ -186,6 +190,7 @@ impl ResponsesAttempt {
             max_attempts: 1,
             full_replay: false,
             logical_turn: 0,
+            session_transport,
         }
     }
 
@@ -200,6 +205,7 @@ impl ResponsesAttempt {
         fast_mode: bool,
         profile: Arc<RequestProfile>,
         observer: ResponsesObserver,
+        session_transport: Arc<SessionTransport>,
     ) -> Self {
         Self {
             kind: ResponsesAttemptKind::Generation,
@@ -217,6 +223,7 @@ impl ResponsesAttempt {
             max_attempts: RESPONSE_MAX_ATTEMPTS.get(),
             full_replay: previous_response_id.is_none(),
             logical_turn: 0,
+            session_transport,
         }
     }
 
@@ -232,6 +239,7 @@ impl ResponsesAttempt {
         fast_mode: bool,
         profile: Arc<RequestProfile>,
         observer: ResponsesObserver,
+        session_transport: Arc<SessionTransport>,
     ) -> Self {
         Self {
             kind: ResponsesAttemptKind::Compaction,
@@ -249,6 +257,7 @@ impl ResponsesAttempt {
             max_attempts: RESPONSE_MAX_ATTEMPTS.get(),
             full_replay: previous_response_id.is_none(),
             logical_turn: 0,
+            session_transport,
         }
     }
 
@@ -356,6 +365,19 @@ impl ResponsesAttempt {
         true
     }
 
+    pub(crate) const fn prepare_transport_fallback(&mut self) {
+        self.attempt = 1;
+        self.full_replay = true;
+    }
+
+    pub(crate) fn effective_transport(&self, preferred: ResponsesTransport) -> ResponsesTransport {
+        self.session_transport.effective(preferred)
+    }
+
+    pub(crate) fn activate_https_fallback(&self) -> bool {
+        self.session_transport.activate_https_fallback()
+    }
+
     pub(crate) fn limit_attempts(&mut self, max_attempts: NonZeroU32) {
         self.max_attempts = self.max_attempts.min(max_attempts.get());
     }
@@ -447,6 +469,7 @@ pub struct ResponsesAttemptFactory {
     profile: Arc<RequestProfile>,
     observer: ResponsesObserver,
     logical_turn: u64,
+    session_transport: Arc<SessionTransport>,
 }
 
 impl ResponsesAttemptFactory {
@@ -460,11 +483,11 @@ impl ResponsesAttemptFactory {
                 response_events: None,
             },
             logical_turn: 0,
+            session_transport: Arc::new(SessionTransport::new()),
         }
     }
 
     /// Replaces the event destination without changing request or retry state.
-    #[doc(hidden)]
     pub fn set_events(&mut self, events: EventSink) {
         self.observer.events = events;
     }
@@ -478,12 +501,12 @@ impl ResponsesAttemptFactory {
     }
 
     /// Returns an attempt factory scoped to one client-side logical turn.
-    #[doc(hidden)]
     pub fn for_logical_turn(&self, logical_turn: u64) -> Self {
         Self {
             profile: Arc::clone(&self.profile),
             observer: self.observer.clone(),
             logical_turn,
+            session_transport: Arc::clone(&self.session_transport),
         }
     }
 
@@ -501,6 +524,7 @@ impl ResponsesAttemptFactory {
             fast_mode,
             Arc::clone(&self.profile),
             self.observer.clone(),
+            Arc::clone(&self.session_transport),
         );
         attempt.logical_turn = self.logical_turn;
         attempt
@@ -529,6 +553,7 @@ impl ResponsesAttemptFactory {
             fast_mode,
             Arc::clone(&self.profile),
             self.observer.clone(),
+            Arc::clone(&self.session_transport),
         );
         attempt.logical_turn = self.logical_turn;
         attempt
@@ -559,6 +584,7 @@ impl ResponsesAttemptFactory {
             fast_mode,
             Arc::clone(&self.profile),
             self.observer.clone(),
+            Arc::clone(&self.session_transport),
         );
         attempt.logical_turn = self.logical_turn;
         attempt
@@ -569,7 +595,8 @@ impl ResponsesAttemptFactory {
 mod tests {
     use super::{ResponseHistory, ResponsesAttemptFactory, TransportStats};
     use crate::{
-        ContentItem, EventSink, MessageRole, ResponseItem, Thinking, responses::RequestProfile,
+        ContentItem, EventSink, MessageRole, ResponseItem, ResponsesTransport, Thinking,
+        responses::RequestProfile,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -637,5 +664,60 @@ mod tests {
                 { "type": "compaction_trigger" }
             ])
         );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn fallback_state_survives_new_attempts_but_not_new_sessions() {
+        let (events, _receiver) = EventSink::channel("attempt-test".to_owned());
+        let factory = ResponsesAttemptFactory::new(
+            RequestProfile::new("attempt-test", "attempt-test", Arc::from([])),
+            events,
+            Arc::new(TransportStats::default()),
+        );
+        let first = factory.generation(
+            1,
+            ResponseHistory::default(),
+            ResponseHistory::default(),
+            0,
+            None,
+            Thinking::High,
+            false,
+        );
+        assert!(first.activate_https_fallback());
+
+        let next = factory.generation(
+            2,
+            ResponseHistory::default(),
+            ResponseHistory::default(),
+            0,
+            None,
+            Thinking::High,
+            false,
+        );
+        assert!(matches!(
+            next.effective_transport(ResponsesTransport::WebSocket),
+            ResponsesTransport::Https
+        ));
+
+        let (fresh_events, _fresh_receiver) = EventSink::channel("fresh-attempt-test".to_owned());
+        let fresh_factory = ResponsesAttemptFactory::new(
+            RequestProfile::new("fresh-attempt-test", "fresh-attempt-test", Arc::from([])),
+            fresh_events,
+            Arc::new(TransportStats::default()),
+        );
+        let fresh = fresh_factory.generation(
+            1,
+            ResponseHistory::default(),
+            ResponseHistory::default(),
+            0,
+            None,
+            Thinking::High,
+            false,
+        );
+        assert!(matches!(
+            fresh.effective_transport(ResponsesTransport::WebSocket),
+            ResponsesTransport::WebSocket
+        ));
     }
 }

@@ -13,14 +13,12 @@ use std::{
 
 use futures_util::Stream;
 use nanocodex_oai_api::{
-    ModelConfig, OpenAi, Prompt, ReasoningMode, Thinking,
+    __private::{EventSink, MakeResponsesService, ModelConfig, into_openai_parts},
+    OpenAi, Prompt, ReasoningMode, Thinking,
     auth::OpenAiAuthMode,
-    events::{AgentEvent, AgentEvents, EventSink},
+    events::{AgentEvent, AgentEvents},
     session::SessionId,
-    tower::{
-        MakeResponsesService, ResponsesAttempt, ResponsesClient, ResponsesServiceResponse,
-        StandardServiceFactory,
-    },
+    tower::{ResponsesAttempt, ResponsesClient, ResponsesServiceResponse, StandardServiceFactory},
     transport::{ResponsesHistory, ResponsesTransport, TransportStats},
 };
 use nanocodex_tools::Tools;
@@ -34,8 +32,8 @@ use crate::prompt_cache::{ModelPromptCache, SharedPromptCache};
 use crate::{
     NanocodexError, Result,
     model::run::{
-        CompletedModelTurn, HistoryCheckpoint, ModelCheckpoint, ModelRun, ModelTurnOutcome,
-        PreparedCheckpoint, prepare_checkpoint, prepare_history_checkpoint,
+        CompletedModelTurn, HistoryCheckpoint, ModelCheckpoint, ModelCompactOutcome, ModelRun,
+        ModelTurnOutcome, PreparedCheckpoint, prepare_history_checkpoint,
         prepare_resumed_checkpoint,
     },
     session::{CommittedSession, SessionResume, SessionSnapshot},
@@ -105,7 +103,7 @@ pub use turn::{Turn, TurnControl, TurnResult};
 use builder::{CodexCompatibility, PromptCacheConfig};
 pub(crate) use context_source::ContextSource;
 use context_source::ContextSourceConfig;
-use driver::{AgentDriver, AgentOrigin, BranchSpawner};
+use driver::{AgentDriver, AgentOrigin, BranchSpawner, DriverShutdown};
 use durability::{Durability, DurabilityConfig};
 pub(crate) use executor::{AgentFactory, AgentSend};
 use executor::{ServiceFactory, spawn_driver};

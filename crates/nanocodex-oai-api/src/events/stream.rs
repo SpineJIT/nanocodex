@@ -349,7 +349,6 @@ fn write_jsonl_event(output: &mut impl Write, event: &AgentEvent) -> Result<(), 
 }
 
 /// Internal emission handle shared by orchestration and transport crates.
-#[doc(hidden)]
 #[derive(Clone)]
 pub struct EventSink {
     request_id: Arc<str>,
@@ -359,6 +358,7 @@ pub struct EventSink {
 }
 
 impl EventSink {
+    /// Creates an emission handle and its independently consumed event stream.
     #[must_use]
     pub fn channel(request_id: String) -> (Self, AgentEvents) {
         let request_id = Arc::<str>::from(request_id);
@@ -377,6 +377,7 @@ impl EventSink {
         )
     }
 
+    /// Returns the stable request/session identity attached to emitted events.
     #[must_use]
     pub fn request_id(&self) -> &str {
         &self.request_id
@@ -387,7 +388,6 @@ impl EventSink {
     /// The returned sink preserves the parent sink's request identity and
     /// sequence counter. Dropping every clone of it closes only the mirror;
     /// the original session stream remains available.
-    #[doc(hidden)]
     #[must_use]
     pub fn mirrored_channel(&self) -> (Self, AgentEvents) {
         let (mirror, receiver) = mpsc::unbounded_channel();
@@ -422,7 +422,6 @@ impl EventSink {
     /// # Errors
     ///
     /// Returns an error when the payload cannot be converted to JSON.
-    #[doc(hidden)]
     pub fn emit_with_sequence<P: Serialize>(
         &self,
         kind: AgentEventKind,
@@ -432,7 +431,6 @@ impl EventSink {
     }
 
     /// Emits an event correlated with the process-monotonic source receipt time.
-    #[doc(hidden)]
     pub fn emit_with_source_sequence<P: Serialize>(
         &self,
         kind: AgentEventKind,

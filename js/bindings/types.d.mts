@@ -75,6 +75,7 @@ export type AgentActions = {
     watch(options?: WatchEventsOptions): EventWatcher;
   };
   session: {
+    compact(): Promise<void>;
     fork(options?: ForkOptions): Promise<DefaultAgent>;
     setFastMode(enabled: boolean): Promise<void>;
     setThinking(thinking: Thinking): Promise<void>;

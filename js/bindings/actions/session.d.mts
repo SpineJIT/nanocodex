@@ -1,5 +1,8 @@
 import type { Agent, DefaultAgent, ForkOptions, Thinking } from "../types.mjs";
 
+/** Compacts retained history immediately without fabricating a user prompt. */
+export function compact(agent: Agent<object>): Promise<void>;
+
 /** Forks the latest checkpoint, or the exact completed Turn supplied in `options.at`. */
 export function fork(agent: Agent<object>, options?: fork.Options): Promise<fork.ReturnType>;
 export declare namespace fork {

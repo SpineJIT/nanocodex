@@ -3,10 +3,22 @@ use serde_json::{Value, json, value::to_raw_value};
 
 #[tool(
     name = "deployment_region",
-    description = "Returns the configured deployment region."
+    description = "Returns the configured deployment region.",
+    parallel = true
 )]
 async fn deployment_region() -> Result<&'static str, &'static str> {
     Ok("us-west-2")
+}
+
+#[tool(description = "Returns the configured deployment zone.")]
+async fn deployment_zone() -> Result<&'static str, &'static str> {
+    Ok("us-west-2a")
+}
+
+#[test]
+fn macro_parallel_execution_requires_an_explicit_opt_in() {
+    assert!(deployment_region.supports_parallel_tool_calls());
+    assert!(!deployment_zone.supports_parallel_tool_calls());
 }
 
 #[tokio::test]

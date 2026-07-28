@@ -10,6 +10,7 @@ pub struct McpServer {
     pub(crate) description: Option<String>,
     pub(crate) startup_timeout: Duration,
     pub(crate) tool_timeout: Duration,
+    pub(crate) supports_parallel_tool_calls: bool,
     pub(crate) enabled_tools: Option<Vec<String>>,
     pub(crate) disabled_tools: Vec<String>,
     pub(crate) unsupported_option: Option<&'static str>,
@@ -50,6 +51,7 @@ impl McpServer {
             description: None,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
+            supports_parallel_tool_calls: false,
             enabled_tools: None,
             disabled_tools: Vec::new(),
             unsupported_option: None,
@@ -68,6 +70,7 @@ impl McpServer {
             description: None,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
+            supports_parallel_tool_calls: false,
             enabled_tools: None,
             disabled_tools: Vec::new(),
             unsupported_option: None,
@@ -92,6 +95,16 @@ impl McpServer {
     #[must_use]
     pub const fn tool_timeout(mut self, timeout: Duration) -> Self {
         self.tool_timeout = timeout;
+        self
+    }
+
+    /// Declares that every tool exposed by this server is safe to call in parallel.
+    ///
+    /// This is disabled by default. Individual tools may still opt in through
+    /// MCP's `annotations.readOnlyHint` metadata.
+    #[must_use]
+    pub const fn supports_parallel_tool_calls(mut self, supports: bool) -> Self {
+        self.supports_parallel_tool_calls = supports;
         self
     }
 
@@ -220,5 +233,20 @@ impl SecretSource {
                 format!("environment variable `{variable}` is unavailable: {error}")
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::McpServer;
+
+    #[test]
+    fn parallel_tool_calls_require_explicit_server_opt_in() {
+        assert!(!McpServer::stdio("fixture").supports_parallel_tool_calls);
+        assert!(
+            McpServer::stdio("fixture")
+                .supports_parallel_tool_calls(true)
+                .supports_parallel_tool_calls
+        );
     }
 }

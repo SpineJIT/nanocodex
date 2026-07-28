@@ -26,6 +26,7 @@ let result = agent
     .await?
     .await?;
 println!("{}", result.final_message());
+agent.shutdown().await?;
 # Ok(())
 # }
 ```
@@ -65,6 +66,7 @@ while let Some(event) = events.next().await {
     }
 }
 let _result = turn.await?;
+agent.shutdown().await?;
 # Ok(())
 # }
 ```

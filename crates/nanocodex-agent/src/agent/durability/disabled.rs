@@ -30,7 +30,22 @@ impl Durability {
         DurabilityTurn
     }
 
+    pub(crate) const fn start_compaction(&self) -> DurabilityTurn {
+        DurabilityTurn
+    }
+
     pub(crate) async fn persist(&self, _checkpoint: &CommittedSession, _turn: DurabilityTurn) {}
+
+    pub(crate) async fn persist_compaction(
+        &self,
+        _checkpoint: &CommittedSession,
+        _turn: DurabilityTurn,
+    ) {
+    }
+
+    pub(crate) async fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) struct DurabilityTurn;
@@ -40,7 +55,19 @@ impl DurabilityTurn {
         self
     }
 
+    pub(crate) const fn completed_without_message(self) -> Self {
+        self
+    }
+
     pub(crate) const fn interrupted(self) -> Self {
+        self
+    }
+
+    pub(crate) const fn replaced(self) -> Self {
+        self
+    }
+
+    pub(crate) const fn failed(self) -> Self {
         self
     }
 }

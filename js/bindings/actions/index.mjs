@@ -10,6 +10,7 @@ export function agentActions() {
       watch: (options) => events.watch(agent, options),
     },
     session: {
+      compact: () => session.compact(agent),
       fork: (options) => session.fork(agent, options),
       setFastMode: (enabled) => session.setFastMode(agent, enabled),
       setThinking: (thinking) => session.setThinking(agent, thinking),

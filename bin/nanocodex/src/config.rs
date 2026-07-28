@@ -14,7 +14,7 @@ use nanocodex::{
     },
     oai::{
         auth::{OpenAiAuth, OpenAiAuthMode},
-        transport::{ResponsesHistory, ResponsesTransport},
+        transport::ResponsesTransport,
     },
     tools::mcp::McpHandle,
 };
@@ -115,10 +115,6 @@ pub(crate) struct AgentArgs {
     #[arg(long, env = "NANOCODEX_RESPONSES_TRANSPORT")]
     responses_transport: Option<ResponsesTransport>,
 
-    /// Incremental response-ID chaining or complete history replay.
-    #[arg(long, env = "NANOCODEX_RESPONSES_HISTORY")]
-    responses_history: Option<ResponsesHistory>,
-
     /// Whether the Responses API retains server-side checkpoints.
     #[arg(long, env = "NANOCODEX_STORE_RESPONSES", action = ArgAction::Set)]
     store_responses: Option<bool>,
@@ -187,9 +183,6 @@ impl AgentArgs {
             .websocket_url(direct_websocket_url);
         if mpp_enabled {
             openai = openai.max_attempts(NonZeroU32::MIN);
-        }
-        if let Some(history) = self.responses_history {
-            openai = openai.history(history);
         }
         if let Some(store) = self.store_responses {
             openai = openai.store(store);
@@ -510,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_transport_is_selected_once_at_startup() {
+    fn responses_transport_and_storage_are_selected_once_at_startup() {
         let command = crate::Cli::command();
         let transport = command
             .get_arguments()
@@ -518,11 +511,12 @@ mod tests {
             .expect("the CLI should expose the Responses transport argument");
         assert!(transport.get_default_values().is_empty());
 
-        let history = command
-            .get_arguments()
-            .find(|argument| argument.get_id() == "responses_history")
-            .expect("the CLI should expose the Responses history argument");
-        assert!(history.get_default_values().is_empty());
+        assert!(
+            command
+                .get_arguments()
+                .all(|argument| argument.get_id() != "responses_history"),
+            "history replay policy is internal and must not be a CLI argument"
+        );
 
         let store = command
             .get_arguments()

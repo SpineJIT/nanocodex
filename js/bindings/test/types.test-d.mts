@@ -15,6 +15,7 @@ async function check() {
     thinking: "high",
     fastMode: false,
   });
+  await agent.session.compact();
   await agent.session.setFastMode(true);
   const options: Actions.turn.prompt.Options = { input: "hello" };
   const turn: Turn = agent.turn.prompt(options);

@@ -16,6 +16,7 @@ use super::super::{ConnectionState, ResponsesService, record_pipeline_stats, req
 
 pub(crate) async fn run(
     service: &ResponsesService,
+    connection: &mut ConnectionState,
     request: &ResponsesAttempt,
     started_at: Instant,
 ) -> Result<ResponsesServiceResponse, ResponsesServiceError> {
@@ -27,7 +28,7 @@ pub(crate) async fn run(
         ));
     }
     let encode_started_at = Instant::now();
-    let encoded = service.encode_request(&ConnectionState::new(), request)?;
+    let encoded = service.encode_request(connection, request, ResponsesTransport::Https)?;
     let encode_duration_ns = elapsed_ns(encode_started_at);
     let request_bytes = encoded.raw().get().len();
     let transport = ResponsesTransport::Https.as_str();
@@ -54,10 +55,15 @@ pub(crate) async fn run(
         },
     )?;
     let send_started_at = Instant::now();
-    let (mut response, metadata) =
-        send_with_auth_recovery(service, request.profile.session_id(), &encoded)
-            .await
-            .map_err(|error| ResponsesServiceError::responses(error, FailurePhase::Send, 0))?;
+    let (mut response, metadata) = send_with_auth_recovery(
+        service,
+        request.profile.session_id(),
+        connection.turn_state.as_deref(),
+        &encoded,
+    )
+    .await
+    .map_err(|error| ResponsesServiceError::responses(error, FailurePhase::Send, 0))?;
+    connection.observe_turn_state(metadata.turn_state.as_deref());
     let send_duration_ns = elapsed_ns(send_started_at);
     span.record("request.send.duration_ns", send_duration_ns);
     let output = match request.kind {
@@ -114,13 +120,20 @@ impl ResponseEventSource for ResponsesHttpStream {
 async fn send_with_auth_recovery(
     service: &ResponsesService,
     session_id: &str,
+    turn_state: Option<&str>,
     request: &EncodedRequest,
 ) -> Result<(ResponsesHttpStream, HttpMetadata), ResponsesError> {
     let auth = service.auth_snapshot().await?;
     match service
         .platform
         .http()
-        .send(&service.config.api_base_url, &auth, session_id, request)
+        .send(
+            &service.config.api_base_url,
+            &auth,
+            session_id,
+            turn_state,
+            request,
+        )
         .await
     {
         Err(ResponsesError::HttpRejected { status: 401, .. })
@@ -142,6 +155,7 @@ async fn send_with_auth_recovery(
                     &service.config.api_base_url,
                     &refreshed,
                     session_id,
+                    turn_state,
                     request,
                 )
                 .await

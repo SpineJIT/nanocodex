@@ -107,6 +107,8 @@ where
             client: ResponsesClient::new(service),
             profile,
             state: ManagedSessionState::new(Vec::new()),
+            canonical_context: Vec::new(),
+            canonical_context_reinjection_pending: false,
             next_call_index: 1,
             next_logical_turn: 1,
             thinking: config.thinking,
@@ -136,6 +138,8 @@ pub struct Session<S> {
     pub(super) client: ResponsesClient<S>,
     pub(super) profile: RequestProfile,
     pub(super) state: ManagedSessionState,
+    pub(super) canonical_context: Vec<ResponseItem>,
+    pub(super) canonical_context_reinjection_pending: bool,
     pub(super) next_call_index: u32,
     next_logical_turn: u64,
     pub(super) thinking: Thinking,
@@ -153,13 +157,16 @@ impl<S> Session<S> {
     /// Starts one logical agent turn.
     ///
     /// Every `create` and `compact` call made through the returned value shares
-    /// turn-scoped protocol state. Dropping it ends the boundary.
+    /// turn-scoped protocol state. A compaction before the first completed
+    /// `create` is pre-turn; a compaction after one is mid-turn. Dropping the
+    /// value ends the boundary.
     pub const fn turn(&mut self) -> ResponseTurn<'_, S> {
         let logical_turn = self.next_logical_turn;
         self.next_logical_turn = self.next_logical_turn.saturating_add(1);
         ResponseTurn {
             session: self,
             logical_turn,
+            completed_generation: false,
         }
     }
 
@@ -192,6 +199,7 @@ impl<S> Session<S> {
 pub struct ResponseTurn<'session, S> {
     pub(super) session: &'session mut Session<S>,
     pub(super) logical_turn: u64,
+    pub(super) completed_generation: bool,
 }
 
 impl<S> ResponseTurn<'_, S> {
@@ -221,6 +229,12 @@ where
     /// Executes `response.compact` and atomically installs its completed
     /// history replacement.
     ///
+    /// Pre-turn compaction defers the session's last caller-supplied developer,
+    /// `AGENTS.md`, and environment-context snapshot until the next normal
+    /// `create`. Mid-turn compaction installs that snapshot immediately at the
+    /// model-trained boundary before the last real user message. The standalone
+    /// session never reads the filesystem to refresh this fallback.
+    ///
     /// # Errors
     ///
     /// Returns a typed transport, protocol, or context error. Failed
@@ -247,6 +261,12 @@ where
 
     /// Executes `response.compact` and atomically installs its completed
     /// history replacement.
+    ///
+    /// Pre-turn compaction defers the session's last caller-supplied developer,
+    /// `AGENTS.md`, and environment-context snapshot until the next normal
+    /// `create`. Mid-turn compaction installs that snapshot immediately at the
+    /// model-trained boundary before the last real user message. The standalone
+    /// session never reads the filesystem to refresh this fallback.
     ///
     /// # Errors
     ///

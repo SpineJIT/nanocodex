@@ -12,5 +12,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tower-native OpenAI Responses transports, typed protocol values, retry and
   reconnect policy, and full-fidelity tracing.
 - Instruction-bound managed sessions with authoritative typed history,
-  incremental continuation, atomic compaction, and opaque checkpoints.
+  incremental continuation, atomic compaction, and completed-only commits.
 - Responses that are both typed streams and awaitable completed aggregates.

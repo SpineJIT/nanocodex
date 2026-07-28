@@ -45,6 +45,7 @@ impl Run {
             Ok(())
         }
         .await;
+        let agent_shutdown = handle.shutdown().await;
         drop(handle);
         drop(events);
         if let Some(child_agents) = configured.child_agents {
@@ -56,6 +57,7 @@ impl Run {
             Ok(())
         };
         run_result?;
+        agent_shutdown?;
         shutdown_result
     }
 }

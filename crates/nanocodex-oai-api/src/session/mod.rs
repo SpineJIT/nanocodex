@@ -14,8 +14,7 @@ mod tests;
 
 pub use builder::{ResponseTurn, Session, SessionBuildError, SessionBuilder};
 pub use response::{
-    CompletedCompaction, CompletedResponse, Response, ResponseCheckpoint, ResponseError,
-    ResponseInput,
+    CompletedCompaction, CompletedResponse, Response, ResponseError, ResponseInput,
 };
 #[doc(hidden)]
 pub use state::{ManagedSessionState, ManagedSessionStateError};

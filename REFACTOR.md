@@ -1,12 +1,9 @@
 # Nanocodex refactor
 
-This is the living design record for the Nanocodex monorepo refactor. It
-captures decisions before they become implementation slices. Once the crate
-boundaries and migrations are complete, this file becomes the active project
-plan.
-
-The current [`PLAN.md`](PLAN.md) remains the record for the architecture on
-`master`. This document describes its replacement.
+This is the design record for the Nanocodex monorepo refactor. It captures the
+decisions that produced the current implementation slices. The active delivery
+order, parity checkpoint, and acceptance gates now live in
+[`PLAN.md`](PLAN.md).
 
 ## Outcome
 

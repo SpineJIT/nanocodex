@@ -18,7 +18,8 @@ use nanocodex_tools::{Tools, tool};
 
 #[tool(
     name = "deployment_region",
-    description = "Return the production region for a named service."
+    description = "Return the production region for a named service.",
+    parallel = true
 )]
 async fn deployment_region(service: String) -> Result<String, std::io::Error> {
     Ok(format!("{service}: us-west-2"))
@@ -32,6 +33,10 @@ let tools = Tools::builder()
 # Ok(())
 # }
 ```
+
+Macro tools execute serially unless `parallel = true` explicitly marks their
+local effects as safe to overlap. This does not change the provider wire
+protocol.
 
 Implement [`Tool`] directly when execution needs [`ToolContext`], freeform
 input, multimodal [`ToolOutput`], or a custom definition:
@@ -109,9 +114,10 @@ let tools = Tools::builder().provider(mcp).build()?;
 # }
 ```
 
-Handshakes and discovery start with the owning runtime. `mcp::Mcp` exposes
-only `tool_search` directly and activates matching remote definitions for Code
-Mode, keeping large catalogs out of the model's initial tool list.
+Handshakes and discovery start with the owning runtime. `mcp::Mcp` exposes only
+the provider-native `tool_search` initially. Search results contain loadable MCP
+namespaces for direct model calls and also activate the matching definitions for
+Code Mode, keeping large catalogs out of the initial tool list.
 
 ## Going lower level
 

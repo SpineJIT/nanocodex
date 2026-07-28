@@ -26,6 +26,10 @@ impl Tool for ViewImageHandler {
         StandardTool::ViewImage.definition()
     }
 
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
         let arguments = input.decode_json::<ViewImageArguments>()?;
         let detail = match arguments.detail.as_deref() {

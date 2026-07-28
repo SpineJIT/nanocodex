@@ -1,21 +1,29 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    any::Any,
+    collections::HashMap,
+    panic::AssertUnwindSafe,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
+use futures_util::{FutureExt, StreamExt, stream::FuturesOrdered};
 use nanocodex_oai_api::{
-    MODEL, ModelConfig, Prompt, Thinking,
-    events::{AgentEventKind, EventSink},
+    __private::{EventSink, ModelConfig, ResponsesAttemptFactory},
+    CONTEXT_WINDOW_TOKENS, MODEL, Prompt, Thinking,
+    events::AgentEventKind,
     pricing::{ServiceTier, estimate},
     responses::{ContentItem, MessageRole, RequestProfile, ResponseItem, ToolDefinition, Usage},
     session::ManagedSessionState,
     tower::{
-        CodeCall, CodeCallKind, GenerationOutput as TurnResult, ResponsesAttempt,
-        ResponsesAttemptFactory, ResponsesClient, ResponsesOutput, ResponsesServiceResponse,
+        CodeCall, CodeCallKind, GenerationOutput as TurnResult, ResponsesAttempt, ResponsesClient,
+        ResponsesOutput, ResponsesServiceResponse,
     },
     transport::{ResponsesError, ResponsesTransport, TransportStats},
 };
 use nanocodex_oai_api::{compaction, context::assign_missing_response_item_id};
 use serde::Serialize;
-use serde_json::value::RawValue;
-use tokio::sync::watch;
+use serde_json::{Value, value::RawValue};
+use tokio::sync::{RwLock, watch};
 use tower::Service;
 use tracing::{Instrument, info, info_span};
 use web_time::Instant;
@@ -23,10 +31,12 @@ use web_time::Instant;
 use super::{
     CompactionCompleted, CompactionFailed, CompactionStarted, ModelCallCompleted, ModelCallFailed,
     ModelCallStarted, RunError, RunStarted, RunStats, RunSteered, ToolCallArguments, ToolCallEvent,
-    ToolResultEvent, WarmupCompleted, WarmupFailed, WarmupStarted, display_endpoint, elapsed_ns,
+    ToolResultEvent, WarmupCompleted, WarmupFailed, WarmupStarted,
+    context::{ContextBaseline, ContextSnapshot, ContextState},
+    display_endpoint, elapsed_ns,
     input::{
         custom_tool_notification, custom_tool_output, developer_context, function_tool_output,
-        task_context, task_input, turn_aborted,
+        task_input, tool_search_output, turn_aborted,
     },
     terminal_payload,
 };
@@ -39,7 +49,7 @@ use crate::{
 use nanocodex_tools::{
     ToolContext, Tools,
     code_mode::{CodeModeExecution, CodeModeObserver, CodeModeUpdate},
-    contract::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolOutputBody},
+    contract::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolInput, ToolOutput, ToolOutputBody},
     image::{prepare_output_images, prepare_user_input},
     runtime::{
         ImageGenerationConfig, OwnedToolContext, ToolRuntime, ToolRuntimeControl, WebSearchConfig,
@@ -57,7 +67,8 @@ pub(crate) struct ModelRun<S> {
     stats: RunStats,
     session: Option<ModelSessionState>,
     active_tools: Option<ToolRuntimeControl>,
-    active_tool_call: Option<ActiveToolCall>,
+    active_tool_calls: Vec<ActiveToolCall>,
+    active_tool_batch_started_at: Option<Instant>,
     tool_call_indices: HashMap<Box<str>, u32>,
     tools: Tools,
     prompt_cache: ModelPromptCache,
@@ -69,6 +80,19 @@ pub(crate) struct ModelRun<S> {
 pub(crate) enum ModelTurnOutcome {
     Completed(CompletedModelTurn),
     Cancelled(ModelCheckpoint),
+    Failed {
+        error: NanocodexError,
+        checkpoint: ModelCheckpoint,
+    },
+}
+
+pub(crate) enum ModelCompactOutcome {
+    Completed(ModelCheckpoint),
+    Cancelled(ModelCheckpoint),
+    Failed {
+        error: NanocodexError,
+        checkpoint: ModelCheckpoint,
+    },
 }
 
 pub(crate) struct CompletedModelTurn {
@@ -85,13 +109,14 @@ pub(crate) struct ModelCheckpoint {
     prompt_cache_key: Arc<str>,
     preserve_inherited_delta: bool,
     global_instructions: Option<Arc<str>>,
+    context_baseline: ContextBaseline,
 }
 
 pub(crate) struct PreparedCheckpoint {
     pub(crate) checkpoint: ModelCheckpoint,
     pub(crate) runtime: ToolRuntime,
     pub(crate) context_source: ContextSource,
-    project_instructions: Option<Arc<str>>,
+    selected_agents_md: Option<Arc<str>>,
 }
 
 pub(crate) struct HistoryCheckpoint {
@@ -99,6 +124,7 @@ pub(crate) struct HistoryCheckpoint {
     pub(crate) canonical_context: ResponseItem,
     pub(crate) history: Vec<ResponseItem>,
     pub(crate) prompt_cache_key: Arc<str>,
+    pub(crate) context_baseline: Option<ContextBaseline>,
 }
 
 impl ModelCheckpoint {
@@ -130,6 +156,10 @@ impl ModelCheckpoint {
         self.conversation.flattened_history()
     }
 
+    pub(crate) const fn context_baseline(&self) -> &ContextBaseline {
+        &self.context_baseline
+    }
+
     pub(crate) fn resume(
         workspace: String,
         mut request_prefix: Vec<ResponseItem>,
@@ -137,8 +167,11 @@ impl ModelCheckpoint {
         canonical_context: ResponseItem,
         history: Vec<ResponseItem>,
         global_instructions: Option<Arc<str>>,
+        context_baseline: Option<ContextBaseline>,
     ) -> Result<Self> {
         assign_request_prefix_ids(&mut request_prefix);
+        let context_baseline =
+            context_baseline.unwrap_or_else(|| ContextBaseline::reconstruct(&history));
         Ok(Self {
             workspace,
             conversation: ConversationState::resume(canonical_context, history)?,
@@ -146,6 +179,7 @@ impl ModelCheckpoint {
             prompt_cache_key,
             preserve_inherited_delta: false,
             global_instructions,
+            context_baseline,
         })
     }
 }
@@ -155,41 +189,58 @@ struct ModelSessionState {
     tools: ToolRuntime,
     factory: ResponsesAttemptFactory,
     conversation: ConversationState,
-    project_instructions: Option<Arc<str>>,
+    context: ContextState,
     preserve_inherited_delta: bool,
 }
 
 impl ModelSessionState {
-    fn validate_workspace(
-        &self,
-        context_source: &ContextSource,
-        requested: Option<&str>,
-    ) -> Result<()> {
+    fn validate_workspace(&self, requested: Option<&str>) -> Result<()> {
         let Some(requested) = requested else {
             return Ok(());
         };
-        let requested = context_source.resolve_workspace(Some(requested))?;
         if requested != self.workspace {
             return Err(NanocodexError::WorkspaceChanged {
                 current: self.workspace.clone(),
-                requested,
+                requested: requested.to_owned(),
             });
         }
         Ok(())
     }
 }
 
+#[derive(Clone)]
 struct ActiveToolCall {
     call_id: String,
     name: String,
     kind: CodeCallKind,
     started_at: Instant,
+    shell_abort_format: bool,
+    completion: Arc<Mutex<Option<CompletedToolCall>>>,
+    progress: Arc<Mutex<ActiveToolProgress>>,
+    execution_started_at: Arc<Mutex<Option<Instant>>>,
+    span: tracing::Span,
+}
+
+#[derive(Default)]
+struct ActiveToolProgress {
+    nested_tool_calls: u32,
+}
+
+struct CompletedToolCall {
+    call_id: String,
+    tool: String,
+    success: bool,
+    duration_ns: u64,
+    work_duration_ns: u64,
+    output: ToolOutputBody,
+    metadata: Option<Box<RawValue>>,
+    response_items: Vec<ResponseItem>,
 }
 
 struct NestedToolEventObserver<'a> {
     events: &'a EventSink,
     tool_call_indices: &'a HashMap<Box<str>, u32>,
-    stats: &'a mut RunStats,
+    progress: &'a Mutex<ActiveToolProgress>,
     fallback_call_index: u32,
     parent_call_id: &'a str,
     error: Option<NanocodexError>,
@@ -217,13 +268,16 @@ impl CodeModeObserver for NestedToolEventObserver<'_> {
                     },
                 );
                 if result.is_ok() {
-                    self.stats.tool_calls += 1;
+                    self.progress
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .nested_tool_calls += 1;
                 }
                 result
             }
             CodeModeUpdate::NestedCallCompleted(call) => {
                 let (call_id, _) = self.event_context(&call.call_id);
-                let result = self.events.emit(
+                self.events.emit(
                     AgentEventKind::ToolResult,
                     ToolResultEvent {
                         call_id: &call_id,
@@ -234,11 +288,7 @@ impl CodeModeObserver for NestedToolEventObserver<'_> {
                         result: &call.output,
                         metadata: call.metadata.as_deref(),
                     },
-                );
-                if result.is_ok() {
-                    self.stats.tool_work_duration_ns += call.duration_ns;
-                }
-                result
+                )
             }
         };
         if let Err(error) = result {
@@ -319,9 +369,7 @@ enum CompactionPhase {
 }
 
 struct CompactionContext<'a> {
-    working_directory: &'a str,
-    shell: &'a str,
-    project_instructions: Option<&'a str>,
+    snapshot: Option<&'a ContextSnapshot>,
     phase: CompactionPhase,
 }
 
@@ -339,6 +387,14 @@ struct ConversationState {
 }
 
 impl ConversationState {
+    fn empty(canonical_context: ResponseItem) -> Self {
+        Self {
+            canonical_context: Arc::new(canonical_context),
+            managed: ManagedSessionState::new(Vec::new()),
+            continuation_policy: None,
+        }
+    }
+
     fn new(history: Vec<ResponseItem>) -> Result<Self> {
         let canonical_context = history
             .iter()
@@ -398,6 +454,14 @@ impl ConversationState {
         self.managed.prompt_history()
     }
 
+    fn prompt_history_with_repair(&self) -> (nanocodex_oai_api::responses::ResponseHistory, bool) {
+        self.managed.prompt_history_with_repair()
+    }
+
+    fn adopt_prompt_history(&mut self, history: nanocodex_oai_api::responses::ResponseHistory) {
+        self.managed.adopt_prompt_history(history);
+    }
+
     fn shared_history(&self) -> nanocodex_oai_api::responses::ResponseHistory {
         self.managed.shared_history()
     }
@@ -419,27 +483,35 @@ impl ConversationState {
         self.managed.history_revision()
     }
 
-    fn install_compaction(
+    fn install_pre_turn_compaction(&mut self, item: ResponseItem, request_prefix: &[ResponseItem]) {
+        self.managed.install_compaction(item, [], request_prefix);
+    }
+
+    fn install_mid_turn_compaction(
         &mut self,
         item: ResponseItem,
         canonical_developer_context: ResponseItem,
         canonical_context: ResponseItem,
         request_prefix: &[ResponseItem],
-        phase: CompactionPhase,
     ) {
         self.canonical_context = Arc::new(canonical_context.clone());
-        match phase {
-            CompactionPhase::PreTurn => {
-                self.managed.install_compaction(item, [], request_prefix);
-                self.managed
-                    .append([canonical_developer_context, canonical_context]);
-            }
-            CompactionPhase::MidTurn => {
-                let initial_context = [canonical_developer_context, canonical_context];
-                self.managed
-                    .install_compaction(item, initial_context, request_prefix);
-            }
-        }
+        let initial_context = [canonical_developer_context, canonical_context];
+        self.managed
+            .install_compaction(item, initial_context, request_prefix);
+    }
+
+    fn append_canonical_context(
+        &mut self,
+        canonical_developer_context: ResponseItem,
+        canonical_context: ResponseItem,
+    ) {
+        self.canonical_context = Arc::new(canonical_context.clone());
+        self.managed
+            .append([canonical_developer_context, canonical_context]);
+    }
+
+    fn set_canonical_context(&mut self, canonical_context: ResponseItem) {
+        self.canonical_context = Arc::new(canonical_context);
     }
 
     fn reset_for_full_request(&mut self) {
@@ -497,7 +569,8 @@ impl<S> ModelRun<S> {
             stats: RunStats::default(),
             session: None,
             active_tools: None,
-            active_tool_call: None,
+            active_tool_calls: Vec::new(),
+            active_tool_batch_started_at: None,
             tool_call_indices: HashMap::new(),
             tools,
             prompt_cache,
@@ -520,7 +593,7 @@ impl<S> ModelRun<S> {
             checkpoint,
             runtime,
             context_source,
-            project_instructions,
+            selected_agents_md,
         } = prepared;
         let active_tools = runtime.control();
         let factory = ResponsesAttemptFactory::new(
@@ -551,11 +624,12 @@ impl<S> ModelRun<S> {
                 tools: runtime,
                 factory,
                 conversation: checkpoint.conversation,
-                project_instructions,
+                context: ContextState::new(selected_agents_md, checkpoint.context_baseline),
                 preserve_inherited_delta: checkpoint.preserve_inherited_delta,
             }),
             active_tools: Some(active_tools),
-            active_tool_call: None,
+            active_tool_calls: Vec::new(),
+            active_tool_batch_started_at: None,
             tool_call_indices: HashMap::new(),
             tools,
             prompt_cache,
@@ -572,10 +646,41 @@ impl<S> ModelRun<S> {
         self.events = events;
     }
 
+    pub(crate) fn replace_client(&mut self, client: ResponsesClient<S>) {
+        self.client = client;
+    }
+
     pub(crate) async fn shutdown(&mut self) {
         if let Some(tools) = &self.active_tools {
             tools.cancel().await;
         }
+    }
+
+    fn empty_session(&mut self, requested_workspace: Option<&str>) -> Result<ModelSessionState> {
+        let workspace = requested_workspace.map_or_else(
+            || self.context_source.resolve_workspace(None),
+            |workspace| Ok(workspace.to_owned()),
+        )?;
+        let selected_agents_md = self
+            .context_source
+            .project_instructions(&workspace)
+            .map(Arc::<str>::from);
+        let tools = tool_runtime(&workspace, &self.config, &self.tools);
+        let tool_control = tools.control();
+        self.active_tools = Some(tool_control);
+        let factory = self.attempt_factory(&tools);
+        let context = ContextState::new(selected_agents_md, ContextBaseline::Missing);
+        let canonical_context = context
+            .capture(tools.working_directory(), tools.default_shell_name())
+            .full_item();
+        Ok(ModelSessionState {
+            workspace,
+            tools,
+            factory,
+            conversation: ConversationState::empty(canonical_context),
+            context,
+            preserve_inherited_delta: false,
+        })
     }
 
     fn attempt_factory(&self, tools: &ToolRuntime) -> ResponsesAttemptFactory {
@@ -603,14 +708,14 @@ pub(crate) fn prepare_checkpoint(
     context_source: ContextSource,
 ) -> PreparedCheckpoint {
     let runtime = tool_runtime(checkpoint.workspace(), config, tools);
-    let project_instructions = context_source
+    let selected_agents_md = context_source
         .project_instructions(checkpoint.workspace())
         .map(Arc::from);
     PreparedCheckpoint {
         checkpoint,
         runtime,
         context_source,
-        project_instructions,
+        selected_agents_md,
     }
 }
 
@@ -666,8 +771,9 @@ pub(crate) fn prepare_history_checkpoint(
         canonical_context,
         history,
         prompt_cache_key,
+        context_baseline,
     } = resume;
-    let project_instructions = context_source
+    let selected_agents_md = context_source
         .project_instructions(&workspace)
         .map(Arc::from);
     let runtime = tool_runtime(&workspace, config, tools);
@@ -687,12 +793,13 @@ pub(crate) fn prepare_history_checkpoint(
         canonical_context,
         history,
         context_source.global_instructions(),
+        context_baseline,
     )?;
     Ok(PreparedCheckpoint {
         checkpoint,
         runtime,
         context_source,
-        project_instructions,
+        selected_agents_md,
     })
 }
 
@@ -713,6 +820,93 @@ where
     S::Error: Into<NanocodexError>,
     S::Future: AgentSend,
 {
+    pub(crate) async fn compact(
+        &mut self,
+        requested_workspace: Option<Arc<str>>,
+        thinking: Thinking,
+        fast_mode: bool,
+        logical_turn: u64,
+        cancel: &mut tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<ModelCompactOutcome> {
+        self.thinking = thinking;
+        self.fast_mode = fast_mode;
+        self.started_at = Instant::now();
+        self.stats = RunStats::default();
+        let mut session = match self.session.take() {
+            Some(session) => session,
+            None => self.empty_session(requested_workspace.as_deref())?,
+        };
+        session.factory = session.factory.for_logical_turn(logical_turn);
+        if let Err(error) = session.validate_workspace(requested_workspace.as_deref()) {
+            let checkpoint =
+                Self::checkpoint_from_session(&session, false, self.global_instructions.clone());
+            self.session = Some(session);
+            return Ok(ModelCompactOutcome::Failed { error, checkpoint });
+        }
+        session
+            .conversation
+            .prepare_request_policy(self.continuation_policy());
+
+        let active_context_tokens = session.conversation.active_context_tokens();
+        let previous_response_id = session
+            .conversation
+            .previous_response_id()
+            .map(str::to_owned);
+        let auto_compact_token_limit =
+            compaction::auto_compact_token_limit(MODEL).unwrap_or(CONTEXT_WINDOW_TOKENS);
+        let compacted = {
+            let compaction = self.perform_compaction(
+                self.stats.model_calls,
+                session.conversation.prompt_history(),
+                session.conversation.delta_start(),
+                previous_response_id.as_deref(),
+                active_context_tokens,
+                auto_compact_token_limit,
+                &session.factory,
+            );
+            tokio::pin!(compaction);
+            tokio::select! {
+                biased;
+                _ = &mut *cancel => None,
+                outcome = &mut compaction => Some(outcome),
+            }
+        };
+        let Some(compacted) = compacted else {
+            session.conversation.reset_for_full_request();
+            let checkpoint =
+                Self::checkpoint_from_session(&session, false, self.global_instructions.clone());
+            self.session = Some(session);
+            return Ok(ModelCompactOutcome::Cancelled(checkpoint));
+        };
+        let (item, _usage, server_reasoning_included) = match compacted {
+            Ok(compacted) => compacted,
+            Err(error) => {
+                session.conversation.reset_for_full_request();
+                let checkpoint = Self::checkpoint_from_session(
+                    &session,
+                    false,
+                    self.global_instructions.clone(),
+                );
+                self.session = Some(session);
+                return Ok(ModelCompactOutcome::Failed { error, checkpoint });
+            }
+        };
+        session
+            .conversation
+            .observe_server_reasoning(server_reasoning_included);
+        session
+            .conversation
+            .install_pre_turn_compaction(item, session.factory.profile().prefix());
+        session.conversation.commit_tail();
+        session.context.require_full_reinjection();
+        session.preserve_inherited_delta = false;
+        self.force_compaction = false;
+        let checkpoint =
+            Self::checkpoint_from_session(&session, false, self.global_instructions.clone());
+        self.session = Some(session);
+        Ok(ModelCompactOutcome::Completed(checkpoint))
+    }
+
     pub(crate) fn emit_cancelled_before_start(
         &mut self,
         task: &Prompt,
@@ -765,6 +959,7 @@ where
         workspace: Option<Arc<str>>,
         thinking: Thinking,
         fast_mode: bool,
+        logical_turn: u64,
         steers: tokio::sync::mpsc::Receiver<Prompt>,
         mut cancel: tokio::sync::oneshot::Receiver<()>,
         fork_snapshots: watch::Sender<Option<ModelCheckpoint>>,
@@ -773,6 +968,9 @@ where
         self.fast_mode = fast_mode;
         self.started_at = Instant::now();
         self.stats = RunStats::default();
+        if let Some(tools) = &self.active_tools {
+            tools.begin_turn();
+        }
         let transport_before = self.transport_stats.snapshot();
         self.events.emit(
             AgentEventKind::RunStarted,
@@ -790,7 +988,14 @@ where
         )?;
 
         let outcome = self
-            .execute_task(task, workspace, steers, &mut cancel, &fork_snapshots)
+            .execute_task(
+                task,
+                workspace,
+                logical_turn,
+                steers,
+                &mut cancel,
+                &fork_snapshots,
+            )
             .await;
         let elapsed = self.started_at.elapsed();
         match outcome {
@@ -819,7 +1024,7 @@ where
             }
             Ok(ModelTaskOutcome::Cancelled) => {
                 if let Some(tools) = &self.active_tools {
-                    tools.cancel().await;
+                    tools.cancel_turn().await;
                 }
                 let checkpoint = self.commit_interrupted_checkpoint()?;
                 let elapsed = self.started_at.elapsed();
@@ -854,13 +1059,33 @@ where
                     // local usage remains below the proactive threshold.
                     self.force_compaction = true;
                 }
-                // Retain client-authored state at its safe boundary, but drop
-                // the transport checkpoint: the provider may have observed
-                // the failed request without returning a usable continuation.
-                if let Some(session) = &mut self.session {
-                    session.conversation.commit_interrupted();
-                    session.preserve_inherited_delta = false;
-                }
+                let checkpoint = if self.active_tool_calls.is_empty() {
+                    self.finish_active_tool_batch_wall();
+                    // Retain client-authored state at its safe boundary, but
+                    // drop the transport checkpoint: the provider may have
+                    // observed the failed request without returning a usable
+                    // continuation.
+                    if let Some(session) = &mut self.session {
+                        session.conversation.commit_interrupted();
+                        session.preserve_inherited_delta = false;
+                    }
+                    self.session.as_ref().map(|session| {
+                        Self::checkpoint_from_session(
+                            session,
+                            false,
+                            self.global_instructions.clone(),
+                        )
+                    })
+                } else {
+                    // A tool-dispatch failure may leave sibling calls in
+                    // flight. Stop their retained runtime work, preserve every
+                    // completed slot, and synthesize outputs for only the
+                    // unfinished calls before committing the failure boundary.
+                    if let Some(tools) = &self.active_tools {
+                        tools.cancel_turn().await;
+                    }
+                    Some(self.commit_interrupted_checkpoint()?)
+                };
                 let message = error.to_string();
                 self.events
                     .emit(AgentEventKind::RunError, RunError { message: &message })?;
@@ -879,7 +1104,10 @@ where
                         &usage,
                     ),
                 )?;
-                Err(error)
+                match checkpoint {
+                    Some(checkpoint) => Ok(ModelTurnOutcome::Failed { error, checkpoint }),
+                    None => Err(error),
+                }
             }
         }
     }
@@ -896,9 +1124,7 @@ where
                 &mut session.conversation,
                 &session.factory,
                 CompactionContext {
-                    working_directory: session.tools.working_directory(),
-                    shell: session.tools.default_shell_name(),
-                    project_instructions: session.project_instructions.as_deref(),
+                    snapshot: session.context.snapshot(),
                     phase: CompactionPhase::PreTurn,
                 },
             );
@@ -921,6 +1147,30 @@ where
         } else {
             session.conversation.clear_delta();
         }
+        if compacted {
+            session.context.require_full_reinjection();
+        }
+        let current_context = session.context.capture(
+            session.tools.working_directory(),
+            session.tools.default_shell_name(),
+        );
+        let canonical_context = current_context.full_item();
+        if let Some(update) = session.context.update(current_context) {
+            if update.full {
+                session
+                    .conversation
+                    .append_canonical_context(developer_context(), update.item);
+            } else {
+                session.conversation.append([update.item]);
+                session
+                    .conversation
+                    .set_canonical_context(canonical_context);
+            }
+        } else {
+            session
+                .conversation
+                .set_canonical_context(canonical_context);
+        }
         let user_content = prepare_user_input(&task.instruction).await;
         session
             .conversation
@@ -932,14 +1182,14 @@ where
         &mut self,
         task: Prompt,
         requested_workspace: Option<Arc<str>>,
+        logical_turn: u64,
         steers: tokio::sync::mpsc::Receiver<Prompt>,
         cancel: &mut tokio::sync::oneshot::Receiver<()>,
         fork_snapshots: &watch::Sender<Option<ModelCheckpoint>>,
     ) -> Result<ModelTaskOutcome> {
         let mut session = if let Some(mut session) = self.session.take() {
-            if let Err(error) =
-                session.validate_workspace(&self.context_source, requested_workspace.as_deref())
-            {
+            session.factory = session.factory.for_logical_turn(logical_turn);
+            if let Err(error) = session.validate_workspace(requested_workspace.as_deref()) {
                 self.session = Some(session);
                 return Err(error);
             }
@@ -962,30 +1212,35 @@ where
             }
             session
         } else {
-            let workspace = self
-                .context_source
-                .resolve_workspace(requested_workspace.as_deref())?;
-            let project_instructions = self
+            // The owning driver resolves its workspace before accepting
+            // prompts. Reuse that stable path instead of introducing a second
+            // filesystem failure between acceptance and session creation.
+            let workspace = requested_workspace.map_or_else(
+                || self.context_source.resolve_workspace(None),
+                |workspace| Ok(workspace.to_string()),
+            )?;
+            let selected_agents_md = self
                 .context_source
                 .project_instructions(&workspace)
                 .map(Arc::<str>::from);
             let tools = tool_runtime(&workspace, &self.config, &self.tools);
-            self.active_tools = Some(tools.control());
-            let factory = self.attempt_factory(&tools);
+            let tool_control = tools.control();
+            tool_control.begin_turn();
+            self.active_tools = Some(tool_control);
+            let factory = self.attempt_factory(&tools).for_logical_turn(logical_turn);
             let user_content = prepare_user_input(&task.instruction).await;
-            let history = task_input(
-                user_content,
-                tools.working_directory(),
-                tools.default_shell_name(),
-                project_instructions.as_deref(),
-            );
+            let mut context = ContextState::new(selected_agents_md, ContextBaseline::Missing);
+            let context_snapshot =
+                context.capture(tools.working_directory(), tools.default_shell_name());
+            let history = task_input(user_content, &context_snapshot);
+            context.establish(context_snapshot);
             let conversation = ConversationState::new(history)?;
             let mut session = ModelSessionState {
                 workspace,
                 tools,
                 factory,
                 conversation,
-                project_instructions,
+                context,
                 preserve_inherited_delta: false,
             };
             session
@@ -1025,7 +1280,10 @@ where
                     session.conversation.reset_for_full_request();
                     self.stats.last_response_id = None;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    self.session = Some(session);
+                    return Err(error);
+                }
             }
             session
         };
@@ -1061,24 +1319,35 @@ where
                 detail: "completed turn did not have a model session",
             })?;
         session.conversation.commit()?;
-        Ok(ModelCheckpoint {
-            workspace: session.workspace.clone(),
-            conversation: session.conversation.clone(),
-            request_prefix: session.factory.profile().shared_prefix(),
-            prompt_cache_key: Arc::from(session.factory.profile().prompt_cache_key()),
-            preserve_inherited_delta: false,
-            global_instructions: self.global_instructions.clone(),
-        })
+        Ok(Self::checkpoint_from_session(
+            session,
+            false,
+            self.global_instructions.clone(),
+        ))
     }
 
     fn commit_interrupted_checkpoint(&mut self) -> Result<ModelCheckpoint> {
-        let aborted_output = if let Some(call) = self.active_tool_call.take() {
+        let mut aborted_outputs = Vec::with_capacity(self.active_tool_calls.len());
+        for call in std::mem::take(&mut self.active_tool_calls) {
+            let completed = call
+                .completion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(completed) = completed {
+                aborted_outputs.extend(self.finish_completed_tool_call(completed, &call.progress)?);
+                continue;
+            }
             let duration_ns = elapsed_ns(call.started_at);
-            let output = ToolOutputBody::Text(format!(
-                "Wall time: {:.3} seconds\naborted by user",
-                call.started_at.elapsed().as_secs_f64()
-            ));
-            self.stats.tool_wall_duration_ns += duration_ns;
+            let elapsed_seconds = call.started_at.elapsed().as_secs_f64();
+            let output = ToolOutputBody::Text(if call.shell_abort_format {
+                format!("Wall time: {elapsed_seconds:.1} seconds\naborted by user")
+            } else {
+                format!("aborted by user after {:.1}s", elapsed_seconds.max(0.1))
+            });
+            self.finish_active_tool_progress(&call.progress);
+            self.finish_cancelled_tool_work(&call);
+            record_tool_span_terminal(&call.span, "cancelled", "ERROR", duration_ns, &output);
             self.events.emit(
                 AgentEventKind::ToolResult,
                 ToolResultEvent {
@@ -1091,30 +1360,43 @@ where
                     metadata: None,
                 },
             )?;
-            Some(match call.kind {
+            aborted_outputs.push(match call.kind {
                 CodeCallKind::Custom => custom_tool_output(call.call_id, output),
                 CodeCallKind::Function => function_tool_output(call.call_id, output),
-            })
-        } else {
-            None
-        };
+                CodeCallKind::ToolSearch => tool_search_output(call.call_id.clone(), Vec::new()),
+            });
+        }
+        self.finish_active_tool_batch_wall();
         let session = self
             .session
             .as_mut()
             .ok_or(NanocodexError::InvalidAttemptState {
-                detail: "cancelled turn did not have a model session",
+                detail: "interrupted turn did not have a model session",
             })?;
-        session.conversation.append(aborted_output);
+        session.conversation.append(aborted_outputs);
         session.conversation.append([turn_aborted()]);
         session.conversation.commit_interrupted();
-        Ok(ModelCheckpoint {
+        Ok(Self::checkpoint_from_session(
+            session,
+            false,
+            self.global_instructions.clone(),
+        ))
+    }
+
+    fn checkpoint_from_session(
+        session: &ModelSessionState,
+        preserve_inherited_delta: bool,
+        global_instructions: Option<Arc<str>>,
+    ) -> ModelCheckpoint {
+        ModelCheckpoint {
             workspace: session.workspace.clone(),
             conversation: session.conversation.clone(),
             request_prefix: session.factory.profile().shared_prefix(),
             prompt_cache_key: Arc::from(session.factory.profile().prompt_cache_key()),
-            preserve_inherited_delta: false,
-            global_instructions: self.global_instructions.clone(),
-        })
+            preserve_inherited_delta,
+            global_instructions,
+            context_baseline: session.context.baseline(),
+        }
     }
 
     fn publish_fork_snapshot(
@@ -1130,6 +1412,7 @@ where
             prompt_cache_key: Arc::from(session.factory.profile().prompt_cache_key()),
             preserve_inherited_delta: true,
             global_instructions: global_instructions.cloned(),
+            context_baseline: session.context.baseline(),
         }));
     }
 
@@ -1173,9 +1456,7 @@ where
                             &mut session.conversation,
                             &session.factory,
                             CompactionContext {
-                                working_directory: session.tools.working_directory(),
-                                shell: session.tools.default_shell_name(),
-                                project_instructions: session.project_instructions.as_deref(),
+                                snapshot: session.context.snapshot(),
                                 phase: CompactionPhase::MidTurn,
                             },
                         )
@@ -1194,9 +1475,7 @@ where
                         &mut session.conversation,
                         &session.factory,
                         CompactionContext {
-                            working_directory: session.tools.working_directory(),
-                            shell: session.tools.default_shell_name(),
-                            project_instructions: session.project_instructions.as_deref(),
+                            snapshot: session.context.snapshot(),
                             phase: CompactionPhase::MidTurn,
                         },
                     )
@@ -1216,23 +1495,25 @@ where
             }
 
             session.conversation.clear_delta();
-            for call in code_calls {
-                let history = (call.name == "exec")
-                    .then(|| Arc::new(session.conversation.flattened_history()));
-                let output = self
-                    .execute_model_tool(&session.tools, call_index, call, history)
-                    .await?;
-                session.conversation.append(output);
-            }
+            let history = code_calls
+                .iter()
+                .any(|call| call.name == "exec")
+                .then(|| Arc::new(session.conversation.flattened_history()));
+            self.execute_model_tools(
+                &session.tools,
+                &mut session.conversation,
+                call_index,
+                code_calls,
+                history,
+            )
+            .await?;
             let compacted = self
                 .maybe_compact(
                     call_index,
                     &mut session.conversation,
                     &session.factory,
                     CompactionContext {
-                        working_directory: session.tools.working_directory(),
-                        shell: session.tools.default_shell_name(),
-                        project_instructions: session.project_instructions.as_deref(),
+                        snapshot: session.context.snapshot(),
                         phase: CompactionPhase::MidTurn,
                     },
                 )
@@ -1274,15 +1555,136 @@ where
         Ok(())
     }
 
-    async fn execute_model_tool(
+    async fn execute_model_tools(
         &mut self,
         tools: &ToolRuntime,
+        conversation: &mut ConversationState,
         call_index: u32,
-        call: CodeCall,
+        calls: Vec<CodeCall>,
         history: Option<Arc<Vec<ResponseItem>>>,
-    ) -> Result<Vec<ResponseItem>> {
+    ) -> Result<()> {
+        self.active_tool_batch_started_at = Some(Instant::now());
+        let mut prepared = Vec::with_capacity(calls.len());
+        for call in calls {
+            let active = self.prepare_model_tool_call(call_index, &call)?;
+            let supports_parallel = tools.supports_parallel_tool_calls(&qualified_tool_name(&call));
+            prepared.push((call, supports_parallel, active));
+        }
+
+        let gate = Arc::new(RwLock::new(()));
+        let events = self.events.clone();
+        let tool_call_indices = self.tool_call_indices.clone();
+        let session_id = events.request_id().to_owned();
+        let mut executions = prepared
+            .into_iter()
+            .map(|(call, supports_parallel, active)| {
+                let gate = Arc::clone(&gate);
+                let history = history.clone();
+                let events = events.clone();
+                let tool_call_indices = tool_call_indices.clone();
+                let session_id = session_id.clone();
+                async move {
+                    let started_at = active.started_at;
+                    let dispatch = async {
+                        if supports_parallel {
+                            let _guard = gate.read().await;
+                            active
+                                .execution_started_at
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .replace(Instant::now());
+                            Self::execute_model_tool_call(
+                                tools,
+                                &events,
+                                &tool_call_indices,
+                                call_index,
+                                call,
+                                history,
+                                &session_id,
+                                started_at,
+                                &active.progress,
+                                &active.span,
+                            )
+                            .await
+                        } else {
+                            let _guard = gate.write().await;
+                            active
+                                .execution_started_at
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .replace(Instant::now());
+                            Self::execute_model_tool_call(
+                                tools,
+                                &events,
+                                &tool_call_indices,
+                                call_index,
+                                call,
+                                history,
+                                &session_id,
+                                started_at,
+                                &active.progress,
+                                &active.span,
+                            )
+                            .await
+                        }
+                    };
+                    let result = match AssertUnwindSafe(dispatch).catch_unwind().await {
+                        Ok(result) => result,
+                        Err(payload) => Ok(Self::panicked_tool_call(&active, payload)),
+                    };
+                    match result {
+                        Ok(mut completed) => {
+                            completed.work_duration_ns =
+                                Self::completed_tool_work_duration(&active);
+                            Self::emit_completed_tool_result(&events, &completed)?;
+                            active
+                                .completion
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .replace(completed);
+                            Ok(active)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            })
+            .collect::<FuturesOrdered<_>>();
+        while let Some(active) = executions.next().await {
+            let active = active?;
+            let Some(completed) = active
+                .completion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            else {
+                return Err(NanocodexError::InvalidAttemptState {
+                    detail: "completed tool call did not retain its output",
+                });
+            };
+            let Some(active_index) = self
+                .active_tool_calls
+                .iter()
+                .position(|candidate| Arc::ptr_eq(&candidate.completion, &active.completion))
+            else {
+                return Err(NanocodexError::InvalidAttemptState {
+                    detail: "completed tool call was not active",
+                });
+            };
+            self.active_tool_calls.remove(active_index);
+            conversation.append(self.finish_completed_tool_call(completed, &active.progress)?);
+        }
+        self.finish_active_tool_batch_wall();
+        Ok(())
+    }
+
+    fn prepare_model_tool_call(
+        &mut self,
+        call_index: u32,
+        call: &CodeCall,
+    ) -> Result<ActiveToolCall> {
         self.tool_call_indices
             .insert(call.call_id.clone().into_boxed_str(), call_index);
+        let qualified_name = qualified_tool_name(call);
         let arguments = if call.name == "exec" {
             ToolCallArguments::Text(&call.input)
         } else {
@@ -1293,40 +1695,241 @@ where
             AgentEventKind::ToolCall,
             ToolCallEvent {
                 call_id: &call.call_id,
-                tool: &call.name,
+                tool: &qualified_name,
                 arguments,
                 model_call_index: call_index,
             },
         )?;
         self.stats.tool_calls += 1;
-        if let Some(message) = unsupported_tool_message(&call) {
-            let output = ToolOutputBody::Text(message);
-            self.events.emit(
-                AgentEventKind::ToolResult,
-                ToolResultEvent {
-                    call_id: &call.call_id,
-                    tool: &call.name,
-                    status: "failed",
-                    duration_ns: 0,
-                    started_after_ns: None,
-                    result: &output,
-                    metadata: None,
-                },
-            )?;
-            return Ok(vec![match call.kind {
-                CodeCallKind::Custom => custom_tool_output(call.call_id, output),
-                CodeCallKind::Function => function_tool_output(call.call_id, output),
-            }]);
+        let started_at = Instant::now();
+        let span = model_tool_span(call, call_index);
+        record_span_content(&span, "tool.arguments", &call.input);
+        let active = ActiveToolCall {
+            call_id: call.call_id.clone(),
+            name: qualified_name,
+            kind: call.kind,
+            started_at,
+            shell_abort_format: call.namespace.is_none()
+                && matches!(call.name.as_str(), "shell_command" | "unified_exec"),
+            completion: Arc::new(Mutex::new(None)),
+            progress: Arc::new(Mutex::new(ActiveToolProgress::default())),
+            execution_started_at: Arc::new(Mutex::new(None)),
+            span,
+        };
+        self.active_tool_calls.push(active.clone());
+        Ok(active)
+    }
+
+    fn finish_completed_tool_call(
+        &mut self,
+        completed: CompletedToolCall,
+        progress: &Mutex<ActiveToolProgress>,
+    ) -> Result<Vec<ResponseItem>> {
+        self.stats.tool_work_duration_ns += completed.work_duration_ns;
+        self.finish_active_tool_progress(progress);
+        Ok(completed.response_items)
+    }
+
+    fn finish_active_tool_progress(&mut self, progress: &Mutex<ActiveToolProgress>) {
+        let progress = std::mem::take(
+            &mut *progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        self.stats.tool_calls += progress.nested_tool_calls;
+    }
+
+    fn completed_tool_work_duration(active: &ActiveToolCall) -> u64 {
+        active
+            .execution_started_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, |started_at| elapsed_ns(*started_at))
+    }
+
+    fn finish_cancelled_tool_work(&mut self, active: &ActiveToolCall) {
+        let started_at = active
+            .execution_started_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(started_at) = started_at {
+            self.stats.tool_work_duration_ns += elapsed_ns(started_at);
         }
-        let owned_context = owned_code_context(&call, history, self.events.request_id())?;
-        let started_at = self.track_active_tool_call(&call);
-        let tool_span = model_tool_span(&call, call_index);
-        record_span_content(&tool_span, "tool.arguments", &call.input);
-        let session_id = self.events.request_id().to_owned();
+    }
+
+    fn finish_active_tool_batch_wall(&mut self) {
+        if let Some(started_at) = self.active_tool_batch_started_at.take() {
+            self.stats.tool_wall_duration_ns += elapsed_ns(started_at);
+        }
+    }
+
+    fn emit_completed_tool_result(events: &EventSink, completed: &CompletedToolCall) -> Result<()> {
+        events.emit(
+            AgentEventKind::ToolResult,
+            ToolResultEvent {
+                call_id: &completed.call_id,
+                tool: &completed.tool,
+                status: status(completed.success),
+                duration_ns: completed.duration_ns,
+                started_after_ns: None,
+                result: &completed.output,
+                metadata: completed.metadata.as_deref(),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn panicked_tool_call(
+        active: &ActiveToolCall,
+        payload: Box<dyn Any + Send>,
+    ) -> CompletedToolCall {
+        let message = panic_payload(payload);
+        record_span_content(&active.span, "tool.panic", &message);
+        let output = ToolOutputBody::Text("aborted".to_owned());
+        let duration_ns = elapsed_ns(active.started_at);
+        record_tool_span_terminal(&active.span, "failed", "ERROR", duration_ns, &output);
+        let response_item = match active.kind {
+            CodeCallKind::Custom => custom_tool_output(active.call_id.clone(), output.clone()),
+            CodeCallKind::Function => function_tool_output(active.call_id.clone(), output.clone()),
+            CodeCallKind::ToolSearch => tool_search_output(active.call_id.clone(), Vec::new()),
+        };
+        CompletedToolCall {
+            call_id: active.call_id.clone(),
+            tool: active.name.clone(),
+            success: false,
+            duration_ns,
+            work_duration_ns: Self::completed_tool_work_duration(active),
+            output,
+            metadata: None,
+            response_items: vec![response_item],
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_model_tool_call(
+        tools: &ToolRuntime,
+        events: &EventSink,
+        tool_call_indices: &HashMap<Box<str>, u32>,
+        call_index: u32,
+        call: CodeCall,
+        history: Option<Arc<Vec<ResponseItem>>>,
+        session_id: &str,
+        started_at: Instant,
+        progress: &Mutex<ActiveToolProgress>,
+        tool_span: &tracing::Span,
+    ) -> Result<CompletedToolCall> {
+        let qualified_name = qualified_tool_name(&call);
+        if let Some(message) = unsupported_tool_message(tools, &call) {
+            let output = ToolOutputBody::Text(message);
+            record_tool_span_terminal(tool_span, "failed", "ERROR", 0, &output);
+            let response_item = match call.kind {
+                CodeCallKind::Custom => custom_tool_output(call.call_id.clone(), output.clone()),
+                CodeCallKind::Function => {
+                    function_tool_output(call.call_id.clone(), output.clone())
+                }
+                CodeCallKind::ToolSearch => tool_search_output(call.call_id.clone(), Vec::new()),
+            };
+            return Ok(CompletedToolCall {
+                call_id: call.call_id,
+                tool: qualified_name,
+                success: false,
+                duration_ns: 0,
+                work_duration_ns: 0,
+                output,
+                metadata: None,
+                response_items: vec![response_item],
+            });
+        }
+        if matches!(call.kind, CodeCallKind::Function) && call.namespace.is_some() {
+            let context = ToolContext::new(
+                MODEL,
+                session_id,
+                &call.call_id,
+                &[],
+                DEFAULT_TOOL_OUTPUT_TOKENS,
+            );
+            let execution = match RawValue::from_string(call.input.clone()) {
+                Ok(input) => {
+                    tools
+                        .execute_tool(&qualified_name, ToolInput::Function(input), context)
+                        .instrument(tool_span.clone())
+                        .await
+                }
+                Err(error) => ToolOutput::error(format!(
+                    "failed to encode {qualified_name} arguments: {error}"
+                )),
+            };
+            if let Some(content) = serialize_trace_content(&execution.output) {
+                record_span_content(tool_span, "tool.output", &content);
+            }
+            let duration_ns = elapsed_ns(started_at);
+            tool_span.record("status", status(execution.success));
+            tool_span.record("otel.status_code", otel_status(execution.success));
+            tool_span.record("duration_ns", duration_ns);
+            return Ok(CompletedToolCall {
+                call_id: call.call_id.clone(),
+                tool: qualified_name,
+                success: execution.success,
+                duration_ns,
+                work_duration_ns: 0,
+                response_items: vec![function_tool_output(call.call_id, execution.output.clone())],
+                output: execution.output,
+                metadata: execution.metadata,
+            });
+        }
+        if matches!(call.kind, CodeCallKind::ToolSearch) {
+            let search_history = history.as_deref().map_or(&[][..], Vec::as_slice);
+            let context = ToolContext::new(
+                MODEL,
+                session_id,
+                &call.call_id,
+                search_history,
+                DEFAULT_TOOL_OUTPUT_TOKENS,
+            );
+            let execution = match RawValue::from_string(call.input.clone()) {
+                Ok(input) => {
+                    tools
+                        .execute_tool("tool_search", ToolInput::Function(input), context)
+                        .instrument(tool_span.clone())
+                        .await
+                }
+                Err(error) => {
+                    ToolOutput::error(format!("failed to encode tool_search arguments: {error}"))
+                }
+            };
+            if let Some(content) = serialize_trace_content(&execution.output) {
+                record_span_content(tool_span, "tool.output", &content);
+            }
+            let duration_ns = elapsed_ns(started_at);
+            tool_span.record("status", status(execution.success));
+            tool_span.record("otel.status_code", otel_status(execution.success));
+            tool_span.record("duration_ns", duration_ns);
+            let tools = if execution.success {
+                match execution.code_mode_value() {
+                    Value::Array(tools) => tools,
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            return Ok(CompletedToolCall {
+                call_id: call.call_id.clone(),
+                tool: qualified_name,
+                success: execution.success,
+                duration_ns,
+                work_duration_ns: 0,
+                response_items: vec![tool_search_output(call.call_id, tools)],
+                output: execution.output,
+                metadata: execution.metadata,
+            });
+        }
+        let owned_context = owned_code_context(&call, history, session_id)?;
         let mut observer = NestedToolEventObserver {
-            events: &self.events,
-            tool_call_indices: &self.tool_call_indices,
-            stats: &mut self.stats,
+            events,
+            tool_call_indices,
+            progress,
             fallback_call_index: call_index,
             parent_call_id: &call.call_id,
             error: None,
@@ -1335,9 +1938,9 @@ where
             tools,
             &call,
             owned_context,
-            &session_id,
+            session_id,
             &mut observer,
-            &tool_span,
+            tool_span,
         )
         .await;
         let update_error = observer.error.take();
@@ -1347,29 +1950,22 @@ where
         }
         prepare_output_images(&mut execution.output).await;
         if let Some(content) = serialize_trace_content(&execution.output) {
-            record_span_content(&tool_span, "tool.output", &content);
+            record_span_content(tool_span, "tool.output", &content);
         }
-        self.active_tool_call = None;
         let duration_ns = elapsed_ns(started_at);
         tool_span.record("status", status(execution.success));
         tool_span.record("otel.status_code", otel_status(execution.success));
         tool_span.record("duration_ns", duration_ns);
-        self.stats.tool_wall_duration_ns += duration_ns;
-        self.events.emit(
-            AgentEventKind::ToolResult,
-            ToolResultEvent {
-                call_id: &call.call_id,
-                tool: &call.name,
-                status: status(execution.success),
-                duration_ns,
-                started_after_ns: None,
-                result: &execution.output,
-                metadata: None,
-            },
-        )?;
         let output = match call.kind {
-            CodeCallKind::Custom => custom_tool_output(call.call_id.clone(), execution.output),
-            CodeCallKind::Function => function_tool_output(call.call_id.clone(), execution.output),
+            CodeCallKind::Custom => {
+                custom_tool_output(call.call_id.clone(), execution.output.clone())
+            }
+            CodeCallKind::Function => {
+                function_tool_output(call.call_id.clone(), execution.output.clone())
+            }
+            CodeCallKind::ToolSearch => {
+                unreachable!("native tool_search returned through Code Mode")
+            }
         };
         let mut outputs = Vec::with_capacity(execution.notifications.len() + 1);
         outputs.push(output);
@@ -1378,18 +1974,16 @@ where
                 custom_tool_notification(notification.call_id, notification.text)
             }),
         );
-        Ok(outputs)
-    }
-
-    fn track_active_tool_call(&mut self, call: &CodeCall) -> Instant {
-        let started_at = Instant::now();
-        self.active_tool_call = Some(ActiveToolCall {
-            call_id: call.call_id.clone(),
-            name: call.name.clone(),
-            kind: call.kind,
-            started_at,
-        });
-        started_at
+        Ok(CompletedToolCall {
+            call_id: call.call_id,
+            tool: qualified_name,
+            success: execution.success,
+            duration_ns,
+            work_duration_ns: 0,
+            output: execution.output,
+            metadata: None,
+            response_items: outputs,
+        })
     }
 
     async fn maybe_compact(
@@ -1399,12 +1993,7 @@ where
         factory: &ResponsesAttemptFactory,
         context: CompactionContext<'_>,
     ) -> Result<bool> {
-        let CompactionContext {
-            working_directory,
-            shell,
-            project_instructions,
-            phase,
-        } = context;
+        let CompactionContext { snapshot, phase } = context;
         let Some(auto_compact_token_limit) = compaction::auto_compact_token_limit(MODEL) else {
             return Ok(false);
         };
@@ -1425,14 +2014,23 @@ where
             )
             .await?;
         conversation.observe_server_reasoning(server_reasoning_included);
-        let canonical_context = task_context(working_directory, shell, project_instructions);
-        conversation.install_compaction(
-            item,
-            developer_context(),
-            canonical_context,
-            factory.profile().prefix(),
-            phase,
-        );
+        match phase {
+            CompactionPhase::PreTurn => {
+                conversation.install_pre_turn_compaction(item, factory.profile().prefix());
+            }
+            CompactionPhase::MidTurn => {
+                let snapshot = snapshot.ok_or(NanocodexError::InvalidAttemptState {
+                    detail: "mid-turn compaction is missing its context snapshot",
+                })?;
+                let canonical_context = snapshot.full_item();
+                conversation.install_mid_turn_compaction(
+                    item,
+                    developer_context(),
+                    canonical_context,
+                    factory.profile().prefix(),
+                );
+            }
+        }
         self.force_compaction = false;
         Ok(true)
     }
@@ -1577,7 +2175,12 @@ where
         conversation: &mut ConversationState,
         factory: &ResponsesAttemptFactory,
     ) -> Result<TurnResult> {
-        let previous_response_id = conversation.previous_response_id();
+        let (prompt_history, prompt_repaired) = conversation.prompt_history_with_repair();
+        let previous_response_id = if prompt_repaired {
+            None
+        } else {
+            conversation.previous_response_id().map(str::to_owned)
+        };
         let started_at = Instant::now();
         self.stats.model_calls += 1;
         self.events.emit(
@@ -1587,15 +2190,15 @@ where
                 model: MODEL,
                 reasoning_mode: self.config.reasoning_mode.as_str(),
                 effort: self.thinking.as_str(),
-                previous_response_id,
+                previous_response_id: previous_response_id.as_deref(),
             },
         )?;
         let request = factory.generation(
             call_index,
-            conversation.prompt_history(),
+            prompt_history.clone(),
             conversation.shared_history(),
             conversation.delta_start(),
-            previous_response_id,
+            previous_response_id.as_deref(),
             self.thinking,
             self.fast_mode,
         );
@@ -1630,6 +2233,9 @@ where
                 detail: "generation returned a non-generation response",
             });
         };
+        if prompt_repaired {
+            conversation.adopt_prompt_history(prompt_history);
+        }
         let duration_ns = elapsed_ns(started_at);
         record_model_response(&span, &response);
         span.record("status", "completed");
@@ -1797,15 +2403,25 @@ where
     }
 }
 
-fn unsupported_tool_message(call: &CodeCall) -> Option<String> {
+fn unsupported_tool_message(tools: &ToolRuntime, call: &CodeCall) -> Option<String> {
     if call.namespace.is_none() && matches!(call.name.as_str(), "exec" | "wait") {
         return None;
     }
-    let qualified_name = format!("{}{}", call.namespace.as_deref().unwrap_or(""), call.name);
+    if call.namespace.is_some() && matches!(call.kind, CodeCallKind::Function) {
+        let qualified_name = qualified_tool_name(call);
+        return (!tools.contains(&qualified_name))
+            .then(|| format!("unsupported call: {qualified_name}"));
+    }
+    let qualified_name = qualified_tool_name(call);
     Some(match &call.kind {
         CodeCallKind::Custom => format!("unsupported custom tool call: {qualified_name}"),
         CodeCallKind::Function => format!("unsupported call: {qualified_name}"),
+        CodeCallKind::ToolSearch => return None,
     })
+}
+
+fn qualified_tool_name(call: &CodeCall) -> String {
+    format!("{}{}", call.namespace.as_deref().unwrap_or(""), call.name)
 }
 
 fn trace_model_input(request: &ResponsesAttempt) -> (usize, usize, Option<String>) {
@@ -1829,13 +2445,39 @@ fn serialize_trace_content<T: Serialize + ?Sized>(value: &T) -> Option<String> {
         .flatten()
 }
 
+fn record_tool_span_terminal(
+    span: &tracing::Span,
+    status: &'static str,
+    otel_status: &'static str,
+    duration_ns: u64,
+    output: &ToolOutputBody,
+) {
+    if let Some(content) = serialize_trace_content(output) {
+        record_span_content(span, "tool.output", &content);
+    }
+    span.record("status", status);
+    span.record("otel.status_code", otel_status);
+    span.record("duration_ns", duration_ns);
+}
+
+fn panic_payload(payload: Box<dyn Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => payload.downcast::<&'static str>().map_or_else(
+            |_| "non-string panic payload".to_owned(),
+            |message| (*message).to_owned(),
+        ),
+    }
+}
+
 fn model_tool_span(call: &CodeCall, call_index: u32) -> tracing::Span {
+    let qualified_name = qualified_tool_name(call);
     info_span!(
         target: "nanocodex",
         "tool.call",
         otel.kind = "internal",
         otel.status_code = tracing::field::Empty,
-        tool.name = %call.name,
+        tool.name = %qualified_name,
         tool.call_id = %call.call_id,
         tool.arguments.bytes = call.input.len(),
         model.call_index = call_index,

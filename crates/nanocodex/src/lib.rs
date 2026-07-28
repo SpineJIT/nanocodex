@@ -19,14 +19,13 @@ pub use nanocodex_tools::{Tool, Tools};
 pub mod agent {
     #![doc = include_str!("../../nanocodex-agent/README.md")]
 
-    pub use nanocodex_agent::{
-        AgentEvents, CostStatus, EstimatedUsdCost, NanocodexError, Result, ServiceTier, TurnUsage,
-        UsdAmount, events, input, session, usage,
-    };
     #[cfg(not(target_family = "wasm"))]
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+    pub use nanocodex_agent::rollout;
     pub use nanocodex_agent::{
-        AgentHandle, Nanocodex, NanocodexBuilder, Turn, TurnControl, TurnResult, rollout,
+        AgentEvents, AgentHandle, CostStatus, EstimatedUsdCost, Nanocodex, NanocodexBuilder,
+        NanocodexError, Result, ServiceTier, Turn, TurnControl, TurnResult, TurnUsage, UsdAmount,
+        events, input, session, usage,
     };
 }
 

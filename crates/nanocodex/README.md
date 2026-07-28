@@ -29,6 +29,7 @@ let turn = agent
 let result = turn.await?;
 
 println!("{}", result.final_message());
+agent.shutdown().await?;
 # Ok(())
 # }
 ```
@@ -59,6 +60,7 @@ if let Some(cost) = result.usage().estimated_cost() {
 } else {
     println!("cost unavailable: {}", result.usage().cost_status().as_str());
 }
+agent.shutdown().await?;
 # Ok(())
 # }
 ```

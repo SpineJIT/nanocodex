@@ -17,5 +17,6 @@ pub use event::{
     WarmupResponse, WarmupServerEvent,
 };
 pub use item::{ResponseItem, ResponseItemId};
-pub use request::{RequestProfile, ResponseCreate, ResponseHistory, ResponsesInput};
+pub(crate) use request::{CreatePolicy, ResponseCreate};
+pub use request::{RequestProfile, ResponseHistory, ResponsesInput};
 pub use tool::{CustomToolFormat, JsonSchema, JsonValue, ToolDefinition};

@@ -56,6 +56,9 @@ test("the headless client exposes matching direct and standalone actions", async
   const fresh = await agent.session.spawn();
   assert.equal(fresh.sessionId, "session-1-spawn");
 
+  await agent.session.compact();
+  await Actions.session.compact(agent);
+
   const extended = agent.extend((client) => ({ inspect: { session: () => client.sessionId } }));
   assert.equal(extended.inspect.session(), "session-1");
 });
@@ -139,6 +142,7 @@ function rawAgent(sessionId) {
     async spawn() {
       return rawAgent(`${sessionId}-spawn`);
     },
+    async compact() {},
     free() {},
   };
 }

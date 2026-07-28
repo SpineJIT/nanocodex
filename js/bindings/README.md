@@ -22,6 +22,7 @@ console.log(turn.usage().cost_status);
 
 await agent.session.setThinking("high");
 await agent.session.setFastMode(true);
+await agent.session.compact();
 
 const branch = await agent.session.fork({ at: turn });
 console.log(await branch.turn.prompt({ input: "Try another approach." }).result());
@@ -136,6 +137,7 @@ an owned client decorated with matching domain actions:
 - `turn.snapshot()` / `Actions.turn.getSnapshot(turn)`
 - `turn.usage()` / `Actions.turn.getUsage(turn)`
 - `agent.session.fork(...)` / `Actions.session.fork(agent, ...)`
+- `agent.session.compact()` / `Actions.session.compact(agent)`
 - `agent.session.setThinking(...)` / `Actions.session.setThinking(agent, ...)`
 - `agent.session.setFastMode(...)` / `Actions.session.setFastMode(agent, ...)`
 - `agent.session.spawn()` / `Actions.session.spawn(agent)`

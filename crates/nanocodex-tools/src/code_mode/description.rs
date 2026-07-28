@@ -126,16 +126,15 @@ pub(super) fn exec_description(definitions: &[ToolDefinition], has_deferred_tool
         );
     }
     for spec in definitions {
-        let input_name = match &spec {
-            ToolDefinition::Function { .. } => "args",
-            ToolDefinition::Custom { .. } => "input",
-        };
-        let input_type = match &spec {
-            ToolDefinition::Function { .. } => spec
-                .parameters()
-                .map(JsonSchema::as_value)
-                .map_or_else(|| "unknown".to_owned(), render_json_schema_to_typescript),
-            ToolDefinition::Custom { .. } => "string".to_owned(),
+        let (input_name, input_type) = match spec {
+            ToolDefinition::Function { .. } => (
+                "args",
+                spec.parameters()
+                    .map(JsonSchema::as_value)
+                    .map_or_else(|| "unknown".to_owned(), render_json_schema_to_typescript),
+            ),
+            ToolDefinition::Custom { .. } => ("input", "string".to_owned()),
+            ToolDefinition::ToolSearch { .. } => continue,
         };
         let output_type = match spec.output_schema().map(JsonSchema::as_value) {
             Some(schema) => match mcp_structured_content_schema(schema) {

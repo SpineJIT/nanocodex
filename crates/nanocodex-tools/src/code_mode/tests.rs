@@ -2,7 +2,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -26,6 +26,10 @@ struct ConcurrencyProbe {
     state: Arc<ConcurrencyProbeState>,
 }
 
+struct SerialConcurrencyProbe {
+    state: Arc<ConcurrencyProbeState>,
+}
+
 struct ConcurrencyProbeState {
     active: AtomicUsize,
     maximum: AtomicUsize,
@@ -46,6 +50,10 @@ impl Tool for ConcurrencyProbe {
         )
     }
 
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
         let active = self.state.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.state.maximum.fetch_max(active, Ordering::SeqCst);
@@ -59,6 +67,63 @@ impl Tool for ConcurrencyProbe {
         self.state.active.fetch_sub(1, Ordering::SeqCst);
         Ok(ToolOutput::text("released"))
     }
+}
+
+#[async_trait::async_trait]
+impl Tool for SerialConcurrencyProbe {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "serial_concurrency_probe",
+            "Records whether default tool execution overlaps.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        let active = self.state.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.state.maximum.fetch_max(active, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        self.state.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolOutput::text("completed"))
+    }
+}
+
+#[tokio::test]
+async fn nested_tool_calls_are_serial_by_default() -> Result<()> {
+    let workspace = temporary_workspace("serial-nested-tools")?;
+    let state = Arc::new(ConcurrencyProbeState {
+        active: AtomicUsize::new(0),
+        maximum: AtomicUsize::new(0),
+        release: Semaphore::new(0),
+    });
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(SerialConcurrencyProbe {
+            state: Arc::clone(&state),
+        })
+        .build()?;
+    let runtime = ToolRuntime::new_with_tools(&workspace, None, None, &tools);
+    let history = Vec::new();
+    let execution = runtime
+        .execute_code(
+            r"
+await Promise.all([
+  tools.serial_concurrency_probe({}),
+  tools.serial_concurrency_probe({}),
+]);
+",
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert_eq!(state.maximum.load(Ordering::SeqCst), 1);
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -498,6 +563,124 @@ try {
     assert!(emitted_text(&execution)?.contains("unable to locate image"));
     assert_eq!(execution.nested_calls.len(), 1);
     assert!(!execution.nested_calls[0].success);
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_runtime_failures_reject_but_nonzero_exits_resolve() -> Result<()> {
+    let workspace = temporary_workspace("shell-runtime-failures")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let missing_workdir = workspace.join("missing");
+    let execution = tools
+        .execute_code(
+            &format!(
+                r#"
+const observed = [];
+try {{
+  await tools.exec_command({{
+    cmd: "true",
+    workdir: {},
+    login: false,
+  }});
+  observed.push("spawn-resolved");
+}} catch (error) {{
+  observed.push(String(error).startsWith("exec_command failed for `true`: CreateProcess"));
+}}
+try {{
+  await tools.write_stdin({{ session_id: 999999, chars: "" }});
+  observed.push("unknown-resolved");
+}} catch (error) {{
+  observed.push(String(error) === "write_stdin failed: Unknown process id 999999");
+}}
+const nonzero = await tools.exec_command({{ cmd: "exit 17", login: false }});
+observed.push(nonzero.exit_code);
+text(observed);
+"#,
+                serde_json::to_string(&missing_workdir.to_string_lossy())?
+            ),
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert_eq!(
+        serde_json::from_str::<Value>(emitted_text(&execution)?)?,
+        serde_json::json!([true, true, 17])
+    );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn non_tty_stdin_is_closed_but_interrupt_is_supported() -> Result<()> {
+    let workspace = temporary_workspace("non-tty-stdin")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+const command = await tools.exec_command({
+  cmd: "sleep 30",
+  login: false,
+  tty: false,
+  yield_time_ms: 250,
+});
+let closed = false;
+try {
+  await tools.write_stdin({
+    session_id: command.session_id,
+    chars: "hello\n",
+  });
+} catch (error) {
+  closed = String(error) === "write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open";
+}
+const interrupted = await tools.write_stdin({
+  session_id: command.session_id,
+  chars: "\u0003",
+  yield_time_ms: 1000,
+});
+text({ closed, exit_code: interrupted.exit_code });
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert_eq!(
+        serde_json::from_str::<Value>(emitted_text(&execution)?)?,
+        serde_json::json!({ "closed": true, "exit_code": 130 })
+    );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_results_always_report_original_token_count() -> Result<()> {
+    let workspace = temporary_workspace("shell-original-token-count")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+const result = await tools.exec_command({ cmd: "printf hi", login: false });
+text({
+  present: Object.hasOwn(result, "original_token_count"),
+  count: result.original_token_count,
+});
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    let result = serde_json::from_str::<Value>(emitted_text(&execution)?)?;
+    assert_eq!(result["present"], true);
+    assert_eq!(result["count"], 1);
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -1084,6 +1267,79 @@ await new Promise(() => {});
     assert!(!missing.success);
     assert!(execution_output(&missing).contains("exec cell 1 not found"));
 
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_a_turn_preserves_prior_turn_shell_sessions() -> Result<()> {
+    let workspace = temporary_workspace("turn-scoped-shell-cancellation")?;
+    let tools = test_tools(&workspace);
+    let control = tools.control();
+    let history = Vec::new();
+
+    control.begin_turn();
+    let prior = tools
+        .execute_code(
+            r#"
+const command = await tools.exec_command({
+  cmd: "sleep 30",
+  login: false,
+  yield_time_ms: 250,
+});
+text(command.session_id);
+"#,
+            test_context(&history),
+        )
+        .await;
+    assert!(prior.success, "{}", execution_output(&prior));
+    assert_eq!(emitted_text(&prior)?, "1");
+
+    control.begin_turn();
+    let current = tools
+        .execute_code(
+            r#"
+const command = await tools.exec_command({
+  cmd: "sleep 30",
+  login: false,
+  yield_time_ms: 250,
+});
+text(command.session_id);
+"#,
+            test_context(&history),
+        )
+        .await;
+    assert!(current.success, "{}", execution_output(&current));
+    assert_eq!(emitted_text(&current)?, "2");
+
+    control.cancel_turn().await;
+    let result = tools
+        .execute_code(
+            r#"
+const prior = await tools.write_stdin({
+  session_id: 1,
+  chars: "\u0003",
+  yield_time_ms: 1000,
+});
+let currentMissing = false;
+try {
+  await tools.write_stdin({ session_id: 2, chars: "" });
+} catch (error) {
+  currentMissing = String(error) === "write_stdin failed: Unknown process id 2";
+}
+text({ prior_exit_code: prior.exit_code, current_missing: currentMissing });
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(result.success, "{}", execution_output(&result));
+    assert_eq!(
+        serde_json::from_str::<Value>(emitted_text(&result)?)?,
+        serde_json::json!({ "prior_exit_code": 130, "current_missing": true })
+    );
+    control.cancel().await;
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -1866,6 +2122,7 @@ fn test_live_cell(
 ) -> Arc<LiveCell> {
     Arc::new(LiveCell {
         id,
+        turn_id: AtomicU64::new(0),
         output_token_budget: crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
         observation: Arc::new(tokio::sync::Mutex::new(CellObservationState {
             updates,

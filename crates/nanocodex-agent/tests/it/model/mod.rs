@@ -75,6 +75,7 @@ fn chatgpt_auth() -> OpenAiAuth {
 }
 
 mod branching;
+mod context;
 mod control;
 mod instructions;
 mod persistence;

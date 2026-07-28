@@ -26,8 +26,6 @@ use tracing::{Instrument, info_span};
 pub use config::McpServer;
 pub use oauth::{McpOAuthCredentials, McpOAuthStore};
 
-const TOOL_SEARCH_NAME: &str = "tool_search";
-
 /// A configured family of MCP servers installed into [`crate::Tools`].
 pub struct Mcp {
     servers: Arc<[NamedServer]>,
@@ -287,9 +285,11 @@ impl McpHandle {
                     .map(|tool| {
                         ToolEntry::new(
                             server_name,
+                            server.config.description.as_deref(),
                             &tool,
                             Arc::clone(&connected.client),
                             server.config.tool_timeout,
+                            server.config.supports_parallel_tool_calls,
                         )
                     })
                     .collect();
@@ -457,9 +457,11 @@ impl DynamicToolProvider for Mcp {
                             .map(|tool| {
                                 ToolEntry::new(
                                     &name,
+                                    config.description.as_deref(),
                                     &tool,
                                     Arc::clone(&connected.client),
                                     config.tool_timeout,
+                                    config.supports_parallel_tool_calls,
                                 )
                             })
                             .collect::<Vec<_>>()
@@ -490,6 +492,16 @@ impl DynamicToolProvider for Mcp {
 
     fn available_definitions(&self) -> Vec<ToolDefinition> {
         self.state.available_definitions()
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.state.active_entry(name).is_some()
+    }
+
+    fn supports_parallel_tool_calls(&self, name: &str) -> bool {
+        self.state
+            .active_entry(name)
+            .is_some_and(|entry| entry.supports_parallel_tool_calls)
     }
 
     async fn execute(
@@ -587,20 +599,18 @@ struct SearchInput {
 #[async_trait]
 impl Tool for McpSearch {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function(
-            TOOL_SEARCH_NAME,
+        ToolDefinition::tool_search(
+            "client",
             self.description.clone(),
             json!({
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search query for deferred MCP tools."
+                        "description": "Search query for deferred tools."
                     },
                     "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 32,
+                        "type": "number",
                         "description": "Maximum number of tools to return. Defaults to 8."
                     }
                 },
@@ -608,6 +618,10 @@ impl Tool for McpSearch {
                 "additionalProperties": false
             }),
         )
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
     }
 
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
@@ -651,7 +665,12 @@ impl Tool for McpSearch {
             span.record("pending_servers", result.pending_server_count());
         }
         Ok(match result {
-            Ok(result) => ToolOutput::json(&result),
+            Ok(result) => match result.loadable_tools() {
+                Ok(tools) => ToolOutput::json(&result).with_code_mode_value(tools),
+                Err(error) => {
+                    ToolOutput::error(format!("failed to encode MCP tool definitions: {error}"))
+                }
+            },
             Err(error) => ToolOutput::error(error),
         })
     }
@@ -701,7 +720,7 @@ fn search_description(servers: &[NamedServer]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "# MCP tool discovery\n\nSearches deferred MCP tool metadata with BM25 and activates matching tools for Code Mode. MCP handshakes and tools/list run in the background when the agent starts. Search before using an MCP tool; returned names can be called as `tools[name](arguments)` in the same or a later exec cell.\n\nConfigured sources:\n{sources}"
+        "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nYou have access to tools from the following sources:\n{sources}\nSome of the tools may not have been provided to you upfront, and you should use this tool (`tool_search`) to search for the required tools. For MCP tool discovery, always use `tool_search` instead of `list_mcp_resources` or `list_mcp_resource_templates`."
     )
 }
 
@@ -742,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn search_definition_describes_background_discovery() {
+    fn search_definition_uses_the_native_provider_contract() {
         let mcp = Mcp::builder()
             .server(
                 "docs",
@@ -751,11 +770,29 @@ mod tests {
             )
             .build()
             .unwrap();
-        assert!(
-            mcp.search
-                .definition()
-                .description()
-                .contains("tools/list run in the background")
+        let definition = serde_json::to_value(mcp.search.definition()).unwrap();
+        assert_eq!(
+            definition,
+            json!({
+                "type": "tool_search",
+                "execution": "client",
+                "description": "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nYou have access to tools from the following sources:\n- docs: Search product documentation.\nSome of the tools may not have been provided to you upfront, and you should use this tool (`tool_search`) to search for the required tools. For MCP tool discovery, always use `tool_search` instead of `list_mcp_resources` or `list_mcp_resource_templates`.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query for deferred tools."
+                        },
+                        "limit": {
+                            "type": "number",
+                            "description": "Maximum number of tools to return. Defaults to 8."
+                        }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }
+            })
         );
     }
 
@@ -781,6 +818,38 @@ mod tests {
             .await
             .unwrap();
         assert!(search.success);
+        assert_eq!(
+            search.code_mode_value(),
+            json!([
+                {
+                    "type": "namespace",
+                    "name": "mcp__fixture__",
+                    "description": "Tools in the mcp__fixture__ namespace.",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "echo",
+                            "description": "Echo deterministic MCP fixture message 0.",
+                            "strict": false,
+                            "defer_loading": true,
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "message": { "type": "string" },
+                                    "delay_ms": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 1000
+                                    }
+                                },
+                                "required": ["message"],
+                                "additionalProperties": false
+                            }
+                        }
+                    ]
+                }
+            ])
+        );
         assert!(matches!(
             &search.output,
             ToolOutputBody::Text(output) if output.contains("mcp__fixture__echo")

@@ -9,7 +9,8 @@ use std::{
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use nanocodex_oai_api::{
-    events::{AgentEvent, AgentEventKind, EventSink, monotonic_now_ns},
+    __private::EventSink,
+    events::{AgentEvent, AgentEventKind, monotonic_now_ns},
     pricing::{ServiceTier, estimate},
     responses::{
         ContentItem, FunctionOutputBody, FunctionOutputContent, InputTokenDetails, MessageRole,

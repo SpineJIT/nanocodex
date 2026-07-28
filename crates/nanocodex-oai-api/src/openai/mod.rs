@@ -2,13 +2,15 @@ use std::{num::NonZeroU32, sync::Arc};
 
 use ::tower::Layer;
 
+mod config;
 mod platform;
 
 use crate::{
-    DefaultResponsesService, ModelConfig, OpenAiAuth, OpenAiAuthError, OpenAiAuthMode,
-    ReasoningMode, ResponsesHistory, ResponsesRetryPolicy, ResponsesTransport, Thinking,
-    session::SessionBuilder,
+    DefaultResponsesService, OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, ReasoningMode,
+    ResponsesHistory, ResponsesRetryPolicy, ResponsesTransport, Thinking, session::SessionBuilder,
 };
+
+pub use config::ModelConfig;
 
 /// Configured, cloneable `OpenAI` client recipe.
 ///
@@ -22,7 +24,8 @@ pub struct OpenAi<F = StandardServiceFactory> {
 }
 
 impl OpenAi<StandardServiceFactory> {
-    /// Creates a client with the standard persistent WebSocket and retry stack.
+    /// Creates a client with the standard persistent WebSocket and retry
+    /// stack, including session-scoped HTTPS fallback on native targets.
     ///
     /// # Errors
     ///
@@ -70,10 +73,7 @@ where
         self.factory.make(Arc::new(self.config.clone()))
     }
 
-    /// Consumes the recipe into its validated policy and concrete service factory.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn into_parts(self) -> (ModelConfig, F) {
+    pub(crate) fn into_parts(self) -> (ModelConfig, F) {
         (self.config, self.factory)
     }
 }
@@ -86,7 +86,12 @@ pub struct OpenAiBuilder<F = StandardServiceFactory> {
 }
 
 impl<F> OpenAiBuilder<F> {
-    /// Selects the Responses transport used by sessions from this client.
+    /// Selects the initial Responses transport policy for new sessions.
+    ///
+    /// [`ResponsesTransport::WebSocket`] prefers a persistent socket. The
+    /// native standard stack degrades one-way to HTTPS after exhausting its
+    /// retry budget.
+    /// [`ResponsesTransport::Https`] never probes the WebSocket endpoint.
     #[must_use]
     pub const fn transport(mut self, transport: ResponsesTransport) -> Self {
         self.config.responses_transport = transport;
@@ -333,8 +338,7 @@ impl Default for StandardServiceFactory {
     }
 }
 
-/// Caller-supplied fresh-service factory.
-#[doc(hidden)]
+/// Caller-supplied fresh-service factory used by the private agent bridge.
 pub struct CallerServiceFactory<M> {
     make: Arc<M>,
 }
@@ -348,15 +352,13 @@ impl<M> Clone for CallerServiceFactory<M> {
 }
 
 /// A concrete Tower layer applied to another service factory.
-#[doc(hidden)]
 #[derive(Clone)]
 pub struct LayeredServiceFactory<F, L> {
     inner: F,
     layer: L,
 }
 
-/// Private generic construction boundary used to retain concrete Tower types.
-#[doc(hidden)]
+/// Generic construction boundary used by the private agent bridge.
 pub trait MakeResponsesService: Clone {
     /// Concrete service owned by each managed session.
     type Service;

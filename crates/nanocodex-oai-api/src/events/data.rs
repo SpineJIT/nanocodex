@@ -219,9 +219,9 @@ pub struct RunMetrics {
     pub model_duration_ns: u64,
     /// Nanoseconds spent warming the persistent connection.
     pub warmup_duration_ns: u64,
-    /// Sum of nested tool work durations.
+    /// Sum of top-level tool-handler execution durations after scheduler admission.
     pub tool_work_duration_ns: u64,
-    /// Wall-clock nanoseconds spent in top-level tool execution.
+    /// Union of wall-clock intervals spent executing top-level tool batches.
     pub tool_wall_duration_ns: u64,
     /// Token usage from generation and compaction operations.
     pub usage: EventUsage,

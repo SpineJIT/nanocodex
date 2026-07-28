@@ -247,14 +247,19 @@ impl OAuthCallback {
     }
 }
 
-/// Load a persisted `ChatGPT` OAuth session as the shared authorization for an agent family.
+/// Loads a persisted `ChatGPT` OAuth session as shared authorization for an agent family.
+///
+/// The file uses Codex's `auth.json` format and can be shared with Codex and other Nanocodex
+/// processes. Before refreshing, each authorization handle reloads a same-account credential
+/// written by another process. Refreshes within one handle are serialized, and successful writes
+/// preserve unknown fields while atomically replacing the file with owner-only permissions.
 ///
 /// # Errors
 ///
 /// Returns an error when the credential file cannot be read or is invalid.
 pub fn load_chatgpt_auth(auth_file: impl Into<PathBuf>) -> Result<OpenAiAuth, ChatGptAuthError> {
     let auth_file = auth_file.into();
-    let credentials = read_store(&auth_file)?;
+    let (credentials, auth_record) = read_stored_auth(&auth_file)?;
     credentials.validate(&auth_file)?;
     let manager = ManagedChatGptAuth {
         auth_file,
@@ -262,6 +267,7 @@ pub fn load_chatgpt_auth(auth_file: impl Into<PathBuf>) -> Result<OpenAiAuth, Ch
         client: auth_client()?,
         state: RwLock::new(ManagedState {
             credentials,
+            auth_record,
             revision: 0,
             permanent_failure: None,
         }),
@@ -398,7 +404,7 @@ impl StoredCredentials {
     }
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, PartialEq, Serialize)]
 struct CodexAuthDocument {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auth_mode: Option<String>,
@@ -412,7 +418,7 @@ struct CodexAuthDocument {
     extra: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 struct CodexTokenData {
     id_token: String,
     access_token: String,
@@ -433,8 +439,14 @@ struct ManagedChatGptAuth {
 
 struct ManagedState {
     credentials: StoredCredentials,
+    auth_record: CodexAuthDocument,
     revision: u64,
-    permanent_failure: Option<Arc<str>>,
+    permanent_failure: Option<AuthScopedRefreshFailure>,
+}
+
+struct AuthScopedRefreshFailure {
+    auth_record: CodexAuthDocument,
+    detail: Arc<str>,
 }
 
 impl ManagedChatGptAuth {
@@ -444,34 +456,52 @@ impl ManagedChatGptAuth {
             .map_err(|_| OpenAiAuthError::Unavailable(Arc::from("authorization state poisoned")))
     }
 
-    fn snapshot_now(&self) -> Result<OpenAiAuthSnapshot, OpenAiAuthError> {
-        let state = self.state()?;
-        if let Some(error) = &state.permanent_failure {
-            return Err(OpenAiAuthError::LoginRequired(Arc::clone(error)));
-        }
-        Ok(OpenAiAuthSnapshot::new(
+    fn snapshot_from_state(state: &ManagedState) -> OpenAiAuthSnapshot {
+        OpenAiAuthSnapshot::new(
             OpenAiAuthMode::ChatGpt,
             Arc::<str>::from(state.credentials.access_token.as_str()),
             Some(Arc::<str>::from(state.credentials.account_id.as_str())),
             state.credentials.fedramp,
             state.revision,
-        ))
+        )
     }
 
-    async fn refresh_if_current(
-        &self,
-        rejected_revision: u64,
-        reload: bool,
-    ) -> Result<(), OpenAiAuthError> {
+    fn snapshot_unchecked(&self) -> Result<OpenAiAuthSnapshot, OpenAiAuthError> {
+        let state = self.state()?;
+        Ok(Self::snapshot_from_state(&state))
+    }
+
+    fn snapshot_now(&self) -> Result<OpenAiAuthSnapshot, OpenAiAuthError> {
+        let state = self.state()?;
+        if let Some(failure) = &state.permanent_failure
+            && failure.auth_record == state.auth_record
+        {
+            return Err(OpenAiAuthError::LoginRequired(Arc::clone(&failure.detail)));
+        }
+        Ok(Self::snapshot_from_state(&state))
+    }
+
+    async fn refresh_if_current(&self, rejected_revision: u64) -> Result<(), OpenAiAuthError> {
         let _refresh = self.refresh.lock().await;
         if self.state()?.revision != rejected_revision {
             return Ok(());
         }
-        if reload && self.reload_if_changed()? {
+        if self.reload_if_changed()? {
             return Ok(());
         }
 
-        let refresh_token = self.state()?.credentials.refresh_token.clone();
+        let (refresh_token, attempted_auth_record) = {
+            let state = self.state()?;
+            if let Some(failure) = &state.permanent_failure
+                && failure.auth_record == state.auth_record
+            {
+                return Err(OpenAiAuthError::LoginRequired(Arc::clone(&failure.detail)));
+            }
+            (
+                state.credentials.refresh_token.clone(),
+                state.auth_record.clone(),
+            )
+        };
         let response = self
             .client
             .post(format!("{}/oauth/token", self.issuer.trim_end_matches('/')))
@@ -502,13 +532,19 @@ impl ManagedChatGptAuth {
             let detail: Arc<str> =
                 Arc::from(code.unwrap_or_else(|| format!("token endpoint returned HTTP {status}")));
             if permanent {
-                self.state
-                    .write()
-                    .map_err(|_| {
-                        OpenAiAuthError::Unavailable(Arc::from("authorization state poisoned"))
-                    })?
-                    .permanent_failure = Some(Arc::clone(&detail));
-                return Err(OpenAiAuthError::LoginRequired(detail));
+                // A different process can rotate the shared refresh token while this request is
+                // in flight. Adopt that same-account record before treating this credential as
+                // permanently rejected.
+                if self.reload_if_changed()? {
+                    return Ok(());
+                }
+                if self.record_permanent_failure_if_unchanged(
+                    &attempted_auth_record,
+                    Arc::clone(&detail),
+                )? {
+                    return Err(OpenAiAuthError::LoginRequired(detail));
+                }
+                return Ok(());
             }
             return Err(OpenAiAuthError::Refresh(detail));
         }
@@ -518,7 +554,8 @@ impl ManagedChatGptAuth {
     }
 
     fn reload_if_changed(&self) -> Result<bool, OpenAiAuthError> {
-        let stored = read_store(&self.auth_file).map_err(|error| auth_store_error(&error))?;
+        let (stored, auth_record) =
+            read_stored_auth(&self.auth_file).map_err(|error| auth_store_error(&error))?;
         stored
             .validate(&self.auth_file)
             .map_err(|error| auth_store_error(&error))?;
@@ -529,12 +566,32 @@ impl ManagedChatGptAuth {
         if stored.account_id != state.credentials.account_id {
             return Err(OpenAiAuthError::AccountChanged);
         }
-        if stored.access_token == state.credentials.access_token {
+        if auth_record == state.auth_record {
             return Ok(false);
         }
         state.credentials = stored;
+        state.auth_record = auth_record;
         state.revision = state.revision.wrapping_add(1);
         state.permanent_failure = None;
+        Ok(true)
+    }
+
+    fn record_permanent_failure_if_unchanged(
+        &self,
+        attempted_auth_record: &CodexAuthDocument,
+        detail: Arc<str>,
+    ) -> Result<bool, OpenAiAuthError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| OpenAiAuthError::Unavailable(Arc::from("authorization state poisoned")))?;
+        if state.auth_record != *attempted_auth_record {
+            return Ok(false);
+        }
+        state.permanent_failure = Some(AuthScopedRefreshFailure {
+            auth_record: attempted_auth_record.clone(),
+            detail,
+        });
         Ok(true)
     }
 
@@ -566,8 +623,10 @@ impl ManagedChatGptAuth {
             next.plan = auth.plan;
             next.fedramp = auth.fedramp;
         }
-        write_store(&self.auth_file, &next).map_err(|error| auth_store_error(&error))?;
+        let auth_record =
+            write_store(&self.auth_file, &next).map_err(|error| auth_store_error(&error))?;
         state.credentials = next;
+        state.auth_record = auth_record;
         state.revision = state.revision.wrapping_add(1);
         state.permanent_failure = None;
         Ok(())
@@ -581,11 +640,18 @@ impl OpenAiAuthSource for ManagedChatGptAuth {
 
     fn snapshot(&self) -> OpenAiAuthFuture<'_, Result<OpenAiAuthSnapshot, OpenAiAuthError>> {
         Box::pin(async move {
-            let snapshot = self.snapshot_now()?;
-            let expires_soon = jwt_expiration(&self.state()?.credentials.access_token)
-                .is_some_and(|expiry| expiry <= unix_now() + REFRESH_EARLY_SECONDS);
-            if expires_soon
-                && let Err(error) = self.refresh_if_current(snapshot.revision(), false).await
+            let snapshot = self.snapshot_unchecked()?;
+            let should_refresh = {
+                let state = self.state()?;
+                let expires_soon = jwt_expiration(&state.credentials.access_token)
+                    .is_some_and(|expiry| expiry <= unix_now() + REFRESH_EARLY_SECONDS);
+                let permanently_rejected = state
+                    .permanent_failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.auth_record == state.auth_record);
+                expires_soon || permanently_rejected
+            };
+            if should_refresh && let Err(error) = self.refresh_if_current(snapshot.revision()).await
             {
                 tracing::warn!(error = %error, "proactive ChatGPT token refresh failed");
             }
@@ -605,7 +671,7 @@ impl OpenAiAuthSource for ManagedChatGptAuth {
                     "authorization mode changed",
                 )));
             }
-            self.refresh_if_current(revision, true).await
+            self.refresh_if_current(revision).await
         })
     }
 }
@@ -727,9 +793,16 @@ fn rfc3339_utc(timestamp: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-fn read_store(path: &Path) -> Result<StoredCredentials, ChatGptAuthError> {
+fn read_stored_auth(
+    path: &Path,
+) -> Result<(StoredCredentials, CodexAuthDocument), ChatGptAuthError> {
     let document = read_document(path)?;
-    StoredCredentials::from_document(&document, path)
+    let credentials = StoredCredentials::from_document(&document, path)?;
+    Ok((credentials, document))
+}
+
+fn read_store(path: &Path) -> Result<StoredCredentials, ChatGptAuthError> {
+    read_stored_auth(path).map(|(credentials, _)| credentials)
 }
 
 fn read_document(path: &Path) -> Result<CodexAuthDocument, ChatGptAuthError> {
@@ -743,7 +816,10 @@ fn read_document(path: &Path) -> Result<CodexAuthDocument, ChatGptAuthError> {
     })
 }
 
-fn write_store(path: &Path, credentials: &StoredCredentials) -> Result<(), ChatGptAuthError> {
+fn write_store(
+    path: &Path,
+    credentials: &StoredCredentials,
+) -> Result<CodexAuthDocument, ChatGptAuthError> {
     let parent = path.parent().ok_or_else(|| ChatGptAuthError::Storage {
         path: path.to_path_buf(),
         source: io::Error::new(ErrorKind::InvalidInput, "auth file has no parent directory"),
@@ -808,7 +884,7 @@ fn write_store(path: &Path, credentials: &StoredCredentials) -> Result<(), ChatG
             source,
         });
     }
-    Ok(())
+    Ok(document)
 }
 
 fn auth_store_error(error: &ChatGptAuthError) -> OpenAiAuthError {
@@ -944,273 +1020,4 @@ fn random_urlsafe() -> Result<String, ChatGptAuthError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::{Arc, RwLock};
-
-    use super::{
-        ManagedChatGptAuth, ManagedState, StoredCredentials, authorize_url, jwt_expiration,
-        read_store, refresh_error_code, rfc3339_utc, unix_now, write_store,
-    };
-    use crate::auth::{OpenAiAuth, OpenAiAuthError};
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-        sync::Mutex,
-    };
-
-    fn jwt(payload: &serde_json::Value) -> String {
-        format!(
-            "header.{}.signature",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap())
-        )
-    }
-
-    fn credentials(access: &str, refresh: &str) -> StoredCredentials {
-        StoredCredentials {
-            id_token: jwt(&serde_json::json!({
-                "email": "user@example.com",
-                "https://api.openai.com/auth": {
-                    "chatgpt_account_id": "account-1",
-                    "chatgpt_plan_type": "plus"
-                }
-            })),
-            access_token: access.to_owned(),
-            refresh_token: refresh.to_owned(),
-            account_id: "account-1".into(),
-            email: Some("user@example.com".into()),
-            plan: Some("plus".into()),
-            fedramp: false,
-        }
-    }
-
-    #[test]
-    fn formats_unix_timestamps_as_codex_compatible_utc() {
-        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
-        assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
-        assert_eq!(rfc3339_utc(2_147_483_647), "2038-01-19T03:14:07Z");
-    }
-
-    fn temp_auth_file() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "nanocodex-auth-test-{}.json",
-            super::random_urlsafe().unwrap()
-        ))
-    }
-
-    fn managed(
-        auth_file: &std::path::Path,
-        issuer: impl Into<Arc<str>>,
-        credentials: StoredCredentials,
-    ) -> OpenAiAuth {
-        OpenAiAuth::managed_chatgpt(Arc::new(ManagedChatGptAuth {
-            auth_file: auth_file.to_path_buf(),
-            issuer: issuer.into(),
-            client: super::auth_client().unwrap(),
-            state: RwLock::new(ManagedState {
-                credentials,
-                revision: 0,
-                permanent_failure: None,
-            }),
-            refresh: Mutex::new(()),
-        }))
-    }
-
-    #[test]
-    fn parses_account_and_expiry_without_exposing_tokens() {
-        let id_token = jwt(&serde_json::json!({
-            "email": "user@example.com",
-            "https://api.openai.com/auth": {
-                "chatgpt_account_id": "account-1",
-                "chatgpt_plan_type": "plus",
-                "chatgpt_account_is_fedramp": true
-            }
-        }));
-        let credentials = StoredCredentials::from_tokens(super::TokenResponse {
-            id: id_token,
-            access: jwt(&serde_json::json!({ "exp": 12345 })),
-            refresh: "refresh-secret".into(),
-        })
-        .unwrap();
-        assert_eq!(credentials.account_id, "account-1");
-        assert_eq!(credentials.status().plan.as_deref(), Some("plus"));
-        assert_eq!(jwt_expiration(&credentials.access_token), Some(12345));
-    }
-
-    #[test]
-    fn recognizes_nested_refresh_error_codes() {
-        assert_eq!(
-            refresh_error_code(br#"{"error":{"code":"refresh_token_reused"}}"#).as_deref(),
-            Some("refresh_token_reused")
-        );
-    }
-
-    #[test]
-    fn codex_auth_document_round_trip_preserves_unrelated_fields() {
-        let auth_file = temp_auth_file();
-        let original = credentials("access-1", "refresh-1");
-        let document = serde_json::json!({
-            "auth_mode": "chatgpt",
-            "OPENAI_API_KEY": "preserved-api-key",
-            "tokens": {
-                "id_token": original.id_token,
-                "access_token": original.access_token,
-                "refresh_token": original.refresh_token,
-                "account_id": original.account_id,
-                "future_token_field": {"preserved": true}
-            },
-            "last_refresh": "2026-01-01T00:00:00Z",
-            "agent_identity": {"future": "preserved"}
-        });
-        std::fs::write(&auth_file, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
-
-        let loaded = read_store(&auth_file).unwrap();
-        assert_eq!(loaded.email.as_deref(), Some("user@example.com"));
-        let rotated = credentials("access-2", "refresh-2");
-        write_store(&auth_file, &rotated).unwrap();
-
-        let stored: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&auth_file).unwrap()).unwrap();
-        assert_eq!(stored["auth_mode"], "chatgpt");
-        assert_eq!(stored["OPENAI_API_KEY"], "preserved-api-key");
-        assert_eq!(stored["agent_identity"]["future"], "preserved");
-        assert_eq!(stored["tokens"]["access_token"], "access-2");
-        assert_eq!(stored["tokens"]["refresh_token"], "refresh-2");
-        assert_eq!(stored["tokens"]["future_token_field"]["preserved"], true);
-        std::fs::remove_file(auth_file).unwrap();
-    }
-
-    #[test]
-    fn authorization_url_contains_the_pkce_and_offline_access_contract() {
-        let url = authorize_url(
-            "https://auth.openai.com",
-            "http://localhost:1455/auth/callback",
-            "state-value",
-            "challenge-value",
-        )
-        .unwrap();
-        let url = url::Url::parse(&url).unwrap();
-        let query = url
-            .query_pairs()
-            .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(url.path(), "/oauth/authorize");
-        assert_eq!(query.get("response_type").unwrap(), "code");
-        assert_eq!(query.get("client_id").unwrap(), super::OAUTH_CLIENT_ID);
-        assert_eq!(query.get("code_challenge_method").unwrap(), "S256");
-        assert_eq!(query.get("code_challenge").unwrap(), "challenge-value");
-        assert_eq!(query.get("state").unwrap(), "state-value");
-        assert!(query.get("scope").unwrap().contains("offline_access"));
-    }
-
-    #[tokio::test]
-    async fn unauthorized_recovery_reloads_a_rotated_credential_from_disk() {
-        let auth_file = temp_auth_file();
-        let original = credentials("access-1", "refresh-1");
-        write_store(&auth_file, &original).unwrap();
-        let auth = managed(&auth_file, "http://127.0.0.1:1", original);
-        let rejected = auth.snapshot().await.unwrap();
-
-        let rotated = credentials("access-2", "refresh-2");
-        write_store(&auth_file, &rotated).unwrap();
-        auth.recover_unauthorized(&rejected).await.unwrap();
-
-        let recovered = auth.snapshot().await.unwrap();
-        assert_eq!(recovered.bearer(), "access-2");
-        assert_eq!(recovered.revision(), 1);
-        std::fs::remove_file(auth_file).unwrap();
-    }
-
-    #[tokio::test]
-    async fn unauthorized_recovery_refuses_a_different_stored_account() {
-        let auth_file = temp_auth_file();
-        let original = credentials("access-1", "refresh-1");
-        write_store(&auth_file, &original).unwrap();
-        let auth = managed(&auth_file, "http://127.0.0.1:1", original);
-        let rejected = auth.snapshot().await.unwrap();
-
-        let mut changed = credentials("access-2", "refresh-2");
-        changed.account_id = "account-2".into();
-        write_store(&auth_file, &changed).unwrap();
-        assert!(matches!(
-            auth.recover_unauthorized(&rejected).await,
-            Err(OpenAiAuthError::AccountChanged)
-        ));
-        std::fs::remove_file(auth_file).unwrap();
-    }
-
-    #[tokio::test]
-    async fn expired_access_token_is_refreshed_and_rotated_atomically() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let issuer = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            loop {
-                let mut chunk = [0_u8; 1024];
-                let read = stream.read(&mut chunk).await.unwrap();
-                assert_ne!(read, 0);
-                request.extend_from_slice(&chunk[..read]);
-                let Some(headers_end) = request
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                    .map(|position| position + 4)
-                else {
-                    continue;
-                };
-                let headers = String::from_utf8_lossy(&request[..headers_end]);
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .map(str::trim)
-                            .and_then(|length| length.parse::<usize>().ok())
-                    })
-                    .unwrap();
-                if request.len() >= headers_end + content_length {
-                    break;
-                }
-            }
-            let request = String::from_utf8(request).unwrap();
-            assert!(request.starts_with("POST /oauth/token HTTP/1.1"));
-            assert!(request.contains(r#""refresh_token":"refresh-1""#));
-            let response = serde_json::json!({
-                "access_token": "fresh-access",
-                "refresh_token": "refresh-2"
-            })
-            .to_string();
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
-                        response.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-        });
-
-        let auth_file = temp_auth_file();
-        let expired = jwt(&serde_json::json!({ "exp": unix_now() - 1 }));
-        let original = credentials(&expired, "refresh-1");
-        write_store(&auth_file, &original).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&auth_file).unwrap().permissions().mode() & 0o077,
-                0
-            );
-        }
-        let auth = managed(&auth_file, issuer, original);
-
-        let snapshot = auth.snapshot().await.unwrap();
-        assert_eq!(snapshot.bearer(), "fresh-access");
-        let stored = read_store(&auth_file).unwrap();
-        assert_eq!(stored.access_token, "fresh-access");
-        assert_eq!(stored.refresh_token, "refresh-2");
-        server.await.unwrap();
-        std::fs::remove_file(auth_file).unwrap();
-    }
-}
+mod tests;

@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use nanocodex_oai_api::{
     responses::CustomToolFormat,
-    tools::{ToolContext, ToolDefinition, ToolOutputBody},
+    tools::{ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolOutputBody},
 };
 
 use super::{
@@ -161,6 +161,39 @@ impl HostedToolRuntime {
         )]
     }
 
+    /// Returns `false`; hosted definitions execute inside one Code Mode cell.
+    ///
+    /// The embedding host owns any concurrency policy below that cell.
+    #[must_use]
+    pub const fn supports_parallel_tool_calls(&self, _name: &str) -> bool {
+        false
+    }
+
+    /// Returns `false`; hosted tools are callable only inside Code Mode.
+    #[must_use]
+    pub const fn contains(&self, _name: &str) -> bool {
+        false
+    }
+
+    /// Returns a model-visible failure for unsupported direct hosted dispatch.
+    ///
+    /// Hosted tools remain nested below the embedding application's Code Mode
+    /// host rather than becoming direct Responses API tools.
+    #[allow(
+        clippy::unused_async,
+        reason = "matches the native tool-runtime contract"
+    )]
+    pub async fn execute_tool(
+        &self,
+        name: &str,
+        _input: ToolInput,
+        _context: ToolContext<'_>,
+    ) -> ToolOutput {
+        ToolOutput::error(format!(
+            "direct tool `{name}` is unavailable in a hosted runtime"
+        ))
+    }
+
     /// Executes one Code Mode cell through the embedding host.
     pub async fn execute_code(&self, source: &str, context: ToolContext<'_>) -> CodeModeExecution {
         let Some(host) = &self.host else {
@@ -220,6 +253,16 @@ impl HostedToolRuntime {
 }
 
 impl HostedToolRuntimeControl {
+    /// Begins a new logical agent turn.
+    pub const fn begin_turn(&self) {}
+
+    /// Cancels work owned by the current logical turn.
+    #[allow(
+        clippy::unused_async,
+        reason = "matches the native tool-runtime control contract"
+    )]
+    pub async fn cancel_turn(&self) {}
+
     /// Cancels active work.
     ///
     /// Hosted calls are cancelled by dropping their futures, so no additional

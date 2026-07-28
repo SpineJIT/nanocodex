@@ -17,13 +17,13 @@ use web_time::Instant;
 use crate::{
     ContentItem, EventSink, MessageRole, ResponseEvent, ResponseItem, ResponsesAttempt,
     ResponsesAttemptFactory, ResponsesOutput, ResponsesServiceError, ResponsesServiceResponse,
-    Usage, responses::ResponseHistory,
+    Usage,
 };
 
 use super::{
     builder::{ResponseTurn, Session},
     compaction,
-    state::SessionId,
+    context::{assign_missing_response_item_ids, is_canonical_context_item},
 };
 
 /// Typed input accepted by `response.create`.
@@ -33,7 +33,7 @@ pub struct ResponseInput {
 }
 
 impl ResponseInput {
-    /// Creates one user message from ordered text, image, or audio content.
+    /// Creates one user message from ordered typed content.
     ///
     /// ```
     /// use nanocodex_oai_api::{
@@ -107,7 +107,6 @@ pub struct CompletedResponse {
     estimated_cost: Option<crate::EstimatedUsdCost>,
     cost_status: crate::CostStatus,
     end_turn: Option<bool>,
-    checkpoint: ResponseCheckpoint,
 }
 
 impl CompletedResponse {
@@ -162,12 +161,6 @@ impl CompletedResponse {
     pub const fn end_turn(&self) -> Option<bool> {
         self.end_turn
     }
-
-    /// Returns the opaque completed client-owned checkpoint.
-    #[must_use]
-    pub const fn checkpoint(&self) -> &ResponseCheckpoint {
-        &self.checkpoint
-    }
 }
 
 impl fmt::Debug for CompletedResponse {
@@ -181,30 +174,12 @@ impl fmt::Debug for CompletedResponse {
     }
 }
 
-/// Opaque completed session boundary.
-#[derive(Clone)]
-pub struct ResponseCheckpoint {
-    session_id: SessionId,
-    history: ResponseHistory,
-}
-
-impl fmt::Debug for ResponseCheckpoint {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ResponseCheckpoint")
-            .field("session_id", &self.session_id)
-            .field("history_items", &self.history.len())
-            .finish_non_exhaustive()
-    }
-}
-
 /// A completed and installed remote compaction.
 #[derive(Clone)]
 pub struct CompletedCompaction {
     usage: Option<Usage>,
     estimated_cost: Option<crate::EstimatedUsdCost>,
     cost_status: crate::CostStatus,
-    checkpoint: ResponseCheckpoint,
 }
 
 impl CompletedCompaction {
@@ -224,12 +199,6 @@ impl CompletedCompaction {
     #[must_use]
     pub const fn cost_status(&self) -> crate::CostStatus {
         self.cost_status
-    }
-
-    /// Returns the opaque completed client-owned checkpoint.
-    #[must_use]
-    pub const fn checkpoint(&self) -> &ResponseCheckpoint {
-        &self.checkpoint
     }
 }
 
@@ -498,7 +467,7 @@ where
 
 async fn run_create_inner<S>(
     turn: &mut ResponseTurn<'_, S>,
-    input: ResponseInput,
+    mut input: ResponseInput,
     sink: EventSink,
     response_events: mpsc::Sender<ResponseEvent>,
 ) -> Result<CompletedResponse, ResponseError>
@@ -515,8 +484,26 @@ where
     let session = &mut *turn.session;
     let call_index = session.next_call_index;
     session.next_call_index = session.next_call_index.saturating_add(1);
+    assign_missing_response_item_ids(&mut input.items);
+    let observed_canonical_context = input
+        .items
+        .iter()
+        .filter(|item| is_canonical_context_item(item))
+        .cloned()
+        .collect::<Vec<_>>();
+    let reinject_canonical_context =
+        session.canonical_context_reinjection_pending && observed_canonical_context.is_empty();
     let mut candidate = session.state.clone();
+    if reinject_canonical_context {
+        candidate.append(session.canonical_context.iter().cloned());
+    }
     candidate.append(input.items);
+    let (prompt_history, prompt_repaired) = candidate.prompt_history_with_repair();
+    let previous_response_id = if prompt_repaired {
+        None
+    } else {
+        candidate.previous_response_id().map(str::to_owned)
+    };
 
     let factory = ResponsesAttemptFactory::new(
         session.profile.clone(),
@@ -527,10 +514,10 @@ where
     .for_logical_turn(turn.logical_turn);
     let request = factory.generation(
         call_index,
-        candidate.prompt_history(),
+        prompt_history.clone(),
         candidate.shared_history(),
         candidate.delta_start(),
-        candidate.previous_response_id(),
+        previous_response_id.as_deref(),
         session.thinking,
         session.fast_mode,
     );
@@ -542,6 +529,9 @@ where
         ));
     };
 
+    if prompt_repaired {
+        candidate.adopt_prompt_history(prompt_history);
+    }
     candidate.append(response.output_items.clone());
     candidate.update_token_info(response.usage.as_ref());
     candidate.set_previous_response_id(response.id);
@@ -549,6 +539,10 @@ where
         .commit()
         .map_err(|error| ResponseError::protocol(error.to_string()))?;
     session.state = candidate;
+    if !observed_canonical_context.is_empty() {
+        session.canonical_context = observed_canonical_context;
+    }
+    session.canonical_context_reinjection_pending = false;
 
     let output: Arc<[ResponseItem]> = response.output_items.into();
     let output_text = response
@@ -556,15 +550,16 @@ where
         .unwrap_or_else(|| output_text(&output))
         .into();
     let (estimated_cost, cost_status) = estimate_cost(response.usage.as_ref(), session.fast_mode);
-    Ok(CompletedResponse {
+    let completed = CompletedResponse {
         output,
         output_text,
         usage: response.usage,
         estimated_cost,
         cost_status,
         end_turn: response.end_turn,
-        checkpoint: session.checkpoint(),
-    })
+    };
+    turn.completed_generation = true;
+    Ok(completed)
 }
 
 pub(super) async fn run_compact<S>(
@@ -668,15 +663,21 @@ where
 
     let mut candidate = session.state.clone();
     candidate.observe_server_reasoning(server_reasoning_included);
-    candidate.install_compaction(response.item, [], session.profile.prefix());
+    let mid_turn = turn.completed_generation;
+    let canonical_context = if mid_turn {
+        session.canonical_context.clone()
+    } else {
+        Vec::new()
+    };
+    candidate.install_compaction(response.item, canonical_context, session.profile.prefix());
     session.state = candidate;
+    session.canonical_context_reinjection_pending = !mid_turn;
 
     let (estimated_cost, cost_status) = estimate_cost(response.usage.as_ref(), session.fast_mode);
     Ok(CompletedCompaction {
         usage: response.usage,
         estimated_cost,
         cost_status,
-        checkpoint: session.checkpoint(),
     })
 }
 
@@ -838,15 +839,6 @@ pub(super) fn estimate_cost(
             crate::CostStatus::EstimatedFromUsage,
         ),
         None => (None, crate::CostStatus::UsageNotReported),
-    }
-}
-
-impl<S> Session<S> {
-    fn checkpoint(&self) -> ResponseCheckpoint {
-        ResponseCheckpoint {
-            session_id: self.id,
-            history: self.state.shared_history(),
-        }
     }
 }
 

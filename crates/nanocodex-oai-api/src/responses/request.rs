@@ -430,7 +430,10 @@ impl Serialize for ResponsesInput<'_> {
     {
         let mut sequence = serializer.serialize_seq(Some(self.len()))?;
         for item in self.iter() {
-            sequence.serialize_element(&RequestResponseItem { item })?;
+            sequence.serialize_element(&RequestResponseItem {
+                item,
+                retain_client_item_ids: true,
+            })?;
         }
         sequence.end()
     }
@@ -439,6 +442,7 @@ impl Serialize for ResponsesInput<'_> {
 #[derive(Clone, Copy)]
 struct RequestInput<'a> {
     input: ResponsesInput<'a>,
+    retain_client_item_ids: bool,
 }
 
 impl Serialize for RequestInput<'_> {
@@ -448,7 +452,10 @@ impl Serialize for RequestInput<'_> {
     {
         let mut sequence = serializer.serialize_seq(Some(self.input.len()))?;
         for item in self.input.iter() {
-            sequence.serialize_element(&RequestResponseItem { item })?;
+            sequence.serialize_element(&RequestResponseItem {
+                item,
+                retain_client_item_ids: self.retain_client_item_ids,
+            })?;
         }
         sequence.end()
     }
@@ -456,6 +463,7 @@ impl Serialize for RequestInput<'_> {
 
 struct RequestResponseItem<'a> {
     item: &'a ResponseItem,
+    retain_client_item_ids: bool,
 }
 
 impl Serialize for RequestResponseItem<'_> {
@@ -463,7 +471,11 @@ impl Serialize for RequestResponseItem<'_> {
     where
         S: serde::Serializer,
     {
-        if self.item.id().is_some_and(|id| !id.is_prefixed()) {
+        if self
+            .item
+            .id()
+            .is_some_and(|id| !self.retain_client_item_ids || !id.is_prefixed())
+        {
             let mut item = self.item.clone();
             item.set_id(None);
             item.serialize(serializer)
@@ -475,7 +487,7 @@ impl Serialize for RequestResponseItem<'_> {
 
 /// Fully typed wire request for `response.create` or WebSocket warmup.
 #[derive(Serialize)]
-pub struct ResponseCreate<'a> {
+pub(crate) struct ResponseCreate<'a> {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     kind: Option<&'static str>,
     model: &'a str,
@@ -500,7 +512,7 @@ pub struct ResponseCreate<'a> {
 impl<'a> ResponseCreate<'a> {
     /// Builds a non-generating WebSocket warmup request.
     #[must_use]
-    pub fn warmup(
+    pub(crate) fn warmup(
         config: &'a ModelConfig,
         thinking: Thinking,
         fast_mode: bool,
@@ -509,7 +521,8 @@ impl<'a> ResponseCreate<'a> {
     ) -> Self {
         Self::new(
             config,
-            RequestPolicy {
+            CreatePolicy {
+                transport: config.responses_transport,
                 thinking,
                 fast_mode,
             },
@@ -521,12 +534,9 @@ impl<'a> ResponseCreate<'a> {
         )
     }
 
-    /// Builds a generating Responses request.
-    #[must_use]
-    pub fn generation(
+    pub(crate) fn generation_with_policy(
         config: &'a ModelConfig,
-        thinking: Thinking,
-        fast_mode: bool,
+        policy: CreatePolicy,
         input: ResponsesInput<'a>,
         previous_response_id: Option<&'a str>,
         profile: &'a RequestProfile,
@@ -534,10 +544,7 @@ impl<'a> ResponseCreate<'a> {
     ) -> Self {
         Self::new(
             config,
-            RequestPolicy {
-                thinking,
-                fast_mode,
-            },
+            policy,
             input,
             previous_response_id,
             None,
@@ -548,23 +555,26 @@ impl<'a> ResponseCreate<'a> {
 
     fn new(
         config: &'a ModelConfig,
-        policy: RequestPolicy,
+        policy: CreatePolicy,
         input: ResponsesInput<'a>,
         previous_response_id: Option<&'a str>,
         generate: Option<bool>,
         profile: &'a RequestProfile,
         turn_state: Option<&'a str>,
     ) -> Self {
-        let websocket = matches!(
-            config.responses_transport,
-            crate::ResponsesTransport::WebSocket
-        );
+        let websocket = matches!(policy.transport, crate::ResponsesTransport::WebSocket);
         Self {
             kind: websocket.then_some("response.create"),
             model: crate::MODEL,
             previous_response_id,
-            input: RequestInput { input },
+            input: RequestInput {
+                input,
+                retain_client_item_ids: config.store_responses,
+            },
             tool_choice: "auto",
+            // gpt-5.6-sol uses Responses Lite. Codex disables the provider
+            // parallel-call request bit for Lite even though the client-side
+            // scheduler still accepts multi-call responses and replays.
             parallel_tool_calls: false,
             reasoning: ReasoningControls {
                 mode: config.reasoning_mode.request_value(),
@@ -590,9 +600,24 @@ impl<'a> ResponseCreate<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct RequestPolicy {
+pub(crate) struct CreatePolicy {
+    transport: crate::ResponsesTransport,
     thinking: Thinking,
     fast_mode: bool,
+}
+
+impl CreatePolicy {
+    pub(crate) const fn new(
+        transport: crate::ResponsesTransport,
+        thinking: Thinking,
+        fast_mode: bool,
+    ) -> Self {
+        Self {
+            transport,
+            thinking,
+            fast_mode,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -650,6 +675,7 @@ mod tests {
         assert_eq!(request["client_metadata"]["thread_id"], json!("branch-a"));
         assert_eq!(request["store"], false);
         assert_eq!(request["generate"], false);
+        assert_eq!(request["parallel_tool_calls"], false);
         assert!(request.get("tools").is_none());
         assert!(request.get("instructions").is_none());
         assert_eq!(request["reasoning"]["summary"], json!("auto"));
@@ -686,10 +712,9 @@ mod tests {
         };
         let profile = RequestProfile::new("agent", "lineage", Arc::from([]));
 
-        let stored_request = serde_json::to_value(ResponseCreate::generation(
+        let stored_request = serde_json::to_value(ResponseCreate::generation_with_policy(
             &stored_config,
-            Thinking::Medium,
-            false,
+            CreatePolicy::new(stored_config.responses_transport, Thinking::Medium, false),
             ResponsesInput::history(&[], &history, None),
             None,
             &profile,
@@ -704,10 +729,13 @@ mod tests {
             store_responses: false,
             ..ModelConfig::default()
         };
-        let ephemeral_request = serde_json::to_value(ResponseCreate::generation(
+        let ephemeral_request = serde_json::to_value(ResponseCreate::generation_with_policy(
             &ephemeral_config,
-            Thinking::Medium,
-            false,
+            CreatePolicy::new(
+                ephemeral_config.responses_transport,
+                Thinking::Medium,
+                false,
+            ),
             ResponsesInput::history(&[], &history, None),
             None,
             &profile,
@@ -715,7 +743,7 @@ mod tests {
         ))
         .expect("request should serialize");
 
-        assert_eq!(ephemeral_request["input"][0]["id"], "msg_stable");
+        assert!(ephemeral_request["input"][0].get("id").is_none());
         assert!(ephemeral_request["input"][1].get("id").is_none());
         assert_eq!(
             history

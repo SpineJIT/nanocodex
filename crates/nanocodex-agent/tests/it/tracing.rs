@@ -1,17 +1,34 @@
 use std::{
     collections::HashMap,
-    future::{Pending, pending},
-    sync::{Arc, Mutex},
+    future::{Pending, Ready, pending, ready},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
+    task::{Context, Poll},
     time::Instant,
 };
 
 use nanocodex_agent::{
     Nanocodex, NanocodexError, OpenAi, Tools,
-    transport::{ResponsesAttempt, ResponsesServiceResponse},
+    transport::{ResponsesAttempt, ResponsesAttemptKind, ResponsesServiceResponse},
 };
+use nanocodex_oai_api::{
+    responses::WarmupResponse,
+    tower::{CodeCall, CodeCallKind, GenerationOutput, ResponsePipelineStats, ResponsesOutput},
+};
+use nanocodex_tools::{
+    Tool, ToolContext, ToolDefinition, ToolInput, ToolResult, contract::async_trait,
+};
+use serde_json::json;
 use tokio::sync::mpsc;
 use tower::Service;
-use tracing::{Id, Instrument, Subscriber, info_span, span::Attributes};
+use tracing::{
+    Id, Instrument, Subscriber,
+    field::{Field, Visit},
+    info_span,
+    span::{Attributes, Record},
+};
 use tracing_subscriber::{Layer, layer::Context as LayerContext, prelude::*, registry::LookupSpan};
 
 #[derive(Clone)]
@@ -34,6 +51,87 @@ impl Service<ResponsesAttempt> for PendingService {
     }
 }
 
+struct PendingSpanTool {
+    started: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Tool for PendingSpanTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "trace__pending",
+            "Remains active until the turn is cancelled.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
+
+#[derive(Clone)]
+struct PendingToolService {
+    calls: Arc<AtomicU32>,
+}
+
+impl Service<ResponsesAttempt> for PendingToolService {
+    type Response = ResponsesServiceResponse;
+    type Error = NanocodexError;
+    type Future = Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
+        let call = self.calls.fetch_add(1, Ordering::Relaxed);
+        let output = match (call, request.kind()) {
+            (0, ResponsesAttemptKind::Warmup) => ResponsesOutput::Warmup(WarmupResponse {
+                id: "resp-warmup".to_owned(),
+                usage: None,
+            }),
+            (1, ResponsesAttemptKind::Generation) => pending_tool_generation(),
+            _ => panic!("unexpected attempt {call}: {:?}", request.kind()),
+        };
+        ready(Ok(ResponsesServiceResponse::new(output)))
+    }
+}
+
+fn pending_tool_generation() -> ResponsesOutput {
+    let item = serde_json::from_value(json!({
+        "type": "function_call",
+        "call_id": "call-pending",
+        "namespace": "trace__",
+        "name": "pending",
+        "arguments": "{}"
+    }))
+    .expect("function call item decodes");
+    ResponsesOutput::Generation(GenerationOutput {
+        id: "resp-tool".to_owned(),
+        status: "completed".to_owned(),
+        end_turn: Some(false),
+        final_message: None,
+        output_items: vec![item],
+        code_calls: vec![CodeCall {
+            call_id: "call-pending".to_owned(),
+            name: "pending".to_owned(),
+            namespace: Some("trace__".to_owned()),
+            input: "{}".to_owned(),
+            kind: CodeCallKind::Function,
+        }],
+        usage: None,
+        time_to_first_event_ns: 0,
+        time_to_first_output_ns: None,
+        pipeline_stats: ResponsePipelineStats::default(),
+    })
+}
+
 #[derive(Clone, Default)]
 struct TraceCapture(Arc<Mutex<HashMap<u64, CapturedSpan>>>);
 
@@ -43,6 +141,31 @@ struct CapturedSpan {
     parent: Option<u64>,
     opened: Instant,
     closed: Option<Instant>,
+    fields: HashMap<String, String>,
+}
+
+struct FieldCapture<'a>(&'a mut HashMap<String, String>);
+
+impl Visit for FieldCapture<'_> {
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.0.insert(field.name().to_owned(), value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.0.insert(field.name().to_owned(), value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.0.insert(field.name().to_owned(), value.to_string());
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.to_owned());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
 }
 
 impl<S> Layer<S> for TraceCapture
@@ -50,6 +173,8 @@ where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
     fn on_new_span(&self, attributes: &Attributes<'_>, id: &Id, context: LayerContext<'_, S>) {
+        let mut fields = HashMap::new();
+        attributes.record(&mut FieldCapture(&mut fields));
         let parent = attributes
             .parent()
             .map(|parent| parent.clone().into_u64())
@@ -66,8 +191,15 @@ where
                 parent,
                 opened: Instant::now(),
                 closed: None,
+                fields,
             },
         );
+    }
+
+    fn on_record(&self, id: &Id, values: &Record<'_>, _context: LayerContext<'_, S>) {
+        if let Some(span) = self.0.lock().unwrap().get_mut(&id.clone().into_u64()) {
+            values.record(&mut FieldCapture(&mut span.fields));
+        }
     }
 
     fn on_close(&self, id: Id, _context: LayerContext<'_, S>) {
@@ -186,4 +318,70 @@ fn contextual_child_turns_preserve_parallel_orchestration_parentage() {
         first.opened < second.closed.unwrap() && second.opened < first.closed.unwrap(),
         "child turn intervals should overlap"
     );
+}
+
+#[test]
+fn cancelled_tool_span_records_its_terminal_state_before_closing() {
+    let capture = TraceCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async {
+            let calls = Arc::new(AtomicU32::new(0));
+            let started = Arc::new(tokio::sync::Notify::new());
+            let service_calls = Arc::clone(&calls);
+            let openai = OpenAi::builder("test")
+                .service(move || PendingToolService {
+                    calls: Arc::clone(&service_calls),
+                })
+                .build()
+                .unwrap();
+            let tools = Tools::builder()
+                .without_defaults()
+                .tool(PendingSpanTool {
+                    started: Arc::clone(&started),
+                })
+                .build()
+                .unwrap();
+            let (agent, events) = Nanocodex::builder(openai).tools(tools).build().unwrap();
+            let turn = agent.prompt("run pending tool").await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+                .await
+                .expect("pending tool did not start");
+            turn.cancel().await.unwrap();
+            assert!(matches!(
+                turn.result().await,
+                Err(NanocodexError::TurnCancelled)
+            ));
+            agent.shutdown().await.unwrap();
+            drop((agent, events));
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+        });
+    });
+
+    let spans = capture.0.lock().unwrap();
+    let tool = spans
+        .values()
+        .find(|span| span.name == "tool.call")
+        .expect("tool span was not captured");
+    assert_eq!(
+        tool.fields.get("status").map(String::as_str),
+        Some("cancelled")
+    );
+    assert_eq!(
+        tool.fields.get("otel.status_code").map(String::as_str),
+        Some("ERROR")
+    );
+    assert!(
+        tool.fields
+            .get("duration_ns")
+            .and_then(|duration| duration.parse::<u64>().ok())
+            .is_some_and(|duration| duration > 0)
+    );
+    assert!(tool.closed.is_some(), "tool span did not close");
 }

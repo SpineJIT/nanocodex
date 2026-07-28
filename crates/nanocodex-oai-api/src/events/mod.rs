@@ -1,7 +1,7 @@
 //! Complete typed lifecycle events emitted around Responses operations.
 
 mod data;
-mod stream;
+pub(crate) mod stream;
 
 #[doc(inline)]
 pub use data::{
@@ -15,4 +15,4 @@ pub use data::{
 #[doc(inline)]
 pub use stream::{AgentEvent, AgentEventKind, AgentEvents, EventError};
 #[doc(hidden)]
-pub use stream::{AgentEventTiming, EventSink, TimedAgentEvent, monotonic_now_ns};
+pub use stream::{AgentEventTiming, TimedAgentEvent, monotonic_now_ns};

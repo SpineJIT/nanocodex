@@ -9,8 +9,8 @@ use ::tower::retry::{Policy, Retry};
 use web_time::Instant;
 
 use crate::{
-    ModelConfig,
-    attempt::{ResponsesAttempt, ResponsesServiceResponse},
+    ModelConfig, ResponsesError, ResponsesTransport,
+    attempt::{ResponsesAttempt, ResponsesAttemptKind, ResponsesServiceResponse},
     service::ResponsesService,
     service_error::{FailurePhase, ResponsesServiceError},
     telemetry::{AttemptRetrying, duration_ns, elapsed_ns},
@@ -23,6 +23,7 @@ use super::delay::{RetryDelay, RetryFuture};
 pub struct ResponsesRetryPolicy {
     max_attempts: NonZeroU32,
     delay: RetryDelay,
+    standard_transport: Option<ResponsesTransport>,
 }
 
 impl ResponsesRetryPolicy {
@@ -35,6 +36,7 @@ impl ResponsesRetryPolicy {
         Self {
             max_attempts,
             delay: RetryDelay::unconfigured(),
+            standard_transport: None,
         }
     }
 
@@ -46,7 +48,16 @@ impl ResponsesRetryPolicy {
         Self {
             max_attempts,
             delay: RetryDelay::from_config(config),
+            standard_transport: None,
         }
+    }
+
+    pub(crate) const fn with_standard_transport_fallback(
+        mut self,
+        transport: ResponsesTransport,
+    ) -> Self {
+        self.standard_transport = Some(transport);
+        self
     }
 }
 
@@ -71,6 +82,76 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
         let checkpoint_missing =
             failure.is_checkpoint_missing() && request.previous_response_id().is_some();
         let advice = failure.retry_advice;
+        let upgrade_required = matches!(
+            failure.responses_error(),
+            Some(ResponsesError::HandshakeRejected { status: 426, .. })
+        );
+        let exhausted_websocket_budget = !matches!(request.kind, ResponsesAttemptKind::Warmup)
+            && advice.is_some()
+            && request.attempt >= request.max_attempts;
+        let fallback_reason = if upgrade_required {
+            Some("upgrade_required")
+        } else if exhausted_websocket_budget {
+            Some("retry_exhausted")
+        } else {
+            None
+        };
+        if let Some(fallback_reason) = fallback_reason
+            && matches!(self.standard_transport, Some(ResponsesTransport::WebSocket))
+            && request.activate_https_fallback()
+        {
+            let failed_attempt = request.attempt;
+            let message = failure.source.to_string();
+            tracing::warn!(
+                target: "nanocodex_oai_api",
+                previous_transport = "responses_websocket_v2",
+                next_transport = "responses_https_sse",
+                reason = fallback_reason,
+                phase = request.kind.phase(),
+                model.call_index = request.call_index,
+                attempt = failed_attempt,
+                "falling back from WebSocket to HTTPS Responses transport"
+            );
+            if matches!(request.kind, ResponsesAttemptKind::Warmup) {
+                return None;
+            }
+            if let Err(error) = request.observer.emit(
+                AgentEventKind::ModelAttemptRetrying,
+                AttemptRetrying {
+                    phase: request.kind,
+                    model_call_index: request.call_index,
+                    attempt: failed_attempt,
+                    next_attempt: 1,
+                    max_attempts: request.max_attempts,
+                    failure_phase: failure.phase,
+                    error_class: "websocket_fallback",
+                    delay_ns: 0,
+                    server_requested_delay: false,
+                    opens_new_socket: false,
+                    replay_mode: "full_history",
+                    connection_generation: failure.connection_generation,
+                    error: &message,
+                },
+            ) {
+                *result = Err(ResponsesServiceError::event(
+                    error,
+                    FailurePhase::Output,
+                    failure.connection_generation,
+                ));
+                return None;
+            }
+            request.prepare_transport_fallback();
+            request
+                .observer
+                .stats
+                .response_retries
+                .fetch_add(1, Ordering::Relaxed);
+            return Some(
+                self.delay
+                    .clone_for_retry()
+                    .wait(request.profile.session_id().to_owned(), Duration::ZERO),
+            );
+        }
         if !checkpoint_missing && advice.is_none() {
             return None;
         }

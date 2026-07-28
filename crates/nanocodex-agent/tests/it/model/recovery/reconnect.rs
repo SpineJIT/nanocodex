@@ -42,11 +42,7 @@ async fn reconnect_drops_previous_response_id_and_replays_full_history() -> Resu
         assert_eq!(replay["input"][5]["type"], "custom_tool_call");
         assert!(replay["input"][5].get("id").is_none());
         assert_eq!(replay["input"][6]["type"], "custom_tool_call_output");
-        assert!(
-            replay["input"][6]["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("ctco_"))
-        );
+        assert!(replay["input"][6].get("id").is_none());
         send_final(&mut second, "resp-final").await
     });
 

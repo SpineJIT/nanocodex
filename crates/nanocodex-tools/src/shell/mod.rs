@@ -83,6 +83,8 @@ impl WriteStdin {
 
 #[derive(Serialize)]
 pub(crate) struct ExecCommandResult {
+    #[serde(skip)]
+    error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chunk_id: Option<String>,
     wall_time_seconds: f64,
@@ -98,6 +100,7 @@ pub(crate) struct ExecCommandResult {
 pub(crate) struct ShellSessions {
     sessions: Mutex<SessionStore>,
     next_session_id: AtomicI64,
+    current_turn: Arc<AtomicU64>,
     default_shell: selection::Shell,
     environment: Arc<Vec<(OsString, OsString)>>,
 }
@@ -108,10 +111,19 @@ impl ShellSessions {
         Self::with_environment(Arc::new(Vec::new()))
     }
 
+    #[cfg(test)]
     pub(crate) fn with_environment(environment: Arc<Vec<(OsString, OsString)>>) -> Self {
+        Self::with_environment_and_turn(environment, Arc::new(AtomicU64::new(0)))
+    }
+
+    pub(crate) fn with_environment_and_turn(
+        environment: Arc<Vec<(OsString, OsString)>>,
+        current_turn: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             sessions: Mutex::new(SessionStore::default()),
             next_session_id: AtomicI64::new(1),
+            current_turn,
             default_shell: selection::default_user_shell(),
             environment,
         }
@@ -146,11 +158,20 @@ impl ShellSessions {
             Err(error) => {
                 return ExecCommandResult::failed(
                     started_at.elapsed(),
-                    format!("failed to spawn {}: {error}", shell.path().display()),
+                    format!(
+                        "exec_command failed for `{}`: CreateProcess {{ message: {:?} }}",
+                        command.script,
+                        error.to_string()
+                    ),
                 );
             }
         };
-        let session = Session::new(session_id, spawned, secrets);
+        let session = Session::new(
+            session_id,
+            self.current_turn.load(Ordering::Acquire),
+            spawned,
+            secrets,
+        );
         let _interaction_guard = session.interaction.lock().await;
         let pruned = self.sessions.lock().await.insert(Arc::clone(&session));
         if let Some(pruned) = pruned {
@@ -175,25 +196,36 @@ impl ShellSessions {
         let Some(session) = session else {
             return ExecCommandResult::failed(
                 started_at.elapsed(),
-                format!("unknown or completed exec session {}", request.session_id),
+                format!(
+                    "write_stdin failed: Unknown process id {}",
+                    request.session_id
+                ),
             );
         };
 
         let _interaction_guard = session.interaction.lock().await;
+        session
+            .turn_id
+            .store(self.current_turn.load(Ordering::Acquire), Ordering::Release);
         let _interaction = session.begin_interaction();
         if !request.chars.is_empty() {
-            let written = if request.chars == "\u{3}" && !session.tty {
-                session.interrupt().await
+            let written = if !session.tty {
+                if request.chars == "\u{3}" {
+                    session.interrupt().await
+                } else {
+                    return ExecCommandResult::failed(
+                        started_at.elapsed(),
+                        "write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open"
+                            .to_owned(),
+                    );
+                }
             } else {
                 session.write(&request.chars).await
             };
             if let Err(error) = written {
                 return ExecCommandResult::failed(
                     started_at.elapsed(),
-                    format!(
-                        "failed to write to exec session {}: {error}",
-                        request.session_id
-                    ),
+                    format!("write_stdin failed: {error}"),
                 );
             }
         }
@@ -220,6 +252,25 @@ impl ShellSessions {
                 .sessions
                 .drain()
                 .map(|(_, session)| session)
+                .collect::<Vec<_>>()
+        };
+        for session in sessions {
+            session.terminate().await;
+        }
+    }
+
+    pub(crate) async fn terminate_turn(&self, turn_id: u64) {
+        let sessions = {
+            let mut store = self.sessions.lock().await;
+            let ids = store
+                .sessions
+                .iter()
+                .filter_map(|(id, session)| {
+                    (session.turn_id.load(Ordering::Acquire) == turn_id).then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| store.remove(id))
                 .collect::<Vec<_>>()
         };
         for session in sessions {
@@ -278,6 +329,7 @@ impl SessionStore {
 
 struct Session {
     id: i64,
+    turn_id: AtomicU64,
     tty: bool,
     interaction: Mutex<()>,
     child: Mutex<process::ProcessChild>,
@@ -290,7 +342,12 @@ struct Session {
 }
 
 impl Session {
-    fn new(id: i64, spawned: process::SpawnedProcess, secrets: Vec<String>) -> Arc<Self> {
+    fn new(
+        id: i64,
+        turn_id: u64,
+        spawned: process::SpawnedProcess,
+        secrets: Vec<String>,
+    ) -> Arc<Self> {
         let tty = matches!(spawned.stdin.as_ref(), Some(process::ProcessStdin::Pty(_)));
         let captured = Arc::new(Mutex::new(CapturedOutput::default()));
         let drains = match spawned.output {
@@ -314,6 +371,7 @@ impl Session {
         };
         Arc::new(Self {
             id,
+            turn_id: AtomicU64::new(turn_id),
             tty,
             interaction: Mutex::new(()),
             child: Mutex::new(spawned.child),
@@ -336,7 +394,29 @@ impl Session {
     }
 
     async fn terminate(&self) {
-        let _ = self.process_group.lock().await.terminate_and_disarm();
+        // Signal first: a direct caller can hold the interaction lock while
+        // awaiting this child, and waiting for that lock before terminating
+        // would make cancellation wait for the command's full yield timeout.
+        self.stdin.lock().await.take();
+        if let Err(error) = self.process_group.lock().await.terminate_and_disarm() {
+            tracing::warn!(
+                shell.session.id = self.id,
+                %error,
+                "failed to terminate shell process group"
+            );
+        }
+        // The active interaction observes the signal and releases the child
+        // wait path. Own it before the idempotent reap/drain cleanup so a
+        // cancellation acknowledgement is a real process-cleanup boundary.
+        let _interaction = self.interaction.lock().await;
+        if let Err(error) = self.child.lock().await.wait().await {
+            tracing::warn!(
+                shell.session.id = self.id,
+                %error,
+                "failed to reap terminated shell process"
+            );
+        }
+        self.finish_drains().await;
     }
 
     async fn interrupt(&self) -> std::io::Result<()> {
@@ -363,7 +443,7 @@ impl Session {
         };
         let exit_code = match status {
             Ok(Ok(exit_code)) => {
-                self.process_group.lock().await.disarm();
+                let _ = self.process_group.lock().await.terminate_and_disarm();
                 self.finish_drains().await;
                 Some(exit_code)
             }
@@ -387,6 +467,7 @@ impl Session {
             }
         };
         ExecCommandResult {
+            error: None,
             chunk_id,
             wall_time_seconds: started_at.elapsed().as_secs_f64(),
             exit_code,
@@ -417,12 +498,8 @@ impl Session {
         let captured = self.captured.lock().await.take();
         let raw = String::from_utf8_lossy(&captured.with_omission_marker()).into_owned();
         let limit = output::effective_token_limit(max_output_tokens);
-        let (output, limited) = output::redact_and_limit(raw, &self.secrets, limit);
-        let was_truncated = limited || captured.omitted_bytes > 0;
-        (
-            output,
-            was_truncated.then_some(captured.total_bytes.saturating_add(3) / 4),
-        )
+        let (output, _) = output::redact_and_limit(raw, &self.secrets, limit);
+        (output, Some(captured.total_bytes.saturating_add(3) / 4))
     }
 }
 
@@ -524,8 +601,9 @@ impl CapturedChunk {
 }
 
 impl ExecCommandResult {
-    const fn failed(wall_time: Duration, output: String) -> Self {
+    fn failed(wall_time: Duration, output: String) -> Self {
         Self {
+            error: Some(output.clone()),
             chunk_id: None,
             wall_time_seconds: wall_time.as_secs_f64(),
             exit_code: Some(1),
@@ -645,12 +723,12 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn yielded_command_accepts_stdin_and_completes() {
+    async fn yielded_non_tty_command_rejects_stdin_write() {
         let sessions = ShellSessions::new();
         let first = sessions
             .execute(
                 ExecCommand::new(
-                    "read value; printf 'got:%s' \"$value\"".to_owned(),
+                    "sleep 30".to_owned(),
                     None,
                     None,
                     Some(false),
@@ -666,8 +744,13 @@ mod tests {
         let second = sessions
             .write_stdin(WriteStdin::new(1, "hello\n".to_owned(), Some(5_000), None))
             .await;
-        assert_eq!(second.exit_code, Some(0));
-        assert_eq!(second.output, "got:hello");
+        assert_eq!(
+            second.error.as_deref(),
+            Some(
+                "write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open"
+            )
+        );
+        sessions.terminate_all().await;
     }
 
     #[cfg(unix)]
@@ -700,7 +783,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn successful_command_leaves_background_process_running()
+    async fn successful_command_terminates_background_descendants()
     -> Result<(), Box<dyn std::error::Error>> {
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)?
@@ -731,18 +814,15 @@ mod tests {
             )
             .await;
 
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !matches!(std::fs::read_to_string(&marker).as_deref(), Ok("survived")) {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("background process should survive successful shell exit");
-        let contents = std::fs::read_to_string(&marker)?;
+        tokio::time::sleep(Duration::from_millis(1_250)).await;
+        let escaped = marker.exists();
         std::fs::remove_dir_all(directory)?;
 
         assert_eq!(result.exit_code, Some(0));
-        assert_eq!(contents, "survived");
+        assert!(
+            !escaped,
+            "a successful shell left a background descendant running"
+        );
         Ok(())
     }
 
@@ -767,11 +847,6 @@ mod tests {
             )
             .await;
         let elapsed = started_at.elapsed();
-        let background_pid = result.output.trim();
-        let _ = std::process::Command::new("kill")
-            .args(["-9", background_pid])
-            .status();
-
         assert_eq!(result.exit_code, Some(0));
         assert!(
             elapsed < Duration::from_millis(3_500),
@@ -815,6 +890,61 @@ mod tests {
         assert!(!marker.exists(), "a cancelled shell descendant escaped");
         std::fs::remove_dir_all(directory)?;
         Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn assert_direct_cancellation_finishes(tty: bool) {
+        let sessions = Arc::new(ShellSessions::new());
+        let execution = {
+            let sessions = Arc::clone(&sessions);
+            tokio::spawn(async move {
+                sessions
+                    .execute(
+                        ExecCommand::new(
+                            "sleep 30".to_owned(),
+                            None,
+                            None,
+                            Some(false),
+                            tty,
+                            Some(30_000),
+                            None,
+                        ),
+                        std::path::Path::new("/"),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !sessions.sessions.lock().await.sessions.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shell command should enter the retained session store");
+
+        tokio::time::timeout(Duration::from_secs(2), sessions.terminate_all())
+            .await
+            .expect("direct runtime cancellation should not wait for the command yield timeout");
+        let result = tokio::time::timeout(Duration::from_secs(2), execution)
+            .await
+            .expect("cancelled direct command should finish")
+            .expect("direct command task should not panic");
+        assert!(result.exit_code.is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_non_tty_cancellation_signals_before_waiting_for_the_interaction() {
+        assert_direct_cancellation_finishes(/*tty*/ false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_pty_cancellation_reuses_the_completed_wait_result() {
+        assert_direct_cancellation_finishes(/*tty*/ true).await;
     }
 
     #[cfg(unix)]

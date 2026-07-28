@@ -1,8 +1,10 @@
-use chrono::{Local, Utc};
 use nanocodex_oai_api::responses::{
     ContentItem, FunctionOutputBody, FunctionOutputContent, MessageRole, ResponseItem,
 };
 use nanocodex_tools::contract::{ToolOutputBody, ToolOutputContent};
+use serde_json::Value;
+
+use super::context::ContextSnapshot;
 
 const PERMISSIONS_INSTRUCTIONS: &str = concat!(
     "<permissions instructions>\n",
@@ -16,34 +18,13 @@ const PERMISSIONS_INSTRUCTIONS: &str = concat!(
 
 pub(in crate::model) fn task_input(
     user_content: Vec<ContentItem>,
-    workspace: &str,
-    shell: &str,
-    project_instructions: Option<&str>,
+    context: &ContextSnapshot,
 ) -> Vec<ResponseItem> {
-    let (current_date, timezone) = local_time_context();
-    task_input_with_time_context(
-        user_content,
-        workspace,
-        shell,
-        project_instructions,
-        &current_date,
-        &timezone,
-    )
-}
-
-pub(in crate::model) fn task_context(
-    workspace: &str,
-    shell: &str,
-    project_instructions: Option<&str>,
-) -> ResponseItem {
-    let (current_date, timezone) = local_time_context();
-    task_context_with_time(
-        workspace,
-        shell,
-        project_instructions,
-        &current_date,
-        &timezone,
-    )
+    vec![
+        developer_context(),
+        context.full_item(),
+        ResponseItem::message(MessageRole::User, user_content),
+    ]
 }
 
 pub(in crate::model) fn turn_aborted() -> ResponseItem {
@@ -62,27 +43,6 @@ pub(in crate::model) fn turn_aborted() -> ResponseItem {
     )
 }
 
-fn task_input_with_time_context(
-    user_content: Vec<ContentItem>,
-    workspace: &str,
-    shell: &str,
-    project_instructions: Option<&str>,
-    current_date: &str,
-    timezone: &str,
-) -> Vec<ResponseItem> {
-    vec![
-        developer_context(),
-        task_context_with_time(
-            workspace,
-            shell,
-            project_instructions,
-            current_date,
-            timezone,
-        ),
-        ResponseItem::message(MessageRole::User, user_content),
-    ]
-}
-
 pub(in crate::model) fn developer_context() -> ResponseItem {
     ResponseItem::message(
         MessageRole::Developer,
@@ -90,68 +50,6 @@ pub(in crate::model) fn developer_context() -> ResponseItem {
             text: PERMISSIONS_INSTRUCTIONS.into(),
         }],
     )
-}
-
-fn task_context_with_time(
-    workspace: &str,
-    shell: &str,
-    project_instructions: Option<&str>,
-    current_date: &str,
-    timezone: &str,
-) -> ResponseItem {
-    let mut context = Vec::with_capacity(2);
-    if let Some(project_instructions) = project_instructions {
-        context.push(ContentItem::InputText {
-            text: format!(
-                "# AGENTS.md instructions for {workspace}\n\n<INSTRUCTIONS>\n{project_instructions}\n</INSTRUCTIONS>"
-            )
-            .into_boxed_str(),
-        });
-    }
-    context.push(ContentItem::InputText {
-        text: environment_context(workspace, shell, current_date, timezone).into_boxed_str(),
-    });
-    ResponseItem::message(MessageRole::User, context)
-}
-
-fn local_time_context() -> (String, String) {
-    match iana_time_zone::get_timezone() {
-        Ok(timezone) => (Local::now().format("%Y-%m-%d").to_string(), timezone),
-        Err(_) => (
-            Utc::now().format("%Y-%m-%d").to_string(),
-            "Etc/UTC".to_owned(),
-        ),
-    }
-}
-
-fn environment_context(workspace: &str, shell: &str, current_date: &str, timezone: &str) -> String {
-    let mut context = String::from("<environment_context>\n  <cwd>");
-    push_xml_escaped_text(&mut context, workspace);
-    context.push_str("</cwd>\n  <shell>");
-    push_xml_escaped_text(&mut context, shell);
-    context.push_str("</shell>\n  <current_date>");
-    push_xml_escaped_text(&mut context, current_date);
-    context.push_str("</current_date>\n  <timezone>");
-    push_xml_escaped_text(&mut context, timezone);
-    context.push_str("</timezone>\n  <filesystem><workspace_roots><root>");
-    push_xml_escaped_text(&mut context, workspace);
-    context.push_str(
-        "</root></workspace_roots><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>\n</environment_context>",
-    );
-    context
-}
-
-fn push_xml_escaped_text(output: &mut String, text: &str) {
-    for character in text.chars() {
-        match character {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
-            '"' => output.push_str("&quot;"),
-            '\'' => output.push_str("&apos;"),
-            _ => output.push(character),
-        }
-    }
 }
 
 pub(in crate::model) fn custom_tool_output(
@@ -174,6 +72,17 @@ pub(in crate::model) fn function_tool_output(
     output: ToolOutputBody,
 ) -> ResponseItem {
     ResponseItem::function_call_output(call_id, function_output(output))
+}
+
+pub(in crate::model) fn tool_search_output(call_id: String, tools: Vec<Value>) -> ResponseItem {
+    ResponseItem::ToolSearchOutput {
+        id: None,
+        call_id: Some(call_id.into_boxed_str()),
+        status: "completed".into(),
+        execution: "client".into(),
+        tools: tools.into_iter().map(Into::into).collect(),
+        internal_chat_message_metadata_passthrough: None,
+    }
 }
 
 fn function_output(output: ToolOutputBody) -> FunctionOutputBody {
@@ -213,15 +122,18 @@ mod tests {
 
     #[test]
     fn task_input_matches_codex_context_shape() {
-        let input = task_input_with_time_context(
-            vec![ContentItem::InputText {
-                text: "fix the bug".into(),
-            }],
+        let context = ContextSnapshot::capture_at(
             "/workspace/a&b",
             "bash",
             Some("Follow the project formatter."),
             "2026-07-17",
             "America/Los_Angeles",
+        );
+        let input = task_input(
+            vec![ContentItem::InputText {
+                text: "fix the bug".into(),
+            }],
+            &context,
         );
         assert_eq!(
             serde_json::to_value(input).unwrap(),

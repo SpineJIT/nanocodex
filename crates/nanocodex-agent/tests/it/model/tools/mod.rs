@@ -1,6 +1,331 @@
 use super::*;
 
 mod environment;
+mod panic;
+mod parallel;
+
+struct NativeToolSearch;
+
+#[nanocodex_tools::contract::async_trait]
+impl nanocodex_tools::Tool for NativeToolSearch {
+    fn definition(&self) -> nanocodex_tools::ToolDefinition {
+        nanocodex_tools::ToolDefinition::tool_search(
+            "client",
+            "Search caller-configured deferred tools.",
+            nanocodex_oai_api::responses::JsonSchema::from(json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query for deferred tools."
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of tools to return."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            })),
+        )
+    }
+
+    async fn execute(
+        &self,
+        input: nanocodex_tools::ToolInput,
+        _context: nanocodex_tools::ToolContext<'_>,
+    ) -> nanocodex_tools::ToolResult {
+        let arguments: Value = input.decode_json()?;
+        assert_eq!(arguments, json!({"query": "calendar create", "limit": 1}));
+        Ok(nanocodex_tools::ToolOutput::json(&json!([{
+            "type": "function",
+            "name": "calendar_create_event",
+            "description": "Create a calendar event.",
+            "defer_loading": true,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"}
+                },
+                "required": ["title"],
+                "additionalProperties": false
+            }
+        }])))
+    }
+}
+
+#[tokio::test]
+async fn configured_native_tool_search_round_trips_its_dedicated_items() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+
+        let warmup = next_json(&mut socket).await?;
+        let definitions = warmup["input"][0]["tools"]
+            .as_array()
+            .ok_or_else(|| eyre!("warmup tools were not an array"))?;
+        let definition = definitions
+            .iter()
+            .find(|definition| definition["type"] == "tool_search")
+            .ok_or_else(|| eyre!("native tool_search definition was missing"))?;
+        assert_eq!(
+            definition,
+            &json!({
+                "type": "tool_search",
+                "execution": "client",
+                "description": "Search caller-configured deferred tools.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query for deferred tools."
+                        },
+                        "limit": {
+                            "type": "number",
+                            "description": "Maximum number of tools to return."
+                        }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }
+            })
+        );
+        let exec = definitions
+            .iter()
+            .find(|definition| definition["name"] == "exec")
+            .ok_or_else(|| eyre!("Code Mode exec definition was missing"))?;
+        assert!(
+            !exec["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Search caller-configured deferred tools."),
+            "native tool_search must not also leak into Code Mode's nested surface"
+        );
+        send_warmup(&mut socket, "resp-warmup").await?;
+
+        let generation = next_json(&mut socket).await?;
+        assert_eq!(generation["previous_response_id"], "resp-warmup");
+        send_json(
+            &mut socket,
+            completed_response(
+                "resp-search",
+                &[json!({
+                    "type": "tool_search_call",
+                    "call_id": "search-1",
+                    "execution": "client",
+                    "arguments": {
+                        "query": "calendar create",
+                        "limit": 1
+                    }
+                })],
+            ),
+        )
+        .await?;
+
+        let continuation = next_json(&mut socket).await?;
+        assert_eq!(continuation["previous_response_id"], "resp-search");
+        assert_eq!(
+            continuation["input"],
+            json!([{
+                "type": "tool_search_output",
+                "call_id": "search-1",
+                "status": "completed",
+                "execution": "client",
+                "tools": [{
+                    "type": "function",
+                    "name": "calendar_create_event",
+                    "description": "Create a calendar event.",
+                    "defer_loading": true,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"}
+                        },
+                        "required": ["title"],
+                        "additionalProperties": false
+                    }
+                }]
+            }])
+        );
+        send_final(&mut socket, "resp-final").await
+    });
+
+    let workspace = temporary_workspace("native-tool-search")?;
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(NativeToolSearch)
+        .build()?;
+    let openai = OpenAi::builder("test-key")
+        .websocket_url(&endpoint)
+        .build()?;
+    let (agent, events) = Nanocodex::builder(openai)
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .session_id(test_session_id())
+        .tools(tools)
+        .build()?;
+    let turn = agent.prompt("Find the calendar creation tool.").await?;
+    drop(agent);
+    let mut output = Vec::new();
+    let (event_result, turn_result) = tokio::join!(events.write_jsonl(&mut output), turn.result());
+    event_result?;
+    turn_result?;
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    let output = String::from_utf8(output)?;
+    assert!(output.contains(r#""tool":"tool_search""#), "{output}");
+    assert!(output.contains("\"run.completed\""), "{output}");
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_tool_search_exposes_and_dispatches_a_native_namespace() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+
+        let warmup = next_json(&mut socket).await?;
+        let definitions = warmup["input"][0]["tools"]
+            .as_array()
+            .ok_or_else(|| eyre!("warmup tools were not an array"))?;
+        let search = definitions
+            .iter()
+            .find(|definition| definition["type"] == "tool_search")
+            .ok_or_else(|| eyre!("MCP tool_search definition was missing"))?;
+        assert_eq!(search["execution"], "client");
+        assert!(
+            search["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("- fixture"))
+        );
+        send_warmup(&mut socket, "resp-warmup").await?;
+
+        let generation = next_json(&mut socket).await?;
+        assert_eq!(generation["previous_response_id"], "resp-warmup");
+        send_json(
+            &mut socket,
+            completed_response(
+                "resp-search",
+                &[json!({
+                    "type": "tool_search_call",
+                    "call_id": "search-mcp",
+                    "execution": "client",
+                    "arguments": {
+                        "query": "echo deterministic message",
+                        "limit": 1
+                    }
+                })],
+            ),
+        )
+        .await?;
+
+        let searched = next_json(&mut socket).await?;
+        assert_eq!(
+            searched["input"],
+            json!([{
+                "type": "tool_search_output",
+                "call_id": "search-mcp",
+                "status": "completed",
+                "execution": "client",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "mcp__fixture__",
+                    "description": "Tools in the mcp__fixture__ namespace.",
+                    "tools": [{
+                        "type": "function",
+                        "name": "echo",
+                        "description": "Echo deterministic MCP fixture message 0.",
+                        "strict": false,
+                        "defer_loading": true,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "message": { "type": "string" },
+                                "delay_ms": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 1000
+                                }
+                            },
+                            "required": ["message"],
+                            "additionalProperties": false
+                        }
+                    }]
+                }]
+            }])
+        );
+        send_json(
+            &mut socket,
+            completed_response(
+                "resp-tool",
+                &[json!({
+                    "type": "function_call",
+                    "call_id": "call-mcp",
+                    "namespace": "mcp__fixture__",
+                    "name": "echo",
+                    "arguments": "{\"message\":\"hello\"}"
+                })],
+            ),
+        )
+        .await?;
+
+        let called = next_json(&mut socket).await?;
+        assert_eq!(called["input"][0]["type"], "function_call_output");
+        assert_eq!(called["input"][0]["call_id"], "call-mcp");
+        assert!(
+            called["input"][0]["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("fixture:hello")),
+            "{called}"
+        );
+        send_final(&mut socket, "resp-final").await
+    });
+
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../nanocodex-tools/tests/fixtures/mcp-stdio-server.mjs");
+    let mcp = nanocodex_tools::mcp::Mcp::builder()
+        .server(
+            "fixture",
+            nanocodex_tools::mcp::McpServer::stdio("node").arg(fixture.to_string_lossy()),
+        )
+        .build()?;
+    let workspace = temporary_workspace("mcp-native-tool-search")?;
+    let tools = Tools::builder().provider(mcp).build()?;
+    let openai = OpenAi::builder("test-key")
+        .websocket_url(&endpoint)
+        .build()?;
+    let (agent, events) = Nanocodex::builder(openai)
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .session_id(test_session_id())
+        .tools(tools)
+        .build()?;
+    let turn = agent.prompt("Find and call the MCP echo tool.").await?;
+    drop(agent);
+    let mut output = Vec::new();
+    let (event_result, turn_result) = tokio::join!(events.write_jsonl(&mut output), turn.result());
+    event_result?;
+    turn_result?;
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    let output = String::from_utf8(output)?;
+    assert!(output.contains(r#""tool":"tool_search""#), "{output}");
+    assert!(
+        output.contains(r#""tool":"mcp__fixture__echo""#),
+        "{output}"
+    );
+    assert!(output.contains("\"run.completed\""), "{output}");
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn connection_local_response_code_mode_round_trip() -> Result<()> {
@@ -123,22 +448,14 @@ async fn unsupported_direct_tools_return_failed_results_to_the_model() -> Result
             input[0]["output"],
             "unsupported custom tool call: missing_custom"
         );
-        assert!(
-            input[0]["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("ctco_"))
-        );
+        assert!(input[0].get("id").is_none());
         assert_eq!(input[1]["type"], "function_call_output");
         assert_eq!(input[1]["call_id"], "call-function");
         assert_eq!(
             input[1]["output"],
             "unsupported call: example::missing_function"
         );
-        assert!(
-            input[1]["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("fco_"))
-        );
+        assert!(input[1].get("id").is_none());
         send_final(&mut socket, "resp-final").await
     });
 

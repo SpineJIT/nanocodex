@@ -465,6 +465,14 @@ pub trait Tool: Send + Sync + 'static {
     /// Returns the complete model-visible definition and registry name.
     fn definition(&self) -> ToolDefinition;
 
+    /// Returns whether this handler is safe to execute alongside sibling tool calls.
+    ///
+    /// Execution is serial by default. Opt in only when the handler's state and
+    /// effects are safe to overlap with other parallel-capable tools.
+    fn supports_parallel_tool_calls(&self) -> bool {
+        false
+    }
+
     /// Executes one invocation.
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult;
 }
