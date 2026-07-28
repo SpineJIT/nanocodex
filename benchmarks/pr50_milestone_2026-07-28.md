@@ -50,3 +50,24 @@ Latency is not the only gate. The benchmark workloads also assert that:
 
 The retained trace corpus used to derive the committed deterministic fixtures
 remains outside Git, as required by the repository performance policy.
+
+## Live model-latency boundary
+
+Five alternating, sequential runs of the identical 10-turn plus three-fork
+workload completed successfully for both Nanocodex
+`b7b7df6c1e09d7e391181a5550c24bd73f3bda67` and local Codex
+`3418498f01422f5f650ea645d4bd19e05c3a9616` using shared ChatGPT
+authentication. Workload, generated-prompt, and `AGENTS.md` digests matched in
+all ten runs.
+
+Across Nanocodex's 70 measured turns, total wall latency was 130,665.66 ms and
+reported model duration was 127,893.84 ms: model work accounted for 97.879% of
+the measured turn time. Median local turn overhead was 0.267 ms. Constructing
+three historical forks took 12.2 ms at p50, while warm model turns took
+1,371.4 ms at p50. The corresponding stock-Codex medians were 155.3 ms and
+1,555.3 ms. This paired result, rather than the local microbenchmarks alone,
+establishes that the representative harness remains model-latency bound.
+
+The complete trial records, usage/cache fields, outputs, and p50/p95
+distributions are retained in
+`paired-parity-b7b7df6-vs-3418498f-chatgpt.json` outside Git.
