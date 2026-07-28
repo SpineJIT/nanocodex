@@ -92,7 +92,7 @@ jobs:
       - uses: crate-ci/typos@96d9af6217dc2855210655af7e1ff19d23d4e593 # v1
 
   bindings:
-    name: Python, Node, and browser bindings
+    name: Node and browser bindings
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -115,9 +115,6 @@ jobs:
           cache-dependency-path: |
             js/bindings/package-lock.json
             examples/react-vite/package-lock.json
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.13"
       - uses: taiki-e/install-action@3522286d40783523f9c7880e33f785905b4c20d0 # v2
         with:
           tool: wasm-bindgen-cli@0.2.126
@@ -143,14 +140,6 @@ jobs:
           npm run check:package --prefix js/bindings
           npm test --prefix js/react
           npm run build --prefix examples/react-vite
-      - name: Build and test Python bindings
-        shell: bash
-        run: |
-          python -m venv py/bindings/.venv
-          source py/bindings/.venv/bin/activate
-          python -m pip install 'maturin>=1.9,<2'
-          maturin develop --manifest-path py/bindings/Cargo.toml
-          python -m unittest discover -s py/bindings/tests -v
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nanocodex-web-wasm
