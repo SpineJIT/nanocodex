@@ -28,7 +28,7 @@ read-only runtime disk, and launch a private copy of an immutable root:
 
 ```no_run
 use nanocodex_vm::{
-    VmWorkspaceBuilder,
+    image::{CachePolicy, VmImageBuilder},
     tools::GuestRuntimeDisk,
 };
 
@@ -37,15 +37,24 @@ let runtime = GuestRuntimeDisk::prepare(
     "target/aarch64-unknown-linux-musl/debug/nanocodex-vm-guest",
     ".cache/nanocodex/vm",
 )?;
-let workspace = VmWorkspaceBuilder::private_from(
-    ".cache/nanocodex/images/project.ext4",
+let image = VmImageBuilder::new("nanocodex", runtime.path())
+    .vmm_args(["vm-run-config", "--config"])
+    .firmware_directory(".cache/libkrunfw/libkrunfw")
+    .prepare(
+        "tasks/project/environment",
+        10 * 1024 * 1024 * 1024,
+        ".cache/nanocodex/vm",
+        CachePolicy::Reuse,
+    )
+    .await?;
+let workspace = image.private_workspace(
     ".nanocodex/sessions/018f/root.ext4",
     "nanocodex",
 )?
 .vmm_argument("vm-run-config")
+.vmm_argument("--config")
 .guest_runtime_disk(runtime.path())
 .firmware_directory(".cache/libkrunfw/libkrunfw")
-.guest_workspace("/app")
 .launch()
 .await?;
 
@@ -114,9 +123,32 @@ musl 1.2.3 ABI floor because the pinned libkrun KVM path requires `statx`.
 ## Root and runtime disks
 
 [`image::VmImageBuilder`] resolves a constrained Dockerfile/OCI build context
-into a content-addressed immutable ext4 root. A session should attach only a
-reflink or sparse copy made with
-[`image::PreparedRootDisk::reflink_to`]; writable roots are session-private.
+into a content-addressed immutable ext4 root. The final OCI/Dockerfile working
+directory, process environment, and detected shell are retained with
+[`image::PreparedRootDisk`]. Its
+[`image::PreparedRootDisk::private_workspace`] method is the normal bridge to
+the retained workspace API: it makes a no-clobber reflink or sparse copy and
+applies that runtime metadata. Writable roots are session-private.
+
+Build cache identity includes the Dockerfile and deterministic context, base
+manifest digests, architecture and disk size, VMM arguments and exact
+VMM/guest-runtime/configured-firmware file identities,
+CPU/memory/address-family policy, host resolver configuration, network mode,
+and the egress lease's non-secret cache scope. Set the firmware directory
+explicitly when firmware upgrades must invalidate cache entries; omitted
+system firmware is caller-managed stable runtime state. Cached
+OCI blobs are SHA-256 checked before their metadata fast path is established.
+Cached blobs and ext4 disks are published atomically and made read-only;
+changes to their inode, size, modification/change time, or permissions force
+validation or rebuilding. The caller-selected cache directory remains trusted
+application state rather than a security boundary against the same OS user.
+
+Dockerfile build VMs temporarily install the current usable host resolver and
+restore the image's original `/etc/resolv.conf` before a stage disk can be
+published. Retained private ext4 workspaces install resolver configuration at
+boot instead, so immutable images never retain host-specific DNS. Offline and
+gvproxy workspaces do not receive host resolver injection. Directory roots are
+host-backed development escape hatches and are not rewritten.
 
 [`tools::GuestRuntimeDisk::prepare`] hashes the exact companion ELF and
 atomically publishes a reusable 128 MiB ext4 disk. The runtime disk is mounted
@@ -161,6 +193,11 @@ exactly one response carries the same ID unless the request is cancelled or
 the session fails. Responses may arrive in any order. The host allows at most
 63 ordinary requests to await responses; the guest executes at most 64
 requests concurrently, leaving capacity for control traffic.
+
+Each ordinary request emits a `vm.tool.rpc` span. Its
+`rpc.admission.duration_ns` field measures time waiting for one of those 63
+host slots, while `rpc.queue.duration_ns` measures the later wait to enter the
+bounded writer channel. `duration_ns` covers the complete RPC.
 
 ### Requests and responses
 
@@ -234,11 +271,14 @@ process group on timeout, output overflow, cancellation, or shutdown. It is a
 bounded one-response operation rather than a streaming terminal; retained
 interactive shells use the `exec_command`/`write_stdin` tool protocol.
 
-Dropping a host request removes its pending response and best-effort queues a
-`cancel` with a fresh ID. Cancelling an unknown or already completed target is
-successful. The host does not wait for this automatically generated cancel
-acknowledgement. `shutdown` stops acceptance, cancels active tool work and
-shell process groups, runs `/bin/sync`, replies, and exits.
+Dropping a host request removes its pending response and queues a `cancel` with
+a fresh ID. The cancellation queue is bounded by the same 63 admission
+permits, and a permit is retained until the original request and its
+cancellation have both been written in that order. Cancelling an unknown or
+already completed target is successful. The host does not wait for this
+automatically generated cancel acknowledgement. `shutdown` stops acceptance,
+cancels active tool work and shell process groups, gives `/bin/sync` a
+five-second deadline, replies, and exits.
 
 ### Protocol failure
 
@@ -258,10 +298,21 @@ and host-side guards that must live as long as the VM. The VM crate never
 resolves secrets or chooses a payment provider. Conflicting environment or
 mount claims fail closed.
 
-The last workspace/tool capability kills the VMM child. Explicit shutdown
-first rejects live sibling capabilities, then requests guest cancellation and
-filesystem sync with a bounded exit wait. Timeouts and request cancellation
-terminate process groups and descendants.
+The built-in internet and disabled leases have stable build-cache scopes.
+Adding provider environment, mounts, or files clears that scope. An application
+using the resulting lease for Dockerfile builds must assign a non-secret
+identity with [`host::EgressLease::set_build_cache_scope`] after composition;
+otherwise image preparation fails rather than reusing output built through a
+different route or credential policy.
+
+The last workspace/tool capability kills the VMM child. Workspace startup has
+a 30-second default deadline covering readiness and egress provisioning;
+graceful shutdown has a 10-second default covering guest acknowledgement and
+VMM exit. Both are configurable on [`VmWorkspaceBuilder`]. Explicit shutdown
+atomically rejects live sibling capabilities and owner-borrowed requests.
+Cancelling the shutdown future force-terminates and reaps the child instead of
+leaving an unreachable VM. Timeouts and request cancellation terminate process
+groups and descendants.
 
 ## Cargo features
 
@@ -270,7 +321,9 @@ VM-backed tool clients on Linux and macOS. `guest-runtime` contains only the
 companion server and the canonical `nanocodex-tools` workspace runtime. The
 split exists to produce a small static Linux guest ELF; it is not a second
 public execution model. Normal native `nanocodex-tools` and
-`nanocodex-oai-api` builds retain their complete default behavior.
+`nanocodex-oai-api` builds retain their complete default behavior. CI checks
+the guest-only all-target matrix and builds the actual x86_64 musl guest
+artifact independently from the host feature.
 
 See `docs/VM.md` in the repository for CLI operation, egress composition, and
 build commands.

@@ -28,20 +28,29 @@ retains image preparation, libkrun lifecycle, and VM-backed `Tools`;
 view-image handlers. The guest deliberately excludes the OpenAI transport,
 Code Mode/QuickJS, MCP, HTTP clients, and OCI preparation. Normal
 `nanocodex-tools` and `nanocodex-oai-api` builds retain their complete native
-behavior through default features.
+behavior through default features. CI checks the guest-only all-target matrix
+and separately builds the actual x86_64 musl companion.
 
 The checked-in x86_64 musl target configuration sets the supported ABI floor
-to musl 1.2.3 because the pinned libkrun KVM path requires `statx`. A Linux
-release host build therefore needs `musl-tools` and produces a static PIE with
-the same public host API; VM execution still requires `/dev/kvm` and
-`libkrunfw.so.5` at runtime.
+to musl 1.2.3 because the pinned libkrun KVM path requires `statx`. Building
+the companion on Linux therefore needs `musl-tools` and produces a static PIE.
+The host application remains a normal native build; VM execution still
+requires `/dev/kvm` and `libkrunfw.so.5` at runtime.
 
 ## Preparing immutable images
 
 `VmImageBuilder` turns a directory containing a concrete `Dockerfile` into one
-validated immutable disk. The cache key includes the Dockerfile, deterministic
-context archive, target architecture, base manifest digests, and disk size.
-Every mutable VM gets a reflink or sparse copy:
+validated immutable disk. The cache key covers the Dockerfile, deterministic
+context archive, target architecture, base manifest digests, disk size, VMM
+arguments and exact VMM/guest-runtime/configured-firmware files, VM resources
+and address-family policy, resolver configuration, network mode, and a
+non-secret egress-policy identity. Configure the firmware directory explicitly
+when firmware upgrades must invalidate cache entries; omitted system firmware
+is caller-managed stable runtime state. The caller-selected cache directory is
+trusted application state, not a security boundary against the same OS user.
+`PreparedRootDisk` retains the final container working directory, environment,
+and shell, then applies them while making each mutable VM's no-clobber reflink
+or sparse copy:
 
 ```rust,no_run
 use nanocodex_vm::{
@@ -68,8 +77,17 @@ let image = images
         CachePolicy::Reuse,
     )
     .await?;
-std::fs::create_dir_all(".nanocodex/attempts/018f")?;
-image.reflink_to(".nanocodex/attempts/018f/rootfs.ext4")?;
+let workspace = image
+    .private_workspace(
+        ".nanocodex/attempts/018f/rootfs.ext4",
+        "target/debug/vm-tools",
+    )?
+    .vmm_argument("--vmm")
+    .guest_runtime_disk(runtime.path())
+    .firmware_directory(".cache/libkrunfw/libkrunfw")
+    .launch()
+    .await?;
+# workspace.shutdown().await?;
 # Ok(())
 # }
 ```
@@ -88,8 +106,16 @@ Dockerfile build VMs default to 2 vCPUs, 4096 MiB, ordinary internet egress, a
 OCI references and layers resolve concurrently, with at most eight operations
 at either boundary. Same-key work single-flights across tasks and processes,
 while unrelated images remain parallel. Cache records and disks publish
-atomically; a valid warm disk hit never launches a VM or decodes layer
-contents.
+atomically and are made read-only. OCI blobs are SHA-256 checked before their
+metadata fast path is established; changes to cached file identity or
+permissions force validation or rebuilding. A valid warm disk hit never
+launches a VM or decodes layer contents.
+
+Build guests temporarily install the current usable host resolver and restore
+the image's original `/etc/resolv.conf` before publishing a stage. A retained
+private ext4 workspace installs resolver configuration only at boot, so an
+immutable image never captures host-specific DNS. Offline and gvproxy
+workspaces skip that injection; host-backed directory roots are left alone.
 
 ## Selecting host or VM tools
 
@@ -138,16 +164,17 @@ mounts, private process configuration, and guest readiness stay inside
 
 ```rust,no_run
 # use nanocodex::{Nanocodex, OpenAiAuth};
-# use nanocodex_vm::VmWorkspaceBuilder;
-# async fn build(auth: OpenAiAuth) -> Result<(), Box<dyn std::error::Error>> {
-let workspace = VmWorkspaceBuilder::private_from(
-    ".cache/nanocodex/images/task.ext4",
+# use nanocodex_vm::image::PreparedRootDisk;
+# async fn build(
+#     auth: OpenAiAuth,
+#     image: &PreparedRootDisk,
+# ) -> Result<(), Box<dyn std::error::Error>> {
+let workspace = image.private_workspace(
     ".nanocodex/sessions/018f/root.ext4",
     "nanocodex-vmm",
 )?
 .guest_runtime_disk(".cache/nanocodex/runtime.ext4")
 .firmware_directory(".cache/libkrunfw/libkrunfw")
-.guest_workspace("/app")
 .launch()
 .await?;
 let tools = workspace.tools_builder().build()?;
@@ -237,11 +264,20 @@ secrets.insert_mount(EgressMount::read_only(
 ))?;
 secrets.retain(Arc::new(())); // the real layer retains its proxy lease
 
-EgressLease::internet()
+let mut egress = EgressLease::internet()
     .with_layer(payment_proxy)?
-    .with_layer(secrets)
+    .with_layer(secrets)?;
+egress.set_build_cache_scope("mpp-and-secret-route-v1")?;
+Ok(egress)
 # }
 ```
+
+The built-in internet and disabled leases have stable cache scopes. Adding
+provider environment, mounts, or files clears the scope. Set a non-secret
+identity only after complete composition when the lease will be used by
+`VmImageBuilder`: Dockerfile build preparation rejects an unscoped provider
+lease rather than reusing output from a different route or credential policy.
+Runtime-only `VmWorkspaceBuilder::egress` does not require a cache scope.
 
 `VmToolSession::spawn_configured` consumes the complete lease and applies it to
 both launch configuration and retained session state. This selects the network,
@@ -302,11 +338,16 @@ provider's credentials.
   interactive guest processes across sequential turns and subagent calls.
 - Concurrent drivers are multiplexed by request ID; one slow guest command
   does not block unrelated subagent calls. Dropping an individual host request
-  sends a targeted cancellation frame, and the guest aborts that request's
-  process group without disturbing sibling work.
+  sends a targeted cancellation frame through a bounded queue while retaining
+  its admission permit until the request and cancellation are physically
+  written in order. The guest aborts that request's process group without
+  disturbing sibling work.
 - The last session/tool capability kills its VMM child and releases egress.
-  Explicit shutdown first rejects live sibling capabilities, asks the guest to
-  cancel in-flight work and sync filesystems, then bounds the wait for exit.
+  Startup defaults to a 30-second deadline for readiness plus provisioning.
+  Explicit shutdown atomically rejects live sibling capabilities and
+  owner-borrowed requests, gives guest sync and VMM exit a 10-second default
+  deadline, and forcibly terminates the child if the shutdown future itself is
+  cancelled. Both deadlines are configurable on `VmWorkspaceBuilder`.
 - Protocol frames are limited to 64 MiB and carry binary fields as base64
   strings rather than allocation-heavy JSON byte arrays. Host-control file reads
   accept only regular files and are limited to 32 MiB; trusted command output

@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
+    ffi::OsString,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{
@@ -34,6 +35,7 @@ use super::protocol::{
 
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONTROL_FILE_BYTES: usize = 32 * 1024 * 1024;
+const FILESYSTEM_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 
 /// Failure while serving VM tool requests inside the guest.
@@ -83,10 +85,13 @@ async fn serve_io_with_frame_limit(
     mut output: impl AsyncWrite + Unpin,
     max_frame_bytes: usize,
 ) -> Result<(), VmGuestError> {
-    let runtime = Arc::new(WorkspaceToolRuntime::with_view_image_wire_limit(
-        workspace.to_path_buf(),
-        u64::try_from(max_frame_bytes).unwrap_or(u64::MAX),
-    ));
+    let runtime = Arc::new(
+        WorkspaceToolRuntime::with_environment_and_view_image_wire_limit(
+            workspace.to_path_buf(),
+            u64::try_from(max_frame_bytes).unwrap_or(u64::MAX),
+            std::env::vars_os().collect(),
+        ),
+    );
     let mut input = BufReader::new(input);
     let mut requests = JoinSet::<SessionResponse>::new();
     let mut active = HashMap::<u64, tokio::task::AbortHandle>::new();
@@ -321,10 +326,15 @@ async fn read_frame(
 }
 
 async fn sync_filesystems(request: ShutdownRequest) -> ControlResponse {
-    let error = match Command::new("/bin/sync").status().await {
-        Ok(status) if status.success() => None,
-        Ok(status) => Some(format!("sync exited with {status}")),
-        Err(error) => Some(error.to_string()),
+    let mut command = Command::new("/bin/sync");
+    command.kill_on_drop(true);
+    let error = match tokio::time::timeout(FILESYSTEM_SYNC_TIMEOUT, command.status()).await {
+        Ok(Ok(status)) if status.success() => None,
+        Ok(Ok(status)) => Some(format!("sync exited with {status}")),
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(_) => Some(format!(
+            "sync exceeded the {FILESYSTEM_SYNC_TIMEOUT:?} shutdown deadline"
+        )),
     };
     ControlResponse {
         id: request.id,
@@ -470,12 +480,13 @@ async fn read_file(request: ReadFileRequest) -> ReadFileResponse {
 }
 
 async fn execute_command(request: ExecuteRequest) -> ExecuteResponse {
+    let environment = command_environment(std::env::vars_os(), &request.environment);
     let mut command = Command::new(&request.program);
     command
         .args(&request.arguments)
         .current_dir(&request.current_directory)
         .env_clear()
-        .envs(request.environment.iter().cloned())
+        .envs(environment)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -521,6 +532,20 @@ async fn execute_command(request: ExecuteRequest) -> ExecuteResponse {
             output_limit_exceeded: false,
         },
     }
+}
+
+fn command_environment(
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    overrides: &[(String, String)],
+) -> BTreeMap<OsString, OsString> {
+    let mut environment = inherited.into_iter().collect::<BTreeMap<_, _>>();
+    environment.extend(overrides.iter().map(|(name, value)| {
+        (
+            OsString::from(name.as_str()),
+            OsString::from(value.as_str()),
+        )
+    }));
+    environment
 }
 
 enum CommandOutcome {
@@ -667,6 +692,7 @@ async fn read_bounded(
 #[cfg(test)]
 mod tests {
     use std::{
+        ffi::OsString,
         fs::{self, File},
         time::{Duration, Instant, UNIX_EPOCH},
     };
@@ -680,12 +706,39 @@ mod tests {
         SessionResponse, ShutdownRequest, ToolRequest, WireToolContext, WireToolInput,
     };
     use super::{
-        atomic_write_file, create_directory_path, execute_command, read_file, serve_io,
-        serve_io_with_frame_limit,
+        atomic_write_file, command_environment, create_directory_path, execute_command, read_file,
+        serve_io, serve_io_with_frame_limit,
     };
 
     const DEFAULT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
     const PATH_TRACING_IMAGE_BYTES: u64 = 48_262_737;
+
+    #[test]
+    fn trusted_commands_inherit_guest_environment_and_apply_explicit_overrides() {
+        let environment = command_environment(
+            [
+                (OsString::from("HTTPS_PROXY"), OsString::from("from-guest")),
+                (OsString::from("PATH"), OsString::from("/guest/bin")),
+            ],
+            &[
+                ("PATH".to_owned(), "/image/bin".to_owned()),
+                ("IMAGE_MODE".to_owned(), "release".to_owned()),
+            ],
+        );
+
+        assert_eq!(
+            environment.get(&OsString::from("HTTPS_PROXY")),
+            Some(&OsString::from("from-guest"))
+        );
+        assert_eq!(
+            environment.get(&OsString::from("PATH")),
+            Some(&OsString::from("/image/bin"))
+        );
+        assert_eq!(
+            environment.get(&OsString::from("IMAGE_MODE")),
+            Some(&OsString::from("release"))
+        );
+    }
 
     #[tokio::test]
     async fn filesystem_controls_apply_exact_modes_and_epoch_mtimes() {

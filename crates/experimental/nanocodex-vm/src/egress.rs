@@ -19,6 +19,9 @@ use crate::{
 pub const GUEST_EGRESS_ROOT: &str = "/tmp/nanocodex/egress";
 /// Maximum size of one public file provisioned through an egress lease.
 pub const MAX_EGRESS_FILE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BUILD_CACHE_SCOPE_BYTES: usize = 256;
+const INTERNET_BUILD_CACHE_SCOPE: &str = "network-internet-v1";
+const DISABLED_BUILD_CACHE_SCOPE: &str = "network-disabled-v1";
 
 /// VM-facing outbound-access configuration retained for one guest lifetime.
 ///
@@ -33,6 +36,7 @@ pub struct EgressLease {
     guest_mounts: BTreeMap<String, EgressMount>,
     guest_files: BTreeMap<PathBuf, EgressFile>,
     guards: Vec<Arc<dyn Any + Send + Sync>>,
+    build_cache_scope: Option<String>,
 }
 
 /// One provider-owned host directory mounted read-only into the guest.
@@ -119,12 +123,18 @@ impl EgressLease {
     /// Creates an empty lease for an explicit network mode.
     #[must_use]
     pub fn new(network: Network) -> Self {
+        let build_cache_scope = match &network {
+            Network::Disabled => Some(DISABLED_BUILD_CACHE_SCOPE.to_owned()),
+            Network::Internet => Some(INTERNET_BUILD_CACHE_SCOPE.to_owned()),
+            Network::Gvproxy { .. } => None,
+        };
         Self {
             network,
             guest_environment: BTreeMap::new(),
             guest_mounts: BTreeMap::new(),
             guest_files: BTreeMap::new(),
             guards: Vec::new(),
+            build_cache_scope,
         }
     }
 
@@ -166,7 +176,11 @@ impl EgressLease {
         {
             return Err(EgressError::EnvironmentConflict(name));
         }
+        if self.guest_environment.get(&name) == Some(&value) {
+            return Ok(());
+        }
         self.guest_environment.insert(name, value);
+        self.build_cache_scope = None;
         Ok(())
     }
 
@@ -198,6 +212,9 @@ impl EgressLease {
         {
             return Err(EgressError::MountTagConflict(mount.tag));
         }
+        if self.guest_mounts.get(&mount.tag) == Some(&mount) {
+            return Ok(());
+        }
         if self
             .guest_files
             .keys()
@@ -206,6 +223,7 @@ impl EgressLease {
             return Err(EgressError::GuestMountFileOverlap(mount.guest_path));
         }
         self.guest_mounts.insert(mount.tag.clone(), mount);
+        self.build_cache_scope = None;
         Ok(())
     }
 
@@ -246,8 +264,45 @@ impl EgressLease {
         {
             return Err(EgressError::GuestFileConflict(file.guest_path));
         }
+        if self.guest_files.get(&file.guest_path) == Some(&file) {
+            return Ok(());
+        }
         self.guest_files.insert(file.guest_path.clone(), file);
+        self.build_cache_scope = None;
         Ok(())
+    }
+
+    /// Assigns an opaque non-secret identity for outputs built through this
+    /// exact egress policy.
+    ///
+    /// Adding environment, mounts, or files clears the scope. Set it only after
+    /// composing the complete lease. The value becomes part of VM image cache
+    /// identity and must distinguish credential or provider state that can
+    /// change a Dockerfile `RUN` result, but it must never contain the
+    /// credential itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the scope is empty, too large, or contains a NUL
+    /// byte.
+    pub fn set_build_cache_scope(&mut self, scope: impl Into<String>) -> Result<(), EgressError> {
+        let scope = scope.into();
+        if scope.is_empty() || scope.len() > MAX_BUILD_CACHE_SCOPE_BYTES || scope.contains('\0') {
+            return Err(EgressError::InvalidBuildCacheScope);
+        }
+        self.build_cache_scope = Some(scope);
+        Ok(())
+    }
+
+    /// Returns this complete lease with an opaque non-secret build-cache
+    /// identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors documented by [`Self::set_build_cache_scope`].
+    pub fn with_build_cache_scope(mut self, scope: impl Into<String>) -> Result<Self, EgressError> {
+        self.set_build_cache_scope(scope)?;
+        Ok(self)
     }
 
     /// Retains provider state, such as a revocable proxy lease, until the guest
@@ -273,6 +328,29 @@ impl EgressLease {
         if self.network != other.network {
             return Err(EgressError::NetworkConflict);
         }
+        let self_contributes_policy = !self.guest_environment.is_empty()
+            || !self.guest_mounts.is_empty()
+            || !self.guest_files.is_empty()
+            || !self.guards.is_empty();
+        let other_contributes_policy = !other.guest_environment.is_empty()
+            || !other.guest_mounts.is_empty()
+            || !other.guest_files.is_empty()
+            || !other.guards.is_empty();
+        let other_adds_policy = !other.guards.is_empty()
+            || other
+                .guest_environment
+                .iter()
+                .any(|(name, value)| self.guest_environment.get(name) != Some(value))
+            || other
+                .guest_mounts
+                .iter()
+                .any(|(tag, mount)| self.guest_mounts.get(tag) != Some(mount))
+            || other
+                .guest_files
+                .iter()
+                .any(|(path, file)| self.guest_files.get(path) != Some(file));
+        let self_build_cache_scope = self.build_cache_scope.clone();
+        let other_build_cache_scope = other.build_cache_scope.clone();
         let mut merged = self.clone();
         for (name, value) in other.guest_environment {
             merged.insert_environment(name, value)?;
@@ -284,6 +362,16 @@ impl EgressLease {
             merged.insert_file(file)?;
         }
         merged.guards.extend(other.guards);
+        merged.build_cache_scope = match (self_contributes_policy, other_contributes_policy) {
+            (false, false) | (true, false) => self_build_cache_scope,
+            (false, true) => other_build_cache_scope,
+            (true, true)
+                if !other_adds_policy && self_build_cache_scope == other_build_cache_scope =>
+            {
+                self_build_cache_scope
+            }
+            (true, true) => None,
+        };
         *self = merged;
         Ok(())
     }
@@ -362,6 +450,16 @@ impl EgressLease {
         &self.guest_environment
     }
 
+    /// Returns the non-secret identity under which Dockerfile build outputs may
+    /// be reused.
+    ///
+    /// `None` means guest-visible provider state was added after the last
+    /// explicit scope assignment, so a cached `RUN` output must not be reused.
+    #[must_use]
+    pub fn build_cache_scope(&self) -> Option<&str> {
+        self.build_cache_scope.as_deref()
+    }
+
     /// Iterates over read-only provider mounts.
     pub fn guest_mounts(&self) -> impl Iterator<Item = &EgressMount> {
         self.guest_mounts.values()
@@ -391,6 +489,7 @@ impl fmt::Debug for EgressLease {
                 &self.guest_files.keys().collect::<Vec<_>>(),
             )
             .field("guards", &self.guards.len())
+            .field("build_cache_scoped", &self.build_cache_scope.is_some())
             .finish()
     }
 }
@@ -398,6 +497,9 @@ impl fmt::Debug for EgressLease {
 /// Invalid or conflicting egress capability composition.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum EgressError {
+    /// A build-cache scope was empty, too large, or contained a NUL byte.
+    #[error("egress build-cache scope must be 1 to 256 non-NUL bytes")]
+    InvalidBuildCacheScope,
     /// Two layers require different guest network modes.
     #[error("egress fragments require conflicting VM network modes")]
     NetworkConflict,
@@ -519,6 +621,104 @@ fn shell_single_quote(value: &OsStr) -> OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_cache_scope_tracks_the_complete_egress_policy() {
+        let mut internet = EgressLease::internet();
+        assert_eq!(
+            internet.build_cache_scope(),
+            Some(INTERNET_BUILD_CACHE_SCOPE)
+        );
+        assert_eq!(
+            EgressLease::disabled().build_cache_scope(),
+            Some(DISABLED_BUILD_CACHE_SCOPE)
+        );
+        assert!(
+            EgressLease::new(Network::gvproxy("/tmp/gvproxy.sock"))
+                .build_cache_scope()
+                .is_none()
+        );
+
+        internet
+            .insert_environment("HTTPS_PROXY", "http://proxy")
+            .unwrap();
+        assert!(internet.build_cache_scope().is_none());
+        internet.set_build_cache_scope("proxy-policy-v1").unwrap();
+        internet
+            .insert_environment("HTTPS_PROXY", "http://proxy")
+            .unwrap();
+        assert_eq!(internet.build_cache_scope(), Some("proxy-policy-v1"));
+        internet
+            .insert_file(EgressFile::new(
+                "/tmp/nanocodex/egress/ca.pem",
+                Vec::new(),
+                0o444,
+            ))
+            .unwrap();
+        assert!(internet.build_cache_scope().is_none());
+    }
+
+    #[test]
+    fn merged_egress_preserves_only_an_identical_cache_scope() {
+        let mut empty = EgressLease::internet();
+        let mut scoped = EgressLease::internet();
+        scoped
+            .insert_environment("HTTPS_PROXY", "http://proxy")
+            .unwrap();
+        scoped.set_build_cache_scope("scoped-policy").unwrap();
+        empty.merge(scoped).unwrap();
+        assert_eq!(empty.build_cache_scope(), Some("scoped-policy"));
+
+        let mut first = EgressLease::internet();
+        first
+            .insert_environment("HTTPS_PROXY", "http://proxy")
+            .unwrap();
+        first.set_build_cache_scope("same-policy").unwrap();
+        let mut identical = EgressLease::internet();
+        identical
+            .insert_environment("HTTPS_PROXY", "http://proxy")
+            .unwrap();
+        identical.set_build_cache_scope("same-policy").unwrap();
+        first.merge(identical).unwrap();
+        assert_eq!(first.build_cache_scope(), Some("same-policy"));
+
+        first.merge(EgressLease::internet()).unwrap();
+        assert_eq!(first.build_cache_scope(), Some("same-policy"));
+
+        let mut additional = EgressLease::internet();
+        additional
+            .insert_environment("NO_PROXY", "localhost")
+            .unwrap();
+        additional.set_build_cache_scope("same-policy").unwrap();
+        first.merge(additional).unwrap();
+        assert!(first.build_cache_scope().is_none());
+
+        first.set_build_cache_scope("same-policy").unwrap();
+        let mut different = EgressLease::internet();
+        different
+            .insert_environment("HTTPS_PROXY", "http://proxy")
+            .unwrap();
+        different.set_build_cache_scope("different-policy").unwrap();
+        first.merge(different).unwrap();
+        assert!(first.build_cache_scope().is_none());
+    }
+
+    #[test]
+    fn build_cache_scope_rejects_unsafe_identifiers() {
+        let mut lease = EgressLease::internet();
+        assert_eq!(
+            lease.set_build_cache_scope(""),
+            Err(EgressError::InvalidBuildCacheScope)
+        );
+        assert_eq!(
+            lease.set_build_cache_scope("contains\0nul"),
+            Err(EgressError::InvalidBuildCacheScope)
+        );
+        assert_eq!(
+            lease.set_build_cache_scope("x".repeat(MAX_BUILD_CACHE_SCOPE_BYTES + 1)),
+            Err(EgressError::InvalidBuildCacheScope)
+        );
+    }
 
     #[test]
     fn independently_provisioned_egress_fragments_compose() {

@@ -2,7 +2,8 @@ use std::{fs, path::PathBuf};
 
 use arcbox_ext4::Reader;
 use nanocodex_vm::{
-    image::{CachePolicy, VmImageBuilder},
+    host::EgressLease,
+    image::{CachePolicy, DiskStatus, VmImageBuilder},
     tools::GuestRuntimeDisk,
 };
 
@@ -20,14 +21,28 @@ async fn run_instruction_uses_the_public_private_config_vmm_contract() {
     let context = tempfile::tempdir().expect("build context");
     fs::write(
         context.path().join("Dockerfile"),
-        "FROM alpine:3.24\nRUN printf nanocodex-vm-image-live > /nanocodex-vm-image-proof\nWORKDIR /workspace\n",
+        concat!(
+            "FROM alpine:3.24\n",
+            "RUN printf nanocodex-vm-image-live > /nanocodex-vm-image-proof && ",
+            "printf %s \"$NANOCODEX_BUILD_EGRESS_PROOF\" > /nanocodex-vm-egress-proof\n",
+            "WORKDIR /workspace\n",
+        ),
     )
     .expect("Dockerfile");
 
-    let image = VmImageBuilder::new(vmm, runtime.path())
+    let mut egress = EgressLease::internet();
+    egress
+        .insert_environment("NANOCODEX_BUILD_EGRESS_PROOF", "inherited-by-run")
+        .expect("build egress environment");
+    egress
+        .set_build_cache_scope("image-live-build-egress-v1")
+        .expect("build egress cache scope");
+    let builder = VmImageBuilder::new(vmm, runtime.path())
         .firmware_directory(firmware)
-        .vmm_arg("--vmm")
-        .prepare(context.path(), DISK_BYTES, cache, CachePolicy::Reuse)
+        .egress(egress)
+        .vmm_arg("--vmm");
+    let image = builder
+        .prepare(context.path(), DISK_BYTES, &cache, CachePolicy::Reuse)
         .await
         .expect("prepared image");
 
@@ -37,7 +52,23 @@ async fn run_instruction_uses_the_public_private_config_vmm_contract() {
             .expect("proof file"),
         b"nanocodex-vm-image-live"
     );
+    assert_eq!(
+        disk.read_file("/nanocodex-vm-egress-proof", 0, Some(64))
+            .expect("egress proof file"),
+        b"inherited-by-run"
+    );
+    assert!(
+        !disk.exists("/run/nanocodex-build-resolver"),
+        "build-only resolver state must not persist in the prepared image"
+    );
     assert_eq!(image.workdir(), "/workspace");
+
+    let warm = builder
+        .prepare(context.path(), DISK_BYTES, &cache, CachePolicy::Reuse)
+        .await
+        .expect("warm prepared image");
+    assert_eq!(warm.disk_status(), DiskStatus::Hit);
+    assert_eq!(warm.path(), image.path());
 }
 
 fn required_path(name: &str) -> PathBuf {

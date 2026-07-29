@@ -1,7 +1,9 @@
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use nanocodex_tools::ToolsBuilder;
@@ -9,10 +11,13 @@ use tokio::process::Command;
 
 use crate::{
     command::GuestCommand,
-    config::{BlockDevice, VmConfig},
+    config::{BlockDevice, Network, VmConfig},
     egress::EgressLease,
-    image::reflink_or_sparse_copy,
-    tools::{VmToolSession, VmToolSessionError, VmTools},
+    image::{host_resolver_configuration, reflink_or_sparse_copy},
+    tools::{
+        DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_STARTUP_TIMEOUT, VmToolSession, VmToolSessionError,
+        VmTools,
+    },
 };
 
 const DEFAULT_CPUS: u8 = 2;
@@ -38,9 +43,12 @@ pub struct VmWorkspaceBuilder {
     firmware_directory: Option<PathBuf>,
     workspace: String,
     shell: String,
+    environment: BTreeMap<String, String>,
     cpus: u8,
     memory_mib: u32,
     egress: EgressLease,
+    startup_timeout: Duration,
+    shutdown_timeout: Duration,
 }
 
 /// One retained VM and the standard workspace tools routed into it.
@@ -136,8 +144,9 @@ impl VmWorkspace {
     ///
     /// # Errors
     ///
-    /// Returns an error when clone-cheap sibling tool capabilities are still
-    /// alive or the guest/VMM does not complete its bounded shutdown.
+    /// Returns an error when clone-cheap sibling capabilities or owner-borrowed
+    /// requests are still alive, or the guest/VMM does not complete its
+    /// bounded shutdown.
     pub async fn shutdown(&self) -> Result<(), VmWorkspaceError> {
         self.session.shutdown().await?;
         Ok(())
@@ -156,9 +165,12 @@ impl VmWorkspaceBuilder {
             firmware_directory: None,
             workspace: DEFAULT_WORKSPACE.to_owned(),
             shell: DEFAULT_SHELL.to_owned(),
+            environment: BTreeMap::new(),
             cpus: DEFAULT_CPUS,
             memory_mib: DEFAULT_MEMORY_MIB,
             egress: EgressLease::internet(),
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
         }
     }
 
@@ -237,6 +249,16 @@ impl VmWorkspaceBuilder {
         self
     }
 
+    /// Replaces the environment inherited by guest workspace commands.
+    ///
+    /// The egress lease is applied after this environment and therefore wins
+    /// when both provide the same name.
+    #[must_use]
+    pub fn environment(mut self, environment: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.environment = environment.into_iter().collect();
+        self
+    }
+
     /// Sets the virtual CPU count.
     #[must_use]
     pub const fn cpus(mut self, cpus: u8) -> Self {
@@ -248,6 +270,20 @@ impl VmWorkspaceBuilder {
     #[must_use]
     pub const fn memory_mib(mut self, memory_mib: u32) -> Self {
         self.memory_mib = memory_mib;
+        self
+    }
+
+    /// Sets the complete deadline for guest readiness and egress provisioning.
+    #[must_use]
+    pub const fn startup_timeout(mut self, timeout: Duration) -> Self {
+        self.startup_timeout = timeout;
+        self
+    }
+
+    /// Sets the complete deadline for guest sync and VMM exit.
+    #[must_use]
+    pub const fn shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
         self
     }
 
@@ -289,7 +325,12 @@ impl VmWorkspaceBuilder {
         }
 
         let ext4 = self.rootfs.is_file();
-        let (config, guest) = if ext4 {
+        let resolver = if ext4 && matches!(self.egress.network(), Network::Internet) {
+            Some(host_resolver_configuration()?)
+        } else {
+            None
+        };
+        let (config, mut guest) = if ext4 {
             let runtime = self
                 .guest_runtime_disk
                 .ok_or(VmWorkspaceError::MissingGuestRuntime)?;
@@ -305,7 +346,7 @@ impl VmWorkspaceBuilder {
                 .block_device(BlockDevice::read_only(RUNTIME_BLOCK_ID, runtime));
             let guest = GuestCommand::new("/bin/sh")
                 .arg("-c")
-                .arg(ext4_bootstrap(&self.workspace));
+                .arg(ext4_bootstrap(&self.workspace, resolver.as_deref()));
             (config, guest)
         } else if self.rootfs.is_dir() {
             let runtime = self.rootfs.join("usr/local/bin/nanocodex-vm-guest");
@@ -327,6 +368,9 @@ impl VmWorkspaceBuilder {
                 reason: "private root is neither a raw ext4 image nor a directory",
             });
         };
+        for (name, value) in &self.environment {
+            guest = guest.env(name, value);
+        }
 
         let mut command = Command::new(&self.vmm_executable);
         command.args(self.vmm_arguments);
@@ -356,7 +400,15 @@ impl VmWorkspaceBuilder {
             }
         }
 
-        let session = VmToolSession::spawn_configured(command, config, guest, self.egress).await?;
+        let session = VmToolSession::spawn_configured_with_timeouts(
+            command,
+            config,
+            guest,
+            self.egress,
+            self.startup_timeout,
+            self.shutdown_timeout,
+        )
+        .await?;
         Ok(VmWorkspace {
             session,
             rootfs: self.rootfs,
@@ -366,13 +418,21 @@ impl VmWorkspaceBuilder {
     }
 }
 
-fn ext4_bootstrap(workspace: &str) -> String {
+fn ext4_bootstrap(workspace: &str, resolver: Option<&str>) -> String {
     let workspace = shell_word(workspace);
+    let resolver = resolver_bootstrap(resolver);
     format!(
-        "set -eu; mkdir -p -- {workspace} {RUNTIME_MOUNT}; \
+        "set -eu; {resolver}mkdir -p -- {workspace} {RUNTIME_MOUNT}; \
          mount -t ext4 -o ro {RUNTIME_DEVICE} {RUNTIME_MOUNT}; \
          exec {RUNTIME_EXECUTABLE} {workspace}"
     )
+}
+
+fn resolver_bootstrap(resolver: Option<&str>) -> String {
+    resolver.map_or_else(String::new, |resolver| {
+        let resolver = shell_word(&resolver.replace("\\n", "\n"));
+        format!("rm -f /etc/resolv.conf; printf '%s' {resolver} > /etc/resolv.conf; ")
+    })
 }
 
 fn shell_word(value: &str) -> String {
@@ -411,6 +471,28 @@ mod tests {
 
         assert_eq!(builder.rootfs, destination);
         assert_eq!(fs::read(builder.rootfs).unwrap(), fs::read(source).unwrap());
+    }
+
+    #[test]
+    fn resolver_injection_is_limited_to_private_ext4_roots() {
+        let resolver = "nameserver 192.0.2.1\\n";
+        let ext4 = ext4_bootstrap("/workspace", Some(resolver));
+        let offline = ext4_bootstrap("/workspace", None);
+
+        assert!(ext4.contains("192.0.2.1"));
+        assert!(ext4.contains("> /etc/resolv.conf"));
+        assert!(!offline.contains("resolv.conf"));
+    }
+
+    #[test]
+    fn builder_retains_explicit_image_environment() {
+        let builder = VmWorkspaceBuilder::new("/root.ext4", "/vmm").environment([
+            ("LANG".to_owned(), "C.UTF-8".to_owned()),
+            ("APP_MODE".to_owned(), "test".to_owned()),
+        ]);
+
+        assert_eq!(builder.environment["LANG"], "C.UTF-8");
+        assert_eq!(builder.environment["APP_MODE"], "test");
     }
 
     #[tokio::test]

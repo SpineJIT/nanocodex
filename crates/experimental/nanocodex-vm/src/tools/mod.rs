@@ -72,6 +72,8 @@ mod protocol;
 mod runtime_disk;
 #[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
 mod session;
+#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+pub(crate) use session::{DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_STARTUP_TIMEOUT};
 
 #[cfg(feature = "guest-runtime")]
 use std::path::Path;

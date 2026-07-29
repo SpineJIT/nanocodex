@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    io,
     path::PathBuf,
     process::{ExitStatus, Stdio},
     sync::{
@@ -20,7 +21,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
-    sync::{Mutex, Notify, Semaphore, mpsc, oneshot},
+    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
 };
 use tracing::{Instrument, Span, info, info_span};
 
@@ -33,7 +34,8 @@ use super::{
     },
 };
 
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_GUEST_IN_FLIGHT_REQUESTS: usize = 64;
@@ -151,6 +153,10 @@ pub enum VmToolSessionError {
     #[error("the VM tool console closed before replying")]
     Closed,
 
+    /// VM startup or egress provisioning did not complete before its deadline.
+    #[error("VM readiness and egress provisioning did not complete within {0:?}")]
+    StartupTimeout(Duration),
+
     /// The background response router failed.
     #[error("VM tool response router failed: {0}")]
     Router(String),
@@ -196,6 +202,10 @@ pub enum VmToolSessionError {
     #[error("cannot shut down the VM while {0} sibling capabilities are still alive")]
     ActiveCapabilities(usize),
 
+    /// Graceful shutdown was requested while owner-borrowed operations remained.
+    #[error("cannot shut down the VM while {0} requests are still in flight")]
+    ActiveRequests(usize),
+
     /// A public egress destination could not be represented by the guest protocol.
     #[error("egress guest file path is not valid UTF-8: {0}")]
     EgressFilePath(PathBuf),
@@ -222,17 +232,20 @@ pub struct VmToolSession {
 }
 
 /// Clone-cheap capability for sending workspace tool calls to one owned VM.
-#[derive(Clone)]
 pub struct VmToolSessionHandle {
     inner: Arc<VmToolSessionInner>,
+    counted_capability: bool,
 }
 
 struct VmToolSessionInner {
     spawned_at: Instant,
     next_id: AtomicU64,
     closing: AtomicBool,
-    input: mpsc::Sender<Vec<u8>>,
-    request_slots: Semaphore,
+    lifecycle: StdMutex<SessionLifecycle>,
+    input: mpsc::Sender<OutboundRequest>,
+    cancellations: mpsc::Sender<OutboundCancellation>,
+    request_slots: Arc<Semaphore>,
+    shutdown_timeout: Duration,
     output: Mutex<Option<ChildStdout>>,
     pending: StdMutex<PendingState>,
     terminal: StdMutex<TerminalDiagnostics>,
@@ -240,6 +253,26 @@ struct VmToolSessionInner {
     child: StdMutex<Option<Child>>,
     egress: StdMutex<Option<EgressLease>>,
     process_config: StdMutex<Option<PrivateVmProcessConfig>>,
+}
+
+#[derive(Default)]
+struct SessionLifecycle {
+    capabilities: usize,
+    in_flight_requests: usize,
+    closing: bool,
+}
+
+struct OutboundRequest {
+    id: u64,
+    frame: Vec<u8>,
+    written: Arc<AtomicBool>,
+}
+
+struct OutboundCancellation {
+    target_id: u64,
+    frame: Vec<u8>,
+    written: Arc<AtomicBool>,
+    _request_slot: OwnedSemaphorePermit,
 }
 
 #[derive(Default)]
@@ -264,6 +297,18 @@ struct PendingRequestGuard {
     inner: Weak<VmToolSessionInner>,
     id: u64,
     armed: bool,
+    queued: bool,
+    written: Arc<AtomicBool>,
+    request_slot: Option<OwnedSemaphorePermit>,
+}
+
+struct InFlightRequestGuard {
+    inner: Weak<VmToolSessionInner>,
+}
+
+struct ShutdownGuard {
+    inner: Arc<VmToolSessionInner>,
+    armed: bool,
 }
 
 impl VmToolSession {
@@ -282,13 +327,22 @@ impl VmToolSession {
     /// Returns an error when the private configuration cannot be written or
     /// the VMM process cannot start.
     pub fn spawn_vm(
-        mut command: Command,
+        command: Command,
         vm: VmConfig,
         guest: GuestCommand,
     ) -> Result<Self, VmToolSessionError> {
+        Self::spawn_vm_with_shutdown_timeout(command, vm, guest, DEFAULT_SHUTDOWN_TIMEOUT)
+    }
+
+    fn spawn_vm_with_shutdown_timeout(
+        mut command: Command,
+        vm: VmConfig,
+        guest: GuestCommand,
+        shutdown_timeout: Duration,
+    ) -> Result<Self, VmToolSessionError> {
         let process_config = VmProcessConfig::new(vm, guest).write_private()?;
         command.arg(process_config.path());
-        let session = Self::spawn(&mut command)?;
+        let session = Self::spawn_with_shutdown_timeout(&mut command, shutdown_timeout)?;
         *lock_unpoisoned(&session.handle.inner.process_config) = Some(process_config);
         Ok(session)
     }
@@ -309,18 +363,50 @@ impl VmToolSession {
     /// # Errors
     ///
     /// Returns an error when private configuration cannot be written, the VMM
-    /// cannot start, or guest egress provisioning fails.
+    /// cannot start, the guest is not ready within 30 seconds, or egress
+    /// provisioning fails or exceeds that same startup deadline.
     pub async fn spawn_configured(
         command: Command,
         vm: VmConfig,
         guest: GuestCommand,
         egress: EgressLease,
     ) -> Result<Self, VmToolSessionError> {
+        Self::spawn_configured_with_timeouts(
+            command,
+            vm,
+            guest,
+            egress,
+            DEFAULT_STARTUP_TIMEOUT,
+            DEFAULT_SHUTDOWN_TIMEOUT,
+        )
+        .await
+    }
+
+    pub(crate) async fn spawn_configured_with_timeouts(
+        command: Command,
+        vm: VmConfig,
+        guest: GuestCommand,
+        egress: EgressLease,
+        startup_timeout: Duration,
+        shutdown_timeout: Duration,
+    ) -> Result<Self, VmToolSessionError> {
         let (vm, guest) = egress.configure(vm, &guest);
-        let session = Self::spawn_vm(command, vm, guest)?;
-        session.ready().await?;
-        session.provision_egress(egress).await?;
-        Ok(session)
+        let session = Self::spawn_vm_with_shutdown_timeout(command, vm, guest, shutdown_timeout)?;
+        let startup = async {
+            session.ready().await?;
+            session.provision_egress(egress).await
+        };
+        match tokio::time::timeout(startup_timeout, startup).await {
+            Ok(Ok(())) => Ok(session),
+            Ok(Err(error)) => {
+                session.terminate().await;
+                Err(error)
+            }
+            Err(_) => {
+                session.terminate().await;
+                Err(VmToolSessionError::StartupTimeout(startup_timeout))
+            }
+        }
     }
 
     /// Spawns a VMM command whose guest process runs the companion guest server.
@@ -334,6 +420,13 @@ impl VmToolSession {
     /// Returns an error when the child or either protocol pipe cannot be
     /// created.
     pub fn spawn(command: &mut Command) -> Result<Self, VmToolSessionError> {
+        Self::spawn_with_shutdown_timeout(command, DEFAULT_SHUTDOWN_TIMEOUT)
+    }
+
+    fn spawn_with_shutdown_timeout(
+        command: &mut Command,
+        shutdown_timeout: Duration,
+    ) -> Result<Self, VmToolSessionError> {
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| VmToolSessionError::NoRuntime)?;
         let program = command
@@ -381,12 +474,17 @@ impl VmToolSession {
                 .take()
                 .ok_or(VmToolSessionError::MissingPipe("stderr"))?;
             let (input_sender, input_receiver) = mpsc::channel(REQUEST_QUEUE_CAPACITY);
+            let (cancellation_sender, cancellation_receiver) =
+                mpsc::channel(MAX_HOST_IN_FLIGHT_REQUESTS);
             let inner = Arc::new(VmToolSessionInner {
                 spawned_at: Instant::now(),
                 next_id: AtomicU64::new(0),
                 closing: AtomicBool::new(false),
+                lifecycle: StdMutex::new(SessionLifecycle::default()),
                 input: input_sender,
-                request_slots: Semaphore::new(MAX_HOST_IN_FLIGHT_REQUESTS),
+                cancellations: cancellation_sender,
+                request_slots: Arc::new(Semaphore::new(MAX_HOST_IN_FLIGHT_REQUESTS)),
+                shutdown_timeout,
                 output: Mutex::new(Some(output)),
                 pending: StdMutex::new(PendingState::default()),
                 terminal: StdMutex::new(TerminalDiagnostics::default()),
@@ -398,11 +496,15 @@ impl VmToolSession {
             runtime.spawn(write_requests(
                 input,
                 input_receiver,
+                cancellation_receiver,
                 Arc::downgrade(&inner),
             ));
             runtime.spawn(capture_terminal_stderr(stderr, Arc::downgrade(&inner)));
             Ok(Self {
-                handle: VmToolSessionHandle { inner },
+                handle: VmToolSessionHandle {
+                    inner,
+                    counted_capability: false,
+                },
             })
         });
         record_vm_result(&span, started_at, &result);
@@ -543,44 +645,91 @@ impl VmToolSession {
         self.handle.command(command).await
     }
 
+    async fn terminate(&self) {
+        let child = begin_termination(&self.handle.inner);
+        if let Some(mut child) = child {
+            let _ = tokio::time::timeout(self.handle.inner.shutdown_timeout, child.wait()).await;
+        }
+    }
+
     /// Flushes guest filesystems and waits for the VMM process to exit.
     ///
-    /// The operation rejects live sibling capabilities so it cannot stop the
-    /// VM while another driver in the same agent tree is using it. Because the
-    /// owner is borrowed, callers can drop those capabilities and retry.
+    /// The operation rejects live sibling capabilities and owner-borrowed
+    /// requests so it cannot stop the VM while another driver in the same
+    /// agent tree is using it. Because the owner is borrowed, callers can drop
+    /// those capabilities or await those requests and retry.
     ///
     /// # Errors
     ///
     /// Returns an error when the guest cannot acknowledge the request, the
     /// VMM does not stop promptly, or it exits unsuccessfully.
     pub async fn shutdown(&self) -> Result<(), VmToolSessionError> {
-        let sibling_capabilities = Arc::strong_count(&self.handle.inner).saturating_sub(1);
-        if sibling_capabilities != 0 {
-            return Err(VmToolSessionError::ActiveCapabilities(sibling_capabilities));
+        {
+            let mut lifecycle = lock_unpoisoned(&self.handle.inner.lifecycle);
+            if lifecycle.closing {
+                return Err(VmToolSessionError::Closed);
+            }
+            if lifecycle.capabilities != 0 {
+                return Err(VmToolSessionError::ActiveCapabilities(
+                    lifecycle.capabilities,
+                ));
+            }
+            if lifecycle.in_flight_requests != 0 {
+                return Err(VmToolSessionError::ActiveRequests(
+                    lifecycle.in_flight_requests,
+                ));
+            }
+            lifecycle.closing = true;
         }
+        let mut shutdown_guard = ShutdownGuard {
+            inner: Arc::clone(&self.handle.inner),
+            armed: true,
+        };
         self.handle.inner.closing.store(true, Ordering::Release);
-        let response = self
-            .handle
-            .control_request_inner(|id| SessionRequest::Shutdown(ShutdownRequest { id }), true)
-            .await?;
+        self.handle.inner.request_slots.close();
+        let shutdown_timeout = self.handle.inner.shutdown_timeout;
+        let started_at = Instant::now();
+        let response = match tokio::time::timeout(
+            shutdown_timeout,
+            self.handle
+                .control_request_inner(|id| SessionRequest::Shutdown(ShutdownRequest { id }), true),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                self.terminate().await;
+                return Err(error);
+            }
+            Err(_) => {
+                self.terminate().await;
+                return Err(VmToolSessionError::ShutdownTimeout(shutdown_timeout));
+            }
+        };
         let SessionResponse::Shutdown(response) = response else {
+            self.terminate().await;
             return Err(VmToolSessionError::Protocol("expected a shutdown response"));
         };
-        control_result(response)?;
+        if let Err(error) = control_result(response) {
+            self.terminate().await;
+            return Err(error);
+        }
 
         let child = lock_unpoisoned(&self.handle.inner.child).take();
         let Some(mut child) = child else {
             return Err(VmToolSessionError::Closed);
         };
-        let status = if let Ok(status) = tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await
-        {
-            status?
-        } else {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            return Err(VmToolSessionError::ShutdownTimeout(SHUTDOWN_TIMEOUT));
+        let remaining = shutdown_timeout.saturating_sub(started_at.elapsed());
+        let status = match tokio::time::timeout(remaining, child.wait()).await {
+            Ok(status) => status?,
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(shutdown_timeout, child.wait()).await;
+                return Err(VmToolSessionError::ShutdownTimeout(shutdown_timeout));
+            }
         };
         close_pending(&self.handle.inner, "VM session shut down");
+        shutdown_guard.armed = false;
         if !status.success() {
             return Err(VmToolSessionError::VmmExit(status));
         }
@@ -592,9 +741,40 @@ impl Drop for VmToolSessionInner {
     fn drop(&mut self) {
         self.closing.store(true, Ordering::Release);
         close_pending(self, "last VM session capability was dropped");
-        if let Some(child) = lock_unpoisoned(&self.child).as_mut() {
+        let child = lock_unpoisoned(&self.child).take();
+        if let Some(mut child) = child {
             let _ = child.start_kill();
+            let egress = lock_unpoisoned(&self.egress).take();
+            let timeout = self.shutdown_timeout;
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _egress = egress;
+                    let _ = tokio::time::timeout(timeout, child.wait()).await;
+                });
+            }
         }
+    }
+}
+
+impl Clone for VmToolSessionHandle {
+    fn clone(&self) -> Self {
+        let mut lifecycle = lock_unpoisoned(&self.inner.lifecycle);
+        lifecycle.capabilities = lifecycle.capabilities.saturating_add(1);
+        drop(lifecycle);
+        Self {
+            inner: Arc::clone(&self.inner),
+            counted_capability: true,
+        }
+    }
+}
+
+impl Drop for VmToolSessionHandle {
+    fn drop(&mut self) {
+        if !self.counted_capability {
+            return;
+        }
+        let mut lifecycle = lock_unpoisoned(&self.inner.lifecycle);
+        lifecycle.capabilities = lifecycle.capabilities.saturating_sub(1);
     }
 }
 
@@ -660,6 +840,7 @@ impl VmToolSessionHandle {
             rpc.request.id = tracing::field::Empty,
             rpc.request.bytes = tracing::field::Empty,
             rpc.response.bytes = tracing::field::Empty,
+            rpc.admission.duration_ns = tracing::field::Empty,
             rpc.queue.duration_ns = tracing::field::Empty,
             vm.session.first_call = tracing::field::Empty,
             vm.session.age_ns = tracing::field::Empty,
@@ -928,21 +1109,38 @@ impl VmToolSessionHandle {
         allow_closing: bool,
     ) -> Result<(SessionResponse, usize), VmToolSessionError> {
         if self.inner.closing.load(Ordering::Acquire) && !allow_closing {
-            return Err(VmToolSessionError::Closed);
+            return Err(self.closed_error());
         }
-        let _request_slot = if allow_closing {
+        let request_slot = if allow_closing {
             None
         } else {
-            let permit = self
-                .inner
-                .request_slots
-                .acquire()
+            let admission_started_at = Instant::now();
+            let permit = Arc::clone(&self.inner.request_slots)
+                .acquire_owned()
                 .await
-                .map_err(|_| VmToolSessionError::Closed)?;
+                .map_err(|_| self.closed_error())?;
+            span.record(
+                "rpc.admission.duration_ns",
+                elapsed_ns(admission_started_at),
+            );
             if self.inner.closing.load(Ordering::Acquire) {
-                return Err(VmToolSessionError::Closed);
+                return Err(self.closed_error());
             }
             Some(permit)
+        };
+        let _in_flight = if allow_closing {
+            None
+        } else {
+            let mut lifecycle = lock_unpoisoned(&self.inner.lifecycle);
+            if lifecycle.closing {
+                drop(lifecycle);
+                return Err(self.closed_error());
+            }
+            lifecycle.in_flight_requests = lifecycle.in_flight_requests.saturating_add(1);
+            drop(lifecycle);
+            Some(InFlightRequestGuard {
+                inner: Arc::downgrade(&self.inner),
+            })
         };
         self.ensure_reader().await?;
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
@@ -970,21 +1168,26 @@ impl VmToolSessionHandle {
                 },
             );
         }
+        let written = Arc::new(AtomicBool::new(false));
         let mut guard = PendingRequestGuard {
             inner: Arc::downgrade(&self.inner),
             id,
             armed: true,
+            queued: false,
+            written: Arc::clone(&written),
+            request_slot,
         };
         let queued_at = Instant::now();
         let mut frame = encoded.into_bytes();
         frame.push(b'\n');
         self.inner
             .input
-            .send(frame)
+            .send(OutboundRequest { id, frame, written })
             .await
-            .map_err(|_| VmToolSessionError::Closed)?;
+            .map_err(|_| self.closed_error())?;
+        guard.queued = true;
         span.record("rpc.queue.duration_ns", elapsed_ns(queued_at));
-        let response = receiver.await.map_err(|_| VmToolSessionError::Closed)?;
+        let response = receiver.await.map_err(|_| self.closed_error())?;
         guard.armed = false;
         response.map_err(VmToolSessionError::Router)
     }
@@ -1004,6 +1207,13 @@ impl VmToolSessionHandle {
             None => Ok(()),
         }
     }
+
+    fn closed_error(&self) -> VmToolSessionError {
+        lock_unpoisoned(&self.inner.pending)
+            .closed
+            .clone()
+            .map_or(VmToolSessionError::Closed, VmToolSessionError::Router)
+    }
 }
 
 impl Drop for PendingRequestGuard {
@@ -1012,12 +1222,64 @@ impl Drop for PendingRequestGuard {
             && let Some(inner) = self.inner.upgrade()
         {
             lock_unpoisoned(&inner.pending).requests.remove(&self.id);
-            queue_cancel(&inner, self.id);
+            if self.queued
+                && let Some(request_slot) = self.request_slot.take()
+            {
+                queue_cancel(&inner, self.id, Arc::clone(&self.written), request_slot);
+            }
         }
     }
 }
 
-fn queue_cancel(inner: &Arc<VmToolSessionInner>, target_id: u64) {
+impl Drop for InFlightRequestGuard {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let mut lifecycle = lock_unpoisoned(&inner.lifecycle);
+        lifecycle.in_flight_requests = lifecycle.in_flight_requests.saturating_sub(1);
+    }
+}
+
+impl Drop for ShutdownGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let child = begin_termination(&self.inner);
+        let Some(mut child) = child else {
+            return;
+        };
+        let timeout = self.inner.shutdown_timeout;
+        let egress = lock_unpoisoned(&self.inner.egress).clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _egress = egress;
+                let _ = tokio::time::timeout(timeout, child.wait()).await;
+            });
+        }
+    }
+}
+
+fn begin_termination(inner: &Arc<VmToolSessionInner>) -> Option<Child> {
+    {
+        let mut lifecycle = lock_unpoisoned(&inner.lifecycle);
+        lifecycle.closing = true;
+    }
+    inner.closing.store(true, Ordering::Release);
+    inner.request_slots.close();
+    close_pending(inner, "VM session terminated");
+    let mut child = lock_unpoisoned(&inner.child).take()?;
+    let _ = child.start_kill();
+    Some(child)
+}
+
+fn queue_cancel(
+    inner: &Arc<VmToolSessionInner>,
+    target_id: u64,
+    written: Arc<AtomicBool>,
+    request_slot: OwnedSemaphorePermit,
+) {
     if inner.closing.load(Ordering::Acquire) {
         return;
     }
@@ -1027,41 +1289,87 @@ fn queue_cancel(inner: &Arc<VmToolSessionInner>, target_id: u64) {
         return;
     };
     frame.push(b'\n');
-    match inner.input.try_send(frame) {
+    let cancellation = OutboundCancellation {
+        target_id,
+        frame,
+        written,
+        _request_slot: request_slot,
+    };
+    match inner.cancellations.try_send(cancellation) {
         Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-        Err(mpsc::error::TrySendError::Full(frame)) => {
-            let input = inner.input.clone();
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(async move {
-                    let _ = input.send(frame).await;
-                });
-            }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            inner.closing.store(true, Ordering::Release);
+            inner.request_slots.close();
+            close_pending(
+                inner,
+                "bounded VM cancellation queue exhausted unexpectedly",
+            );
         }
     }
 }
 
 async fn write_requests(
     mut input: ChildStdin,
-    mut requests: mpsc::Receiver<Vec<u8>>,
+    mut requests: mpsc::Receiver<OutboundRequest>,
+    mut cancellations: mpsc::Receiver<OutboundCancellation>,
     inner: Weak<VmToolSessionInner>,
 ) {
-    while let Some(frame) = requests.recv().await {
-        let result = async {
-            input.write_all(&frame).await?;
-            input.flush().await
+    let mut deferred_cancellations = HashMap::<u64, OutboundCancellation>::new();
+    loop {
+        enum Outbound {
+            Request(OutboundRequest),
+            Cancellation(OutboundCancellation),
         }
-        .await;
-        if let Err(error) = result {
-            if let Some(inner) = inner.upgrade() {
-                let message = terminal_router_message(
-                    &inner,
-                    &format!("VM tool console write failed: {error}"),
-                )
-                .await;
-                close_pending(&inner, &message);
+        let outbound = tokio::select! {
+            biased;
+            Some(cancellation) = cancellations.recv() => {
+                Outbound::Cancellation(cancellation)
             }
-            return;
+            Some(request) = requests.recv() => Outbound::Request(request),
+            else => break,
+        };
+        let result = match outbound {
+            Outbound::Cancellation(cancellation)
+                if !cancellation.written.load(Ordering::Acquire) =>
+            {
+                deferred_cancellations.insert(cancellation.target_id, cancellation);
+                continue;
+            }
+            Outbound::Cancellation(cancellation) => {
+                write_request_frame(&mut input, &cancellation.frame).await
+            }
+            Outbound::Request(request) => {
+                let result = write_request_frame(&mut input, &request.frame).await;
+                if result.is_ok() {
+                    request.written.store(true, Ordering::Release);
+                    if let Some(cancellation) = deferred_cancellations.remove(&request.id)
+                        && let Err(error) =
+                            write_request_frame(&mut input, &cancellation.frame).await
+                    {
+                        break close_writer_after_error(&inner, error).await;
+                    }
+                }
+                result
+            }
+        };
+        if let Err(error) = result {
+            close_writer_after_error(&inner, error).await;
+            break;
         }
+    }
+}
+
+async fn write_request_frame(input: &mut ChildStdin, frame: &[u8]) -> io::Result<()> {
+    input.write_all(frame).await?;
+    input.flush().await
+}
+
+async fn close_writer_after_error(inner: &Weak<VmToolSessionInner>, error: io::Error) {
+    if let Some(inner) = inner.upgrade() {
+        let message =
+            terminal_router_message(&inner, &format!("VM tool console write failed: {error}"))
+                .await;
+        close_pending(&inner, &message);
     }
 }
 
@@ -1246,6 +1554,7 @@ const fn set_request_id(request: &mut SessionRequest, id: u64) {
 }
 
 fn close_pending(inner: &VmToolSessionInner, message: &str) {
+    inner.request_slots.close();
     let requests = {
         let mut pending = lock_unpoisoned(&inner.pending);
         if pending.closed.is_none() {
@@ -1345,8 +1654,8 @@ impl VmToolClient for VmToolSessionHandle {
 mod tracing_tests {
     use std::{
         collections::HashMap,
-        sync::{Arc, Mutex},
-        time::Duration,
+        sync::{Arc, Mutex, atomic::Ordering},
+        time::{Duration, Instant},
     };
 
     use nanocodex_tools::{
@@ -1359,7 +1668,9 @@ mod tracing_tests {
         Layer, layer::Context as LayerContext, prelude::*, registry::LookupSpan,
     };
 
-    use super::{VmCommand, VmCommandPartialOutput, VmToolSession, VmToolSessionError};
+    use super::{
+        VmCommand, VmCommandPartialOutput, VmToolSession, VmToolSessionError, lock_unpoisoned,
+    };
 
     static TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1440,7 +1751,7 @@ mod tracing_tests {
     }
 
     #[test]
-    fn vm_rpc_is_timed_and_parented_to_the_calling_tool() {
+    fn vm_rpc_is_timed_parented_and_records_admission_wait() {
         let _test_guard = TRACE_TEST_LOCK.lock().unwrap();
         let response = r#"{"kind":"tool","payload":{"id":0,"execution":{"output":"ok","success":true,"code_mode_value":null,"metadata":null,"process_trace":null},"error":null}}"#;
         let script = format!("IFS= read -r request\nprintf '%s\\n' '{response}'");
@@ -1461,18 +1772,28 @@ mod tracing_tests {
             tracing::callsite::rebuild_interest_cache();
             runtime.block_on(async {
                 let session = VmToolSession::spawn(&mut command).unwrap();
+                let handle = session.handle();
+                let held_slots = handle
+                    .inner
+                    .request_slots
+                    .acquire_many(super::MAX_HOST_IN_FLIGHT_REQUESTS as u32)
+                    .await
+                    .unwrap();
                 let context =
                     ToolContext::new("test-model", "test-session", "test-call", &[], 1_000);
-                let execution = session
-                    .handle()
+                let request = handle
                     .request(
                         StandardTool::ExecCommand,
                         ToolInput::Function(to_raw_value(&json!({"cmd": "true"})).unwrap()),
                         context,
                     )
-                    .instrument(tracing::info_span!("test.tool.execute"))
-                    .await
-                    .unwrap();
+                    .instrument(tracing::info_span!("test.tool.execute"));
+                let release_slots = async move {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    drop(held_slots);
+                };
+                let (execution, ()) = tokio::join!(request, release_slots);
+                let execution = execution.unwrap();
                 assert!(execution.success);
             });
         });
@@ -1495,6 +1816,13 @@ mod tracing_tests {
             rpc.fields.get("vm.session.first_call").map(String::as_str),
             Some("true")
         );
+        let admission_duration_ns = rpc
+            .fields
+            .get("rpc.admission.duration_ns")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(admission_duration_ns >= 15_000_000);
         assert!(rpc.fields.contains_key("rpc.queue.duration_ns"));
         assert!(rpc.fields.contains_key("duration_ns"));
         assert!(capture.names.lock().unwrap().contains(&"vm.session.spawn"));
@@ -1717,10 +2045,13 @@ mod tracing_tests {
             );
 
             drop(tools);
-            assert!(
-                weak_guard.upgrade().is_none(),
-                "the last VM capability must release retained egress state"
-            );
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while weak_guard.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("egress must be released after the killed VMM is reaped");
         });
     }
 
@@ -1745,6 +2076,143 @@ mod tracing_tests {
             ));
             drop(handle);
             session.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn graceful_shutdown_rejects_owner_requests_already_in_flight() {
+        let _test_guard = TRACE_TEST_LOCK.lock().unwrap();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.arg("-c").arg("IFS= read -r request\nsleep 30");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let session = VmToolSession::spawn(&mut command).unwrap();
+            {
+                let request = session.write_file("/pending", Vec::new(), 0o600);
+                tokio::pin!(request);
+                tokio::select! {
+                    result = &mut request => panic!("request unexpectedly completed: {result:?}"),
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+                assert!(matches!(
+                    session.shutdown().await,
+                    Err(VmToolSessionError::ActiveRequests(1))
+                ));
+            }
+            session.terminate().await;
+        });
+    }
+
+    #[test]
+    fn cancelling_graceful_shutdown_forcibly_terminates_the_vmm() {
+        let _test_guard = TRACE_TEST_LOCK.lock().unwrap();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.arg("-c").arg("IFS= read -r request\nsleep 30");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let session =
+                VmToolSession::spawn_with_shutdown_timeout(&mut command, Duration::from_millis(50))
+                    .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), session.shutdown())
+                    .await
+                    .is_err()
+            );
+            assert!(session.handle.inner.closing.load(Ordering::Acquire));
+            assert!(lock_unpoisoned(&session.handle.inner.child).is_none());
+        });
+    }
+
+    #[test]
+    fn startup_and_shutdown_deadlines_are_enforced() {
+        let _test_guard = TRACE_TEST_LOCK.lock().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let mut startup_command = tokio::process::Command::new("/bin/sh");
+            startup_command.arg("-c").arg("sleep 30");
+            let started_at = Instant::now();
+            let startup = VmToolSession::spawn_configured_with_timeouts(
+                startup_command,
+                crate::config::VmConfig::ext4("/unused/root.ext4"),
+                crate::command::GuestCommand::new("/bin/true"),
+                crate::egress::EgressLease::disabled(),
+                Duration::from_millis(10),
+                Duration::from_millis(50),
+            )
+            .await;
+            assert!(matches!(
+                startup,
+                Err(VmToolSessionError::StartupTimeout(timeout))
+                    if timeout == Duration::from_millis(10)
+            ));
+            assert!(started_at.elapsed() < Duration::from_secs(1));
+
+            let mut shutdown_command = tokio::process::Command::new("/bin/sh");
+            shutdown_command
+                .arg("-c")
+                .arg("IFS= read -r request\nsleep 30");
+            let session = VmToolSession::spawn_with_shutdown_timeout(
+                &mut shutdown_command,
+                Duration::from_millis(10),
+            )
+            .unwrap();
+            let started_at = Instant::now();
+            assert!(matches!(
+                session.shutdown().await,
+                Err(VmToolSessionError::ShutdownTimeout(timeout))
+                    if timeout == Duration::from_millis(10)
+            ));
+            assert!(started_at.elapsed() < Duration::from_secs(1));
+        });
+    }
+
+    #[test]
+    fn cancellation_storm_releases_bounded_admission_slots() {
+        let _test_guard = TRACE_TEST_LOCK.lock().unwrap();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 30");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let session = VmToolSession::spawn(&mut command).unwrap();
+            for index in 0..(super::MAX_HOST_IN_FLIGHT_REQUESTS * 2) {
+                assert!(
+                    tokio::time::timeout(
+                        Duration::from_millis(1),
+                        session.write_file(format!("/cancelled-{index}"), Vec::new(), 0o600),
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+            let permits = tokio::time::timeout(
+                Duration::from_secs(1),
+                session
+                    .handle
+                    .inner
+                    .request_slots
+                    .acquire_many(super::MAX_HOST_IN_FLIGHT_REQUESTS as u32),
+            )
+            .await
+            .expect("cancelled requests must release all admission slots")
+            .unwrap();
+            drop(permits);
+            session.terminate().await;
         });
     }
 

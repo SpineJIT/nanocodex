@@ -37,7 +37,11 @@ impl WorkspaceToolRuntime {
     /// environment.
     #[must_use]
     pub fn new(workspace: PathBuf) -> Self {
-        Self::with_optional_view_image_wire_limit(workspace, None)
+        Self::with_optional_view_image_wire_limit(
+            workspace,
+            None,
+            Arc::<Vec<(OsString, OsString)>>::default(),
+        )
     }
 
     /// Creates a retained runtime whose `view_image` responses must fit one
@@ -48,15 +52,40 @@ impl WorkspaceToolRuntime {
     #[doc(hidden)]
     #[must_use]
     pub fn with_view_image_wire_limit(workspace: PathBuf, max_wire_bytes: u64) -> Self {
-        Self::with_optional_view_image_wire_limit(workspace, Some(max_wire_bytes))
+        Self::with_optional_view_image_wire_limit(
+            workspace,
+            Some(max_wire_bytes),
+            Arc::<Vec<(OsString, OsString)>>::default(),
+        )
+    }
+
+    /// Creates a process-boundary runtime with an explicit environment that
+    /// should remain visible to guest shell commands.
+    ///
+    /// Values whose names look sensitive remain available to the isolated
+    /// process while also participating in normal subprocess-output
+    /// sanitization. Normal in-process callers should use [`Self::new`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_environment_and_view_image_wire_limit(
+        workspace: PathBuf,
+        max_wire_bytes: u64,
+        environment: Vec<(OsString, OsString)>,
+    ) -> Self {
+        Self::with_optional_view_image_wire_limit(
+            workspace,
+            Some(max_wire_bytes),
+            Arc::new(environment),
+        )
     }
 
     fn with_optional_view_image_wire_limit(
         workspace: PathBuf,
         max_wire_bytes: Option<u64>,
+        environment: Arc<Vec<(OsString, OsString)>>,
     ) -> Self {
         let sessions = Arc::new(ShellSessions::with_environment_and_turn(
-            Arc::<Vec<(OsString, OsString)>>::default(),
+            environment,
             Arc::new(AtomicU64::new(0)),
         ));
         Self {
@@ -121,7 +150,7 @@ impl WorkspaceToolRuntimeControl {
 
 #[cfg(test)]
 mod tests {
-    use nanocodex_oai_api::tools::ToolInput;
+    use nanocodex_oai_api::tools::{ToolInput, ToolOutputBody};
     use serde_json::value::to_raw_value;
     use tempfile::tempdir;
 
@@ -161,5 +190,40 @@ mod tests {
             )
             .await;
         assert!(!output.success);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_boundary_environment_reaches_guest_shell_commands() {
+        let workspace = tempdir().unwrap();
+        let runtime = WorkspaceToolRuntime::with_environment_and_view_image_wire_limit(
+            workspace.path().to_path_buf(),
+            1024 * 1024,
+            vec![(
+                OsString::from("NANOCODEX_IMAGE_ENV"),
+                OsString::from("from-image"),
+            )],
+        );
+        let input = ToolInput::Function(
+            to_raw_value(&serde_json::json!({
+                "cmd": "printf %s \"$NANOCODEX_IMAGE_ENV\""
+            }))
+            .unwrap(),
+        );
+
+        let output = runtime
+            .execute_tool(
+                StandardTool::ExecCommand.name(),
+                input,
+                ToolContext::new("model", "session", "call", &[], 10_000),
+            )
+            .await;
+
+        assert!(output.success);
+        let ToolOutputBody::Text(output) = output.output else {
+            panic!("shell command should return text");
+        };
+        let output = serde_json::from_str::<serde_json::Value>(&output).unwrap();
+        assert_eq!(output["output"], "from-image");
     }
 }

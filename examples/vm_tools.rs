@@ -113,6 +113,7 @@ async fn run_host(arguments: Vec<std::ffi::OsString>) -> Result<(), AnyError> {
                 "cmd": "cat",
                 "workdir": "/workspace",
                 "login": false,
+                "tty": true,
                 "yield_time_ms": 250
             }))?,
             context,

@@ -80,10 +80,17 @@ required-features = ["guest-runtime"]
 [[bench]]
 name = "image_cache"
 harness = false
+required-features = ["host"]
 
 [[bench]]
 name = "vm_session"
 harness = false
+required-features = ["host"]
+
+[[test]]
+name = "image_live_build"
+path = "tests/image_live_build.rs"
+required-features = ["host"]
 
 [lints.rust]
 unsafe_code = "deny"

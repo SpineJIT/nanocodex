@@ -1,8 +1,8 @@
 //! Content-addressed OCI and Dockerfile root disks for Nanocodex VMs.
 //!
-//! The cache owns immutable prepared disks. Each VM attempt should take a
-//! cheap copy-on-write clone with [`PreparedRootDisk::reflink_to`] and mutate
-//! only that disposable copy.
+//! The cache owns immutable prepared disks. Each VM attempt should use
+//! [`PreparedRootDisk::private_workspace`] to take a cheap copy-on-write clone,
+//! inherit the image's runtime metadata, and mutate only that disposable copy.
 //!
 //! # Prepare and instantiate an image
 //!
@@ -31,8 +31,17 @@
 //!         CachePolicy::Reuse,
 //!     )
 //!     .await?;
-//! std::fs::create_dir_all(".nanocodex/attempts/018f")?;
-//! image.reflink_to(".nanocodex/attempts/018f/root.ext4")?;
+//! let workspace = image
+//!     .private_workspace(
+//!         ".nanocodex/attempts/018f/root.ext4",
+//!         "target/debug/vm-tools",
+//!     )?
+//!     .vmm_argument("--vmm")
+//!     .guest_runtime_disk(runtime.path())
+//!     .firmware_directory(".cache/libkrunfw/libkrunfw")
+//!     .launch()
+//!     .await?;
+//! # workspace.shutdown().await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -58,15 +67,21 @@ use std::{
     ffi::OsString,
     fs::{self, File},
     io::{self, BufReader, Read, Seek, SeekFrom, Write},
+    os::unix::{
+        ffi::OsStrExt as _,
+        fs::{MetadataExt as _, PermissionsExt as _},
+    },
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
 use crate::{
     command::GuestCommand,
-    config::{BlockDevice, VmConfig},
+    config::{BlockDevice, Network, VmConfig},
     egress::EgressLease,
     tools::{VmCommand, VmToolSession, VmToolSessionError},
+    workspace::{VmWorkspaceBuilder, VmWorkspaceError},
 };
 use arcbox_ext4::{Formatter, Reader};
 use flate2::read::GzDecoder;
@@ -78,14 +93,16 @@ use oci_client::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use tokio::process::Command;
+use tokio::{process::Command, sync::Mutex as AsyncMutex};
 use tracing::{Instrument, info, info_span};
 
 const BLOCK_SIZE: u32 = 4_096;
 const MINIMUM_DISK_BYTES: u64 = 512 * 1024 * 1024;
 const CACHE_RECORD_VERSION: u32 = 2;
-const IMAGE_BUILD_CACHE_VERSION: u32 = 1;
-const PREPARED_DISK_RECORD_VERSION: u32 = 1;
+const IMAGE_BUILD_CACHE_VERSION: u32 = 2;
+const PREPARED_DISK_RECORD_VERSION: u32 = 3;
+const CACHED_EXT4_RECORD_VERSION: u32 = 2;
+const BLOB_RECORD_VERSION: u32 = 2;
 const CONTEXT_DISK_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_mins(30);
 const DEFAULT_COPY_TIMEOUT: Duration = Duration::from_mins(10);
@@ -97,6 +114,13 @@ const BUILD_RUNTIME_DEVICE: &str = "/dev/vdb";
 const BUILD_CONTEXT_DEVICE: &str = "/dev/vdc";
 const BUILD_RUNTIME_MOUNT: &str = "/run/nanocodex";
 const BUILD_CONTEXT_MOUNT: &str = "/mnt/nanocodex-context";
+const BUILD_RESOLVER_STATE: &str = "/run/nanocodex-build-resolver";
+const RESTORE_BUILD_RESOLVER_SCRIPT: &str = r#"set -eu
+rm -f /etc/resolv.conf
+if [ -e /run/nanocodex-build-resolver/original ] || [ -L /run/nanocodex-build-resolver/original ]; then
+  mv /run/nanocodex-build-resolver/original /etc/resolv.conf
+fi
+rm -rf /run/nanocodex-build-resolver"#;
 const DEFAULT_GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const DEFAULT_BUILD_VM_CPUS: u8 = 2;
 const DEFAULT_BUILD_VM_MEMORY_MIB: u32 = 4_096;
@@ -146,6 +170,9 @@ pub struct VmImageBuilder {
     run_timeout: Duration,
     copy_timeout: Duration,
     egress: EgressLease,
+    vmm_digest: Arc<AsyncMutex<Option<CachedFileDigest>>>,
+    runtime_digest: Arc<AsyncMutex<Option<CachedFileDigest>>>,
+    firmware_digest: Arc<AsyncMutex<Option<CachedFileDigest>>>,
 }
 
 impl VmImageBuilder {
@@ -169,6 +196,9 @@ impl VmImageBuilder {
             run_timeout: DEFAULT_RUN_TIMEOUT,
             copy_timeout: DEFAULT_COPY_TIMEOUT,
             egress: EgressLease::internet(),
+            vmm_digest: Arc::new(AsyncMutex::new(None)),
+            runtime_digest: Arc::new(AsyncMutex::new(None)),
+            firmware_digest: Arc::new(AsyncMutex::new(None)),
         }
     }
 
@@ -176,10 +206,14 @@ impl VmImageBuilder {
     ///
     /// A present `libkrunfw.5.dylib` on macOS or `libkrunfw.so.5` on Linux is
     /// added to the dedicated VMM's platform library search path. Builders and
-    /// VMMs with system-installed firmware can omit this setting.
+    /// VMMs with system-installed firmware can omit this setting. Set it
+    /// explicitly when reproducible build-cache invalidation across firmware
+    /// upgrades matters; system-installed firmware is treated as caller-owned
+    /// stable runtime state.
     #[must_use]
     pub fn firmware_directory(mut self, directory: impl Into<PathBuf>) -> Self {
         self.firmware_directory = Some(directory.into());
+        self.firmware_digest = Arc::new(AsyncMutex::new(None));
         self
     }
 
@@ -269,11 +303,53 @@ impl VmImageBuilder {
         self
     }
 
+    async fn build_cache_inputs(&self) -> Result<BuildCacheInputs, ImageError> {
+        let network = match self.egress.network() {
+            Network::Disabled => "disabled",
+            Network::Internet => "internet",
+            Network::Gvproxy { .. } => "gvproxy",
+        }
+        .to_owned();
+        let egress_scope = self
+            .egress
+            .build_cache_scope()
+            .ok_or(ImageError::UnscopedBuildEgress)?
+            .to_owned();
+        let (vmm_digest, runtime_digest, firmware_digest) =
+            if let Some(directory) = &self.firmware_directory {
+                let firmware = directory.join(FIRMWARE_LIBRARY_FILENAME);
+                let (vmm_digest, runtime_digest, firmware_digest) = tokio::try_join!(
+                    cached_file_digest(&self.vmm, &self.vmm_digest),
+                    cached_file_digest(&self.runtime_image, &self.runtime_digest),
+                    cached_file_digest(&firmware, &self.firmware_digest),
+                )?;
+                (vmm_digest, runtime_digest, firmware_digest)
+            } else {
+                let (vmm_digest, runtime_digest) = tokio::try_join!(
+                    cached_file_digest(&self.vmm, &self.vmm_digest),
+                    cached_file_digest(&self.runtime_image, &self.runtime_digest),
+                )?;
+                (vmm_digest, runtime_digest, "system-firmware".to_owned())
+            };
+        Ok(BuildCacheInputs {
+            vmm_digest,
+            runtime_digest,
+            firmware_digest,
+            resolver: match self.egress.network() {
+                Network::Internet => Some(host_resolver_configuration()?),
+                Network::Disabled | Network::Gvproxy { .. } => None,
+            },
+            network,
+            egress_scope,
+        })
+    }
+
     /// Prepares one immutable root disk from `directory/Dockerfile`.
     ///
     /// `disk_bytes` is rounded up to the minimum supported root-disk size.
-    /// Cache keys include the Dockerfile, ordered context archive, base
-    /// image manifests, target platform, and final disk size.
+    /// Cache keys include the Dockerfile, ordered context archive, base image
+    /// manifests, target platform and disk size, plus the complete build VM,
+    /// resolver, and non-secret egress execution identity.
     ///
     /// # Errors
     ///
@@ -438,6 +514,13 @@ pub enum ImageError {
     #[error("root disk formatting task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
 
+    /// Guest-visible egress state can affect a build but has no safe cache
+    /// identity.
+    #[error(
+        "Dockerfile build output cannot be cached because the egress lease has no build-cache scope"
+    )]
+    UnscopedBuildEgress,
+
     /// The constrained Dockerfile parser rejected an instruction.
     #[error("unsupported Dockerfile instruction: {0}")]
     UnsupportedDockerfile(String),
@@ -512,6 +595,11 @@ impl PreparedRootDisk {
             .get(&final_stage.base_image)
             .ok_or_else(|| ImageError::UnknownCopySource(final_stage.base_image.clone()))?;
         let (path, disk_status, environment, shell) = if recipe.requires_build() {
+            let build_cache_inputs = builder.build_cache_inputs().await?;
+            let execution = BuildExecution {
+                builder,
+                cache_inputs: &build_cache_inputs,
+            };
             prepare_built_disk(
                 directory,
                 &dockerfile,
@@ -519,7 +607,7 @@ impl PreparedRootDisk {
                 &images,
                 cache,
                 disk_bytes,
-                builder,
+                &execution,
             )
             .await?
         } else {
@@ -528,14 +616,17 @@ impl PreparedRootDisk {
             (
                 path,
                 status,
-                docker_process_environment(&final_image.config.environment),
+                final_recipe_environment(&recipe, &images)?,
                 shell,
             )
         };
         Ok(Self {
             shell,
             path,
-            workdir: recipe.final_workdir().to_owned(),
+            workdir: recipe
+                .final_workdir()
+                .unwrap_or(&final_image.config.working_directory)
+                .to_owned(),
             environment,
             manifest_digest: final_image.manifest_digest.clone(),
             manifest_source: final_image.source,
@@ -608,6 +699,29 @@ impl PreparedRootDisk {
         }
         Ok(reflink_or_sparse_copy(&self.path, destination)?)
     }
+
+    /// Materializes a private writable root and applies this image's runtime
+    /// working directory, shell, and environment to its workspace builder.
+    ///
+    /// This is the normal library path from a prepared image to a retained VM.
+    /// The caller can continue configuring the returned builder with a guest
+    /// runtime disk, firmware, resources, and egress policy before launch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the private root cannot be materialized.
+    pub fn private_workspace(
+        &self,
+        private_rootfs: impl Into<PathBuf>,
+        vmm_executable: impl Into<PathBuf>,
+    ) -> Result<VmWorkspaceBuilder, VmWorkspaceError> {
+        Ok(
+            VmWorkspaceBuilder::private_from(&self.path, private_rootfs, vmm_executable)?
+                .guest_workspace(self.workdir.clone())
+                .shell(self.shell.clone())
+                .environment(self.environment.clone()),
+        )
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -623,9 +737,37 @@ struct ReferenceRecord {
 #[derive(Deserialize, Serialize)]
 struct PreparedDiskRecord {
     version: u32,
-    file_bytes: u64,
-    modified_nanos: u128,
+    file: CacheFileIdentity,
     shell: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct BlobRecord {
+    version: u32,
+    digest: String,
+    file: CacheFileIdentity,
+}
+
+#[derive(Deserialize, Serialize)]
+struct CachedExt4Record {
+    version: u32,
+    file: CacheFileIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct CacheFileIdentity {
+    bytes: u64,
+    modified_nanos: u128,
+    changed_seconds: i64,
+    changed_nanos: i64,
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CachedFileDigest {
+    file: CacheFileIdentity,
+    digest: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -634,10 +776,34 @@ struct LayerRecord {
     media_type: String,
 }
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct ImageRuntimeConfig {
     environment: BTreeMap<String, String>,
     working_directory: String,
+}
+
+impl Default for ImageRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            environment: BTreeMap::new(),
+            working_directory: "/".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BuildCacheInputs {
+    vmm_digest: String,
+    runtime_digest: String,
+    firmware_digest: String,
+    resolver: Option<String>,
+    network: String,
+    egress_scope: String,
+}
+
+struct BuildExecution<'a> {
+    builder: &'a VmImageBuilder,
+    cache_inputs: &'a BuildCacheInputs,
 }
 
 fn read_cache_record<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, ImageError> {
@@ -842,7 +1008,7 @@ impl DockerfileRecipe {
         self.stages.last()
     }
 
-    fn final_workdir(&self) -> &str {
+    fn final_workdir(&self) -> Option<&str> {
         self.final_stage()
             .into_iter()
             .flat_map(|stage| stage.instructions.iter().rev())
@@ -854,17 +1020,17 @@ impl DockerfileRecipe {
                 | DockerfileInstruction::Arg { .. }
                 | DockerfileInstruction::Cmd(_) => None,
             })
-            .unwrap_or("/")
     }
 
     fn requires_build(&self) -> bool {
-        self.stages.len() != 1
-            || self.stages.iter().any(|stage| {
-                stage
-                    .instructions
-                    .iter()
-                    .any(|instruction| !matches!(instruction, DockerfileInstruction::Workdir(_)))
+        self.stages.iter().any(|stage| {
+            stage.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    DockerfileInstruction::Run(_) | DockerfileInstruction::Copy(_)
+                )
             })
+        })
     }
 }
 
@@ -1091,7 +1257,7 @@ async fn prepare_flattened_disk(
     .await??;
     validate_root_disk(&temporary)?;
     publish(temporary, &path)?;
-    let shell = cached_prepared_shell(&path)?;
+    let shell = record_prepared_disk(&path)?;
     Ok((path, DiskStatus::Created, shell))
 }
 
@@ -1102,7 +1268,7 @@ async fn prepare_copy_source_disk(
 ) -> Result<PathBuf, ImageError> {
     let key = disk_cache_key(&image.manifest_digest, disk_bytes);
     let path = cache.join("images").join(format!("{key}.ext4"));
-    if valid_cached_ext4_disk(&path) {
+    if valid_cached_ext4_disk(&path)? {
         return Ok(path);
     }
     let parent = path
@@ -1110,7 +1276,7 @@ async fn prepare_copy_source_disk(
         .ok_or_else(|| io::Error::other("prepared copy source disk cache path has no parent"))?;
     fs::create_dir_all(parent)?;
     let _lock = acquire_cache_lock(cache, "images", &key).await?;
-    if valid_cached_ext4_disk(&path) {
+    if valid_cached_ext4_disk(&path)? {
         return Ok(path);
     }
     let temporary = temporary_path(parent, &format!(".{key}."))?;
@@ -1129,6 +1295,7 @@ async fn prepare_copy_source_disk(
     .await??;
     validate_ext4_disk(&temporary)?;
     publish(temporary, &path)?;
+    record_cached_ext4_disk(&path)?;
     Ok(path)
 }
 
@@ -1139,8 +1306,10 @@ async fn prepare_built_disk(
     images: &BTreeMap<String, PulledImage>,
     cache: &Path,
     disk_bytes: u64,
-    builder: &VmImageBuilder,
+    execution: &BuildExecution<'_>,
 ) -> Result<(PathBuf, DiskStatus, BTreeMap<String, String>, String), ImageError> {
+    let builder = execution.builder;
+    let build_cache_inputs = execution.cache_inputs;
     let context_directory = context_directory.to_path_buf();
     let context_cache = cache.to_path_buf();
     let span = info_span!(
@@ -1154,7 +1323,15 @@ async fn prepare_built_disk(
         span.in_scope(|| prepare_context_disk(&context_directory, &context_cache, disk_bytes))
     })
     .await??;
-    let key = build_cache_key(dockerfile, &context_digest, recipe, images, disk_bytes);
+    let key = build_cache_key(
+        dockerfile,
+        &context_digest,
+        recipe,
+        images,
+        disk_bytes,
+        builder,
+        build_cache_inputs,
+    );
     let builds = cache.join("builds");
     fs::create_dir_all(&builds)?;
     let path = builds.join(format!("{key}.ext4"));
@@ -1197,17 +1374,18 @@ async fn prepare_built_disk(
             &stage_disks,
             &stage_root,
             builder,
+            build_cache_inputs.resolver.as_deref(),
         )
         .instrument(span)
         .await?;
         stage_disks.push(stage_root);
     }
     let final_stage = stage_disks.last().ok_or(ImageError::InvalidFrom)?;
-    let published = temporary_path(&builds, &format!(".{key}.publish."))?;
+    let published = temporary.path().join("published.ext4");
     reflink_or_sparse_copy(final_stage, &published)?;
     validate_root_disk(&published)?;
-    publish(published, &path)?;
-    let shell = cached_prepared_shell(&path)?;
+    fs::rename(published, &path)?;
+    let shell = record_prepared_disk(&path)?;
     Ok((path, DiskStatus::Created, final_environment, shell))
 }
 
@@ -1268,7 +1446,7 @@ fn prepare_context_disk(
     let key = hex::encode(identity.finalize());
     let path = contexts.join(format!("{key}.ext4"));
     let _lock = CacheLock::acquire(cache, "contexts", &key)?;
-    if !valid_cached_ext4_disk(&path) {
+    if !valid_cached_ext4_disk(&path)? {
         archive_file.as_file_mut().seek(SeekFrom::Start(0))?;
         let temporary = temporary_path(&contexts, &format!(".{key}."))?;
         let mut formatter = Formatter::new(&temporary, BLOCK_SIZE, disk_bytes)?;
@@ -1276,6 +1454,7 @@ fn prepare_context_disk(
         formatter.close()?;
         validate_ext4_disk(&temporary)?;
         publish(temporary, &path)?;
+        record_cached_ext4_disk(&path)?;
     }
     validate_ext4_disk(&path)?;
     Ok((path, digest))
@@ -1358,6 +1537,7 @@ async fn execute_stage(
     stage_disks: &[PathBuf],
     stage_root: &Path,
     builder: &VmImageBuilder,
+    resolver: Option<&str>,
 ) -> Result<(), ImageError> {
     let mut mounts = Vec::<BuildMount>::new();
     let mut source_mounts = BTreeMap::<String, String>::new();
@@ -1404,7 +1584,8 @@ async fn execute_stage(
         });
     }
 
-    let (command, config, guest) = build_vmm_inputs(builder, stage_root, context_image, &mounts)?;
+    let (command, config, guest) =
+        build_vmm_inputs(builder, stage_root, context_image, &mounts, resolver)?;
     let session =
         VmToolSession::spawn_configured(command, config, guest, builder.egress.clone()).await?;
     let execution = execute_stage_inner(
@@ -1417,8 +1598,23 @@ async fn execute_stage(
         builder,
     )
     .await;
+    let resolver_cleanup = if resolver.is_some() {
+        run_build_command(
+            &session,
+            stage_index,
+            stage.instructions.len(),
+            VmCommand::new("/bin/sh")
+                .arg("-c")
+                .arg(RESTORE_BUILD_RESOLVER_SCRIPT)
+                .timeout(builder.copy_timeout),
+        )
+        .await
+    } else {
+        Ok(())
+    };
     let shutdown = session.shutdown().await;
     execution?;
+    resolver_cleanup?;
     shutdown?;
     Ok(())
 }
@@ -1428,6 +1624,7 @@ fn build_vmm_inputs(
     stage_root: &Path,
     context_image: &Path,
     mounts: &[BuildMount],
+    resolver: Option<&str>,
 ) -> Result<(Command, VmConfig, GuestCommand), ImageError> {
     let mut command = Command::new(&builder.vmm);
     command.args(&builder.vmm_arguments);
@@ -1445,15 +1642,14 @@ fn build_vmm_inputs(
     for mount in mounts {
         config = config.block_device(BlockDevice::read_only(&mount.key, &mount.disk));
     }
-    let resolver = host_resolver_configuration()?;
     let guest = GuestCommand::new("/bin/sh")
         .arg("-c")
-        .arg(build_guest_bootstrap_script(&resolver, builder.prefer_ipv4))
+        .arg(build_guest_bootstrap_script(resolver, builder.prefer_ipv4))
         .arg("nanocodex-vm-image-build");
     Ok((command, config, guest))
 }
 
-fn build_guest_bootstrap_script(resolver: &str, prefer_ipv4: bool) -> String {
+fn build_guest_bootstrap_script(resolver: Option<&str>, prefer_ipv4: bool) -> String {
     let address_preference = if prefer_ipv4 {
         concat!(
             "if ! printf 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6; then printf '%s\\n' 'nanocodex image build bootstrap: failed to write /proc/sys/net/ipv6/conf/all/disable_ipv6' >&2; exit 125; fi; ",
@@ -1462,8 +1658,13 @@ fn build_guest_bootstrap_script(resolver: &str, prefer_ipv4: bool) -> String {
     } else {
         ""
     };
+    let resolver = resolver.map_or_else(String::new, |resolver| {
+        format!(
+            "rm -rf {BUILD_RESOLVER_STATE} && mkdir -p {BUILD_RESOLVER_STATE} && if [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; then mv /etc/resolv.conf {BUILD_RESOLVER_STATE}/original; fi && printf '{resolver}' > /etc/resolv.conf && "
+        )
+    });
     format!(
-        "{address_preference}printf '{resolver}' > /etc/resolv.conf && mkdir -p {BUILD_RUNTIME_MOUNT} && mount -t ext4 -o ro {BUILD_RUNTIME_DEVICE} {BUILD_RUNTIME_MOUNT} && exec {BUILD_RUNTIME_MOUNT}/nanocodex-vm-guest /"
+        "{address_preference}{resolver}mkdir -p {BUILD_RUNTIME_MOUNT} && mount -t ext4 -o ro {BUILD_RUNTIME_DEVICE} {BUILD_RUNTIME_MOUNT} && exec {BUILD_RUNTIME_MOUNT}/nanocodex-vm-guest /"
     )
 }
 
@@ -1785,8 +1986,11 @@ fn expand_variables(
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] != b'$' {
-            output.push(char::from(bytes[index]));
-            index += 1;
+            let Some(character) = input[index..].chars().next() else {
+                break;
+            };
+            output.push(character);
+            index += character.len_utf8();
             continue;
         }
         if bytes.get(index + 1) == Some(&b'{') {
@@ -1834,6 +2038,8 @@ fn build_cache_key(
     recipe: &DockerfileRecipe,
     images: &BTreeMap<String, PulledImage>,
     disk_bytes: u64,
+    builder: &VmImageBuilder,
+    inputs: &BuildCacheInputs,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"nanocodex-vm-image-build\0");
@@ -1842,6 +2048,32 @@ fn build_cache_key(
     hasher.update(GUEST_ARCHITECTURE.as_bytes());
     hasher.update([0]);
     hasher.update(disk_bytes.to_le_bytes());
+    hasher.update([builder.cpus]);
+    hasher.update(builder.memory_mib.to_le_bytes());
+    hasher.update([u8::from(builder.prefer_ipv4)]);
+    for argument in &builder.vmm_arguments {
+        hasher.update([0]);
+        hasher.update(argument.as_os_str().as_bytes());
+    }
+    for value in [
+        &inputs.vmm_digest,
+        &inputs.runtime_digest,
+        &inputs.firmware_digest,
+        &inputs.network,
+        &inputs.egress_scope,
+    ] {
+        hasher.update([0]);
+        hasher.update(value.as_bytes());
+    }
+    hasher.update([0]);
+    match &inputs.resolver {
+        Some(resolver) => {
+            hasher.update(b"resolver\0");
+            hasher.update(resolver.as_bytes());
+        }
+        None => hasher.update(b"no-resolver"),
+    }
+    hasher.update([0]);
     hasher.update(context_digest.as_bytes());
     hasher.update([0]);
     hasher.update(dockerfile.as_bytes());
@@ -1862,7 +2094,7 @@ fn build_cache_key(
     hex::encode(hasher.finalize())
 }
 
-fn host_resolver_configuration() -> io::Result<String> {
+pub(crate) fn host_resolver_configuration() -> io::Result<String> {
     for path in ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
         let Ok(contents) = fs::read_to_string(path) else {
             continue;
@@ -1924,14 +2156,14 @@ async fn resolve_image(
         .join(format!("{reference_key}.json"));
     if policy == CachePolicy::Reuse
         && let Some(record) = read_cache_record::<ReferenceRecord>(&reference_path)?
-        && let Some(image) = local_image(image_reference, cache, record)
+        && let Some(image) = local_image(image_reference, cache, record).await?
     {
         return Ok(image);
     }
     let _lock = acquire_cache_lock(cache, "references", &reference_key).await?;
     if policy == CachePolicy::Reuse
         && let Some(record) = read_cache_record::<ReferenceRecord>(&reference_path)?
-        && let Some(image) = local_image(image_reference, cache, record)
+        && let Some(image) = local_image(image_reference, cache, record).await?
     {
         return Ok(image);
     }
@@ -1955,7 +2187,11 @@ async fn resolve_image(
     Ok(image)
 }
 
-fn local_image(image: &str, cache: &Path, record: ReferenceRecord) -> Option<PulledImage> {
+async fn local_image(
+    image: &str,
+    cache: &Path,
+    record: ReferenceRecord,
+) -> Result<Option<PulledImage>, ImageError> {
     if record.version != CACHE_RECORD_VERSION
         || record.image_reference != image
         || !valid_digest(&record.manifest_digest)
@@ -1965,7 +2201,7 @@ fn local_image(image: &str, cache: &Path, record: ReferenceRecord) -> Option<Pul
             .iter()
             .any(|layer| !valid_digest(&layer.digest) || layer.media_type.is_empty())
     {
-        return None;
+        return Ok(None);
     }
     let layers = record
         .layers
@@ -1976,15 +2212,17 @@ fn local_image(image: &str, cache: &Path, record: ReferenceRecord) -> Option<Pul
             media_type: layer.media_type,
         })
         .collect::<Vec<_>>();
-    if layers.iter().any(|layer| !layer.path.is_file()) {
-        return None;
+    for layer in &layers {
+        if !valid_cached_blob(&layer.path, &layer.digest).await? {
+            return Ok(None);
+        }
     }
-    Some(PulledImage {
+    Ok(Some(PulledImage {
         manifest_digest: record.manifest_digest,
         layers,
         source: ManifestSource::Local,
         config: record.config,
-    })
+    }))
 }
 
 async fn pull_layers(image: &str, blobs: &Path) -> Result<PulledImage, ImageError> {
@@ -2015,10 +2253,10 @@ async fn pull_layers(image: &str, blobs: &Path) -> Result<PulledImage, ImageErro
         let reference = &reference;
         async move {
             let path = blob_path(blobs, &descriptor.digest);
-            if !path.is_file() {
+            if !valid_cached_blob(&path, &descriptor.digest).await? {
                 let lock_key = reference_cache_key(&descriptor.digest);
                 let _lock = acquire_cache_lock(blobs, "blobs", &lock_key).await?;
-                if !path.is_file() {
+                if !valid_cached_blob(&path, &descriptor.digest).await? {
                     let temporary = temporary_path(blobs, &format!(".{lock_key}."))?;
                     let mut output = tokio::fs::File::create(&temporary).await?;
                     client
@@ -2027,6 +2265,15 @@ async fn pull_layers(image: &str, blobs: &Path) -> Result<PulledImage, ImageErro
                     output.sync_all().await?;
                     drop(output);
                     publish(temporary, &path)?;
+                    if !valid_cached_blob(&path, &descriptor.digest).await? {
+                        return Err(ImageError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "downloaded OCI blob does not match digest {}",
+                                descriptor.digest
+                            ),
+                        )));
+                    }
                 }
             }
             Ok::<_, ImageError>(PulledLayer {
@@ -2073,6 +2320,47 @@ fn parse_image_config(config: &str) -> Result<ImageRuntimeConfig, ImageError> {
 
 fn blob_path(cache: &Path, digest: &str) -> PathBuf {
     cache.join(digest.replace(':', "-"))
+}
+
+async fn valid_cached_blob(path: &Path, digest: &str) -> Result<bool, ImageError> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(false);
+    };
+    if !metadata.file_type().is_file() {
+        return Ok(false);
+    }
+    let record_path = path.with_extension("blob.json");
+    if let Some(record) = read_cache_record::<BlobRecord>(&record_path)?
+        && record.version == BLOB_RECORD_VERSION
+        && record.digest == digest
+        && record.file == cache_file_identity(&metadata)?
+        && metadata.permissions().mode() & 0o222 == 0
+    {
+        return Ok(true);
+    }
+
+    let Some(expected) = digest.strip_prefix("sha256:") else {
+        return Ok(false);
+    };
+    let before = cache_file_identity(&metadata)?;
+    let path_for_hash = path.to_path_buf();
+    let actual = tokio::task::spawn_blocking(move || sha256_file(&path_for_hash)).await??;
+    let after = fs::symlink_metadata(path)?;
+    if !after.file_type().is_file() || cache_file_identity(&after)? != before || actual != expected
+    {
+        return Ok(false);
+    }
+    mark_cache_file_read_only(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    write_cache_record(
+        &record_path,
+        &BlobRecord {
+            version: BLOB_RECORD_VERSION,
+            digest: digest.to_owned(),
+            file: cache_file_identity(&metadata)?,
+        },
+    )?;
+    Ok(true)
 }
 
 fn valid_digest(digest: &str) -> bool {
@@ -2131,10 +2419,7 @@ fn validate_root_disk(path: &Path) -> Result<(), ImageError> {
 }
 
 fn cached_root_disk(path: &Path) -> Option<String> {
-    if !path.is_file() {
-        return None;
-    }
-    match cached_prepared_shell(path) {
+    match validated_prepared_disk_record(path) {
         Ok(shell) => Some(shell),
         Err(error) => {
             info!(
@@ -2148,42 +2433,162 @@ fn cached_root_disk(path: &Path) -> Option<String> {
     }
 }
 
-fn valid_cached_ext4_disk(path: &Path) -> bool {
-    path.is_file() && validate_ext4_disk(path).is_ok()
+fn valid_cached_ext4_disk(path: &Path) -> Result<bool, ImageError> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(false);
+    };
+    if !metadata.file_type().is_file() {
+        return Ok(false);
+    }
+    let record_path = path.with_extension("ext4.json");
+    let Some(record) = read_cache_record::<CachedExt4Record>(&record_path)? else {
+        return Ok(false);
+    };
+    Ok(record.version == CACHED_EXT4_RECORD_VERSION
+        && record.file == cache_file_identity(&metadata)?
+        && metadata.permissions().mode() & 0o222 == 0
+        && validate_ext4_disk(path).is_ok())
 }
 
-fn cached_prepared_shell(path: &Path) -> Result<String, ImageError> {
-    let metadata = fs::metadata(path)?;
-    let modified_nanos = modified_nanos(&metadata)?;
-    let record_path = path.with_extension("prepared.json");
-    if let Some(record) = read_cache_record::<PreparedDiskRecord>(&record_path)?
-        && record.version == PREPARED_DISK_RECORD_VERSION
-        && record.file_bytes == metadata.len()
-        && record.modified_nanos == modified_nanos
-        && matches!(record.shell.as_str(), "bash" | "sh")
-    {
-        return Ok(record.shell);
+fn validated_prepared_disk_record(path: &Path) -> Result<String, ImageError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(ImageError::Io(io::Error::other(
+            "prepared disk cache path is not a regular file",
+        )));
     }
+    let record_path = path.with_extension("prepared.json");
+    let Some(record) = read_cache_record::<PreparedDiskRecord>(&record_path)? else {
+        return Err(ImageError::Io(io::Error::other(
+            "prepared disk cache record is missing",
+        )));
+    };
+    if record.version != PREPARED_DISK_RECORD_VERSION
+        || record.file != cache_file_identity(&metadata)?
+        || !matches!(record.shell.as_str(), "bash" | "sh")
+        || metadata.permissions().mode() & 0o222 != 0
+    {
+        return Err(ImageError::Io(io::Error::other(
+            "prepared disk cache record does not match the disk",
+        )));
+    }
+    validate_root_disk(path)?;
+    Ok(record.shell)
+}
 
+fn record_prepared_disk(path: &Path) -> Result<String, ImageError> {
+    validate_root_disk(path)?;
+    mark_cache_file_read_only(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    let file = cache_file_identity(&metadata)?;
+    let record_path = path.with_extension("prepared.json");
     let shell = prepared_shell(path)?.to_owned();
+    write_cache_record(
+        &path.with_extension("ext4.json"),
+        &CachedExt4Record {
+            version: CACHED_EXT4_RECORD_VERSION,
+            file: file.clone(),
+        },
+    )?;
     write_cache_record(
         &record_path,
         &PreparedDiskRecord {
             version: PREPARED_DISK_RECORD_VERSION,
-            file_bytes: metadata.len(),
-            modified_nanos,
+            file,
             shell: shell.clone(),
         },
     )?;
     Ok(shell)
 }
 
-fn modified_nanos(metadata: &fs::Metadata) -> io::Result<u128> {
-    metadata
+fn record_cached_ext4_disk(path: &Path) -> Result<(), ImageError> {
+    validate_ext4_disk(path)?;
+    mark_cache_file_read_only(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    write_cache_record(
+        &path.with_extension("ext4.json"),
+        &CachedExt4Record {
+            version: CACHED_EXT4_RECORD_VERSION,
+            file: cache_file_identity(&metadata)?,
+        },
+    )
+}
+
+fn mark_cache_file_read_only(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::other("cache path is not a regular file"));
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(permissions.mode() & !0o222);
+    fs::set_permissions(path, permissions)
+}
+
+fn cache_file_identity(metadata: &fs::Metadata) -> io::Result<CacheFileIdentity> {
+    let modified_nanos = metadata
         .modified()?
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
-        .map_err(io::Error::other)
+        .map_err(io::Error::other)?;
+    Ok(CacheFileIdentity {
+        bytes: metadata.len(),
+        modified_nanos,
+        changed_seconds: metadata.ctime(),
+        changed_nanos: metadata.ctime_nsec(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+async fn cached_file_digest(
+    path: &Path,
+    cache: &Arc<AsyncMutex<Option<CachedFileDigest>>>,
+) -> Result<String, ImageError> {
+    let mut cached = cache.lock().await;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::other(format!(
+            "build runtime input is not a regular file: {}",
+            path.display()
+        ))
+        .into());
+    }
+    let before = cache_file_identity(&metadata)?;
+    if let Some(entry) = cached.as_ref()
+        && entry.file == before
+    {
+        return Ok(entry.digest.clone());
+    }
+    let path = path.to_path_buf();
+    let hash_path = path.clone();
+    let digest = tokio::task::spawn_blocking(move || sha256_file(&hash_path)).await??;
+    let after = cache_file_identity(&fs::symlink_metadata(&path)?)?;
+    if before != after {
+        return Err(io::Error::other(format!(
+            "build runtime input changed while it was being hashed: {}",
+            path.display()
+        ))
+        .into());
+    }
+    *cached = Some(CachedFileDigest {
+        file: after,
+        digest: digest.clone(),
+    });
+    Ok(digest)
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn prepared_shell(path: &Path) -> Result<&'static str, ImageError> {
@@ -2240,13 +2645,14 @@ mod tests {
     use crate::{config::Network, egress::EgressLease};
 
     use super::{
-        CACHE_RECORD_VERSION, CONTEXT_DISK_BYTES, COPY_SCRIPT, CachePolicy, DiskStatus,
-        DockerfileRecipe, FIRMWARE_LIBRARY_FILENAME, FIRMWARE_LIBRARY_PATH_ENVIRONMENT, ImageError,
-        ImageRuntimeConfig, LayerRecord, ManifestSource, PulledImage, PulledLayer, Reader,
-        ReferenceRecord, VmImageBuilder, append_normalized_context_entry, blob_path,
-        build_guest_bootstrap_script, configure_firmware_library_path, disk_cache_key,
-        docker_process_environment, output_tail, prepare_copy_source_disk, prepare_flattened_disk,
-        reference_cache_key, resolver_configuration, write_cache_record,
+        BuildCacheInputs, CACHE_RECORD_VERSION, CONTEXT_DISK_BYTES, COPY_SCRIPT, CachePolicy,
+        DiskStatus, DockerfileRecipe, FIRMWARE_LIBRARY_FILENAME, FIRMWARE_LIBRARY_PATH_ENVIRONMENT,
+        ImageError, ImageRuntimeConfig, LayerRecord, ManifestSource, PulledImage, PulledLayer,
+        Reader, ReferenceRecord, VmImageBuilder, append_normalized_context_entry, blob_path,
+        build_cache_key, build_guest_bootstrap_script, cached_file_digest,
+        configure_firmware_library_path, disk_cache_key, docker_process_environment, output_tail,
+        prepare_copy_source_disk, prepare_flattened_disk, reference_cache_key,
+        resolver_configuration, valid_cached_blob, valid_cached_ext4_disk, write_cache_record,
     };
     use flate2::{Compression, write::GzEncoder};
     use tracing::{
@@ -2261,8 +2667,6 @@ mod tests {
     const FIXTURE_IMAGE: &str = "example.invalid/nanocodex-vm-fixture:latest";
     const FIXTURE_MANIFEST: &str =
         "sha256:56249d7a2f93306106f6d8bcdf6423afb73c1b747d874febcc778beee25cb8bb";
-    const FIXTURE_LAYER: &str =
-        "sha256:bd89d118a7a5c5bcefe7129975d406284981f597340a222b5df50f7044157ff0";
     static IMAGE_PREPARE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[cfg(unix)]
@@ -2396,19 +2800,24 @@ mod tests {
             fs::create_dir_all(&context).unwrap();
             fs::write(
                 context.join("Dockerfile"),
-                format!("FROM {FIXTURE_IMAGE}\nWORKDIR /workspace\n"),
+                format!(
+                    "FROM {FIXTURE_IMAGE}\nENV NANOCODEX_FIXTURE_MODE=flattened\nWORKDIR /workspace\n"
+                ),
             )
             .unwrap();
 
             let blobs = cache.join("blobs");
             fs::create_dir_all(&blobs).unwrap();
-            write_shell_layer(&blob_path(&blobs, FIXTURE_LAYER));
+            let temporary_layer = blobs.join("fixture-layer");
+            write_shell_layer(&temporary_layer);
+            let layer_digest = format!("sha256:{}", super::sha256_file(&temporary_layer).unwrap());
+            fs::rename(&temporary_layer, blob_path(&blobs, &layer_digest)).unwrap();
             let record = ReferenceRecord {
                 version: CACHE_RECORD_VERSION,
                 image_reference: FIXTURE_IMAGE.to_owned(),
                 manifest_digest: FIXTURE_MANIFEST.to_owned(),
                 layers: vec![LayerRecord {
-                    digest: FIXTURE_LAYER.to_owned(),
+                    digest: layer_digest,
                     media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_owned(),
                 }],
                 config: ImageRuntimeConfig::default(),
@@ -2489,7 +2898,7 @@ mod tests {
             recipe.final_stage().unwrap().base_image,
             "python:3.13-slim-bookworm"
         );
-        assert_eq!(recipe.final_workdir(), "/app");
+        assert_eq!(recipe.final_workdir(), Some("/app"));
         assert!(!recipe.requires_build());
     }
 
@@ -2526,10 +2935,10 @@ mod tests {
         assert!(builder.prefer_ipv4);
 
         let resolver = "nameserver 213.186.33.99\\n";
-        let dual_stack = build_guest_bootstrap_script(resolver, false);
+        let dual_stack = build_guest_bootstrap_script(Some(resolver), false);
         assert!(!dual_stack.contains("/proc/sys/net/ipv6"));
 
-        let prefer_ipv4 = build_guest_bootstrap_script(resolver, true);
+        let prefer_ipv4 = build_guest_bootstrap_script(Some(resolver), true);
         let all = prefer_ipv4
             .find("/proc/sys/net/ipv6/conf/all/disable_ipv6")
             .unwrap();
@@ -2550,6 +2959,13 @@ mod tests {
         assert!(prefer_ipv4.contains(
             "nanocodex image build bootstrap: failed to write /proc/sys/net/ipv6/conf/default/disable_ipv6"
         ));
+        assert!(prefer_ipv4.contains("mv /etc/resolv.conf /run/nanocodex-build-resolver/original"));
+        assert!(
+            super::RESTORE_BUILD_RESOLVER_SCRIPT
+                .contains("mv /run/nanocodex-build-resolver/original /etc/resolv.conf")
+        );
+        let offline = build_guest_bootstrap_script(None, false);
+        assert!(!offline.contains("resolv.conf"));
     }
 
     #[test]
@@ -2615,6 +3031,153 @@ ENV LEGACY value with spaces
     }
 
     #[test]
+    fn docker_variable_expansion_preserves_utf8() {
+        let environment = BTreeMap::from([("NAME".to_owned(), "世界".to_owned())]);
+        let arguments = BTreeMap::new();
+
+        assert_eq!(
+            super::expand_variables("café/$NAME/🦀", &environment, &arguments),
+            "café/世界/🦀"
+        );
+    }
+
+    #[test]
+    fn missing_oci_runtime_config_uses_the_container_root() {
+        let config = ImageRuntimeConfig::default();
+
+        assert_eq!(config.working_directory, "/");
+        assert!(config.environment.is_empty());
+    }
+
+    #[test]
+    fn build_cache_identity_covers_the_complete_execution_policy() {
+        let dockerfile = "FROM example.invalid/base:latest\nRUN printf ready > /proof\n";
+        let recipe = DockerfileRecipe::parse(dockerfile).unwrap();
+        let images = BTreeMap::from([(
+            "example.invalid/base:latest".to_owned(),
+            PulledImage {
+                manifest_digest: FIXTURE_MANIFEST.to_owned(),
+                layers: Vec::new(),
+                source: ManifestSource::Local,
+                config: ImageRuntimeConfig::default(),
+            },
+        )]);
+        let builder = VmImageBuilder::new("/vmm", "/runtime");
+        let inputs = BuildCacheInputs {
+            vmm_digest: "vmm-a".to_owned(),
+            runtime_digest: "runtime-a".to_owned(),
+            firmware_digest: "firmware-a".to_owned(),
+            resolver: Some("nameserver 192.0.2.1\\n".to_owned()),
+            network: "internet".to_owned(),
+            egress_scope: "internet-a".to_owned(),
+        };
+        let key = |builder: &VmImageBuilder, inputs: &BuildCacheInputs| {
+            build_cache_key(
+                dockerfile,
+                "context-a",
+                &recipe,
+                &images,
+                1024,
+                builder,
+                inputs,
+            )
+        };
+        let baseline = key(&builder, &inputs);
+
+        for changed in [
+            BuildCacheInputs {
+                vmm_digest: "vmm-b".to_owned(),
+                ..inputs.clone()
+            },
+            BuildCacheInputs {
+                runtime_digest: "runtime-b".to_owned(),
+                ..inputs.clone()
+            },
+            BuildCacheInputs {
+                firmware_digest: "firmware-b".to_owned(),
+                ..inputs.clone()
+            },
+            BuildCacheInputs {
+                resolver: Some("nameserver 192.0.2.2\\n".to_owned()),
+                ..inputs.clone()
+            },
+            BuildCacheInputs {
+                resolver: None,
+                ..inputs.clone()
+            },
+            BuildCacheInputs {
+                network: "gvproxy".to_owned(),
+                ..inputs.clone()
+            },
+            BuildCacheInputs {
+                egress_scope: "internet-b".to_owned(),
+                ..inputs.clone()
+            },
+        ] {
+            assert_ne!(key(&builder, &changed), baseline);
+        }
+        assert_ne!(key(&builder.clone().cpus(3), &inputs), baseline);
+        assert_ne!(key(&builder.clone().memory_mib(2048), &inputs), baseline);
+        assert_ne!(key(&builder.clone().prefer_ipv4(), &inputs), baseline);
+        assert_ne!(key(&builder.vmm_arg("--different"), &inputs), baseline);
+    }
+
+    #[test]
+    fn cached_runtime_digest_is_invalidated_by_file_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("runtime.ext4");
+        fs::write(&path, b"first").unwrap();
+        let cache = Arc::new(tokio::sync::Mutex::new(None));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let first = cached_file_digest(&path, &cache).await.unwrap();
+            assert_eq!(cached_file_digest(&path, &cache).await.unwrap(), first);
+            fs::write(&path, b"second-and-different").unwrap();
+            let second = cached_file_digest(&path, &cache).await.unwrap();
+            assert_ne!(second, first);
+        });
+    }
+
+    #[test]
+    fn cached_oci_blob_detects_same_size_content_corruption() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sha256-fixture");
+        fs::write(&path, b"correct").unwrap();
+        let digest = format!("sha256:{}", super::sha256_file(&path).unwrap());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            assert!(valid_cached_blob(&path, &digest).await.unwrap());
+            let pristine_metadata = fs::metadata(&path).unwrap();
+            assert_eq!(pristine_metadata.permissions().mode() & 0o222, 0);
+
+            let mut permissions = pristine_metadata.permissions();
+            permissions.set_mode(permissions.mode() | 0o200);
+            fs::set_permissions(&path, permissions).unwrap();
+            fs::write(&path, b"corrupt").unwrap();
+            filetime::set_file_mtime(
+                &path,
+                filetime::FileTime::from_last_modification_time(&pristine_metadata),
+            )
+            .unwrap();
+            assert!(!valid_cached_blob(&path, &digest).await.unwrap());
+
+            fs::write(&path, b"correct").unwrap();
+            assert!(valid_cached_blob(&path, &digest).await.unwrap());
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o222, 0);
+        });
+    }
+
+    #[test]
     fn resolver_configuration_rejects_host_local_stubs() {
         assert_eq!(
             resolver_configuration(
@@ -2669,7 +3232,7 @@ CMD ["/bin/sh"]
         assert_eq!(recipe.stages.len(), 2);
         assert_eq!(recipe.stages[0].name.as_deref(), Some("build"));
         assert_eq!(recipe.stages[1].name.as_deref(), Some("target"));
-        assert_eq!(recipe.final_workdir(), "/app");
+        assert_eq!(recipe.final_workdir(), Some("/app"));
         assert!(recipe.requires_build());
         let super::DockerfileInstruction::Copy(copy) = &recipe.stages[1].instructions[0] else {
             panic!("expected the final-stage COPY instruction");
@@ -2792,6 +3355,7 @@ CMD ["/bin/sh"]
         assert_eq!(first.path(), second.path());
         assert_eq!(first.workdir(), "/workspace");
         assert_eq!(first.shell(), "sh");
+        assert_eq!(first.environment()["NANOCODEX_FIXTURE_MODE"], "flattened");
         assert_eq!(
             [first.disk_status(), second.disk_status()]
                 .into_iter()
@@ -2799,6 +3363,7 @@ CMD ["/bin/sh"]
                 .count(),
             1
         );
+        assert!(valid_cached_ext4_disk(first.path()).unwrap());
 
         let attempt = fixture.root.path().join("attempt.ext4");
         assert_eq!(
@@ -2828,6 +3393,13 @@ CMD ["/bin/sh"]
                 )
                 .await
                 .unwrap();
+            let mut permissions = fs::metadata(first.path()).unwrap().permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                permissions.set_mode(permissions.mode() | 0o200);
+            }
+            fs::set_permissions(first.path(), permissions).unwrap();
             fs::write(first.path(), b"corrupt").unwrap();
 
             let repaired = builder
@@ -2922,7 +3494,11 @@ CMD ["/bin/sh"]
         });
         assert_eq!(
             dockerfile_event.as_deref(),
-            Some("FROM example.invalid/nanocodex-vm-fixture:latest\nWORKDIR /workspace\n")
+            Some(
+                "FROM example.invalid/nanocodex-vm-fixture:latest\n\
+                 ENV NANOCODEX_FIXTURE_MODE=flattened\n\
+                 WORKDIR /workspace\n"
+            )
         );
     }
 }

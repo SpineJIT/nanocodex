@@ -20,7 +20,7 @@ const DEFAULT_CPUS: u8 = 2;
 const DEFAULT_MEMORY_MIB: u32 = 1_024;
 const DEFAULT_EXT4_WORKSPACE: &str = "/app";
 const DEFAULT_DIRECTORY_WORKSPACE: &str = "/workspace";
-const DEFAULT_SHELL: &str = "bash";
+const DEFAULT_SHELL: &str = "sh";
 const DEFAULT_KRUNFW_DIRECTORY: &str = ".cache/libkrunfw/libkrunfw";
 const DEFAULT_VM_CACHE: &str = ".cache/vm";
 const CAPABILITY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -210,9 +210,10 @@ impl ConfiguredVm {
         loop {
             match self.session.shutdown().await {
                 Ok(()) => return Ok(()),
-                Err(VmWorkspaceError::Session(VmToolSessionError::ActiveCapabilities(_)))
-                    if started_at.elapsed() < CAPABILITY_DRAIN_TIMEOUT =>
-                {
+                Err(VmWorkspaceError::Session(
+                    VmToolSessionError::ActiveCapabilities(_)
+                    | VmToolSessionError::ActiveRequests(_),
+                )) if started_at.elapsed() < CAPABILITY_DRAIN_TIMEOUT => {
                     sleep(CAPABILITY_DRAIN_INTERVAL).await;
                 }
                 Err(error) => return Err(error).wrap_err("failed to shut down the tool VM"),
