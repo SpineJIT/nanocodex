@@ -145,6 +145,11 @@ fn public_session_streams_results_and_reuses_continuation_state() {
     let subscriber =
         tracing_subscriber::registry().with(ResponseCallCount(Arc::clone(&response_call_count)));
     let dispatch = tracing::Dispatch::new(subscriber);
+    // Keep more than one scoped dispatcher registered while parallel tests
+    // first encounter this callsite. Otherwise tracing's single-dispatcher
+    // fast path can cache the no-subscriber interest from another test thread.
+    let _parallel_test_registration =
+        tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

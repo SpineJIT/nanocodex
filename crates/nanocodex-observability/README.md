@@ -25,7 +25,7 @@ application's primary data.
 
 Keep the returned guard alive for as long as spans may be emitted:
 
-```rust
+```rust,no_run
 use nanocodex_observability::{LogFormat, ObservabilityBuilder};
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -46,7 +46,7 @@ application owns a durable trace path.
 
 Set a collector base endpoint to add OTLP/HTTP export alongside local output:
 
-```rust
+```rust,no_run
 use nanocodex_observability::ObservabilityBuilder;
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
