@@ -17,7 +17,7 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use crossterm::event::{
@@ -42,7 +42,7 @@ use tracing::{Instrument, info_span};
 use self::{
     app::{App, EscapeAction, PaneId, ReasoningPickerAction, SubmittedPrompt},
     notification::Notifier,
-    scheduler::{RenderScheduler, STREAM_FRAME_INTERVAL},
+    scheduler::{ANIMATION_TICK_INTERVAL, RenderScheduler, RenderScope, STREAM_FRAME_INTERVAL},
     telemetry::{StreamTelemetry, ViewTelemetry},
     terminal::TerminalSession,
     transcript::TranscriptItem,
@@ -299,6 +299,7 @@ enum RedrawPriority {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UiUpdate {
     Redraw(RedrawPriority),
+    RedrawAnimation,
     Ignore,
     Quit,
     ExternalEditor,
@@ -467,8 +468,14 @@ impl UiModel {
                 Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
             }
             UiAction::Tick => {
+                let requires_full_redraw =
+                    self.app.mouse_selection_needs_redraw() || self.app.historical_editor_active();
                 self.app.on_tick();
-                Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
+                Ok(if requires_full_redraw {
+                    UiUpdate::Redraw(RedrawPriority::Streaming)
+                } else {
+                    UiUpdate::RedrawAnimation
+                })
             }
         }
     }
@@ -728,7 +735,16 @@ fn render_due_frame(
     ui.apply_pending_mouse_scroll();
     ui.app.advance_smooth_scroll();
     let render_started = Instant::now();
-    let draw_metrics = terminal.draw(|frame| view::render(frame, &mut ui.app))?;
+    let draw_metrics = match scheduler.scope().unwrap_or(RenderScope::Full) {
+        RenderScope::Full => terminal.draw(|frame| view::render(frame, &mut ui.app))?,
+        RenderScope::Animation => terminal.draw_reusing_last_frame(|frame, reused| {
+            if reused {
+                view::render_animation(frame, &mut ui.app);
+            } else {
+                view::render(frame, &mut ui.app);
+            }
+        })?,
+    };
     if let Some(text) = ui.app.take_pending_copy() {
         match clipboard::copy_to_clipboard(&text) {
             Ok(()) => {
@@ -770,7 +786,7 @@ fn worker_event_received(
 }
 
 fn ui_ticker() -> tokio::time::Interval {
-    let mut ticker = interval(Duration::from_millis(80));
+    let mut ticker = interval(ANIMATION_TICK_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker
 }
@@ -809,6 +825,7 @@ fn apply_update(update: UiUpdate, scheduler: &mut RenderScheduler) -> bool {
         UiUpdate::Redraw(RedrawPriority::Immediate) => scheduler.request_immediate(now),
         UiUpdate::Redraw(RedrawPriority::Streaming) => scheduler.request_streaming(now),
         UiUpdate::Redraw(RedrawPriority::InputBurst) => scheduler.request_input_burst(now),
+        UiUpdate::RedrawAnimation => scheduler.request_animation(now),
         UiUpdate::Ignore | UiUpdate::ExternalEditor => {}
         UiUpdate::Quit => return true,
     }
@@ -2786,7 +2803,7 @@ mod tests {
         );
         assert_eq!(
             ui.update(UiAction::Tick, &commands).unwrap(),
-            UiUpdate::Redraw(RedrawPriority::Streaming)
+            UiUpdate::RedrawAnimation
         );
         assert_eq!(
             ui.update(UiAction::WorkerStopped, &commands).unwrap(),
