@@ -3,6 +3,7 @@
 mod content;
 mod event;
 mod item;
+#[cfg(feature = "client")]
 mod request;
 mod tool;
 
@@ -17,6 +18,8 @@ pub use event::{
     WarmupResponse, WarmupServerEvent,
 };
 pub use item::{ResponseItem, ResponseItemId};
+#[cfg(feature = "client")]
 pub(crate) use request::{CreatePolicy, ResponseCreate};
+#[cfg(feature = "client")]
 pub use request::{RequestProfile, ResponseHistory, ResponsesInput};
 pub use tool::{CustomToolFormat, JsonSchema, JsonValue, ToolDefinition};

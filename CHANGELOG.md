@@ -5,6 +5,13 @@ All notable changes to Nanocodex are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Features
+
+- [vm] Add persistent VM-backed workspace tools, immutable root-image
+  preparation, and provider-neutral composable egress leases.
+
 ## [0.3.0](https://github.com/gakonst/nanocodex/releases/tag/v0.3.0) - 2026-07-28
 
 ### Bug Fixes
@@ -145,7 +152,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [mcp] Verify read-only parallel dispatch
 - [tools] Serialize traced runtime integration tests
 - [tui] Preserve stored checkpoint branch coverage
-
 ## [0.2.0](https://github.com/gakonst/nanocodex/releases/tag/v0.2.0) - 2026-07-26
 
 ### Bug Fixes

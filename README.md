@@ -11,7 +11,7 @@
 
 **[Install](#install)** · **[Agent API](#minimal-api-example)** ·
 **[Thesis](#thesis)** · **[Components](#components)** ·
-**[Documentation](#documentation)**
+**[VM-backed tools](#vm-backed-tools)** · **[Documentation](#documentation)**
 
 [ci]: https://github.com/gakonst/nanocodex/actions/workflows/ci.yml
 [crates]: https://crates.io/crates/nanocodex
@@ -211,6 +211,18 @@ directly.
 [Observability guide](crates/nanocodex-observability/README.md) ·
 [API documentation](https://docs.rs/nanocodex-observability)
 
+### Experimental systems components
+
+VM components live under [`crates/experimental/`](crates/experimental/README.md)
+while their public contracts mature:
+
+| Package | Responsibility |
+| --- | --- |
+| [`nanocodex-vm`](crates/experimental/nanocodex-vm/README.md) | VM lifecycle and images plus retained guest-backed workspace tools |
+
+The CLI is a consumer of this crate. VM-backed tools remain opt-in for normal
+agent sessions.
+
 ### CLI and language bindings
 
 The CLI/TUI, Python package, Node/browser package, React bindings, and examples
@@ -220,12 +232,36 @@ agent protocol.
 [Examples](examples/README.md) · [JavaScript](js/README.md) ·
 [Python](py/README.md) · [Web](web/README.md)
 
+## VM-backed tools
+
+Normal TUI and one-shot sessions keep host workspace tools by default. They can
+instead route `exec_command`, `write_stdin`, `apply_patch`, and `view_image`
+through one retained VM:
+
+```sh
+just build-vm-guest
+nanocodex \
+  --vm .nanocodex/vm/session-rootfs.ext4 \
+  --vm-guest-runtime target/aarch64-unknown-linux-musl/debug/nanocodex-vm-guest \
+  --vm-workspace /app
+nanocodex run "inspect the repository" \
+  --vm .nanocodex/vm/session-rootfs.ext4 \
+  --vm-guest-runtime target/aarch64-unknown-linux-musl/debug/nanocodex-vm-guest \
+  --vm-workspace /app
+```
+
+Directory roots may instead contain
+`/usr/local/bin/nanocodex-vm-guest`. See the
+[VM guide](docs/VM.md) for image preparation, lifecycle, egress, Linux
+requirements, and macOS signing.
+
 ## Documentation
 
 - [Facade API](https://docs.rs/nanocodex)
 - [Migration from 0.2.x](docs/MIGRATING.md)
 - [Examples](examples/README.md)
 - [Benchmarks and retained measurements](benchmarks/)
+- [VM-backed tools and egress](docs/VM.md)
 
 ## License
 

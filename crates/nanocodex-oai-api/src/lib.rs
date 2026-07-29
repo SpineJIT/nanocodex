@@ -1,4 +1,5 @@
-#![doc = include_str!("../README.md")]
+#![cfg_attr(feature = "client", doc = include_str!("../README.md"))]
+#![cfg_attr(not(feature = "client"), doc = include_str!("../CONTRACTS.md"))]
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -8,60 +9,84 @@ compile_error!(
 );
 
 /// Authentication sources and managed credential snapshots.
+#[cfg(feature = "client")]
 pub mod auth;
 /// Complete typed lifecycle events emitted around Responses operations.
+#[cfg(feature = "client")]
 pub mod events;
+#[cfg(feature = "client")]
 mod openai;
 /// Automatic `gpt-5.6-sol` USD estimates from provider token usage.
+#[cfg(feature = "client")]
 pub mod pricing;
 /// Complete typed request, event, and item model for the Responses protocol.
 pub mod responses;
 /// Managed session identities, inputs, and compaction results.
+#[cfg(feature = "client")]
 pub mod session;
 /// Tool contracts shared by agent loops and concrete tool runtimes.
 pub mod tools;
 /// Generic Tower attempt, service, retry, and streamed-output contracts.
+#[cfg(feature = "client")]
 pub mod tower;
 /// Responses transport policy, errors, and connection statistics.
+#[cfg(feature = "client")]
 pub mod transport;
 
 use std::{fmt, path::PathBuf, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "client")]
 pub(crate) use auth::{OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, OpenAiAuthSnapshot};
+#[cfg(feature = "client")]
 pub(crate) use events::stream::EventSink;
+#[cfg(feature = "client")]
 pub(crate) use events::{
     AgentEventData, AgentEventKind, AssistantEvent, ContextEvent, EventError, ModelEvent,
     ReasoningEvent, RunEvent, ToolEvent, TransportEvent, monotonic_now_ns,
 };
+#[cfg(feature = "client")]
 pub(crate) use openai::ModelConfig;
+#[cfg(feature = "client")]
 pub use openai::{OpenAi, OpenAiBuilder, OpenAiError};
+#[cfg(feature = "client")]
 pub(crate) use pricing::{CostStatus, EstimatedUsdCost};
 pub use responses::ResponseEvent;
+pub(crate) use responses::ResponseItem;
+#[cfg(feature = "client")]
 pub(crate) use responses::{
     ContentItem, FunctionOutputBody, FunctionOutputContent, MessagePhase, MessageRole,
-    ResponseItem, ResponseItemId, ToolDefinition, Usage,
+    ResponseItemId, ToolDefinition, Usage,
 };
+#[cfg(feature = "client")]
 pub use session::{
     CompletedResponse, Response, ResponseError, ResponseErrorKind, ResponseTurn, Session,
     SessionBuildError, SessionBuilder,
 };
+#[cfg(feature = "client")]
 pub(crate) use tools::ToolOutputBody;
+#[cfg(feature = "client")]
 pub(crate) use tower::attempt::{
     ResponsesAttempt, ResponsesAttemptFactory, ResponsesOutput, ResponsesServiceResponse,
     TransportStats,
 };
+#[cfg(feature = "client")]
 pub(crate) use tower::service::ResponsesService;
+#[cfg(feature = "client")]
 pub(crate) use tower::{
     DefaultResponsesService, ResponsesClient, ResponsesRetryPolicy, ResponsesServiceError,
 };
+#[cfg(feature = "client")]
 pub(crate) use transport::EncodedRequest;
+#[cfg(feature = "client")]
 pub(crate) use transport::{ResponsesError, ResponsesHistory, ResponsesTransport, RetryAdvice};
 
+#[cfg(feature = "client")]
 pub(crate) use tower::{attempt, middleware, service, service_error, stream};
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "client", not(target_family = "wasm")))]
 pub(crate) use transport::{connector, http};
+#[cfg(feature = "client")]
 pub(crate) use transport::{socket, telemetry};
 
 /// Internal bridge for the higher-level `nanocodex-agent` crate.
@@ -71,6 +96,7 @@ pub(crate) use transport::{socket, telemetry};
 /// the normal rustdoc surface while allowing the separately versioned agent
 /// crate to compose this crate without duplicating those mechanics.
 #[doc(hidden)]
+#[cfg(feature = "client")]
 pub mod __private {
     pub use crate::{
         events::stream::EventSink,
@@ -338,6 +364,7 @@ impl ReasoningMode {
         }
     }
 
+    #[cfg(feature = "client")]
     pub(crate) const fn request_value(self) -> Option<&'static str> {
         match self {
             Self::Standard => None,

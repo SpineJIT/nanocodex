@@ -134,6 +134,15 @@ The higher-level `nanocodex-agent` crate decides *when* to compact and how to
 execute tools. This crate implements the provider operation and atomic history
 replacement without embedding agent policy.
 
+## Contract-only builds
+
+The default `client` feature remains the complete OpenAI boundary, including
+authentication, managed sessions, Tower services, transports, telemetry, and
+pricing. Process companions that only need the dependency-light prompt,
+response-item, and tool wire contracts may disable default features. This
+keeps one canonical contract without linking an unused network client; it does
+not create an alternate provider or transport implementation.
+
 ## Tools and managed sessions
 
 The [`tools`] module defines the model-visible tool contract shared with

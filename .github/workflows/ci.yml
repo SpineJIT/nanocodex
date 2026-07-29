@@ -74,6 +74,35 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  vm-guest:
+    name: static Linux VM guest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: true
+      - run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - name: Check the guest-only target matrix
+        run: >-
+          cargo check --locked --package nanocodex-vm --all-targets
+          --no-default-features --features guest-runtime
+      - name: Build the actual static guest artifact
+        run: >-
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+          cargo build --locked --package nanocodex-vm
+          --bin nanocodex-vm-guest --no-default-features
+          --features guest-runtime --target x86_64-unknown-linux-musl
+
   policy:
     name: dependencies and spelling
     runs-on: ubuntu-latest
@@ -87,6 +116,7 @@ jobs:
       - uses: taiki-e/install-action@3522286d40783523f9c7880e33f785905b4c20d0 # v2
         with:
           tool: cargo-deny
+      - run: ./scripts/check-experimental-boundary.sh
       - run: cargo deny check
       - run: ./scripts/check-crate-boundaries.sh
       - uses: crate-ci/typos@96d9af6217dc2855210655af7e1ff19d23d4e593 # v1

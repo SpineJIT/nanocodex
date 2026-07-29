@@ -167,6 +167,7 @@ pub enum ResponseEvent {
 }
 
 impl ServerEvent {
+    #[cfg(feature = "client")]
     pub(crate) fn normalized(&self) -> Option<ResponseEvent> {
         match self {
             Self::Created { .. } => Some(ResponseEvent::Created),
@@ -281,7 +282,7 @@ fn completed_status() -> String {
     "completed".to_owned()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "client"))]
 mod tests {
     use serde_json::json;
 

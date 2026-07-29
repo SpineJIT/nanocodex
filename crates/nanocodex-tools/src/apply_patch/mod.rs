@@ -14,12 +14,12 @@ mod streaming_parser;
 
 use parser::{Hunk, UpdateFileChunk, parse_patch};
 
-pub(super) struct ApplyPatchHandler {
+pub(crate) struct ApplyPatchHandler {
     workspace: PathBuf,
 }
 
 impl ApplyPatchHandler {
-    pub(super) const fn new(workspace: PathBuf) -> Self {
+    pub(crate) const fn new(workspace: PathBuf) -> Self {
         Self { workspace }
     }
 }

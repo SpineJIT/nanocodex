@@ -92,6 +92,33 @@ dev-react-example:
 smoke-mcp:
     cargo run --quiet -p nanocodex-examples --bin mcp
 
+# Build the end-to-end VM tool example. macOS VMM executables need the
+# Hypervisor entitlement; signing the built artifact keeps Cargo inputs clean.
+build-vm-guest:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "$(uname -m)" in
+      arm64|aarch64)
+        target=aarch64-unknown-linux-musl
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker"
+        export CC_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker"
+        export AR_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-ar"
+        ;;
+      x86_64|amd64) target=x86_64-unknown-linux-musl ;;
+      *) echo "unsupported VM guest architecture: $(uname -m)" >&2; exit 2 ;;
+    esac
+    cargo build -p nanocodex-vm --bin nanocodex-vm-guest \
+      --no-default-features --features guest-runtime --target "$target"
+
+build-vm-example:
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \
+    CC_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \
+    AR_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-ar" \
+    cargo build -p nanocodex-examples --bin vm-tools --all-features
+    @if [ "$(uname -s)" = "Darwin" ]; then \
+        codesign --entitlements nanocodex-vm.entitlements --force --sign - target/debug/vm-tools; \
+    fi
+
 # Start the ephemeral localhost Jaeger backend used by the OTLP trace demo.
 otel-up:
     @docker compose -f docker-compose.otel.yml up --detach
@@ -141,6 +168,21 @@ bench-pr50:
     cargo bench -p nanocodex-tools --bench mcp_tool_search
     cargo bench -p nanocodex-bin --bench tui_render -- '^(tui_trace_render/codex_long/tail/(80x24|120x40|200x60)|tui_transcript_delta/assistant_100k|tui_stream_telemetry/apply_1024_and_present|tui_branch_state/codex_long/switch_branch|tui_markdown/syntax_fallback_oversized_line_1m|tui_tool_tree/result_269k_cached_frame/120x40|tui_code_mode_stream/apply_16_out_of_order_completions|tui_trace_resize/codex_long/80x24_to_200x60|tui_live_tail_first_frame/assistant_1m_single_line/120x40|tui_smooth_follow/drain_128_row_backlog/120x40|tui_terminal_output/(catch_up_frame|fast_mode_toggle)/120x40|tui_composer_render/multiline_100k/120x40|tui_large_paste/ingest_100k)$'
     ./scripts/check-benchmark-thresholds.sh
+
+# Deterministic warm-image and retained VM protocol latency gates.
+bench-vm:
+    cargo bench -p nanocodex-vm --bench image_cache
+    cargo bench -p nanocodex-vm --bench vm_session -- vm_session_protocol
+
+# Include actual libkrun boot, first RPC, and graceful shutdown. The root disk
+# is reflinked before each timed sample and is never mutated directly.
+bench-vm-live rootfs runtime firmware=".cache/libkrunfw/libkrunfw":
+    just build-vm-example
+    NANOCODEX_VM_VMM="{{justfile_directory()}}/target/debug/vm-tools" \
+    NANOCODEX_VM_ROOTFS="{{rootfs}}" \
+    NANOCODEX_VM_RUNTIME="{{runtime}}" \
+    NANOCODEX_VM_FIRMWARE="{{firmware}}" \
+    cargo bench -p nanocodex-vm --bench vm_session -- vm_session_live
 
 # Run a tool-using turn and retain events and diagnostic logs independently.
 otel-demo:
@@ -335,6 +377,7 @@ view jobs=default_jobs:
 # Checks stay small until the end-to-end agent path is real.
 check:
     ./scripts/check-crate-boundaries.sh
+    ./scripts/check-experimental-boundary.sh
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo test --workspace
@@ -366,6 +409,10 @@ release-check version:
         cargo package --locked --allow-dirty --no-verify --config .cargo/release.toml --package "$crate"; \
     done
     ./scripts/check-docs.sh
+
+# Enforce the one-way dependency and publication boundary for experimental crates.
+check-experimental:
+    ./scripts/check-experimental-boundary.sh
 
 # Regenerate the committed Alloy-style changelog for a release preparation PR.
 changelog version:

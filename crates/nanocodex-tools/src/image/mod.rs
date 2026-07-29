@@ -703,6 +703,25 @@ mod tests {
     }
 
     #[test]
+    fn converts_bitmap_to_supported_png() {
+        let image = RgbaImage::from_pixel(1, 1, Rgba([10, 20, 30, 255]));
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut encoded, ImageFormat::Bmp)
+            .expect("encode bitmap fixture");
+
+        let image = load_for_prompt_bytes(
+            Path::new("tool-output.bmp"),
+            encoded.into_inner(),
+            HIGH_DETAIL_LIMITS,
+        )
+        .expect("decode bitmap");
+
+        assert_eq!(image.mime, "image/png");
+        assert!(image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
     fn data_url_input_guard_precedes_base64_decoding() {
         let error = decode_data_url("data:image/png;base64,AAAAA", 4)
             .expect_err("oversized representation should fail");

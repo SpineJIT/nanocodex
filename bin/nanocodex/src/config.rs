@@ -22,6 +22,7 @@ use nanocodex::{
 use crate::mcp::{ConfiguredMcp, McpArgs};
 use crate::mpp::{MppAdapter, MppArgs};
 use crate::subagents::{self, ChildAgents};
+use crate::vm::{ConfiguredVm, VmArgs};
 
 pub(crate) struct ConfiguredAgent {
     pub(crate) handle: Nanocodex,
@@ -29,6 +30,7 @@ pub(crate) struct ConfiguredAgent {
     pub(crate) child_agents: Option<Arc<ChildAgents>>,
     pub(crate) mpp_adapter: Option<MppAdapter>,
     pub(crate) mcp: Option<McpHandle>,
+    pub(crate) vm: Option<ConfiguredVm>,
 }
 
 struct SessionBuild {
@@ -153,15 +155,23 @@ impl AgentArgs {
             })
     }
 
-    pub(crate) async fn build(self) -> Result<ConfiguredAgent> {
-        self.build_inner(None).await
+    pub(crate) async fn build(self, vm: VmArgs) -> Result<ConfiguredAgent> {
+        self.build_inner(None, vm).await
     }
 
-    pub(crate) async fn build_resumed(self, session: DurableSession) -> Result<ConfiguredAgent> {
-        self.build_inner(Some(session)).await
+    pub(crate) async fn build_resumed(
+        self,
+        session: DurableSession,
+        vm: VmArgs,
+    ) -> Result<ConfiguredAgent> {
+        self.build_inner(Some(session), vm).await
     }
 
-    async fn build_inner(self, durable: Option<DurableSession>) -> Result<ConfiguredAgent> {
+    async fn build_inner(
+        self,
+        durable: Option<DurableSession>,
+        vm: VmArgs,
+    ) -> Result<ConfiguredAgent> {
         let codex_home = default_codex_home()?;
         let responses_transport = self.responses_transport();
         let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
@@ -200,7 +210,10 @@ impl AgentArgs {
             openai = openai.http_client(mpp_adapter.responses_http_client()?);
         }
         let openai = openai.build()?;
-        let mut tools = Tools::builder()
+        let configured_vm = vm.start().await?;
+        let mut tools = configured_vm
+            .as_ref()
+            .map_or_else(Tools::builder, ConfiguredVm::tools_builder)
             .web_search(self.web_search)
             .image_generation(self.image_generation);
         let mcp = self.mcp.build(&codex_home)?;
@@ -250,6 +263,7 @@ impl AgentArgs {
             child_agents,
             mpp_adapter,
             mcp: mcp_handle,
+            vm: configured_vm,
         })
     }
 }
