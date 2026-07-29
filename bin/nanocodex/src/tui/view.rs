@@ -14,7 +14,40 @@ use super::{
 };
 
 pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
-    let area = frame.area();
+    let layout = view_layout(frame.area(), app);
+
+    render_header(frame, app, layout.header);
+    let mut selectable_areas = SelectableAreas::default();
+    render_transcripts(frame, app, layout.transcript, &mut selectable_areas);
+    render_pending(frame, app, layout.pending);
+    selectable_areas.push(render_composer(
+        frame,
+        app,
+        layout.composer,
+        &layout.composer_layout,
+    ));
+    render_footer(frame, app, layout.footer);
+    app.render_mouse_selection(frame.buffer_mut(), selectable_areas.as_slice());
+    render_reasoning_picker(frame, app);
+}
+
+pub(super) fn render_animation(frame: &mut Frame<'_>, app: &mut App) {
+    let layout = view_layout(frame.area(), app);
+    render_composer(frame, app, layout.composer, &layout.composer_layout);
+    render_footer(frame, app, layout.footer);
+    render_reasoning_picker(frame, app);
+}
+
+struct ViewLayout {
+    header: Rect,
+    transcript: Rect,
+    pending: Rect,
+    composer: Rect,
+    footer: Rect,
+    composer_layout: ComposerLayout,
+}
+
+fn view_layout(area: Rect, app: &mut App) -> ViewLayout {
     let composer_width = if app.historical_editor_active() {
         area.width.saturating_sub(4).max(1)
     } else {
@@ -49,14 +82,14 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     ])
     .areas(area);
 
-    render_header(frame, app, header_area);
-    let mut selectable_areas = SelectableAreas::default();
-    render_transcripts(frame, app, transcript_area, &mut selectable_areas);
-    render_pending(frame, app, pending_area);
-    selectable_areas.push(render_composer(frame, app, composer_area, &composer_layout));
-    render_footer(frame, app, footer_area);
-    app.render_mouse_selection(frame.buffer_mut(), selectable_areas.as_slice());
-    render_reasoning_picker(frame, app);
+    ViewLayout {
+        header: header_area,
+        transcript: transcript_area,
+        pending: pending_area,
+        composer: composer_area,
+        footer: footer_area,
+        composer_layout,
+    }
 }
 
 fn render_reasoning_picker(frame: &mut Frame<'_>, app: &App) {
@@ -710,7 +743,7 @@ mod tests {
         style::{Color, Modifier},
     };
 
-    use super::render;
+    use super::{render, render_animation};
     use crate::tui::{app::App, transcript::TranscriptItem};
 
     #[test]
@@ -772,6 +805,31 @@ mod tests {
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("Working (1m 05s)"));
         assert!(!rendered.contains("Running exec_command"));
+    }
+
+    #[test]
+    fn animation_render_matches_a_full_frame() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        let mut app = App::new("/workspace".into());
+        app.main.running = true;
+        app.main
+            .transcript
+            .push(TranscriptItem::Assistant("static transcript".to_owned()));
+        let cached = terminal
+            .draw(|frame| render(frame, &mut app))
+            .unwrap()
+            .buffer
+            .clone();
+
+        app.on_tick();
+        terminal.current_buffer_mut().clone_from(&cached);
+        terminal
+            .draw(|frame| render_animation(frame, &mut app))
+            .unwrap();
+        let animation_frame = terminal.backend().buffer().clone();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(animation_frame, *terminal.backend().buffer());
     }
 
     #[test]

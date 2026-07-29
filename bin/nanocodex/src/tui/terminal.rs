@@ -25,7 +25,7 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::{Backend, ClearType, CrosstermBackend, WindowSize},
-    buffer::Cell,
+    buffer::{Buffer, Cell},
     layout::{Position, Size},
 };
 
@@ -49,6 +49,7 @@ pub(super) struct MeasuredBackend<B> {
 
 pub(super) struct TerminalSession {
     terminal: TuiTerminal,
+    last_frame: Option<Buffer>,
     output_bytes: Rc<CounterCell<u64>>,
     active: bool,
 }
@@ -163,18 +164,43 @@ impl TerminalSession {
         restore.armed = false;
         Ok(Self {
             terminal,
+            last_frame: None,
             output_bytes,
             active: true,
         })
     }
 
     pub(super) fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> io::Result<DrawMetrics> {
+        self.draw_inner(render)
+    }
+
+    pub(super) fn draw_reusing_last_frame(
+        &mut self,
+        render: impl FnOnce(&mut Frame<'_>, bool),
+    ) -> io::Result<DrawMetrics> {
+        self.terminal.autoresize()?;
+        let cached_area = self
+            .last_frame
+            .as_ref()
+            .filter(|cached| seed_from_cached_frame(&mut self.terminal, cached))
+            .map(|cached| cached.area);
+        self.draw_inner(|frame| render(frame, cached_area == Some(frame.area())))
+    }
+
+    fn draw_inner(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> io::Result<DrawMetrics> {
         let bytes_before = self.output_bytes.get();
         self.terminal.backend_mut().changed_cells = 0;
         begin_synchronized_update(self.terminal.backend_mut())?;
-        let draw_result = self.terminal.draw(render).map(|_| ());
+        let draw_result = self
+            .terminal
+            .draw(render)
+            .map(|completed| completed.buffer.clone());
         let end_result = end_synchronized_update(self.terminal.backend_mut());
-        draw_result.and(end_result)?;
+        let completed = match (draw_result, end_result) {
+            (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
+            (Ok(completed), Ok(())) => completed,
+        };
+        self.last_frame = Some(completed);
         Ok(DrawMetrics {
             changed_cells: self.terminal.backend().changed_cells,
             output_bytes: self.output_bytes.get().saturating_sub(bytes_before),
@@ -206,10 +232,20 @@ impl TerminalSession {
         TERMINAL_ACTIVE.store(true, Ordering::Release);
         self.terminal.clear()?;
         self.terminal.autoresize()?;
+        self.last_frame = None;
         restore.armed = false;
         self.active = true;
         Ok(())
     }
+}
+
+fn seed_from_cached_frame<B: Backend>(terminal: &mut Terminal<B>, cached: &Buffer) -> bool {
+    let current = terminal.current_buffer_mut();
+    if current.area != cached.area {
+        return false;
+    }
+    current.clone_from(cached);
+    true
 }
 
 impl Drop for TerminalSession {
@@ -296,7 +332,7 @@ mod tests {
 
     use super::{
         ByteCountingWriter, MeasuredBackend, begin_synchronized_update, end_synchronized_update,
-        restore_commands,
+        restore_commands, seed_from_cached_frame,
     };
 
     #[test]
@@ -351,5 +387,28 @@ mod tests {
             .draw(|frame| frame.render_widget(Paragraph::new(Text::raw("hello")), frame.area()))
             .unwrap();
         assert_eq!(terminal.backend().changed_cells, 0);
+    }
+
+    #[test]
+    fn cached_frame_seeds_unchanged_cells_for_partial_redraws() {
+        let mut terminal = Terminal::new(TestBackend::new(20, 2)).unwrap();
+        let cached = terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(Text::raw("static content")), frame.area());
+            })
+            .unwrap()
+            .buffer
+            .clone();
+
+        assert!(seed_from_cached_frame(&mut terminal, &cached));
+        terminal
+            .draw(|frame| {
+                frame.buffer_mut()[(0, 1)].set_symbol("x");
+            })
+            .unwrap();
+
+        let rendered = terminal.backend().buffer();
+        assert_eq!(rendered[(0, 0)].symbol(), "s");
+        assert_eq!(rendered[(0, 1)].symbol(), "x");
     }
 }

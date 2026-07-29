@@ -4,11 +4,18 @@ use std::time::{Duration, Instant};
 /// while Ratatui's buffer diff keeps unchanged cells off the wire.
 pub(super) const STREAM_FRAME_INTERVAL: Duration = Duration::from_nanos(8_333_334);
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum RenderScope {
+    Animation,
+    Full,
+}
+
 #[derive(Debug)]
 pub(super) struct RenderScheduler {
     frame_interval: Duration,
     last_presented: Option<Instant>,
     deadline: Option<Instant>,
+    scope: Option<RenderScope>,
 }
 
 impl RenderScheduler {
@@ -17,10 +24,20 @@ impl RenderScheduler {
             frame_interval,
             last_presented: None,
             deadline: Some(now),
+            scope: Some(RenderScope::Full),
         }
     }
 
     pub(super) fn request_streaming(&mut self, now: Instant) {
+        self.request(now, RenderScope::Full);
+    }
+
+    pub(super) fn request_animation(&mut self, now: Instant) {
+        self.request(now, RenderScope::Animation);
+    }
+
+    fn request(&mut self, now: Instant, scope: RenderScope) {
+        self.scope = Some(self.scope.map_or(scope, |pending| pending.max(scope)));
         if self.deadline.is_some() {
             return;
         }
@@ -32,10 +49,12 @@ impl RenderScheduler {
     }
 
     pub(super) fn request_immediate(&mut self, now: Instant) {
+        self.scope = Some(RenderScope::Full);
         self.deadline = Some(self.deadline.map_or(now, |deadline| deadline.min(now)));
     }
 
     pub(super) fn request_input_burst(&mut self, now: Instant) {
+        self.scope = Some(RenderScope::Full);
         let burst_deadline = now + self.frame_interval;
         self.deadline = Some(
             self.deadline
@@ -47,12 +66,17 @@ impl RenderScheduler {
         self.deadline
     }
 
+    pub(super) const fn scope(&self) -> Option<RenderScope> {
+        self.scope
+    }
+
     pub(super) fn is_due(&self, now: Instant) -> bool {
         self.deadline.is_some_and(|deadline| deadline <= now)
     }
 
     pub(super) const fn presented(&mut self, now: Instant) {
         self.deadline = None;
+        self.scope = None;
         self.last_presented = Some(now);
     }
 }
@@ -61,7 +85,7 @@ impl RenderScheduler {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{RenderScheduler, STREAM_FRAME_INTERVAL};
+    use super::{RenderScheduler, RenderScope, STREAM_FRAME_INTERVAL};
 
     const FRAME: Duration = STREAM_FRAME_INTERVAL;
 
@@ -72,6 +96,7 @@ mod tests {
 
         assert!(scheduler.is_due(now));
         assert_eq!(scheduler.deadline(), Some(now));
+        assert_eq!(scheduler.scope(), Some(RenderScope::Full));
     }
 
     #[test]
@@ -85,6 +110,7 @@ mod tests {
         }
 
         assert_eq!(scheduler.deadline(), Some(start + FRAME));
+        assert_eq!(scheduler.scope(), Some(RenderScope::Full));
         assert!(!scheduler.is_due(start + Duration::from_millis(8)));
         assert!(scheduler.is_due(start + FRAME));
     }
@@ -142,6 +168,23 @@ mod tests {
         scheduler.presented(now);
 
         assert_eq!(scheduler.deadline(), None);
+        assert_eq!(scheduler.scope(), None);
         assert!(!scheduler.is_due(now + FRAME));
+    }
+
+    #[test]
+    fn animation_redraw_stays_scoped_until_full_content_changes() {
+        let start = Instant::now();
+        let mut scheduler = RenderScheduler::new(FRAME, start);
+        scheduler.presented(start);
+
+        scheduler.request_animation(start + Duration::from_millis(1));
+        assert_eq!(scheduler.scope(), Some(RenderScope::Animation));
+
+        scheduler.request_streaming(start + Duration::from_millis(2));
+        assert_eq!(scheduler.scope(), Some(RenderScope::Full));
+
+        scheduler.request_animation(start + Duration::from_millis(3));
+        assert_eq!(scheduler.scope(), Some(RenderScope::Full));
     }
 }
