@@ -88,6 +88,7 @@ proc-macro-crate = "3"
 proc-macro2 = "1.0.106"
 quote = "1.0.46"
 ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
+ratatex = "0.1.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 rquickjs = "0.12.1"
@@ -144,6 +145,44 @@ result-large-err = "allow"
 [profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
+
+# Display math runs during interactive debug builds. Keep the small native
+# parser/layout/raster stack optimized so a cold formula is ready in one frame.
+[profile.dev.package.ratatex]
+opt-level = 1
+
+[profile.dev.package.ratex-font]
+opt-level = 3
+
+[profile.dev.package.ratex-font-loader]
+opt-level = 3
+
+[profile.dev.package.ratex-katex-fonts]
+opt-level = 3
+
+[profile.dev.package.ratex-layout]
+opt-level = 3
+
+[profile.dev.package.ratex-lexer]
+opt-level = 3
+
+[profile.dev.package.ratex-parser]
+opt-level = 3
+
+[profile.dev.package.ratex-render]
+opt-level = 3
+
+[profile.dev.package.ratex-types]
+opt-level = 3
+
+[profile.dev.package.ratex-unicode-font]
+opt-level = 3
+
+[profile.dev.package.tiny-skia]
+opt-level = 3
+
+[profile.dev.package.tiny-skia-path]
+opt-level = 3
 
 [profile.release]
 opt-level = 3

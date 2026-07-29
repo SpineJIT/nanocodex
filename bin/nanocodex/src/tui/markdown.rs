@@ -1,9 +1,14 @@
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use ratatex::{Formula, FormulaState, Ratatex};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
 };
-use std::{borrow::Cow, fmt::Write as _, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    fmt::Write as _,
+    sync::{Arc, OnceLock},
+};
 use syntect::{
     easy::HighlightLines,
     highlighting::{FontStyle, Theme, ThemeSet},
@@ -16,15 +21,143 @@ use unicode_width::UnicodeWidthStr;
 const MAX_HIGHLIGHT_LINE_BYTES: usize = 4 * 1024;
 
 pub(super) fn render_agent_markdown(source: &str, width: u16) -> Text<'static> {
-    let mut writer = MarkdownWriter::new(width);
+    render_agent_markdown_inner(source, width, None, &[], MathFallback::Source).text
+}
+
+#[cfg(test)]
+pub(super) fn render_agent_markdown_with_math(
+    source: &str,
+    width: u16,
+    renderer: &Ratatex,
+) -> RenderedAgentMarkdown {
+    render_agent_markdown_inner(source, width, Some(renderer), &[], MathFallback::Pending)
+}
+
+pub(super) fn render_finalized_agent_markdown_with_math(
+    source: &str,
+    width: u16,
+    renderer: &Ratatex,
+    previous: &[StreamingFormulaFrame],
+) -> RenderedAgentMarkdown {
+    render_agent_markdown_inner(
+        source,
+        width,
+        Some(renderer),
+        previous,
+        MathFallback::Pending,
+    )
+}
+
+pub(super) fn render_streaming_agent_markdown_with_math(
+    source: &str,
+    width: u16,
+    renderer: &Ratatex,
+    previous: &[StreamingFormulaFrame],
+) -> RenderedAgentMarkdown {
+    render_agent_markdown_inner(
+        source,
+        width,
+        Some(renderer),
+        previous,
+        MathFallback::PendingOrFailed,
+    )
+}
+
+fn render_agent_markdown_inner(
+    source: &str,
+    width: u16,
+    renderer: Option<&Ratatex>,
+    previous: &[StreamingFormulaFrame],
+    math_fallback: MathFallback,
+) -> RenderedAgentMarkdown {
+    let (prepared, formulas) = renderer.map_or_else(
+        || (Cow::Borrowed(source), Vec::new()),
+        |_| prepare_display_math(source),
+    );
+    let mut writer = MarkdownWriter::new(width, &formulas, renderer, previous, math_fallback);
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_TASKLISTS);
-    for event in Parser::new_ext(source, options) {
+    for event in Parser::new_ext(&prepared, options) {
         writer.event(event);
     }
     writer.finish()
+}
+
+#[derive(Clone, Copy)]
+enum MathFallback {
+    Source,
+    Pending,
+    PendingOrFailed,
+}
+
+impl MathFallback {
+    const fn hides_pending(self) -> bool {
+        !matches!(self, Self::Source)
+    }
+
+    const fn hides_failed(self) -> bool {
+        matches!(self, Self::PendingOrFailed)
+    }
+}
+
+pub(super) struct RenderedAgentMarkdown {
+    pub(super) text: Text<'static>,
+    pub(super) formulas: Vec<MarkdownFormula>,
+    pub(super) formula_sources: Vec<Arc<str>>,
+    pub(super) math_generation: Option<u64>,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct StreamingFormulaFrame {
+    pub(super) sources: Vec<Arc<str>>,
+    pub(super) formula: Option<Arc<Formula>>,
+}
+
+#[derive(Clone)]
+pub(super) struct MarkdownFormula {
+    pub(super) index: usize,
+    pub(super) formula: Arc<Formula>,
+    pub(super) full_source: Arc<str>,
+    pub(super) line: usize,
+    pub(super) column: u16,
+}
+
+struct DisplayFormula {
+    source: String,
+    full_source: String,
+}
+
+fn prepare_display_math(source: &str) -> (Cow<'_, str>, Vec<DisplayFormula>) {
+    let regions = ratatex::display_math(source);
+    if regions.is_empty() {
+        return (Cow::Borrowed(source), Vec::new());
+    }
+    let mut prepared = String::with_capacity(source.len());
+    let mut formulas = Vec::with_capacity(regions.len());
+    let mut cursor = 0;
+    for region in regions {
+        let range = region.range();
+        prepared.push_str(&source[cursor..range.start]);
+        let index = formulas.len();
+        let _ = write!(prepared, "\n\n<!--ratatex-display:{index}-->\n\n");
+        formulas.push(DisplayFormula {
+            source: region.source().to_owned(),
+            full_source: region.full_source().to_owned(),
+        });
+        cursor = range.end;
+    }
+    prepared.push_str(&source[cursor..]);
+    (Cow::Owned(prepared), formulas)
+}
+
+fn display_math_marker(html: &str) -> Option<usize> {
+    html.trim()
+        .strip_prefix("<!--ratatex-display:")?
+        .strip_suffix("-->")?
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]
@@ -276,18 +409,19 @@ fn markdown_code_blocks(source: &str) -> Vec<CodeBlock> {
 }
 
 pub(super) fn heal_streaming_markdown(source: &str) -> Cow<'_, str> {
+    let source = ratatex::heal_streaming_display_math(source);
     let mut suffix = String::new();
-    if let Some(fence) = open_fence(source) {
+    if let Some(fence) = open_fence(&source) {
         if !source.ends_with('\n') {
             suffix.push('\n');
         }
         suffix.extend(std::iter::repeat_n(fence.marker, fence.length));
     } else {
-        heal_inline_markers(source, &mut suffix);
-        heal_link(source, &mut suffix);
+        heal_inline_markers(&source, &mut suffix);
+        heal_link(&source, &mut suffix);
     }
     if suffix.is_empty() {
-        Cow::Borrowed(source)
+        source
     } else {
         Cow::Owned(format!("{source}{suffix}"))
     }
@@ -604,7 +738,7 @@ fn marker_is_delimiter(bytes: &[u8], index: usize, run: usize) -> bool {
     before_flanking || after_flanking
 }
 
-struct MarkdownWriter {
+struct MarkdownWriter<'a> {
     width: u16,
     lines: Vec<Line<'static>>,
     current: Vec<Span<'static>>,
@@ -615,6 +749,11 @@ struct MarkdownWriter {
     code_block: Option<CodeBlock>,
     table: Option<TableState>,
     image: Option<MarkdownImage>,
+    formulas: &'a [DisplayFormula],
+    renderer: Option<&'a Ratatex>,
+    previous_formulas: &'a [StreamingFormulaFrame],
+    math_fallback: MathFallback,
+    rendered_formulas: Vec<MarkdownFormula>,
 }
 
 struct ListState {
@@ -640,8 +779,14 @@ struct TableState {
     in_header: bool,
 }
 
-impl MarkdownWriter {
-    fn new(width: u16) -> Self {
+impl<'a> MarkdownWriter<'a> {
+    fn new(
+        width: u16,
+        formulas: &'a [DisplayFormula],
+        renderer: Option<&'a Ratatex>,
+        previous_formulas: &'a [StreamingFormulaFrame],
+        math_fallback: MathFallback,
+    ) -> Self {
         Self {
             width,
             lines: vec![Line::styled(
@@ -658,6 +803,11 @@ impl MarkdownWriter {
             code_block: None,
             table: None,
             image: None,
+            formulas,
+            renderer,
+            previous_formulas,
+            math_fallback,
+            rendered_formulas: Vec::new(),
         }
     }
 
@@ -797,9 +947,13 @@ impl MarkdownWriter {
                 self.append_text(if checked { "[✓] " } else { "[ ] " });
             }
             Event::Html(html) | Event::InlineHtml(html) => {
-                let plain = strip_html(&html);
-                if !plain.is_empty() {
-                    self.append_text(&plain);
+                if let Some(index) = display_math_marker(&html) {
+                    self.append_display_math(index);
+                } else {
+                    let plain = strip_html(&html);
+                    if !plain.is_empty() {
+                        self.append_text(&plain);
+                    }
                 }
             }
             Event::FootnoteReference(label) => self.append_text(&format!("[{label}]")),
@@ -868,6 +1022,105 @@ impl MarkdownWriter {
                 self.flush_current();
             }
         }
+    }
+
+    fn append_display_math(&mut self, index: usize) {
+        let Some(formula) = self.formulas.get(index) else {
+            return;
+        };
+        let source = formula.source.clone();
+        let full_source = formula.full_source.clone();
+        self.flush_current();
+        self.ensure_prefix();
+        let column = self
+            .current
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum::<usize>()
+            .min(usize::from(u16::MAX)) as u16;
+        let max_columns = self.width.saturating_sub(column).max(1);
+        let state = self.renderer.map_or(FormulaState::Unsupported, |renderer| {
+            renderer.request(&source, max_columns)
+        });
+        match state {
+            FormulaState::Ready(formula) => {
+                self.append_ready_formula(index, formula, full_source, column);
+            }
+            FormulaState::Pending => {
+                if let Some(previous) = self.previous_formula(index, &source, max_columns) {
+                    self.append_ready_formula(index, previous, full_source, column);
+                } else if self.math_fallback.hides_pending() {
+                    self.append_hidden_formula();
+                } else {
+                    self.append_formula_source(&full_source);
+                }
+            }
+            FormulaState::Failed(_) if self.math_fallback.hides_failed() => {
+                if let Some(previous) = self.previous_formula(index, &source, max_columns) {
+                    self.append_ready_formula(index, previous, full_source, column);
+                } else {
+                    self.append_hidden_formula();
+                }
+            }
+            FormulaState::Failed(_) | FormulaState::Unsupported => {
+                self.append_formula_source(&full_source);
+            }
+        }
+    }
+
+    fn previous_formula(
+        &self,
+        index: usize,
+        current_source: &str,
+        max_columns: u16,
+    ) -> Option<Arc<Formula>> {
+        let previous = self.previous_formulas.get(index)?;
+        if let Some(renderer) = self.renderer {
+            for source in previous.sources.iter().rev() {
+                if source.as_ref() == current_source {
+                    continue;
+                }
+                if let FormulaState::Ready(formula) = renderer.request(source, max_columns) {
+                    return Some(formula);
+                }
+            }
+        }
+        previous
+            .formula
+            .as_ref()
+            .filter(|formula| formula.columns() <= max_columns)
+            .cloned()
+    }
+
+    fn append_ready_formula(
+        &mut self,
+        index: usize,
+        formula: Arc<Formula>,
+        full_source: String,
+        column: u16,
+    ) {
+        self.current.clear();
+        let line = self.lines.len();
+        self.lines
+            .extend((0..formula.rows()).map(|_| Line::raw(" ")));
+        self.rendered_formulas.push(MarkdownFormula {
+            index,
+            formula,
+            full_source: full_source.into(),
+            line,
+            column,
+        });
+    }
+
+    fn append_hidden_formula(&mut self) {
+        self.current.clear();
+        self.lines.push(Line::raw(" "));
+    }
+
+    fn append_formula_source(&mut self, full_source: &str) {
+        self.append_text(full_source);
+        self.flush_current();
+        self.blank_line();
     }
 
     fn ensure_prefix(&mut self) {
@@ -1059,7 +1312,7 @@ impl MarkdownWriter {
         }
     }
 
-    fn finish(mut self) -> Text<'static> {
+    fn finish(mut self) -> RenderedAgentMarkdown {
         self.flush_current();
         while self
             .lines
@@ -1069,7 +1322,18 @@ impl MarkdownWriter {
             let _ = self.lines.pop();
         }
         self.lines.push(Line::raw(""));
-        Text::from(self.lines)
+        RenderedAgentMarkdown {
+            text: Text::from(self.lines),
+            formulas: self.rendered_formulas,
+            formula_sources: self
+                .formulas
+                .iter()
+                .map(|formula| Arc::from(formula.source.as_str()))
+                .collect(),
+            math_generation: (!self.formulas.is_empty())
+                .then(|| self.renderer.map(Ratatex::generation))
+                .flatten(),
+        }
     }
 }
 
@@ -1152,13 +1416,14 @@ fn strip_html(html: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, sync::mpsc, time::Duration};
 
+    use ratatex::{PixelSize, Ratatex, TerminalProfile};
     use ratatui::{Terminal, backend::TestBackend, widgets::Paragraph};
 
     use super::{
         code_line_count, heal_streaming_markdown, highlighted_code_lines, render_agent_markdown,
-        restore_markdown_links,
+        render_agent_markdown_with_math, restore_markdown_links,
     };
 
     fn render(markdown: &str, width: u16, height: u16) -> String {
@@ -1188,6 +1453,109 @@ mod tests {
         assert!(!rendered.contains("LOC"));
         assert!(!rendered.contains("┌─"));
         assert!(rendered.contains("fn main() {}"));
+    }
+
+    #[test]
+    fn unsupported_graphics_preserves_display_math_as_text() {
+        let renderer = Ratatex::builder(TerminalProfile::unsupported(PixelSize::default()))
+            .build()
+            .unwrap();
+        let rendered = render_agent_markdown_with_math(
+            "Before\n\n$$\\nabla\\cdot\\mathbf{u}=0$$\n\nAfter",
+            60,
+            &renderer,
+        );
+        let text = rendered
+            .text
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains(r"$$\nabla\cdot\mathbf{u}=0$$"));
+        assert!(rendered.formulas.is_empty());
+        assert!(rendered.math_generation.is_some());
+        renderer.shutdown();
+    }
+
+    #[test]
+    fn display_math_becomes_placeholder_rows() {
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let cache = tempfile::tempdir().unwrap();
+        let renderer = Ratatex::builder(TerminalProfile::kitty(PixelSize::new(10, 20), false))
+            .cache_dir(cache.path())
+            .on_update(move || {
+                let _ = wake_tx.try_send(());
+            })
+            .build()
+            .unwrap();
+        let source = r"Before
+
+$$
+\rho\left(\frac{\partial \mathbf{u}}{\partial t}
++(\mathbf{u}\cdot\nabla)\mathbf{u}\right)
+=-\nabla p+\mu\nabla^2\mathbf{u}+\rho\mathbf{f}
+$$
+
+After";
+
+        let pending = render_agent_markdown_with_math(source, 100, &renderer);
+        assert!(pending.formulas.is_empty());
+        assert!(
+            pending
+                .text
+                .lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .all(|span| !span.content.contains(r"\rho"))
+        );
+        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let rendered = render_agent_markdown_with_math(source, 100, &renderer);
+        assert_eq!(rendered.formulas.len(), 1);
+        assert!(rendered.formulas[0].formula.columns() > 10);
+        assert!(rendered.formulas[0].formula.rows() > 1);
+        assert_eq!(renderer.drain_terminal_commands().len(), 1);
+        renderer.shutdown();
+    }
+
+    #[test]
+    fn display_math_uses_only_one_surrounding_markdown_gap() {
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let cache = tempfile::tempdir().unwrap();
+        let renderer = Ratatex::builder(TerminalProfile::kitty(PixelSize::new(10, 20), false))
+            .cache_dir(cache.path())
+            .on_update(move || {
+                let _ = wake_tx.try_send(());
+            })
+            .build()
+            .unwrap();
+        let source = "### Maxwell\n\n\\[\\nabla\\cdot\\mathbf{E}=0\\]\n\n### Next";
+
+        let _ = render_agent_markdown_with_math(source, 80, &renderer);
+        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let rendered = render_agent_markdown_with_math(source, 80, &renderer);
+        let formula = &rendered.formulas[0];
+        let lines = rendered
+            .text
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let maxwell = lines
+            .iter()
+            .position(|line| line.contains("Maxwell"))
+            .unwrap();
+        let next = lines.iter().position(|line| line.contains("Next")).unwrap();
+
+        assert_eq!(formula.line, maxwell + 2);
+        assert_eq!(next, formula.line + usize::from(formula.formula.rows()));
+        renderer.shutdown();
     }
 
     #[test]

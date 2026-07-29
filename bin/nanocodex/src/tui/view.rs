@@ -422,12 +422,15 @@ fn render_transcript(
     frame.render_widget(block, area);
 
     frame.render_widget(
-        conversation.transcript.widget(
-            scroll_from_bottom,
-            conversation.selected_user,
-            inline_edit,
-            empty_message,
-        ),
+        conversation
+            .transcript
+            .widget(
+                scroll_from_bottom,
+                conversation.selected_user,
+                inline_edit,
+                empty_message,
+            )
+            .math_fallback(preserve_view),
         inner,
     );
     if let Some(edit) = inline_edit
@@ -732,9 +735,13 @@ fn saturating_u16(value: usize) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
-    use std::time::Instant;
+    use std::{
+        io,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
 
+    use ratatex::{PixelSize, Ratatex, TerminalProfile};
     use ratatui::{
         Terminal,
         backend::{Backend, ClearType, TestBackend, WindowSize},
@@ -997,6 +1004,183 @@ mod tests {
         let selected = terminal.backend().buffer().cell((start_x, row)).unwrap();
         assert_eq!(selected.bg, Color::Indexed(8));
         assert!(selected.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn clicking_then_selecting_a_rendered_formula_copies_its_latex() {
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let cache = tempfile::tempdir().unwrap();
+        let renderer = Ratatex::builder(TerminalProfile::kitty(PixelSize::new(10, 20), false))
+            .cache_dir(cache.path())
+            .on_update(move || {
+                let _ = wake_tx.try_send(());
+            })
+            .build()
+            .unwrap();
+        let source = "$$\n\\frac{a}{b}=c\n$$";
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let mut app = App::new("/workspace".into());
+        app.set_math_renderer(renderer.clone());
+        app.main
+            .transcript
+            .push(TranscriptItem::Assistant(source.to_owned()));
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        app.invalidate_math_layouts();
+        let _ = renderer.drain_terminal_commands();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let width = usize::from(terminal.backend().buffer().area.width);
+        let formula_cells = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| {
+                ratatex::is_formula_placeholder(cell.symbol()).then_some(Position::new(
+                    u16::try_from(index % width).unwrap(),
+                    u16::try_from(index / width).unwrap(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert!(!formula_cells.is_empty());
+        let start = Position::new(
+            formula_cells.iter().map(|cell| cell.x).min().unwrap(),
+            formula_cells.iter().map(|cell| cell.y).min().unwrap(),
+        );
+        let end = Position::new(
+            formula_cells.iter().map(|cell| cell.x).max().unwrap(),
+            formula_cells.iter().map(|cell| cell.y).max().unwrap(),
+        );
+
+        assert!(app.begin_mouse_selection(start));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.finish_mouse_selection(start));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(app.take_pending_copy().is_none());
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| !ratatex::is_formula_placeholder(cell.symbol()))
+        );
+        let fallback_text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert_eq!(fallback_text.matches("$$").count(), 2);
+
+        assert!(app.begin_mouse_selection(start));
+        assert!(app.finish_mouse_selection(end));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert_eq!(app.take_pending_copy().as_deref(), Some(source));
+        assert_eq!(
+            terminal.backend().buffer().cell(start).unwrap().bg,
+            Color::Indexed(8)
+        );
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| !ratatex::is_formula_placeholder(cell.symbol()))
+        );
+        renderer.shutdown();
+    }
+
+    #[test]
+    fn source_mode_copies_multiple_formulas_with_surrounding_text() {
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let cache = tempfile::tempdir().unwrap();
+        let renderer = Ratatex::builder(TerminalProfile::kitty(PixelSize::new(10, 20), false))
+            .cache_dir(cache.path())
+            .on_update(move || {
+                let _ = wake_tx.send(());
+            })
+            .build()
+            .unwrap();
+        let source = "Before\n\n$$\na=b\n$$\n\nBetween\n\n$$\nc=d\n$$\n\nAfter";
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let mut app = App::new("/workspace".into());
+        app.set_math_renderer(renderer.clone());
+        app.main
+            .transcript
+            .push(TranscriptItem::Assistant(source.to_owned()));
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        for _ in 0..2 {
+            wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        app.invalidate_math_layouts();
+        let _ = renderer.drain_terminal_commands();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let width = usize::from(terminal.backend().buffer().area.width);
+        let first_formula = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| {
+                ratatex::is_formula_placeholder(cell.symbol()).then_some(Position::new(
+                    u16::try_from(index % width).unwrap(),
+                    u16::try_from(index / width).unwrap(),
+                ))
+            })
+            .unwrap();
+        assert!(app.begin_mouse_selection(first_formula));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.finish_mouse_selection(first_formula));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| !ratatex::is_formula_placeholder(cell.symbol()))
+        );
+
+        let find_text = |needle: &str| {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height).find_map(|row| {
+                (0..buffer.area.width).find_map(|column| {
+                    let end = column.saturating_add(u16::try_from(needle.len()).ok()?);
+                    (end <= buffer.area.width
+                        && (column..end)
+                            .map(|x| buffer[(x, row)].symbol())
+                            .collect::<String>()
+                            == needle)
+                        .then_some((
+                            Position::new(column, row),
+                            Position::new(end.saturating_sub(1), row),
+                        ))
+                })
+            })
+        };
+        let (start, _) = find_text("Before").unwrap();
+        let (_, end) = find_text("After").unwrap();
+
+        assert!(app.begin_mouse_selection(start));
+        assert!(app.finish_mouse_selection(end));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert_eq!(
+            app.take_pending_copy().as_deref(),
+            Some("Before\n$$\na=b\n$$\nBetween\n$$\nc=d\n$$\nAfter")
+        );
+        renderer.shutdown();
     }
 
     #[test]

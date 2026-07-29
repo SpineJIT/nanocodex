@@ -8,6 +8,7 @@ use std::{
     },
 };
 
+use ratatex::{Formula, FormulaWidget, Ratatex, SignedPosition};
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Position, Rect},
@@ -22,8 +23,9 @@ use super::app::PlanStepStatus;
 use super::composer::ComposerLayout;
 use super::diff::{PatchPresentation, present_apply_patch};
 use super::markdown::{
-    LogicalMarkdown, heal_streaming_markdown, render_agent_markdown,
-    restore_markdown_links_from_sources,
+    LogicalMarkdown, MarkdownFormula, RenderedAgentMarkdown, StreamingFormulaFrame,
+    heal_streaming_markdown, render_agent_markdown, render_finalized_agent_markdown_with_math,
+    render_streaming_agent_markdown_with_math, restore_markdown_links_from_sources,
 };
 
 #[derive(Clone, Copy)]
@@ -63,6 +65,7 @@ pub(super) struct Transcript {
     editable_users: Vec<usize>,
     cached_total_height: AtomicU64,
     tool_details_expanded: Arc<AtomicBool>,
+    math_renderer: Option<Ratatex>,
 }
 
 impl Default for Transcript {
@@ -72,6 +75,7 @@ impl Default for Transcript {
             editable_users: Vec::new(),
             cached_total_height: AtomicU64::new(0),
             tool_details_expanded: Arc::new(AtomicBool::new(true)),
+            math_renderer: None,
         }
     }
 }
@@ -83,6 +87,7 @@ impl Clone for Transcript {
             editable_users: self.editable_users.clone(),
             cached_total_height: AtomicU64::new(self.cached_total_height.load(Ordering::Relaxed)),
             tool_details_expanded: Arc::clone(&self.tool_details_expanded),
+            math_renderer: self.math_renderer.clone(),
         }
     }
 }
@@ -122,7 +127,27 @@ impl Transcript {
         self.entries.push(Arc::new(TranscriptEntry::new(
             item,
             Arc::clone(&self.tool_details_expanded),
+            self.math_renderer.clone(),
         )));
+        self.invalidate_total_height();
+    }
+
+    pub(super) fn set_math_renderer(&mut self, renderer: Ratatex) {
+        for entry in &mut self.entries {
+            Arc::make_mut(entry).set_math_renderer(renderer.clone());
+        }
+        self.math_renderer = Some(renderer);
+        self.invalidate_total_height();
+    }
+
+    pub(super) fn math_renderer(&self) -> Option<Ratatex> {
+        self.math_renderer.clone()
+    }
+
+    pub(super) fn invalidate_math_layouts(&self) {
+        for entry in &self.entries {
+            entry.invalidate_math_layout();
+        }
         self.invalidate_total_height();
     }
 
@@ -169,6 +194,7 @@ impl Transcript {
         let mut entry = TranscriptEntry::new(
             TranscriptItem::User(message),
             Arc::clone(&self.tool_details_expanded),
+            self.math_renderer.clone(),
         );
         entry.prompt_id = Some(prompt_id);
         self.editable_users.push(self.entries.len());
@@ -341,6 +367,7 @@ impl Transcript {
                 .to_vec(),
             cached_total_height: AtomicU64::new(0),
             tool_details_expanded: Arc::clone(&self.tool_details_expanded),
+            math_renderer: self.math_renderer.clone(),
         }
     }
 
@@ -416,6 +443,7 @@ impl Transcript {
             selected,
             inline_edit,
             empty_message,
+            math_fallback: false,
         }
     }
 
@@ -475,6 +503,14 @@ pub(super) struct TranscriptWidget<'a> {
     selected: Option<usize>,
     inline_edit: Option<InlineEdit<'a>>,
     empty_message: &'static str,
+    math_fallback: bool,
+}
+
+impl TranscriptWidget<'_> {
+    pub(super) const fn math_fallback(mut self, enabled: bool) -> Self {
+        self.math_fallback = enabled;
+        self
+    }
 }
 
 impl Widget for TranscriptWidget<'_> {
@@ -513,6 +549,7 @@ impl Widget for TranscriptWidget<'_> {
                 viewport,
                 Some(selected),
                 self.inline_edit,
+                self.math_fallback,
             );
             return;
         }
@@ -553,6 +590,7 @@ impl Widget for TranscriptWidget<'_> {
                 },
                 self.selected,
                 self.inline_edit,
+                self.math_fallback,
             );
             return;
         }
@@ -575,6 +613,7 @@ impl Widget for TranscriptWidget<'_> {
             },
             self.selected,
             self.inline_edit,
+            self.math_fallback,
         );
     }
 }
@@ -694,6 +733,7 @@ fn render_entries(
     viewport: Viewport,
     selected: Option<usize>,
     inline_edit: Option<InlineEdit<'_>>,
+    math_fallback: bool,
 ) {
     let mut local_scroll = viewport.local_scroll;
     let mut screen_y = viewport.screen_y;
@@ -724,6 +764,7 @@ fn render_entries(
                     local_scroll,
                     entry_height,
                     selected == Some(index),
+                    math_fallback,
                 );
             }
             screen_y = screen_y.saturating_add(visible_height);
@@ -822,6 +863,14 @@ struct MarkdownContent {
     show_header: bool,
     cached: Mutex<Option<RenderedText>>,
     logical_copy: Mutex<Option<LogicalMarkdown>>,
+    math_frames: Mutex<Option<MathFrames>>,
+    math_renderer: Option<Ratatex>,
+}
+
+#[derive(Clone)]
+struct MathFrames {
+    width: u16,
+    formulas: Vec<StreamingFormulaFrame>,
 }
 
 #[derive(Clone)]
@@ -830,7 +879,16 @@ struct RenderedText {
     text: Text<'static>,
     line_heights: Vec<usize>,
     prewrapped_lines: Vec<Option<Vec<Line<'static>>>>,
+    formulas: Vec<RenderedFormula>,
     height: usize,
+}
+
+#[derive(Clone)]
+struct RenderedFormula {
+    formula: Arc<Formula>,
+    full_source: Arc<str>,
+    visual_top: usize,
+    column: u16,
 }
 
 #[derive(Clone)]
@@ -924,6 +982,13 @@ impl Clone for MarkdownContent {
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone(),
             ),
+            math_frames: Mutex::new(
+                self.math_frames
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            ),
+            math_renderer: self.math_renderer.clone(),
         }
     }
 }
@@ -941,7 +1006,11 @@ impl Clone for TranscriptEntry {
 }
 
 impl TranscriptEntry {
-    fn new(item: TranscriptItem, tool_details_expanded: Arc<AtomicBool>) -> Self {
+    fn new(
+        item: TranscriptItem,
+        tool_details_expanded: Arc<AtomicBool>,
+        math_renderer: Option<Ratatex>,
+    ) -> Self {
         let (kind, user_message, content) = match item {
             TranscriptItem::User(message) => {
                 let text = message_text(
@@ -956,12 +1025,12 @@ impl TranscriptEntry {
             TranscriptItem::Assistant(message) => (
                 EntryKind::Assistant,
                 None,
-                EntryContent::Markdown(MarkdownContent::streaming(&message)),
+                EntryContent::Markdown(MarkdownContent::streaming(&message, math_renderer)),
             ),
             TranscriptItem::Reasoning(message) => (
                 EntryKind::Reasoning,
                 None,
-                EntryContent::Markdown(MarkdownContent::reasoning(&message)),
+                EntryContent::Markdown(MarkdownContent::reasoning(&message, math_renderer)),
             ),
             TranscriptItem::Tool {
                 call_id,
@@ -1004,6 +1073,13 @@ impl TranscriptEntry {
         }
     }
 
+    fn set_math_renderer(&mut self, renderer: Ratatex) {
+        if let EntryContent::Markdown(markdown) = &mut self.content {
+            markdown.set_math_renderer(renderer);
+        }
+        self.cached_height.store(0, Ordering::Relaxed);
+    }
+
     #[cfg(test)]
     fn paragraph(&self) -> Paragraph<'static> {
         Paragraph::new(match &self.content {
@@ -1032,6 +1108,12 @@ impl TranscriptEntry {
         {
             let _ = text.lines.pop();
             self.cached_height.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn invalidate_math_layout(&self) {
+        if let EntryContent::Markdown(markdown) = &self.content {
+            markdown.invalidate_math_layout();
         }
     }
 
@@ -1079,6 +1161,7 @@ impl TranscriptEntry {
         scroll: usize,
         total_height: usize,
         selected: bool,
+        math_fallback: bool,
     ) {
         match &self.content {
             EntryContent::Static(text) => {
@@ -1098,7 +1181,14 @@ impl TranscriptEntry {
                 }
             }
             EntryContent::Markdown(markdown) => {
-                markdown.render(area, buffer, scroll, total_height, selected);
+                markdown.render_with_math_fallback(
+                    area,
+                    buffer,
+                    scroll,
+                    total_height,
+                    selected,
+                    math_fallback,
+                );
             }
             EntryContent::Tool(tool) => {
                 tool.render(area, buffer, scroll, total_height, selected);
@@ -1136,10 +1226,10 @@ impl TranscriptEntry {
         if !matches!(self.kind, EntryKind::Assistant) {
             return false;
         }
-        match &mut self.content {
-            EntryContent::Markdown(markdown) => markdown.finalize(message),
-            _ => self.content = EntryContent::Markdown(MarkdownContent::new(message)),
-        }
+        let EntryContent::Markdown(markdown) = &mut self.content else {
+            return false;
+        };
+        markdown.finalize(message);
         self.cached_height.store(0, Ordering::Relaxed);
         true
     }
@@ -1765,7 +1855,8 @@ fn format_duration(duration_ns: u64) -> String {
 }
 
 impl MarkdownContent {
-    fn new(source: &str) -> Self {
+    #[cfg(test)]
+    fn new(source: &str, math_renderer: Option<Ratatex>) -> Self {
         Self {
             source: source.to_owned(),
             streaming: false,
@@ -1774,10 +1865,12 @@ impl MarkdownContent {
             show_header: true,
             cached: Mutex::new(None),
             logical_copy: Mutex::new(None),
+            math_frames: Mutex::new(None),
+            math_renderer,
         }
     }
 
-    fn streaming(source: &str) -> Self {
+    fn streaming(source: &str, math_renderer: Option<Ratatex>) -> Self {
         Self {
             source: source.to_owned(),
             streaming: true,
@@ -1786,10 +1879,12 @@ impl MarkdownContent {
             show_header: true,
             cached: Mutex::new(None),
             logical_copy: Mutex::new(None),
+            math_frames: Mutex::new(None),
+            math_renderer,
         }
     }
 
-    fn reasoning(source: &str) -> Self {
+    fn reasoning(source: &str, math_renderer: Option<Ratatex>) -> Self {
         let source = format!("• {}", indent_reasoning(source));
         Self {
             plain_streaming: is_plain_streaming_markdown(&source),
@@ -1799,7 +1894,22 @@ impl MarkdownContent {
             show_header: false,
             cached: Mutex::new(None),
             logical_copy: Mutex::new(None),
+            math_frames: Mutex::new(None),
+            math_renderer,
         }
+    }
+
+    fn set_math_renderer(&mut self, renderer: Ratatex) {
+        self.math_renderer = Some(renderer);
+        *self.cached.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        *self
+            .math_frames
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    fn invalidate_math_layout(&self) {
+        *self.cached.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     fn append(&mut self, delta: &str) {
@@ -1905,6 +2015,7 @@ impl MarkdownContent {
         self.with_rendered(width, |rendered| rendered.height)
     }
 
+    #[cfg(test)]
     fn render(
         &self,
         area: Rect,
@@ -1913,11 +2024,23 @@ impl MarkdownContent {
         total_height: usize,
         selected: bool,
     ) {
+        self.render_with_math_fallback(area, buffer, scroll, total_height, selected, false);
+    }
+
+    fn render_with_math_fallback(
+        &self,
+        area: Rect,
+        buffer: &mut Buffer,
+        scroll: usize,
+        total_height: usize,
+        selected: bool,
+        math_fallback: bool,
+    ) {
         if area.is_empty() {
             return;
         }
         self.with_rendered(area.width, |rendered| {
-            rendered.render(area, buffer, scroll, total_height, selected);
+            rendered.render_markdown(area, buffer, scroll, total_height, selected, math_fallback);
         });
     }
 
@@ -1935,10 +2058,38 @@ impl MarkdownContent {
             } else {
                 Cow::Borrowed(self.source.as_str())
             };
-            let mut text = render_agent_markdown(&source, width);
-            if !self.show_header && !text.lines.is_empty() {
-                let _ = text.lines.remove(0);
-                for (index, line) in text.lines.iter_mut().enumerate() {
+            let previous = self
+                .math_frames
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .filter(|frames| frames.width == width)
+                .map_or_else(Vec::new, |frames| frames.formulas.clone());
+            let mut rendered = self.math_renderer.as_ref().map_or_else(
+                || RenderedAgentMarkdown {
+                    text: render_agent_markdown(&source, width),
+                    formulas: Vec::new(),
+                    formula_sources: Vec::new(),
+                    math_generation: None,
+                },
+                |renderer| {
+                    if self.streaming {
+                        render_streaming_agent_markdown_with_math(
+                            &source, width, renderer, &previous,
+                        )
+                    } else {
+                        render_finalized_agent_markdown_with_math(
+                            &source, width, renderer, &previous,
+                        )
+                    }
+                },
+            );
+            if !self.show_header && !rendered.text.lines.is_empty() {
+                let _ = rendered.text.lines.remove(0);
+                for formula in &mut rendered.formulas {
+                    formula.line = formula.line.saturating_sub(1);
+                }
+                for (index, line) in rendered.text.lines.iter_mut().enumerate() {
                     if line
                         .spans
                         .first()
@@ -1951,8 +2102,45 @@ impl MarkdownContent {
                     }
                 }
             }
-            text.style = self.base_style;
-            RenderedText::new(text, width)
+            rendered.text.style = self.base_style;
+            let next_math_frames = rendered.math_generation.is_some().then(|| {
+                let mut formulas = previous;
+                if formulas.len() < rendered.formula_sources.len() {
+                    formulas.resize_with(
+                        rendered.formula_sources.len(),
+                        StreamingFormulaFrame::default,
+                    );
+                }
+                for (index, source) in rendered.formula_sources.iter().enumerate() {
+                    let frame = &mut formulas[index];
+                    if frame
+                        .sources
+                        .last()
+                        .is_none_or(|previous| previous != source)
+                    {
+                        frame.sources.push(Arc::clone(source));
+                        if frame.sources.len() > 8 {
+                            let excess = frame.sources.len().saturating_sub(8);
+                            frame.sources.drain(..excess);
+                        }
+                    }
+                }
+                for formula in &rendered.formulas {
+                    if formulas.len() <= formula.index {
+                        formulas.resize_with(
+                            formula.index.saturating_add(1),
+                            StreamingFormulaFrame::default,
+                        );
+                    }
+                    formulas[formula.index].formula = Some(Arc::clone(&formula.formula));
+                }
+                MathFrames { width, formulas }
+            });
+            *self
+                .math_frames
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = next_math_frames;
+            RenderedText::with_formulas(rendered.text, width, rendered.formulas)
         });
         read(rendered)
     }
@@ -1960,19 +2148,47 @@ impl MarkdownContent {
 
 impl RenderedText {
     fn new(text: Text<'static>, width: u16) -> Self {
+        Self::with_formulas(text, width, Vec::new())
+    }
+
+    fn with_formulas(text: Text<'static>, width: u16, formulas: Vec<MarkdownFormula>) -> Self {
+        let mut formula_rows = vec![false; text.lines.len()];
+        for formula in &formulas {
+            let end = formula
+                .line
+                .saturating_add(usize::from(formula.formula.rows()))
+                .min(formula_rows.len());
+            if let Some(rows) = formula_rows.get_mut(formula.line..end) {
+                rows.fill(true);
+            }
+        }
         let mut line_heights = Vec::with_capacity(text.lines.len());
         let mut prewrapped_lines = Vec::with_capacity(text.lines.len());
-        for line in &text.lines {
-            let (height, rows) = rendered_line_layout(line, &text, width);
+        for (index, line) in text.lines.iter().enumerate() {
+            let (height, rows) = if formula_rows[index] {
+                (1, None)
+            } else {
+                rendered_line_layout(line, &text, width)
+            };
             line_heights.push(height);
             prewrapped_lines.push(rows);
         }
         let height = line_heights.iter().copied().sum();
+        let formulas = formulas
+            .into_iter()
+            .map(|formula| RenderedFormula {
+                visual_top: line_heights.iter().take(formula.line).copied().sum(),
+                formula: formula.formula,
+                full_source: formula.full_source,
+                column: formula.column,
+            })
+            .collect();
         Self {
             width,
             text,
             line_heights,
             prewrapped_lines,
+            formulas,
             height,
         }
     }
@@ -2050,6 +2266,30 @@ impl RenderedText {
         total_height: usize,
         selected: bool,
     ) {
+        self.render_inner(area, buffer, scroll, total_height, selected, false);
+    }
+
+    fn render_markdown(
+        &self,
+        area: Rect,
+        buffer: &mut Buffer,
+        scroll: usize,
+        total_height: usize,
+        selected: bool,
+        math_fallback: bool,
+    ) {
+        self.render_inner(area, buffer, scroll, total_height, selected, math_fallback);
+    }
+
+    fn render_inner(
+        &self,
+        area: Rect,
+        buffer: &mut Buffer,
+        scroll: usize,
+        total_height: usize,
+        selected: bool,
+        math_fallback: bool,
+    ) {
         if area.is_empty() {
             return;
         }
@@ -2102,6 +2342,27 @@ impl RenderedText {
             }
             line_top = line_bottom;
             index = index.saturating_add(1);
+        }
+        for formula in &self.formulas {
+            let formula_bottom = formula
+                .visual_top
+                .saturating_add(usize::from(formula.formula.rows()));
+            if formula_bottom <= scroll || formula.visual_top >= viewport_bottom {
+                continue;
+            }
+            let x = i32::from(formula.column);
+            let y = i32::try_from(formula.visual_top)
+                .unwrap_or(i32::MAX)
+                .saturating_sub(i32::try_from(scroll).unwrap_or(i32::MAX));
+            let widget = FormulaWidget::new(&formula.formula).position(SignedPosition::new(x, y));
+            if math_fallback || selected {
+                widget
+                    .compact_source_fallback(formula.full_source.as_ref())
+                    .source_fallback_style(Style::default().fg(Color::White))
+                    .render(area, buffer);
+            } else {
+                widget.render(area, buffer);
+            }
         }
         if selected {
             buffer.set_style(area, Style::default().add_modifier(Modifier::REVERSED));
@@ -2556,8 +2817,12 @@ fn saturating_u16(value: usize) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::{
+        sync::{Arc, atomic::AtomicBool, mpsc},
+        time::Duration,
+    };
 
+    use ratatex::{PixelSize, Ratatex, TerminalProfile};
     use ratatui::{
         Terminal,
         backend::TestBackend,
@@ -2604,9 +2869,288 @@ mod tests {
     }
 
     #[test]
+    fn formula_flows_through_the_transcript_buffer() {
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let cache = tempfile::tempdir().unwrap();
+        let renderer = Ratatex::builder(TerminalProfile::kitty(PixelSize::new(10, 20), false))
+            .cache_dir(cache.path())
+            .on_update(move || {
+                let _ = wake_tx.try_send(());
+            })
+            .build()
+            .unwrap();
+        let mut transcript = Transcript::default();
+        transcript.set_math_renderer(renderer.clone());
+        transcript.push(TranscriptItem::Assistant(
+            r"For an incompressible fluid:
+
+$$
+\rho\left(\frac{\partial \mathbf{u}}{\partial t}
++(\mathbf{u}\cdot\nabla)\mathbf{u}\right)
+=-\nabla p+\mu\nabla^2\mathbf{u}+\rho\mathbf{f}
+$$
+
+with $\mathbf{u}$ denoting velocity."
+                .to_owned(),
+        ));
+
+        let _ = transcript.height_from(0, 120);
+        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        transcript.invalidate_math_layouts();
+        assert_eq!(renderer.drain_terminal_commands().len(), 1);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(transcript.widget(0, None, None, "empty"), frame.area());
+            })
+            .unwrap();
+        let placeholders = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .filter(|cell| cell.symbol().starts_with('\u{10eeee}'))
+            .count();
+        assert!(placeholders > 10);
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    transcript
+                        .widget(0, None, None, "empty")
+                        .math_fallback(true),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+        assert!(terminal.backend().to_string().contains(r"\rho"));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| !cell.symbol().starts_with('\u{10eeee}'))
+        );
+        renderer.shutdown();
+    }
+
+    #[test]
+    fn streaming_formula_keeps_the_last_ready_frame_without_exposing_tex() {
+        let (wake_tx, wake_rx) = mpsc::sync_channel(4);
+        let cache = tempfile::tempdir().unwrap();
+        let renderer = Ratatex::builder(TerminalProfile::kitty(PixelSize::new(10, 20), false))
+            .cache_dir(cache.path())
+            .on_update(move || {
+                let _ = wake_tx.try_send(());
+            })
+            .build()
+            .unwrap();
+        let mut markdown = MarkdownContent::streaming("Before\n\n\\[\nx", Some(renderer.clone()));
+
+        let (pending_lines, pending_formulas) = markdown.with_rendered(80, |rendered| {
+            (
+                rendered
+                    .text
+                    .lines
+                    .iter()
+                    .map(|line| {
+                        line.spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>(),
+                rendered.formulas.len(),
+            )
+        });
+        assert!(pending_lines.iter().any(|line| line.contains("Before")));
+        assert!(pending_lines.iter().all(|line| !line.contains(r"\[")));
+        assert!(pending_lines.iter().all(|line| line.trim() != "x"));
+        assert_eq!(pending_formulas, 0);
+
+        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        markdown.invalidate_math_layout();
+        markdown.append("+y");
+        let (fallback, fallback_text) = markdown.with_rendered(80, |rendered| {
+            assert_eq!(rendered.formulas.len(), 1);
+            (
+                Arc::clone(&rendered.formulas[0].formula),
+                rendered
+                    .text
+                    .lines
+                    .iter()
+                    .flat_map(|line| line.spans.iter())
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>(),
+            )
+        });
+        assert!(!fallback_text.contains(r"\["));
+        assert!(!fallback_text.contains("x+y"));
+
+        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        markdown.invalidate_math_layout();
+        let replacement = markdown.with_rendered(80, |rendered| {
+            assert_eq!(rendered.formulas.len(), 1);
+            Arc::clone(&rendered.formulas[0].formula)
+        });
+        assert!(!Arc::ptr_eq(&fallback, &replacement));
+
+        markdown.append("+z");
+        let stored_fallback = markdown.with_rendered(80, |rendered| {
+            assert_eq!(rendered.formulas.len(), 1);
+            Arc::clone(&rendered.formulas[0].formula)
+        });
+        assert!(Arc::ptr_eq(&replacement, &stored_fallback));
+        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        markdown.invalidate_math_layout();
+        let final_prefix = markdown.with_rendered(80, |rendered| {
+            assert_eq!(rendered.formulas.len(), 1);
+            Arc::clone(&rendered.formulas[0].formula)
+        });
+
+        markdown.append("\n\\]");
+        let closed = markdown.with_rendered(80, |rendered| {
+            assert_eq!(rendered.formulas.len(), 1);
+            Arc::clone(&rendered.formulas[0].formula)
+        });
+        assert!(Arc::ptr_eq(&final_prefix, &closed));
+
+        let finalized_source = "Before\n\n\\[\nx+y+z+w\n\\]";
+        markdown.finalize(finalized_source);
+        let (finalizing, finalizing_text) = markdown.with_rendered(80, |rendered| {
+            assert_eq!(rendered.formulas.len(), 1);
+            (
+                Arc::clone(&rendered.formulas[0].formula),
+                rendered
+                    .text
+                    .lines
+                    .iter()
+                    .flat_map(|line| line.spans.iter())
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>(),
+            )
+        });
+        assert!(Arc::ptr_eq(&closed, &finalizing));
+        assert!(!finalizing_text.contains(r"\["));
+        assert!(!finalizing_text.contains("x+y+z+w"));
+
+        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        markdown.invalidate_math_layout();
+        let finalized = markdown.with_rendered(80, |rendered| {
+            assert_eq!(rendered.formulas.len(), 1);
+            Arc::clone(&rendered.formulas[0].formula)
+        });
+        assert!(!Arc::ptr_eq(&finalizing, &finalized));
+        renderer.shutdown();
+    }
+
+    #[test]
+    fn scrolling_through_a_formula_preserves_its_placeholder_tiles() {
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let cache = tempfile::tempdir().unwrap();
+        let renderer = Ratatex::builder(TerminalProfile::kitty(PixelSize::new(10, 20), false))
+            .cache_dir(cache.path())
+            .on_update(move || {
+                let _ = wake_tx.try_send(());
+            })
+            .build()
+            .unwrap();
+        let source = "Before\n\n\\[\\frac{a}{b}+\\frac{c}{d}\\]\n\nAfter";
+        let markdown = MarkdownContent::new(source, Some(renderer.clone()));
+        let _ = markdown.height(60);
+        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        markdown.invalidate_math_layout();
+
+        let (formula_top, formula_rows, formula_column, height) =
+            markdown.with_rendered(60, |rendered| {
+                let formula = &rendered.formulas[0];
+                (
+                    formula.visual_top,
+                    usize::from(formula.formula.rows()),
+                    formula.column,
+                    rendered.height,
+                )
+            });
+        assert!(formula_rows > 1);
+
+        let full_area = Rect::new(0, 0, 60, saturating_u16(height));
+        let mut full = Buffer::empty(full_area);
+        markdown.render(full_area, &mut full, 0, height, false);
+        let expected = full[(
+            formula_column,
+            saturating_u16(formula_top.saturating_add(1)),
+        )]
+            .symbol()
+            .to_owned();
+
+        let clipped_area = Rect::new(0, 0, 60, 2);
+        let mut clipped = Buffer::empty(clipped_area);
+        markdown.render(
+            clipped_area,
+            &mut clipped,
+            formula_top.saturating_add(1),
+            height,
+            false,
+        );
+        assert_eq!(clipped[(formula_column, 0)].symbol(), expected);
+        assert!(ratatex::is_formula_placeholder(&expected));
+        renderer.shutdown();
+    }
+
+    #[test]
+    fn formula_only_markdown_reserves_exactly_the_image_rows() {
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let cache = tempfile::tempdir().unwrap();
+        let renderer = Ratatex::builder(TerminalProfile::kitty(PixelSize::new(14, 27), false))
+            .cache_dir(cache.path())
+            .on_update(move || {
+                let _ = wake_tx.try_send(());
+            })
+            .build()
+            .unwrap();
+        let source = r"\[
+\begin{aligned}
+R^\rho{}_{\sigma\mu\nu}
+&=\partial_\mu\Gamma^\rho_{\nu\sigma}
+-\partial_\nu\Gamma^\rho_{\mu\sigma}
++\Gamma^\rho_{\mu\lambda}\Gamma^\lambda_{\nu\sigma}
+-\Gamma^\rho_{\nu\lambda}\Gamma^\lambda_{\mu\sigma},\\
+\Gamma^\rho_{\mu\nu}
+&=\frac12g^{\rho\kappa}
+\left(\partial_\mu g_{\kappa\nu}
++\partial_\nu g_{\kappa\mu}
+-\partial_\kappa g_{\mu\nu}\right),\\
+R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
+&=\frac{8\pi G}{c^4}T_{\mu\nu},
+\qquad
+\nabla_\mu T^{\mu\nu}=0.
+\end{aligned}
+\]";
+        let markdown = MarkdownContent::new(source, Some(renderer.clone()));
+        let _ = markdown.height(54);
+        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        markdown.invalidate_math_layout();
+
+        markdown.with_rendered(54, |rendered| {
+            let formula = &rendered.formulas[0];
+            assert_eq!(
+                rendered.height,
+                formula
+                    .visual_top
+                    .saturating_add(usize::from(formula.formula.rows()))
+                    .saturating_add(1)
+            );
+        });
+        renderer.shutdown();
+    }
+
+    #[test]
     fn markdown_viewport_render_matches_full_paragraph_scrolling() {
         let markdown = MarkdownContent::new(
             "# Heading\n\nA **styled** paragraph with `code`, unicode λ, and a long line that wraps across several visual rows without losing its formatting.\n\n- first\n  - nested\n\n| A | B |\n| - | - |\n| one | two |",
+            None,
         );
         for width in [20, 43] {
             let height = markdown.height(width);
@@ -2628,7 +3172,7 @@ mod tests {
     #[test]
     fn long_styled_markdown_line_uses_parity_checked_cached_rows() {
         let source = format!("**{}**", "styled λ text ".repeat(600));
-        let markdown = MarkdownContent::new(&source);
+        let markdown = MarkdownContent::new(&source, None);
         let width = 20;
         let height = markdown.height(width);
         assert!(height > 256);
@@ -2660,11 +3204,11 @@ mod tests {
             ("plain", "\n\n# heading"),
         ] {
             for width in [20, 80] {
-                let mut incremental = MarkdownContent::streaming(source);
+                let mut incremental = MarkdownContent::streaming(source, None);
                 let _ = incremental.height(width);
                 incremental.append(delta);
 
-                let fresh = MarkdownContent::streaming(&format!("{source}{delta}"));
+                let fresh = MarkdownContent::streaming(&format!("{source}{delta}"), None);
                 assert_eq!(
                     incremental.materialized_text(width),
                     fresh.materialized_text(width),
@@ -2685,11 +3229,11 @@ mod tests {
             ("plain", "\n\nnext paragraph"),
         ] {
             for width in [20, 80] {
-                let mut incremental = MarkdownContent::reasoning(source);
+                let mut incremental = MarkdownContent::reasoning(source, None);
                 let _ = incremental.height(width);
                 incremental.append_reasoning(delta);
 
-                let fresh = MarkdownContent::reasoning(&format!("{source}{delta}"));
+                let fresh = MarkdownContent::reasoning(&format!("{source}{delta}"), None);
                 assert_eq!(
                     incremental.materialized_text(width),
                     fresh.materialized_text(width),

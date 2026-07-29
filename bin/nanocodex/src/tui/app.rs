@@ -16,6 +16,7 @@ use nanocodex::{
         rollout::RolloutTranscriptItem,
     },
 };
+use ratatex::Ratatex;
 use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
@@ -1248,6 +1249,32 @@ impl App {
         self
     }
 
+    pub(super) fn set_math_renderer(&mut self, renderer: Ratatex) {
+        self.main.transcript.set_math_renderer(renderer.clone());
+        for branch in &mut self.main_branches {
+            branch
+                .conversation
+                .transcript
+                .set_math_renderer(renderer.clone());
+        }
+        if let Some(btw) = &mut self.btw {
+            btw.conversation.transcript.set_math_renderer(renderer);
+        }
+    }
+
+    pub(super) fn invalidate_math_layouts(&mut self) {
+        self.main.note_tail_will_change();
+        self.main.transcript.invalidate_math_layouts();
+        for branch in &mut self.main_branches {
+            branch.conversation.note_tail_will_change();
+            branch.conversation.transcript.invalidate_math_layouts();
+        }
+        if let Some(btw) = &mut self.btw {
+            btw.conversation.note_tail_will_change();
+            btw.conversation.transcript.invalidate_math_layouts();
+        }
+    }
+
     pub(super) fn insert_char(&mut self, character: char) {
         self.prepare_composer_edit();
         self.snap_cursor_out_of_pending_paste();
@@ -2033,10 +2060,14 @@ impl App {
     pub(super) fn begin_btw(&mut self) -> u64 {
         let id = self.next_btw_id;
         self.next_btw_id = self.next_btw_id.saturating_add(1);
+        let mut conversation = Conversation::new("Forking latest checkpoint");
+        if let Some(renderer) = self.main.transcript.math_renderer() {
+            conversation.transcript.set_math_renderer(renderer);
+        }
         self.btw = Some(BtwPane {
             id,
             request_id: None,
-            conversation: Conversation::new("Forking latest checkpoint"),
+            conversation,
         });
         if !self.tool_details_expanded
             && let Some(btw) = &mut self.btw
@@ -3159,7 +3190,7 @@ fn bounded_multiline_text(value: &str, max_chars: usize, max_lines: usize) -> St
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::Arc,
+        sync::{Arc, mpsc},
         time::{Duration, Instant},
     };
 
@@ -3168,6 +3199,7 @@ mod tests {
         input::{PromptInput, UserInput},
         rollout::RolloutTranscriptItem,
     };
+    use ratatex::{PixelSize, Ratatex, TerminalProfile};
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
     use serde_json::{Value, json};
 
@@ -3601,6 +3633,52 @@ mod tests {
         assert!(app.main.scroll_from_bottom > old_offset);
         assert!(app.main.has_unseen_output);
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn completed_math_relayout_preserves_a_scrolled_view() {
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let cache = tempfile::tempdir().unwrap();
+        let renderer = Ratatex::builder(TerminalProfile::kitty(PixelSize::new(10, 20), false))
+            .cache_dir(cache.path())
+            .on_update(move || {
+                let _ = wake_tx.try_send(());
+            })
+            .build()
+            .unwrap();
+        let mut app = App::new(".".into());
+        app.set_math_renderer(renderer.clone());
+        app.main.settle_viewport(40, 6);
+        for index in 0..8 {
+            app.main
+                .push_output(TranscriptItem::User(format!("earlier message {index}")));
+        }
+        app.main
+            .push_assistant_delta("formula incoming\n\n\\[\n\\frac{a}{b}+\\frac{c}{d}");
+        app.main.settle_viewport(40, 6);
+        app.main.scroll_from_bottom = 5;
+        app.main.smooth_scroll_from_bottom = 0;
+
+        let area = Rect::new(0, 0, 40, 6);
+        let mut before = Buffer::empty(area);
+        app.main
+            .transcript
+            .widget(app.main.scroll_from_bottom, None, None, "empty")
+            .render(area, &mut before);
+        let old_offset = app.main.scroll_from_bottom;
+
+        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        app.invalidate_math_layouts();
+        app.main.settle_viewport(40, 6);
+
+        let mut after = Buffer::empty(area);
+        app.main
+            .transcript
+            .widget(app.main.scroll_from_bottom, None, None, "empty")
+            .render(area, &mut after);
+        assert!(app.main.scroll_from_bottom > old_offset);
+        assert_eq!(after, before);
+        renderer.shutdown();
     }
 
     #[test]
