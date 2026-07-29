@@ -17,7 +17,7 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use crossterm::event::{
@@ -42,7 +42,7 @@ use tracing::{Instrument, info_span};
 use self::{
     app::{App, EscapeAction, PaneId, ReasoningPickerAction, SubmittedPrompt},
     notification::Notifier,
-    scheduler::{RenderScheduler, RenderScope, STREAM_FRAME_INTERVAL},
+    scheduler::{ANIMATION_TICK_INTERVAL, RenderScheduler, RenderScope, STREAM_FRAME_INTERVAL},
     telemetry::{StreamTelemetry, ViewTelemetry},
     terminal::TerminalSession,
     transcript::TranscriptItem,
@@ -786,7 +786,7 @@ fn worker_event_received(
 }
 
 fn ui_ticker() -> tokio::time::Interval {
-    let mut ticker = interval(Duration::from_millis(80));
+    let mut ticker = interval(ANIMATION_TICK_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker
 }

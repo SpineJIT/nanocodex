@@ -1,13 +1,21 @@
 use criterion::{criterion_group, criterion_main};
 
 mod tui {
-    use std::{cell::Cell, fmt::Write as _, hint::black_box, rc::Rc, sync::Arc, time::Instant};
+    use std::{
+        cell::Cell,
+        fmt::Write as _,
+        hint::black_box,
+        rc::Rc,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
     use nanocodex::agent::events::{AgentEvent, AgentEventKind, AgentEventTiming, TimedAgentEvent};
     use ratatui::{
         Terminal, TerminalOptions, Viewport,
         backend::{CrosstermBackend, TestBackend},
+        buffer::Buffer,
         layout::Rect,
     };
 
@@ -45,6 +53,11 @@ mod tui {
     }
 
     #[allow(dead_code, unused_imports)]
+    mod scheduler {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tui/scheduler.rs"));
+    }
+
+    #[allow(dead_code, unused_imports)]
     mod view {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tui/view.rs"));
     }
@@ -60,8 +73,9 @@ mod tui {
     }
 
     use app::App;
+    use scheduler::{ANIMATION_TICK_INTERVAL, STREAM_FRAME_INTERVAL};
     use telemetry::StreamTelemetry;
-    use terminal::{ByteCountingWriter, DrawMetrics, MeasuredBackend};
+    use terminal::{ByteCountingWriter, DrawMetrics, MeasuredBackend, seed_from_cached_frame};
     use transcript::{ToolStatus, Transcript, TranscriptItem};
 
     #[derive(Clone, Copy)]
@@ -237,10 +251,7 @@ mod tui {
             inner: Vec::new(),
             bytes: Rc::clone(&output_bytes),
         };
-        let backend = MeasuredBackend {
-            inner: CrosstermBackend::new(writer),
-            changed_cells: 0,
-        };
+        let backend = MeasuredBackend::new(CrosstermBackend::new(writer));
         let terminal = Terminal::with_options(
             backend,
             TerminalOptions {
@@ -335,6 +346,220 @@ mod tui {
                 }
             }
         }
+        group.finish();
+    }
+
+    type RedrawTerminal = Terminal<MeasuredBackend<TestBackend>>;
+
+    #[derive(Clone, Copy)]
+    enum RedrawCacheKind {
+        None,
+        LegacySnapshot,
+        Diff,
+    }
+
+    impl RedrawCacheKind {
+        const ALL: [Self; 3] = [Self::None, Self::LegacySnapshot, Self::Diff];
+
+        const fn full_name(self) -> &'static str {
+            match self {
+                Self::None => "full_without_snapshot",
+                Self::LegacySnapshot => "full_with_legacy_snapshot",
+                Self::Diff => "full_with_diff_cache",
+            }
+        }
+
+        const fn animation_name(self) -> &'static str {
+            match self {
+                Self::None => "animation_with_full_render",
+                Self::LegacySnapshot => "animation_with_legacy_snapshot",
+                Self::Diff => "animation_with_diff_cache",
+            }
+        }
+    }
+
+    struct RedrawHarness {
+        app: App,
+        terminal: RedrawTerminal,
+        cache_kind: RedrawCacheKind,
+        legacy_snapshot: Option<Buffer>,
+    }
+
+    impl RedrawHarness {
+        fn new(shape: TraceShape, width: u16, height: u16, cache_kind: RedrawCacheKind) -> Self {
+            let mut app = trace_app(shape);
+            app.main.running = true;
+            let test_backend = TestBackend::new(width, height);
+            let backend = match cache_kind {
+                RedrawCacheKind::Diff => MeasuredBackend::with_frame_cache(test_backend),
+                RedrawCacheKind::None | RedrawCacheKind::LegacySnapshot => {
+                    MeasuredBackend::new(test_backend)
+                }
+            };
+            let mut terminal =
+                Terminal::new(backend).expect("redraw benchmark terminal should initialize");
+            let legacy_snapshot = {
+                let completed = terminal
+                    .draw(|frame| view::render(frame, &mut app))
+                    .expect("initial redraw benchmark frame should render");
+                matches!(cache_kind, RedrawCacheKind::LegacySnapshot)
+                    .then(|| completed.buffer.clone())
+            };
+            Self {
+                app,
+                terminal,
+                cache_kind,
+                legacy_snapshot,
+            }
+        }
+
+        fn draw_full(&mut self) {
+            // Invalidate the streaming tail's layout without growing the
+            // fixture, and advance one visible cell to exercise the diff.
+            self.app.on_tick();
+            assert!(self.app.main.transcript.append_assistant_delta(""));
+            let next_snapshot = {
+                let completed = self
+                    .terminal
+                    .draw(|frame| view::render(frame, &mut self.app))
+                    .expect("full redraw benchmark frame should render");
+                matches!(self.cache_kind, RedrawCacheKind::LegacySnapshot)
+                    .then(|| completed.buffer.clone())
+            };
+            if let Some(snapshot) = next_snapshot {
+                self.legacy_snapshot = Some(snapshot);
+            }
+            black_box(&self.legacy_snapshot);
+        }
+
+        fn draw_animation(&mut self) {
+            self.app.on_tick();
+            match self.cache_kind {
+                RedrawCacheKind::None => {
+                    self.terminal
+                        .draw(|frame| view::render(frame, &mut self.app))
+                        .expect("full animation benchmark frame should render");
+                }
+                RedrawCacheKind::LegacySnapshot => {
+                    let cached = self
+                        .legacy_snapshot
+                        .as_ref()
+                        .expect("legacy redraw benchmark should have a snapshot");
+                    self.terminal.current_buffer_mut().clone_from(cached);
+                    let next_snapshot = self
+                        .terminal
+                        .draw(|frame| view::render_animation(frame, &mut self.app))
+                        .expect("legacy animation benchmark frame should render")
+                        .buffer
+                        .clone();
+                    self.legacy_snapshot = Some(next_snapshot);
+                }
+                RedrawCacheKind::Diff => {
+                    assert!(seed_from_cached_frame(&mut self.terminal));
+                    self.terminal
+                        .draw(|frame| view::render_animation(frame, &mut self.app))
+                        .expect("diff-cached animation benchmark frame should render");
+                }
+            }
+            black_box(&self.legacy_snapshot);
+        }
+    }
+
+    pub(super) fn redraw_scope_benchmark(criterion: &mut Criterion) {
+        let mut group = criterion.benchmark_group("tui_redraw_scope");
+        for shape in TRACE_SHAPES {
+            for (width, height) in TERMINAL_SIZES {
+                for cache_kind in RedrawCacheKind::ALL {
+                    let mut harness = RedrawHarness::new(shape, width, height, cache_kind);
+                    group.bench_function(
+                        BenchmarkId::new(
+                            shape.name,
+                            format!("{}/{width}x{height}", cache_kind.full_name()),
+                        ),
+                        |bencher| bencher.iter(|| harness.draw_full()),
+                    );
+                }
+
+                for cache_kind in RedrawCacheKind::ALL {
+                    let mut harness = RedrawHarness::new(shape, width, height, cache_kind);
+                    group.bench_function(
+                        BenchmarkId::new(
+                            shape.name,
+                            format!("{}/{width}x{height}", cache_kind.animation_name()),
+                        ),
+                        |bencher| bencher.iter(|| harness.draw_animation()),
+                    );
+                }
+            }
+        }
+        group.finish();
+    }
+
+    pub(super) fn streaming_frame_budget_benchmark(criterion: &mut Criterion) {
+        const LEGACY_FRAMES: u64 = 120;
+
+        let mut group = criterion.benchmark_group("tui_streaming_frame_budget");
+        group.sample_size(10);
+        group.throughput(Throughput::Elements(LEGACY_FRAMES));
+
+        let shape = TRACE_SHAPES[0];
+        for cache_kind in RedrawCacheKind::ALL {
+            let mut harness = RedrawHarness::new(shape, 120, 40, cache_kind);
+            group.bench_function(
+                format!("codex_long/{}/120_frames_120x40", cache_kind.full_name()),
+                |bencher| {
+                    bencher.iter(|| {
+                        for _ in 0..LEGACY_FRAMES {
+                            harness.draw_full();
+                        }
+                    });
+                },
+            );
+        }
+
+        let scheduled_frames = u64::try_from(
+            Duration::from_secs(1)
+                .as_nanos()
+                .div_ceil(STREAM_FRAME_INTERVAL.as_nanos()),
+        )
+        .expect("scheduled frame count should fit in u64");
+        group.throughput(Throughput::Elements(scheduled_frames));
+        let mut harness = RedrawHarness::new(shape, 120, 40, RedrawCacheKind::Diff);
+        group.bench_function(
+            format!(
+                "codex_long/{}/{scheduled_frames}_scheduled_frames_120x40",
+                RedrawCacheKind::Diff.full_name()
+            ),
+            |bencher| {
+                bencher.iter(|| {
+                    for _ in 0..scheduled_frames {
+                        harness.draw_full();
+                    }
+                });
+            },
+        );
+
+        let animation_frames = u64::try_from(
+            Duration::from_secs(1)
+                .as_nanos()
+                .div_ceil(ANIMATION_TICK_INTERVAL.as_nanos()),
+        )
+        .expect("animation frame count should fit in u64");
+        group.throughput(Throughput::Elements(animation_frames));
+        let mut harness = RedrawHarness::new(shape, 120, 40, RedrawCacheKind::Diff);
+        group.bench_function(
+            format!(
+                "codex_long/{}/{animation_frames}_scheduled_animation_frames_120x40",
+                RedrawCacheKind::Diff.animation_name()
+            ),
+            |bencher| {
+                bencher.iter(|| {
+                    for _ in 0..animation_frames {
+                        harness.draw_animation();
+                    }
+                });
+            },
+        );
         group.finish();
     }
 
@@ -1631,6 +1856,8 @@ mod tui {
 criterion_group!(
     benches,
     tui::render_benchmarks,
+    tui::redraw_scope_benchmark,
+    tui::streaming_frame_budget_benchmark,
     tui::resize_benchmarks,
     tui::transcript_update_benchmark,
     tui::live_tail_render_benchmark,

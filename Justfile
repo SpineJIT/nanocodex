@@ -155,6 +155,7 @@ bench-stream:
     cargo bench -p nanocodex-bin --bench tui_render -- tui_stream_telemetry
     cargo bench -p nanocodex-bin --bench tui_render -- tui_transcript_delta
     cargo bench -p nanocodex-bin --bench tui_render -- tui_trace_render
+    cargo bench -p nanocodex-bin --bench tui_render -- '^(tui_redraw_scope|tui_streaming_frame_budget)'
 
 # Rebuild every PR #50 hot-path estimate, then enforce the checked-in median
 # latency thresholds. TUI frame-count, changed-cell, and output-byte limits are

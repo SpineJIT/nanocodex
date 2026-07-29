@@ -1,8 +1,11 @@
 use std::time::{Duration, Instant};
 
-/// Maximum demand-driven redraw rate. Fast terminals can present at 120 Hz,
-/// while Ratatui's buffer diff keeps unchanged cells off the wire.
-pub(super) const STREAM_FRAME_INTERVAL: Duration = Duration::from_nanos(8_333_334);
+pub(super) const ANIMATION_TICK_INTERVAL: Duration = Duration::from_millis(80);
+
+/// Maximum demand-driven redraw rate. Thirty frames per second keeps streamed
+/// terminal text responsive while bounding repeated full-frame layout work.
+/// Input and resize redraws bypass this limit.
+pub(super) const STREAM_FRAME_INTERVAL: Duration = Duration::from_nanos(33_333_334);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum RenderScope {
@@ -88,6 +91,24 @@ mod tests {
     use super::{RenderScheduler, RenderScope, STREAM_FRAME_INTERVAL};
 
     const FRAME: Duration = STREAM_FRAME_INTERVAL;
+
+    #[test]
+    fn streaming_frame_budget_is_thirty_per_second() {
+        assert_eq!(
+            Duration::from_secs(1).as_nanos().div_ceil(FRAME.as_nanos()),
+            30
+        );
+    }
+
+    #[test]
+    fn animation_tick_budget_is_thirteen_per_second() {
+        assert_eq!(
+            Duration::from_secs(1)
+                .as_nanos()
+                .div_ceil(super::ANIMATION_TICK_INTERVAL.as_nanos()),
+            13
+        );
+    }
 
     #[test]
     fn initial_frame_is_due_immediately() {

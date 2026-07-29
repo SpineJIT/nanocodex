@@ -142,8 +142,9 @@ Unknown slash-prefixed input is sent to the model as an ordinary prompt.
 ### Scheduling
 
 - Rendering is demand-driven rather than a permanent full-speed loop.
-- Streaming events are coalesced behind an approximately 120 Hz maximum frame
-  rate (`8.333334 ms`).
+- Streaming events are coalesced behind an approximately 30 Hz maximum frame
+  rate (`33.333334 ms`). This bounds saturated full-layout CPU work while input
+  and resize redraws remain immediate.
 - Input and resize request an immediate frame and preempt a pending streaming
   deadline.
 - The retained Codex workload's densest 33 ms bucket contained 590
@@ -277,7 +278,18 @@ cargo bench -p nanocodex-bin --bench tui_render
 Use `just bench-stream` for the focused cross-layer gate. It also measures the
 timed agent-event envelope in `nanocodex-oai-api` and the TUI timing aggregator,
 so UI improvements are not credited for delays introduced before Ratatui
-receives an event or for unmeasured instrumentation overhead.
+receives an event or for unmeasured instrumentation overhead. The redraw-scope
+group retains the PR #64 whole-frame snapshot as a regression comparator, while
+the frame-budget group measures both the former 120-frame ceiling and the
+current scheduler's one-second CPU-work budget.
+
+On the 2026-07-29 `codex_long` `120x40` gate, one saturated second of the former
+120-frame path required 265.91 ms in the unoptimized profile. PR #64's complete
+frame snapshots required 282.87 ms. The 30-frame diff-maintained path required
+65.89 ms, a render-duty proxy of 6.6% of one core; its optimized-profile result
+was 6.62 ms. A waiting turn's 13 scoped animation frames required 15.56 ms
+unoptimized and 1.61 ms optimized. Input and resize latency are excluded because
+those redraws intentionally remain immediate.
 
 Every performance slice should select applicable gates before implementation:
 
