@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use ratatex::is_formula_placeholder;
 use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
@@ -76,6 +77,8 @@ pub(super) struct ScreenSelection {
     copied_before: Vec<String>,
     copied_after: Vec<String>,
     pending_click: Option<SelectionClick>,
+    formula_cells: Vec<Position>,
+    anchor_was_formula: bool,
 }
 
 impl ScreenSelection {
@@ -84,6 +87,7 @@ impl ScreenSelection {
     }
 
     fn begin_at(&mut self, position: Position, now: Instant) -> bool {
+        let anchor_was_formula = self.formula_cells.contains(&position);
         self.pending_copy = None;
         self.copy_after_render = false;
         self.highlight_mode = HighlightMode::Selection;
@@ -94,6 +98,7 @@ impl ScreenSelection {
         self.copied_before.clear();
         self.copied_after.clear();
         self.pending_click = None;
+        self.anchor_was_formula = anchor_was_formula;
         if !self.is_selectable(position) {
             return self.clear();
         }
@@ -164,6 +169,11 @@ impl ScreenSelection {
             });
         }
         if self.anchor == self.head && self.mode == SelectionMode::Character {
+            if self.anchor_was_formula {
+                self.completed_click = None;
+                self.click_count = 0;
+                return true;
+            }
             if let (Some(surface_index), Some(surface)) = (self.surface_index, self.surface) {
                 self.pending_click = Some(SelectionClick {
                     surface_index,
@@ -204,6 +214,7 @@ impl ScreenSelection {
         self.scroll_snapshot = None;
         self.copied_before.clear();
         self.copied_after.clear();
+        self.anchor_was_formula = false;
         changed
     }
 
@@ -231,6 +242,20 @@ impl ScreenSelection {
         self.selectable_area_count = selectable_areas.len().min(self.selectable_areas.len());
         self.selectable_areas[..self.selectable_area_count]
             .copy_from_slice(&selectable_areas[..self.selectable_area_count]);
+        self.formula_cells.clear();
+        for area in &self.selectable_areas[..self.selectable_area_count] {
+            let left = area.x.max(buffer.area.x);
+            let right = area.right().min(buffer.area.right());
+            let top = area.y.max(buffer.area.y);
+            let bottom = area.bottom().min(buffer.area.bottom());
+            for y in top..bottom {
+                for x in left..right {
+                    if is_formula_placeholder(buffer[(x, y)].symbol()) {
+                        self.formula_cells.push(Position::new(x, y));
+                    }
+                }
+            }
+        }
         let Some((raw_start, raw_end)) = self.ordered() else {
             return;
         };
@@ -839,6 +864,22 @@ mod tests {
         assert_eq!(click.surface_index, 0);
         assert_eq!(click.surface, area);
         assert_eq!(click.position, (7, 5).into());
+    }
+
+    #[test]
+    fn clicking_a_formula_placeholder_pins_selection_for_the_source_redraw() {
+        let area = Rect::new(0, 0, 12, 2);
+        let mut buffer = Buffer::empty(area);
+        buffer[(2, 1)].set_symbol("\u{10eeee}\u{0305}\u{0305}");
+        let mut selection = ScreenSelection::default();
+        selection.render(&mut buffer, &[area]);
+
+        assert!(selection.begin((2, 1).into()));
+        assert!(selection.finish((2, 1).into()));
+
+        assert!(selection.is_active());
+        assert!(selection.take_pending_click().is_none());
+        assert!(selection.take_pending_copy().is_none());
     }
 
     #[test]

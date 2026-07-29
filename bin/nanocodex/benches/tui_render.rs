@@ -12,6 +12,7 @@ mod tui {
 
     use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
     use nanocodex::agent::events::{AgentEvent, AgentEventKind, AgentEventTiming, TimedAgentEvent};
+    use ratatex::{PixelSize, Ratatex, TerminalProfile};
     use ratatui::{
         Terminal, TerminalOptions, Viewport,
         backend::{CrosstermBackend, TestBackend},
@@ -1421,6 +1422,25 @@ mod tui {
         criterion.bench_function("tui_markdown/image_placeholder_100k", |bencher| {
             bencher.iter(|| markdown::render_agent_markdown(black_box(&image), 120));
         });
+
+        let display_math = (0..32)
+            .map(|index| {
+                format!(
+                    "Result {index}\n\n$$\\sum_{{k=0}}^n k^2 = \
+                     \\frac{{n(n+1)(2n+1)}}{{6}}$$"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let renderer = Ratatex::builder(TerminalProfile::unsupported(PixelSize::new(10, 20)))
+            .build()
+            .expect("display-math benchmark renderer should initialize");
+        criterion.bench_function("tui_markdown/display_math_fallback_32/120", |bencher| {
+            bencher.iter(|| {
+                markdown::render_agent_markdown_with_math(black_box(&display_math), 120, &renderer)
+            });
+        });
+        renderer.shutdown();
 
         let oversized_rust_line = format!("let value = \"{}\";", "x".repeat(1024 * 1024));
         criterion.bench_function(

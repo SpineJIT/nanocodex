@@ -17,7 +17,7 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crossterm::event::{
@@ -33,6 +33,7 @@ use nanocodex::{
     },
     tools::mcp::McpHandle,
 };
+use ratatex::{Ratatex, TerminalProfile};
 use tokio::{
     sync::mpsc,
     time::{MissedTickBehavior, interval, sleep_until},
@@ -300,6 +301,7 @@ enum RedrawPriority {
 enum UiUpdate {
     Redraw(RedrawPriority),
     RedrawAnimation,
+    RestoreTerminalGraphics,
     Ignore,
     Quit,
     ExternalEditor,
@@ -411,8 +413,10 @@ impl UiModel {
                         self.pending_notification = None;
                         // tmux can resize this pane before returning focus to it. The resize
                         // frame may be presented while tmux is still repainting its layout, so
-                        // redraw once more after focus has settled on this pane.
-                        return Ok(UiUpdate::Redraw(RedrawPriority::Immediate));
+                        // redraw once more after focus has settled on this pane. Graphics
+                        // passthrough emitted while a tmux window is invisible is discarded, so
+                        // the caller must also restore Ratatex's terminal-side image state.
+                        return Ok(UiUpdate::RestoreTerminalGraphics);
                     }
                     Event::FocusLost => {
                         self.terminal_focused = false;
@@ -543,9 +547,25 @@ pub(crate) async fn run(
     );
 
     let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
+    let terminal_profile = TerminalProfile::query(Duration::from_millis(750));
+    let (math_update_tx, mut math_update_rx) = mpsc::channel(1);
+    let math_renderer = Ratatex::builder(terminal_profile)
+        .on_update(move || {
+            let _ = math_update_tx.try_send(());
+        })
+        .build()
+        .wrap_err("failed to initialize the display-math renderer")?;
+    let availability = math_renderer.availability();
+    tracing::debug!(
+        graphics = availability.graphics,
+        cell_width = terminal_profile.cell.width,
+        cell_height = terminal_profile.cell.height,
+        "initialized Ratatex"
+    );
     let mut input_events = EventStream::new();
     let mut ticker = ui_ticker();
     let mut app = App::new(cwd).with_thinking(initial_thinking);
+    app.set_math_renderer(math_renderer.clone());
     app.restore_transcript(restored_transcript);
     let mut ui = UiModel::new(app, Arc::clone(&root_session_id));
     let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
@@ -564,6 +584,7 @@ pub(crate) async fn run(
                 &mut scheduler,
                 &mut stream_telemetry,
                 &mut notifier,
+                &math_renderer,
             )?;
 
             let render_deadline = scheduler.deadline();
@@ -578,8 +599,13 @@ pub(crate) async fn run(
                     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "terminal input closed")
                 })?;
                 let update = ui.update(UiAction::Terminal(event), &worker_tx)?;
-                if update == UiUpdate::ExternalEditor {
+                if update == UiUpdate::RestoreTerminalGraphics {
+                    math_renderer.reupload_all();
+                    ui.app.invalidate_math_layouts();
+                } else if update == UiUpdate::ExternalEditor {
                     input_events = run_external_editor(input_events, &mut terminal, &mut ui.app).await?;
+                    math_renderer.reupload_all();
+                    ui.app.invalidate_math_layouts();
                     scheduler.request_immediate(Instant::now());
                 } else if apply_update(update, &mut scheduler) {
                     break Ok(());
@@ -625,6 +651,10 @@ pub(crate) async fn run(
                     break Ok(());
                 }
             }
+            _ = math_update_rx.recv() => {
+                ui.app.invalidate_math_layouts();
+                scheduler.request_immediate(Instant::now());
+            }
             }
         }
     }
@@ -632,6 +662,7 @@ pub(crate) async fn run(
 
     // Restore the terminal before disconnecting the paid WebSocket session.
     drop((terminal, worker_tx, agent_events));
+    math_renderer.shutdown();
     let shutdown_result = shutdown_runtime(worker, child_agents, mpp_adapter, vm).await;
     loop_result?;
     shutdown_result
@@ -728,6 +759,7 @@ fn render_due_frame(
     scheduler: &mut RenderScheduler,
     stream_telemetry: &mut StreamTelemetry,
     notifier: &mut Notifier,
+    math_renderer: &Ratatex,
 ) -> Result<()> {
     if !scheduler.is_due(Instant::now()) {
         return Ok(());
@@ -735,7 +767,8 @@ fn render_due_frame(
     ui.apply_pending_mouse_scroll();
     ui.app.advance_smooth_scroll();
     let render_started = Instant::now();
-    let draw_metrics = match scheduler.scope().unwrap_or(RenderScope::Full) {
+    let math_output_bytes = flush_math_commands(terminal, math_renderer)?;
+    let mut draw_metrics = match scheduler.scope().unwrap_or(RenderScope::Full) {
         RenderScope::Full => terminal.draw(|frame| view::render(frame, &mut ui.app))?,
         RenderScope::Animation => terminal.draw_reusing_last_frame(|frame, reused| {
             if reused {
@@ -745,6 +778,7 @@ fn render_due_frame(
             }
         })?,
     };
+    draw_metrics.output_bytes = draw_metrics.output_bytes.saturating_add(math_output_bytes);
     if let Some(text) = ui.app.take_pending_copy() {
         match clipboard::copy_to_clipboard(&text) {
             Ok(()) => {
@@ -768,6 +802,16 @@ fn render_due_frame(
         scheduler.request_streaming(presented_at);
     }
     Ok(())
+}
+
+fn flush_math_commands(terminal: &mut TerminalSession, math_renderer: &Ratatex) -> Result<u64> {
+    let mut output_bytes = 0_u64;
+    for command in math_renderer.drain_terminal_commands() {
+        terminal.write_control_sequence(command.as_bytes())?;
+        output_bytes =
+            output_bytes.saturating_add(u64::try_from(command.len()).unwrap_or(u64::MAX));
+    }
+    Ok(output_bytes)
 }
 
 fn worker_event_received(
@@ -823,6 +867,7 @@ fn apply_update(update: UiUpdate, scheduler: &mut RenderScheduler) -> bool {
     let now = Instant::now();
     match update {
         UiUpdate::Redraw(RedrawPriority::Immediate) => scheduler.request_immediate(now),
+        UiUpdate::RestoreTerminalGraphics => scheduler.request_immediate(now),
         UiUpdate::Redraw(RedrawPriority::Streaming) => scheduler.request_streaming(now),
         UiUpdate::Redraw(RedrawPriority::InputBurst) => scheduler.request_input_burst(now),
         UiUpdate::RedrawAnimation => scheduler.request_animation(now),
@@ -3002,7 +3047,7 @@ mod tests {
         assert_eq!(
             ui.update(UiAction::Terminal(Event::FocusGained), &commands)
                 .unwrap(),
-            UiUpdate::Redraw(RedrawPriority::Immediate)
+            UiUpdate::RestoreTerminalGraphics
         );
         assert!(ui.pending_notification.is_none());
         assert_eq!(ui.app.input, "unfinished draft");

@@ -53,6 +53,7 @@ pulldown-cmark.workspace = true
 mpp = { workspace = true, optional = true, features = ["client", "tempo", "reqwest-rustls-tls"] }
 rand = { workspace = true, optional = true }
 ratatui.workspace = true
+ratatex.workspace = true
 reqwest = { workspace = true, features = ["blocking", "stream"] }
 self-replace.workspace = true
 semver.workspace = true
