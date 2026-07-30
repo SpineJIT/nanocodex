@@ -36,8 +36,8 @@ use webrtc::{
 };
 
 use super::{
-    CONNECT_TIMEOUT, EVENT_CAPACITY, RealtimeAudio, RealtimeError, RealtimeVoice, Socket,
-    map_websocket_error,
+    CONNECT_TIMEOUT, EVENT_CAPACITY, RealtimeAudio, RealtimeError, RealtimeInitialItem,
+    RealtimeVoice, Socket, map_websocket_error,
 };
 use crate::{OpenAiAuth, OpenAiAuthSnapshot, connector::connect_async};
 
@@ -90,6 +90,7 @@ pub(super) struct ConnectConfig<'a> {
     pub(super) model: &'a str,
     pub(super) voice: RealtimeVoice,
     pub(super) session_id: Option<&'a str>,
+    pub(super) initial_items: &'a [RealtimeInitialItem],
 }
 
 pub(super) async fn connect(config: ConnectConfig<'_>) -> Result<WebRtcConnection, RealtimeError> {
@@ -473,6 +474,23 @@ struct CallSession<'a> {
     instructions: &'a str,
     audio: CallAudio<'a>,
     delegation: CallDelegation,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    initial_items: Vec<CallInitialItem<'a>>,
+}
+
+#[derive(Serialize)]
+struct CallInitialItem<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    role: &'static str,
+    content: [CallInitialText<'a>; 1],
+}
+
+#[derive(Serialize)]
+struct CallInitialText<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
 }
 
 #[derive(Serialize)]
@@ -548,6 +566,18 @@ async fn create_call(
                 },
             },
             delegation: CallDelegation { kind: "client" },
+            initial_items: config
+                .initial_items
+                .iter()
+                .map(|item| CallInitialItem {
+                    kind: "message",
+                    role: item.role.as_str(),
+                    content: [CallInitialText {
+                        kind: item.role.content_type(),
+                        text: &item.text,
+                    }],
+                })
+                .collect(),
         },
     };
     let mut builder = realtime_http_client()
@@ -733,7 +763,10 @@ mod tests {
         OpusEncoder, OpusSampleRate, WEBRTC_INPUT_FRAME_SAMPLES, call_endpoint, call_id,
         create_call, inbound_sample_builder, sideband_endpoint,
     };
-    use crate::{OpenAiAuth, OpenAiAuthMode, OpenAiAuthSnapshot, realtime::RealtimeVoice};
+    use crate::{
+        OpenAiAuth, OpenAiAuthMode, OpenAiAuthSnapshot,
+        realtime::{RealtimeInitialItem, RealtimeTextRole, RealtimeVoice},
+    };
 
     #[test]
     fn derives_chatgpt_call_and_direct_sideband_endpoints() {
@@ -864,6 +897,21 @@ mod tests {
             assert_eq!(body["session"]["model"], "gpt-live-1-boulder-alpha");
             assert_eq!(body["session"]["audio"]["output"]["voice"], "cove");
             assert_eq!(body["session"]["delegation"]["type"], "client");
+            assert_eq!(
+                body["session"]["initial_items"],
+                serde_json::json!([
+                    {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": "Remember this."}],
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Understood."}],
+                    },
+                ])
+            );
             assert!(body["session"].get("type").is_none());
             assert!(body["session"]["audio"].get("input").is_none());
             stream
@@ -876,6 +924,10 @@ mod tests {
 
         let auth_source = OpenAiAuth::api_key("unused");
         let api_base_url = format!("http://{address}/backend-api/codex");
+        let initial_items = [
+            RealtimeInitialItem::new(RealtimeTextRole::Developer, "Remember this."),
+            RealtimeInitialItem::new(RealtimeTextRole::Assistant, "Understood."),
+        ];
         let config = ConnectConfig {
             auth: &auth_source,
             api_base_url: &api_base_url,
@@ -885,6 +937,7 @@ mod tests {
             model: "gpt-live-1-boulder-alpha",
             voice: RealtimeVoice::Cove,
             session_id: Some("session-1"),
+            initial_items: &initial_items,
         };
         let snapshot = OpenAiAuthSnapshot::new(
             OpenAiAuthMode::ChatGpt,

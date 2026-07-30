@@ -25,7 +25,7 @@ mod audio;
 
 pub use nanocodex::oai::realtime::{
     CHATGPT_REALTIME_VOICE, CHATGPT_REALTIME_VOICES, PLATFORM_REALTIME_VOICE,
-    PLATFORM_REALTIME_VOICES, RealtimeVoice,
+    PLATFORM_REALTIME_VOICES, RealtimeInitialItem, RealtimeTextRole, RealtimeVoice,
 };
 
 use audio::VoiceAudio;
@@ -181,6 +181,7 @@ pub struct VoiceSessionBuilder {
     session_id: Option<Arc<str>>,
     attestation_header: Option<Arc<str>>,
     voice: Option<RealtimeVoice>,
+    initial_items: Vec<RealtimeInitialItem>,
     audio: AudioConfig,
 }
 
@@ -195,6 +196,7 @@ impl VoiceSessionBuilder {
             session_id: None,
             attestation_header: None,
             voice: None,
+            initial_items: Vec::new(),
             audio: AudioConfig::default(),
         }
     }
@@ -224,6 +226,21 @@ impl VoiceSessionBuilder {
     #[must_use]
     pub const fn voice(mut self, voice: RealtimeVoice) -> Self {
         self.voice = Some(voice);
+        self
+    }
+
+    /// Replaces the role-bearing text history used to seed ChatGPT voice.
+    #[must_use]
+    pub fn initial_items(mut self, items: impl IntoIterator<Item = RealtimeInitialItem>) -> Self {
+        self.initial_items = items.into_iter().collect();
+        self
+    }
+
+    /// Appends one role-bearing text item to the ChatGPT voice bootstrap.
+    #[must_use]
+    pub fn initial_item(mut self, role: RealtimeTextRole, text: impl Into<String>) -> Self {
+        self.initial_items
+            .push(RealtimeInitialItem::new(role, text));
         self
     }
 
@@ -371,7 +388,11 @@ async fn run_voice(
         OpenAiAuthMode::ChatGpt => CHATGPT_REALTIME_VOICE,
         OpenAiAuthMode::ApiKey => PLATFORM_REALTIME_VOICE,
     });
-    let mut realtime = builder.openai.realtime(builder.instructions).voice(voice);
+    let mut realtime = builder
+        .openai
+        .realtime(builder.instructions)
+        .voice(voice)
+        .initial_items(builder.initial_items);
     if let Some(session_id) = builder.session_id {
         realtime = realtime.session_id(session_id.as_ref());
     }

@@ -23,7 +23,7 @@ use tokio_tungstenite::{
         http::{HeaderValue, header},
     },
 };
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use url::Url;
 
 use crate::{OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, connector::connect_async};
@@ -85,6 +85,9 @@ const AGENT_COMPLETE_ACKNOWLEDGEMENT: &str =
     "Background agent finished. Use the preceding [BACKEND] messages as the result.";
 const BACKEND_TEXT_PREFIX: &str = "[BACKEND] ";
 const CONTEXT_APPEND_MAX_BYTES: usize = 500;
+const INITIAL_ITEMS_MAX_COUNT: usize = 128;
+const INITIAL_ITEMS_MAX_TOKENS: usize = 8_192;
+const APPROX_BYTES_PER_TOKEN: usize = 4;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -188,6 +191,54 @@ impl RealtimeVoice {
                 | Self::Shimmer
                 | Self::Verse
         )
+    }
+}
+
+/// Role of one text item used to seed a Frameless realtime conversation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RealtimeTextRole {
+    /// Developer-provided context or policy.
+    Developer,
+    /// A prior user message.
+    User,
+    /// A prior assistant message.
+    Assistant,
+}
+
+impl RealtimeTextRole {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Developer => "developer",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+
+    const fn content_type(self) -> &'static str {
+        match self {
+            Self::Developer | Self::User => "input_text",
+            Self::Assistant => "output_text",
+        }
+    }
+}
+
+/// One role-bearing text item used to seed a Frameless realtime conversation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealtimeInitialItem {
+    /// Conversation role for the text.
+    pub role: RealtimeTextRole,
+    /// Complete text content for the item.
+    pub text: String,
+}
+
+impl RealtimeInitialItem {
+    /// Creates one initial role-bearing text item.
+    #[must_use]
+    pub fn new(role: RealtimeTextRole, text: impl Into<String>) -> Self {
+        Self {
+            role,
+            text: text.into(),
+        }
     }
 }
 
@@ -519,6 +570,7 @@ pub struct RealtimeSessionBuilder {
     model: String,
     voice: Option<RealtimeVoice>,
     session_id: Option<String>,
+    initial_items: Vec<RealtimeInitialItem>,
 }
 
 impl RealtimeSessionBuilder {
@@ -536,6 +588,7 @@ impl RealtimeSessionBuilder {
             model: model.to_owned(),
             voice: None,
             session_id: None,
+            initial_items: Vec::new(),
         }
     }
 
@@ -567,6 +620,25 @@ impl RealtimeSessionBuilder {
         self
     }
 
+    /// Replaces the role-bearing text history used to seed a Frameless session.
+    ///
+    /// Initial items are supported by ChatGPT-authenticated Frameless sessions
+    /// only. The list may contain at most 128 items and at most 8,192 estimated
+    /// tokens per item and in aggregate.
+    #[must_use]
+    pub fn initial_items(mut self, items: impl IntoIterator<Item = RealtimeInitialItem>) -> Self {
+        self.initial_items = items.into_iter().collect();
+        self
+    }
+
+    /// Appends one role-bearing text item to the Frameless session bootstrap.
+    #[must_use]
+    pub fn initial_item(mut self, role: RealtimeTextRole, text: impl Into<String>) -> Self {
+        self.initial_items
+            .push(RealtimeInitialItem::new(role, text));
+        self
+    }
+
     /// Supplies a host-generated `x-oai-attestation` value for ChatGPT calls.
     ///
     /// The value is opaque to Nanocodex and is reused only for the call and its
@@ -594,6 +666,7 @@ impl RealtimeSessionBuilder {
         if self.model.trim().is_empty() {
             return Err(RealtimeError::InvalidModel);
         }
+        validate_initial_items(self.auth.mode(), &self.initial_items)?;
 
         let (socket, protocol, media) = match self.auth.mode() {
             OpenAiAuthMode::ApiKey => {
@@ -655,6 +728,7 @@ impl RealtimeSessionBuilder {
                     model: &self.model,
                     voice,
                     session_id: self.session_id.as_deref(),
+                    initial_items: &self.initial_items,
                 })
                 .await?;
                 (
@@ -676,6 +750,45 @@ impl RealtimeSessionBuilder {
             RealtimeEvents { receiver: event_rx },
         ))
     }
+}
+
+fn validate_initial_items(
+    auth_mode: OpenAiAuthMode,
+    items: &[RealtimeInitialItem],
+) -> Result<(), RealtimeError> {
+    if !items.is_empty() && matches!(auth_mode, OpenAiAuthMode::ApiKey) {
+        return Err(RealtimeError::InvalidInitialItems(
+            "initial items require a ChatGPT-authenticated Frameless session".to_owned(),
+        ));
+    }
+    if items.len() > INITIAL_ITEMS_MAX_COUNT {
+        return Err(RealtimeError::InvalidInitialItems(format!(
+            "must contain no more than {INITIAL_ITEMS_MAX_COUNT} items"
+        )));
+    }
+
+    let mut total_tokens = 0_usize;
+    for item in items {
+        let item_tokens = approx_token_count(&item.text);
+        if item_tokens > INITIAL_ITEMS_MAX_TOKENS {
+            return Err(RealtimeError::InvalidInitialItems(format!(
+                "each item must not exceed {INITIAL_ITEMS_MAX_TOKENS} estimated tokens"
+            )));
+        }
+        total_tokens = total_tokens.saturating_add(item_tokens);
+    }
+    if total_tokens > INITIAL_ITEMS_MAX_TOKENS {
+        return Err(RealtimeError::InvalidInitialItems(format!(
+            "items must not exceed {INITIAL_ITEMS_MAX_TOKENS} estimated tokens in total"
+        )));
+    }
+    Ok(())
+}
+
+const fn approx_token_count(text: &str) -> usize {
+    text.len()
+        .saturating_add(APPROX_BYTES_PER_TOKEN.saturating_sub(1))
+        / APPROX_BYTES_PER_TOKEN
 }
 
 /// Failure from configuring or operating a GPT Realtime session.
@@ -705,6 +818,9 @@ pub enum RealtimeError {
     /// A caller-owned session header was invalid.
     #[error("invalid GPT Realtime session ID: {0}")]
     InvalidSessionId(String),
+    /// Initial text history violated the Frameless bootstrap policy.
+    #[error("invalid GPT Realtime initial items: {0}")]
+    InvalidInitialItems(String),
     /// Connecting exceeded the transport deadline.
     #[error("GPT Realtime connection timed out")]
     ConnectTimeout,
@@ -757,6 +873,12 @@ enum ClientEvent<'a> {
     AudioBufferAppend { audio: String },
     #[serde(rename = "conversation.item.create")]
     ItemCreate { item: ConversationItem<'a> },
+    #[serde(rename = "conversation.item.truncate")]
+    ItemTruncate {
+        item_id: &'a str,
+        content_index: u8,
+        audio_end_ms: u32,
+    },
     #[serde(rename = "response.create")]
     ResponseCreate,
     #[serde(rename = "delegation.context.append")]
@@ -903,7 +1025,10 @@ fn session_update(instructions: &str, voice: RealtimeVoice) -> ClientEvent<'_> {
                     parameters: json!({
                         "type": "object",
                         "properties": {
-                            "prompt": { "type": "string" }
+                            "prompt": {
+                                "type": "string",
+                                "description": "The user request to delegate to the background agent."
+                            }
                         },
                         "required": ["prompt"],
                         "additionalProperties": false
@@ -935,6 +1060,7 @@ async fn run_socket(
     let media_input = media.as_ref().map(webrtc::WebRtcMedia::input);
     let mut active_transcript = ActiveTranscript::default();
     let mut response_create = ResponseCreateQueue::default();
+    let mut output_audio = None;
     loop {
         tokio::select! {
             command = commands.recv() => {
@@ -969,6 +1095,7 @@ async fn run_socket(
                     protocol,
                     &mut active_transcript,
                     &mut response_create,
+                    &mut output_audio,
                 ).await {
                     Ok(true) => break,
                     Ok(false) => {}
@@ -1192,6 +1319,7 @@ async fn handle_server_message(
     protocol: RealtimeProtocol,
     active_transcript: &mut ActiveTranscript,
     response_create: &mut ResponseCreateQueue,
+    output_audio: &mut Option<OutputAudioState>,
 ) -> Result<bool, RealtimeError> {
     let Some(message) = message else {
         return Ok(true);
@@ -1199,7 +1327,12 @@ async fn handle_server_message(
     match message.map_err(map_websocket_error)? {
         Message::Text(payload) => {
             trace!(target: "nanocodex_oai_api::realtime::wire", payload = %payload, "GPT Realtime event");
-            if let Some(mut event) = parse_event(&payload, protocol)? {
+            let value: Value = serde_json::from_str(&payload)
+                .map_err(|error| RealtimeError::Message(error.to_string()))?;
+            if let Some(mut event) = parse_event_value(&value, protocol)? {
+                if matches!(protocol, RealtimeProtocol::Direct) {
+                    handle_direct_audio_state(socket, &value, &event, output_audio).await;
+                }
                 active_transcript.update(&mut event);
                 if matches!(protocol, RealtimeProtocol::Direct) {
                     match &event {
@@ -1229,6 +1362,89 @@ async fn handle_server_message(
             "unexpected binary WebSocket frame".to_owned(),
         )),
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct OutputAudioState {
+    item_id: String,
+    audio_end_ms: u32,
+}
+
+async fn handle_direct_audio_state(
+    socket: &mut Socket,
+    value: &Value,
+    event: &RealtimeEvent,
+    output_audio: &mut Option<OutputAudioState>,
+) {
+    match event {
+        RealtimeEvent::Audio(audio) => update_output_audio_state(value, audio, output_audio),
+        RealtimeEvent::SpeechStarted => {
+            let Some(state) = output_audio.take() else {
+                return;
+            };
+            let speech_item_id = value.get("item_id").and_then(Value::as_str);
+            if speech_item_id.is_some_and(|item_id| item_id != state.item_id) {
+                return;
+            }
+            if let Err(error) = send_json(
+                socket,
+                &ClientEvent::ItemTruncate {
+                    item_id: &state.item_id,
+                    content_index: 0,
+                    audio_end_ms: state.audio_end_ms,
+                },
+            )
+            .await
+            {
+                warn!(%error, "failed to truncate interrupted GPT Realtime audio");
+            }
+        }
+        RealtimeEvent::ResponseDone
+        | RealtimeEvent::AgentRequest { .. }
+        | RealtimeEvent::RemainSilent { .. } => *output_audio = None,
+        RealtimeEvent::SessionReady { .. }
+        | RealtimeEvent::InputTranscriptDelta(_)
+        | RealtimeEvent::InputTranscriptDone(_)
+        | RealtimeEvent::OutputTranscriptDelta(_)
+        | RealtimeEvent::OutputTranscriptDone(_)
+        | RealtimeEvent::ResponseStarted
+        | RealtimeEvent::Error(_) => {}
+    }
+}
+
+fn update_output_audio_state(
+    value: &Value,
+    audio: &RealtimeAudio,
+    output_audio: &mut Option<OutputAudioState>,
+) {
+    let Some(item_id) = value.get("item_id").and_then(Value::as_str) else {
+        return;
+    };
+    let samples = value
+        .get("samples_per_channel")
+        .and_then(Value::as_u64)
+        .unwrap_or(audio.samples() as u64);
+    let sample_rate = value
+        .get("sample_rate")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::from(REALTIME_SAMPLE_RATE))
+        .max(1);
+    let audio_end_ms =
+        u32::try_from(samples.saturating_mul(1_000) / sample_rate).unwrap_or(u32::MAX);
+    if audio_end_ms == 0 {
+        return;
+    }
+
+    if let Some(state) = output_audio
+        && state.item_id == item_id
+    {
+        state.audio_end_ms = state.audio_end_ms.saturating_add(audio_end_ms);
+        return;
+    }
+    *output_audio = Some(OutputAudioState {
+        item_id: item_id.to_owned(),
+        audio_end_ms,
+    });
 }
 
 #[derive(Default)]
@@ -1373,19 +1589,27 @@ fn append_handoff_input(entries: &mut Vec<RealtimeTranscriptEntry>, input: &str)
     });
 }
 
+#[cfg(test)]
 fn parse_event(
     payload: &str,
     protocol: RealtimeProtocol,
 ) -> Result<Option<RealtimeEvent>, RealtimeError> {
     let value: Value =
         serde_json::from_str(payload).map_err(|error| RealtimeError::Message(error.to_string()))?;
+    parse_event_value(&value, protocol)
+}
+
+fn parse_event_value(
+    value: &Value,
+    protocol: RealtimeProtocol,
+) -> Result<Option<RealtimeEvent>, RealtimeError> {
     let kind = value
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default();
     let event = match protocol {
-        RealtimeProtocol::Direct => parse_direct_event(&value, kind)?,
-        RealtimeProtocol::Frameless => parse_frameless_event(&value, kind),
+        RealtimeProtocol::Direct => parse_direct_event(value, kind)?,
+        RealtimeProtocol::Frameless => parse_frameless_event(value, kind),
     };
     Ok(event)
 }
@@ -1547,16 +1771,19 @@ fn delegated_prompt(arguments: Option<&str>) -> String {
     let Some(arguments) = arguments else {
         return String::new();
     };
-    serde_json::from_str::<Value>(arguments)
-        .ok()
-        .and_then(|value| {
-            ["prompt", "input_transcript", "input", "text", "query"]
-                .into_iter()
-                .find_map(|key| value.get(key).and_then(Value::as_str).map(str::trim))
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| arguments.to_owned())
+    if let Ok(value) = serde_json::from_str::<Value>(arguments)
+        && let Some(object) = value.as_object()
+    {
+        for key in ["input_transcript", "input", "text", "prompt", "query"] {
+            if let Some(value) = object.get(key).and_then(Value::as_str) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return value.to_owned();
+                }
+            }
+        }
+    }
+    arguments.to_owned()
 }
 
 fn string_field(value: &Value, field: &str) -> Option<String> {
@@ -1601,10 +1828,11 @@ mod tests {
     use super::{
         ActiveTranscript, CHATGPT_REALTIME_MODEL, CHATGPT_REALTIME_VOICE, CHATGPT_REALTIME_VOICES,
         PLATFORM_REALTIME_VOICE, PLATFORM_REALTIME_VOICES, RealtimeAgentSteer, RealtimeAudio,
-        RealtimeEvent, RealtimeProtocol, RealtimeTranscriptEntry, RealtimeVoice,
-        context_append_chunks, delegated_prompt, parse_event, realtime_endpoint, session_update,
+        RealtimeEvent, RealtimeInitialItem, RealtimeProtocol, RealtimeTextRole,
+        RealtimeTranscriptEntry, RealtimeVoice, context_append_chunks, delegated_prompt,
+        parse_event, realtime_endpoint, session_update, validate_initial_items,
     };
-    use crate::OpenAi;
+    use crate::{OpenAi, OpenAiAuthMode};
 
     #[test]
     fn derives_realtime_endpoint_from_api_base() {
@@ -1658,6 +1886,59 @@ mod tests {
         assert_eq!(value["session"]["audio"]["input"]["format"]["rate"], 24_000);
         assert_eq!(value["session"]["audio"]["output"]["voice"], "cove");
         assert_eq!(value["session"]["tools"][0]["name"], "background_agent");
+        assert_eq!(
+            value["session"]["tools"][0]["parameters"]["properties"]["prompt"]["description"],
+            "The user request to delegate to the background agent."
+        );
+    }
+
+    #[test]
+    fn validates_frameless_initial_item_limits() {
+        assert!(
+            validate_initial_items(
+                OpenAiAuthMode::ChatGpt,
+                &[
+                    RealtimeInitialItem::new(RealtimeTextRole::Developer, "policy"),
+                    RealtimeInitialItem::new(RealtimeTextRole::User, "request"),
+                    RealtimeInitialItem::new(RealtimeTextRole::Assistant, "answer"),
+                ],
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_initial_items(
+                OpenAiAuthMode::ApiKey,
+                &[RealtimeInitialItem::new(RealtimeTextRole::User, "request",)],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_initial_items(
+                OpenAiAuthMode::ChatGpt,
+                &vec![RealtimeInitialItem::new(RealtimeTextRole::User, "x"); 129],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_initial_items(
+                OpenAiAuthMode::ChatGpt,
+                &[RealtimeInitialItem::new(
+                    RealtimeTextRole::User,
+                    "x".repeat(32_769),
+                )],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_initial_items(
+                OpenAiAuthMode::ChatGpt,
+                &[
+                    RealtimeInitialItem::new(RealtimeTextRole::User, "x".repeat(16_384)),
+                    RealtimeInitialItem::new(RealtimeTextRole::Assistant, "x".repeat(16_388)),
+                ],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1792,6 +2073,18 @@ mod tests {
         assert_eq!(RealtimeAudio::pcm16_le([0, 1]).unwrap().samples(), 1);
         assert!(RealtimeAudio::pcm16_le([0]).is_err());
         assert_eq!(delegated_prompt(Some("plain request")), "plain request");
+        assert_eq!(
+            delegated_prompt(Some(
+                r#"{"input_transcript":"  ","input":" steer this ","prompt":"wrong"}"#
+            )),
+            "steer this"
+        );
+        assert_eq!(
+            delegated_prompt(Some(
+                r#"{"input_transcript":"spoken request","prompt":"rewritten request"}"#
+            )),
+            "spoken request"
+        );
     }
 
     #[test]
@@ -1801,6 +2094,55 @@ mod tests {
         assert_eq!(chunks.concat(), text);
         assert!(chunks.iter().all(|chunk| chunk.len() <= 500));
         assert_eq!(context_append_chunks(""), [""]);
+    }
+
+    #[tokio::test]
+    async fn truncates_unheard_direct_audio_when_speech_interrupts() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let update = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&update).unwrap()["type"],
+                "session.update"
+            );
+            for _ in 0..2 {
+                socket
+                    .send(Message::Text(
+                        r#"{"type":"response.output_audio.delta","item_id":"message_1","sample_rate":24000,"samples_per_channel":480,"delta":"AAE="}"#
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            socket
+                .send(Message::Text(
+                    r#"{"type":"input_audio_buffer.speech_started"}"#.into(),
+                ))
+                .await
+                .unwrap();
+
+            let truncate = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let truncate: serde_json::Value = serde_json::from_str(&truncate).unwrap();
+            assert_eq!(truncate["type"], "conversation.item.truncate");
+            assert_eq!(truncate["item_id"], "message_1");
+            assert_eq!(truncate["content_index"], 0);
+            assert_eq!(truncate["audio_end_ms"], 40);
+        });
+
+        let openai = OpenAi::new("test-key").unwrap();
+        let (_session, mut events) = openai
+            .realtime("delegate coding work")
+            .websocket_url(format!("ws://{address}"))
+            .connect()
+            .await
+            .unwrap();
+        assert!(matches!(events.recv().await, Some(RealtimeEvent::Audio(_))));
+        assert!(matches!(events.recv().await, Some(RealtimeEvent::Audio(_))));
+        assert_eq!(events.recv().await, Some(RealtimeEvent::SpeechStarted));
+        server.await.unwrap();
     }
 
     #[tokio::test]
