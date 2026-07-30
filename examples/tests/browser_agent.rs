@@ -58,8 +58,8 @@ async fn run_agent(browser: BrowserTool) -> Result<Value> {
         assert!(
             exec["description"]
                 .as_str()
-                .is_some_and(|description| description.contains("tools.browser")),
-            "Code Mode did not advertise the browser tool: {exec}"
+                .is_some_and(|description| !description.contains("tools.browser")),
+            "warmup unexpectedly included the browser schema: {exec}"
         );
         send_completed(&mut socket, "resp-warmup", &[], None).await?;
 
@@ -97,7 +97,10 @@ async fn run_agent(browser: BrowserTool) -> Result<Value> {
         Result::<Value>::Ok(continuation)
     });
 
-    let tools = Tools::builder().without_defaults().tool(browser).build()?;
+    let tools = Tools::builder()
+        .without_defaults()
+        .provider(browser)
+        .build()?;
     let openai = OpenAi::builder("test-key")
         .websocket_url(endpoint)
         .build()?;

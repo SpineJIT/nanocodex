@@ -167,6 +167,12 @@ impl ToolRuntime {
     /// session.
     #[must_use]
     pub fn model_specs(&self, _session_id: &str) -> Vec<ToolDefinition> {
+        let has_deferred_search = !self.registry.providers.is_empty()
+            && self
+                .registry
+                .definitions()
+                .iter()
+                .any(|definition| definition.name() == "tool_search");
         let (mut native, mut nested): (Vec<_>, Vec<_>) = self
             .registry
             .definitions()
@@ -175,7 +181,7 @@ impl ToolRuntime {
             .partition(|definition| matches!(definition, ToolDefinition::ToolSearch { .. }));
         nested.sort_by(|left, right| left.name().cmp(right.name()));
         native.extend([
-            code_mode::exec_spec(&nested, !self.registry.providers.is_empty()),
+            code_mode::exec_spec(&nested, has_deferred_search),
             code_mode::wait_spec(),
         ]);
         native.sort_by(|left, right| left.name().cmp(right.name()));

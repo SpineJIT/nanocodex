@@ -4631,6 +4631,7 @@ dependencies = [
  "image",
  "mpp",
  "nanocodex",
+ "nanocodex-browser",
  "nanocodex-observability",
  "nanocodex-tools",
  "nanocodex-vm",

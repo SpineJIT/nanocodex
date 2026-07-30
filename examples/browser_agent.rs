@@ -6,7 +6,7 @@ use nanocodex_browser::BrowserTool;
 async fn main() -> Result<()> {
     let api_key = std::env::var("OPENAI_API_KEY").wrap_err("OPENAI_API_KEY is required")?;
     let browser = BrowserTool::new()?;
-    let tools = Tools::builder().tool(browser).build()?;
+    let tools = Tools::builder().provider(browser).build()?;
     let openai = OpenAi::new(api_key)?;
     let (agent, mut events) = Nanocodex::builder(openai)
         .instructions(

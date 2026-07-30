@@ -300,6 +300,58 @@ async fn code_mode_description_exposes_browser_action_schema() -> Result<()> {
 }
 
 #[tokio::test]
+async fn deferred_browser_is_discoverable_without_model_schema_bytes() -> Result<()> {
+    let baseline_tools = Tools::builder().without_defaults().build()?;
+    let baseline =
+        ToolRuntime::new_with_tools(".", None, None, &baseline_tools).model_specs("test-session");
+    let (browser, recording) = BrowserTool::recording();
+    let tools = Tools::builder()
+        .without_defaults()
+        .provider(browser)
+        .build()?;
+    let runtime = ToolRuntime::new_with_tools(".", None, None, &tools);
+    let specs = runtime.model_specs("test-session");
+
+    assert_eq!(
+        serde_json::to_vec(&specs)?,
+        serde_json::to_vec(&baseline)?,
+        "deferred browser registration must not change the model-facing tool prefix"
+    );
+    assert!(runtime.contains("browser"));
+
+    let execution = runtime
+        .execute_code(
+            r#"
+const browser = ALL_TOOLS.find((tool) => tool.name === "browser");
+if (!browser) throw new Error("browser metadata missing");
+const schema = JSON.stringify(browser.input_schema);
+const opened = await tools[browser.name]({
+  action: "open",
+  url: "https://example.com"
+});
+text({
+  name: browser.name,
+  hasOpen: schema.includes('"open"'),
+  hasSnapshot: schema.includes('"snapshot"'),
+  opened
+});
+"#,
+            context(),
+        )
+        .await;
+
+    assert!(execution.success);
+    assert_eq!(execution.nested_calls.len(), 1);
+    let output: Value = serde_json::from_str(execution_text(&execution.output)?)?;
+    assert_eq!(output["name"], "browser");
+    assert_eq!(output["hasOpen"], true);
+    assert_eq!(output["hasSnapshot"], true);
+    assert_eq!(output["opened"]["action"], "open");
+    assert_eq!(recording.actions()?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires local Chromium or NANOCODEX_TEST_REMOTE_CDP_ENDPOINT"]
 #[allow(
     clippy::too_many_lines,

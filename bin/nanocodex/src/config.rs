@@ -19,6 +19,7 @@ use nanocodex::{
     tools::mcp::McpHandle,
 };
 
+use crate::browser::{BrowserArgs, ConfiguredBrowser};
 use crate::mcp::{ConfiguredMcp, McpArgs};
 use crate::mpp::{MppAdapter, MppArgs};
 use crate::subagents::{self, ChildAgents};
@@ -30,6 +31,7 @@ pub(crate) struct ConfiguredAgent {
     pub(crate) child_agents: Option<Arc<ChildAgents>>,
     pub(crate) mpp_adapter: Option<MppAdapter>,
     pub(crate) mcp: Option<McpHandle>,
+    pub(crate) browser: Option<ConfiguredBrowser>,
     pub(crate) vm: Option<ConfiguredVm>,
 }
 
@@ -130,6 +132,9 @@ pub(crate) struct AgentArgs {
 
     #[command(flatten)]
     mpp: MppArgs,
+
+    #[command(flatten)]
+    browser: BrowserArgs,
 }
 
 impl AgentArgs {
@@ -140,6 +145,11 @@ impl AgentArgs {
     #[cfg(test)]
     pub(crate) const fn uses_tempo(&self) -> bool {
         self.mpp.is_enabled()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn browser_enabled(&self) -> bool {
+        self.browser.is_enabled()
     }
 
     pub(crate) const fn thinking(&self) -> Thinking {
@@ -175,6 +185,7 @@ impl AgentArgs {
         let codex_home = default_codex_home()?;
         let responses_transport = self.responses_transport();
         let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
+        let configured_browser = self.browser.configure(&session.workspace)?;
         let mpp_enabled = self.mpp.is_enabled();
         if mpp_enabled && !matches!(responses_transport, ResponsesTransport::Https) {
             return Err(eyre!(
@@ -226,6 +237,9 @@ impl AgentArgs {
                 .process_environment(mpp_adapter.tool_environment())
                 .remote_http_client(mpp_adapter.tool_http_client()?);
         }
+        if let Some(browser) = &configured_browser {
+            tools = tools.provider(browser.tool());
+        }
         let tools = tools.build()?;
         let child_agents = self.subagents.then(|| Arc::new(ChildAgents::default()));
         let mut builder = Nanocodex::builder(openai)
@@ -263,6 +277,7 @@ impl AgentArgs {
             child_agents,
             mpp_adapter,
             mcp: mcp_handle,
+            browser: configured_browser,
             vm: configured_vm,
         })
     }
