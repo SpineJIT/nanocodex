@@ -1,4 +1,8 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 
 use nanocodex_oai_api::{
     responses::CustomToolFormat,
@@ -66,6 +70,7 @@ impl HostedTools {
 pub struct HostedToolRuntime {
     working_directory: Arc<str>,
     host: Option<Arc<dyn CodeModeHost>>,
+    direct_tool_names: RwLock<HashSet<String>>,
 }
 
 /// Cancellation handle for a hosted runtime.
@@ -91,6 +96,7 @@ impl HostedToolRuntime {
         Self {
             working_directory: Arc::from(workspace.to_string_lossy().into_owned()),
             host: None,
+            direct_tool_names: RwLock::new(HashSet::new()),
         }
     }
 
@@ -159,6 +165,19 @@ impl HostedToolRuntime {
         });
         definitions.sort_by(|left, right| left.name().cmp(right.name()));
         if mode == HostedToolMode::Direct {
+            if let Ok(mut names) = self.direct_tool_names.write() {
+                names.clear();
+                names.extend(
+                    definitions
+                        .iter()
+                        .map(|definition| definition.name().to_owned()),
+                );
+            } else {
+                tracing::warn!(
+                    target: "nanocodex_tools",
+                    "hosted direct-tool registry lock was poisoned"
+                );
+            }
             return (definitions, Vec::new());
         }
         let code_mode_tool_names = definitions
@@ -197,10 +216,14 @@ impl HostedToolRuntime {
 
     /// Returns `false`; hosted tools are callable only inside Code Mode.
     #[must_use]
-    pub fn contains(&self, _name: &str) -> bool {
-        self.host
-            .as_ref()
-            .is_some_and(|host| host.tool_mode() == HostedToolMode::Direct)
+    pub fn contains(&self, name: &str) -> bool {
+        self.host.as_ref().is_some_and(|host| {
+            host.tool_mode() == HostedToolMode::Direct
+                && self
+                    .direct_tool_names
+                    .read()
+                    .is_ok_and(|names| names.contains(name))
+        })
     }
 
     /// Returns a model-visible failure for unsupported direct hosted dispatch.

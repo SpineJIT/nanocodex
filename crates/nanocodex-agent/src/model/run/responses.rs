@@ -135,6 +135,9 @@ pub(super) fn unsupported_tool_message(tools: &ToolRuntime, call: &CodeCall) -> 
     if call.namespace.is_none() && matches!(call.name.as_str(), "exec" | "wait") {
         return None;
     }
+    if matches!(call.kind, CodeCallKind::Function) && tools.contains(&qualified_tool_name(call)) {
+        return None;
+    }
     if call.namespace.is_some() && matches!(call.kind, CodeCallKind::Function) {
         let qualified_name = qualified_tool_name(call);
         return (!tools.contains(&qualified_name))

@@ -151,7 +151,6 @@ test("web-target WASM directly dispatches a CSP-safe application tool", async ()
         output: [{
           type: "function_call",
           call_id: "call-runtime",
-          namespace: "",
           name: "runtimeInfo",
           arguments: "{}",
         }],
