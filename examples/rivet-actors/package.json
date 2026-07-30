@@ -10,6 +10,7 @@
     "check": "npm run typecheck && npm test",
     "brutalize": "node --import tsx scripts/soak.ts",
     "dev": "node --env-file-if-exists=../../.env --import tsx src/server.ts",
+    "repl": "node --import tsx scripts/repl.ts",
     "smoke": "node --import tsx scripts/live-smoke.ts",
     "stress": "node --import tsx scripts/stress.ts",
     "test": "vitest run",

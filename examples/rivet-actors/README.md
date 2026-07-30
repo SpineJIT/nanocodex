@@ -69,10 +69,27 @@ npm run dev --prefix examples/rivet-actors
 In another terminal:
 
 ```sh
+npm run repl --prefix examples/rivet-actors
 npm run smoke --prefix examples/rivet-actors
 npm run stress --prefix examples/rivet-actors
 npm run brutalize --prefix examples/rivet-actors
 ```
+
+The REPL is intentionally disposable. It stores only the Rivet endpoint,
+actor key, and an unfinished turn ID/input in `.nanocodex/rivet-repl.json`.
+The file is mode `0600` because it may contain unfinished prompt text.
+The `start` action transfers ownership to the actor with `keepAwake` before it
+returns; the REPL then waits through the ordinary idempotent `prompt` action.
+Pressing Ctrl-C kills only that waiter. Re-running the command with the same
+`NANOCODEX_REPL_SESSION` reattaches to the active turn or replays its committed
+result, then continues the actor's durable conversation. Use `/status` or
+`/exit` at the prompt. Set `NANOCODEX_REPL_STATE` to isolate another local
+REPL state file.
+
+This demonstrates durable client detachment, not distributed exactly-once
+inference. If the actor host itself dies before a turn commits, reopening the
+REPL resubmits the same turn from the last committed snapshot; a partial
+provider response cannot be resumed.
 
 The local Rivet endpoint is `http://127.0.0.1:6420`. Set
 `RIVET_PUBLIC_ENDPOINT` for another deployment.

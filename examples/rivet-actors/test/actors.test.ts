@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 
 import { setupTest } from "rivetkit/test";
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 import { WebSocketServer } from "ws";
 
 import { registry } from "../src/registry.js";
@@ -130,6 +130,44 @@ describe.sequential("Nanocodex Rivet Actors", () => {
     });
     expect(completedEvents).toEqual(["turn-1", "turn-2"]);
     await connection.dispose();
+  });
+
+  test("keeps a started turn alive without a client waiter", async (context) => {
+    resetMock();
+    configureApiKey();
+    responseDelayMs = 100;
+    const { client } = await setupTest(context, registry);
+    const session = client.nanocodex.getOrCreate([`detached-${crypto.randomUUID()}`]);
+    const request = {
+      id: "detached-turn",
+      input: "Reply with exactly DETACHED_OK",
+    };
+
+    await expect(session.start(request)).resolves.toEqual({
+      type: "turn_accepted",
+      id: request.id,
+      replayed: false,
+    });
+    expect((await session.status()).active_turns).toContain(request.id);
+
+    await expect(session.start({ ...request, input: "different" }))
+      .rejects.toThrow(/different input/);
+    const replayed = await session.start(request);
+    expect(replayed.replayed).toBe(true);
+    await vi.waitFor(async () => {
+      expect(await session.status()).toMatchObject({
+        active_turns: [],
+        completed_turns: 1,
+      });
+    });
+    const requestsAfterDetachedCompletion = modelRequests;
+    expect(requestsAfterDetachedCompletion).toBeGreaterThan(0);
+
+    await session.start(request);
+    const completed = await session.prompt(request);
+    expect(completed.final_message).toBe("DETACHED_OK");
+    expect((await session.status()).active_turns).not.toContain(request.id);
+    expect(modelRequests).toBe(requestsAfterDetachedCompletion);
   });
 
   test("single-flights rotating subscription credentials and retries a rejected upgrade", async (context) => {

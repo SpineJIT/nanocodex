@@ -57,6 +57,12 @@ export type TurnCompleted = {
   usage: TurnUsage;
 };
 
+export type TurnAccepted = {
+  type: "turn_accepted";
+  id: string;
+  replayed: boolean;
+};
+
 export type TurnFailed = {
   type: "turn_failed";
   id: string;
@@ -154,26 +160,17 @@ export const nanocodex = actor({
     turnFailed: event<TurnFailed>(),
   },
   actions: {
+    start: async (c, request: PromptRequest): Promise<TurnAccepted> => {
+      const started = startPrompt(c, request, true);
+      void started.operation.catch(() => {});
+      return {
+        type: "turn_accepted",
+        id: request.id,
+        replayed: started.replayed,
+      };
+    },
     prompt: async (c, request: PromptRequest): Promise<TurnCompleted> => {
-      validatePrompt(request);
-      const inputHash = hashInput(request.input);
-      const existing = c.vars.inFlight.get(request.id);
-      if (existing) {
-        if (existing.inputHash !== inputHash) throw userError(`turn ${request.id} already has different input`);
-        return c.keepAwake(existing.operation);
-      }
-      if (c.vars.inFlight.size >= MAX_ACTIVE_TURNS) {
-        throw userError(`at most ${MAX_ACTIVE_TURNS} turns may be active`);
-      }
-
-      const operation = runPrompt(c, request, inputHash);
-      const inFlight = { inputHash, operation };
-      c.vars.inFlight.set(request.id, inFlight);
-      try {
-        return await c.keepAwake(operation);
-      } finally {
-        if (c.vars.inFlight.get(request.id) === inFlight) c.vars.inFlight.delete(request.id);
-      }
+      return startPrompt(c, request, false).operation;
     },
     steer: async (c, id: string, input: string): Promise<void> => {
       validateTurnId(id);
@@ -224,6 +221,35 @@ export const nanocodex = actor({
   },
 });
 
+function startPrompt(
+  context: SessionContext,
+  request: PromptRequest,
+  detached: boolean,
+): InFlightTurn & { replayed: boolean } {
+  validatePrompt(request);
+  const inputHash = hashInput(request.input);
+  const existing = context.vars.inFlight.get(request.id);
+  if (existing) {
+    if (existing.inputHash !== inputHash) throw userError(`turn ${request.id} already has different input`);
+    return { ...existing, replayed: true };
+  }
+  if (context.vars.inFlight.size >= MAX_ACTIVE_TURNS) {
+    throw userError(`at most ${MAX_ACTIVE_TURNS} turns may be active`);
+  }
+
+  const running = runPrompt(context, request, inputHash, !detached);
+  let inFlight: InFlightTurn;
+  const operation = running.finally(() => {
+    if (context.vars.inFlight.get(request.id) === inFlight) {
+      context.vars.inFlight.delete(request.id);
+    }
+  });
+  inFlight = { inputHash, operation };
+  context.vars.inFlight.set(request.id, inFlight);
+  context.keepAwake(operation);
+  return { ...inFlight, replayed: false };
+}
+
 // AgentOS actors and ordinary Rivet Actors share one registry and actor-to-actor
 // client. This actor keeps AgentOS filesystem/process/session capabilities while
 // delegating model work to the lighter Nanocodex actor instead of nesting one
@@ -254,6 +280,7 @@ async function runPrompt(
   context: SessionContext,
   request: PromptRequest,
   inputHash: string,
+  cancelOnContextAbort: boolean,
 ): Promise<TurnCompleted> {
   const stored = await terminal(context.db, request.id);
   if (stored) {
@@ -265,7 +292,9 @@ async function runPrompt(
   const onAbort = () => {
     void turn?.cancel().catch(() => {});
   };
-  context.abortSignal.addEventListener("abort", onAbort, { once: true });
+  if (cancelOnContextAbort) {
+    context.abortSignal.addEventListener("abort", onAbort, { once: true });
+  }
   try {
     const agent = await ensureAgent(context);
     turn = agent.turn.prompt({ input: request.input });
@@ -326,7 +355,9 @@ async function runPrompt(
     if (error instanceof UserError) throw error;
     throw userError(failed.error, "turn_failed");
   } finally {
-    context.abortSignal.removeEventListener("abort", onAbort);
+    if (cancelOnContextAbort) {
+      context.abortSignal.removeEventListener("abort", onAbort);
+    }
     context.vars.turns.delete(request.id);
     turn?.dispose();
   }
