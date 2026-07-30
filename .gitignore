@@ -39,6 +39,9 @@ examples/vercel-workflows/node_modules/
 examples/vercel-workflows/workflows/nanocodex.wasm
 examples/react-vite/node_modules/
 examples/react-vite/test-results/
+examples/cloudflare-workers/dist/
+examples/cloudflare-workers/node_modules/
+examples/cloudflare-workers/src/nanocodex.wasm
 jobs/
 trials/
 /generated_images/
