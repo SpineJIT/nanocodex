@@ -1,12 +1,13 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Once},
+    sync::{Arc, Once, OnceLock},
     time::Duration,
 };
 
 use opusic_c::{
     Application as OpusApplication, Channels as OpusChannels, Decoder as OpusDecoder,
-    Encoder as OpusEncoder, SampleRate as OpusSampleRate,
+    Encoder as OpusEncoder, InbandFec as OpusInbandFec, SampleRate as OpusSampleRate,
+    Signal as OpusSignal,
 };
 use reqwest::{Client, StatusCode, header::LOCATION};
 use serde::Serialize;
@@ -48,6 +49,7 @@ const WEBRTC_MAX_FRAME_SAMPLES: usize = 2_880;
 const WEBRTC_REORDER_PACKETS: u16 = 3;
 const WEBRTC_REORDER_DELAY: Duration = Duration::from_millis(60);
 const WEBRTC_MAX_CONCEALED_PACKETS: u16 = 6;
+const WEBRTC_EXPECTED_PACKET_LOSS_PERCENT: u8 = 5;
 const OPUS_PACKET_CAPACITY: usize = 4_000;
 const OPENAI_REALTIME_BASE: &str = "https://api.openai.com/v1";
 const ATTESTATION_UNAVAILABLE: &str = r#"{"v":1,"s":1}"#;
@@ -405,6 +407,16 @@ fn spawn_microphone_encoder(
             error.message()
         ))
     })?;
+    encoder
+        .set_signal(OpusSignal::Voice)
+        .and_then(|()| encoder.set_inband_fec(OpusInbandFec::Mode1))
+        .and_then(|()| encoder.set_packet_loss(WEBRTC_EXPECTED_PACKET_LOSS_PERCENT))
+        .map_err(|error| {
+            RealtimeError::WebRtc(format!(
+                "failed to configure microphone Opus encoder: {}",
+                error.message()
+            ))
+        })?;
     tokio::spawn(async move {
         let mut pending = VecDeque::with_capacity(WEBRTC_INPUT_FRAME_SAMPLES * 2);
         let mut pcm = Vec::with_capacity(WEBRTC_INPUT_FRAME_SAMPLES);
@@ -538,7 +550,7 @@ async fn create_call(
             delegation: CallDelegation { kind: "client" },
         },
     };
-    let mut builder = Client::new()
+    let mut builder = realtime_http_client()
         .post(endpoint)
         .bearer_auth(auth.bearer())
         .header("openai-alpha", "quicksilver=v2")
@@ -557,9 +569,11 @@ async fn create_call(
             .header("session-id", session_id)
             .header("thread-id", session_id);
     }
-    let payload = serde_json::to_string(&request)
-        .map_err(|error| CallAttemptError::Other(RealtimeError::Message(error.to_string())))?;
-    trace!(target: "nanocodex_oai_api::realtime::wire", payload = %payload, "GPT Realtime call request");
+    if tracing::enabled!(target: "nanocodex_oai_api::realtime::wire", tracing::Level::TRACE) {
+        let payload = serde_json::to_string(&request)
+            .map_err(|error| CallAttemptError::Other(RealtimeError::Message(error.to_string())))?;
+        trace!(target: "nanocodex_oai_api::realtime::wire", payload = %payload, "GPT Realtime call request");
+    }
     let response = timeout(CONNECT_TIMEOUT, builder.send())
         .await
         .map_err(|_| CallAttemptError::Other(RealtimeError::ConnectTimeout))?
@@ -594,6 +608,11 @@ async fn create_call(
     })?;
     let id = call_id(location.as_deref()).map_err(CallAttemptError::Other)?;
     Ok(CallResponse { sdp, id })
+}
+
+fn realtime_http_client() -> Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(Client::new).clone()
 }
 
 async fn bounded_body(
