@@ -15,6 +15,7 @@ import { db, type RawAccess } from "rivetkit/db";
 
 import type { SubscriptionSnapshot, SubscriptionStatus } from "./auth.js";
 import { type AuthCapabilityProof, createCapabilityProof } from "./auth-capability.js";
+import { createCodexAuthFileProvider } from "./codex-auth-file.js";
 import {
   type BrowserAuthRequest,
   openApiKeyWebSocket,
@@ -370,27 +371,35 @@ async function createAgent(context: SessionContext): Promise<DefaultAgent> {
       createWebSocket: openApiKeyWebSocket,
     });
   } else {
-    const client = context.client() as InternalActorClient;
-    const auth = client.nanocodexAuth.getOrCreate([
-      process.env.NANOCODEX_AUTH_ACTOR_KEY ?? "subscription",
-    ]);
+    const authFile = process.env.NANOCODEX_CODEX_AUTH_FILE;
+    const auth = authFile
+      ? createCodexAuthFileProvider(authFile)
+      : subscriptionActorProvider(context);
     agent = await Agent.create({
       ...common,
       hostAuth: true,
       createWebSocket: (endpoint: string, sessionId: string, request: BrowserAuthRequest) =>
-        openSubscriptionWebSocket({
-          snapshot: () => auth.snapshot(createCapabilityProof("snapshot")),
-          recover: (revision) => auth.recover(
-            createCapabilityProof(`recover:${revision}`),
-            revision,
-          ),
-        }, endpoint, sessionId, request),
+        openSubscriptionWebSocket(auth, endpoint, sessionId, request),
     });
   }
   const watcher = agent.events.watch();
   watcher.onEvent((agentEvent) => context.broadcast("agentEvent", agentEvent));
   context.vars.events = watcher;
   return agent;
+}
+
+function subscriptionActorProvider(context: SessionContext) {
+  const client = context.client() as InternalActorClient;
+  const auth = client.nanocodexAuth.getOrCreate([
+    process.env.NANOCODEX_AUTH_ACTOR_KEY ?? "subscription",
+  ]);
+  return {
+    snapshot: () => auth.snapshot(createCapabilityProof("snapshot")),
+    recover: (revision: number) => auth.recover(
+      createCapabilityProof(`recover:${revision}`),
+      revision,
+    ),
+  };
 }
 
 async function shutdown(context: SessionContext): Promise<void> {

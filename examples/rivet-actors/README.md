@@ -28,11 +28,13 @@ Actions execute in parallel in Rivet. The actor therefore caps fan-in at 16
 turns, distinguishes conflicting idempotency keys by a SHA-256 input digest,
 and keeps each prompt action awake through its complete model turn.
 
-The singleton `nanocodexAuth` actor owns ChatGPT subscription credentials. It
-persists rotating refresh tokens in its own SQLite database, refreshes five
-minutes early, single-flights concurrent refreshes, and retries one WebSocket
-upgrade after a revision-guarded 401 recovery. Bearer credentials remain in
-host code and never enter Nanocodex WASM.
+Local development reads the current access token and account ID from the
+mode-`0600` Codex auth file for each connection. It never uses the refresh token
+or stores credentials in Rivet SQLite. Deployments can instead use the singleton
+`nanocodexAuth` actor to own dedicated rotating credentials, refresh five
+minutes early, single-flight concurrent refreshes, and retry one WebSocket
+upgrade after revision-guarded 401 recovery. In both paths bearer credentials
+remain in host code and never enter Nanocodex WASM.
 
 ## Build and run
 
@@ -47,18 +49,20 @@ npm run check --prefix examples/rivet-actors
 The dependency check fails if the lockfile acquires AgentOS's Pi adapter or any
 of the upstream Pi harness packages.
 
-For API-key authentication, set:
+Log in to Codex with the ChatGPT subscription you want to use, then start the
+real subscription server:
 
 ```sh
-export NANOCODEX_AUTH_MODE=api_key
-export OPENAI_API_KEY=sk-...
-export RIVET__file_system__path=/tmp/nanocodex-rivet-demo/engine-db
-npm run dev --prefix examples/rivet-actors
+codex login
+npm run dev:subscription --prefix examples/rivet-actors
 ```
 
-The explicit database path isolates the demo from other local Rivet versions
-and persists actor state across server restarts. Do not point an older Rivet
-Engine at a database created by a newer version.
+This reads `~/.codex/auth.json` by default. Override it with
+`NANOCODEX_CODEX_AUTH_FILE` or `CODEX_HOME`. The access token is reread when a
+new socket opens, but the refresh token is never used or persisted by the
+local path. If ChatGPT rejects the current token, run `codex login` again. Actor
+state defaults to `$XDG_STATE_HOME/nanocodex/rivet-subscription-demo` or
+`~/.local/state/nanocodex/rivet-subscription-demo`.
 
 In another terminal:
 
@@ -100,9 +104,11 @@ Tune its corresponding `NANOCODEX_SOAK_*` variables for larger runs. Set
 or `NANOCODEX_SOAK_KEYSPACE` when running multiple drivers concurrently; the
 stable defaults prevent repeated local runs from accumulating actor records.
 
-## ChatGPT subscription authentication
+## Deployment-managed subscription authentication
 
-Subscription mode does not require `OPENAI_API_KEY`:
+The local command above is the safest demo path. A deployed actor cannot read
+your local Codex auth file, so give it dedicated rotating subscription
+credentials instead. This still does not require `OPENAI_API_KEY`:
 
 ```sh
 export NANOCODEX_AUTH_MODE=chatgpt

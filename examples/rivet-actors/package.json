@@ -11,6 +11,7 @@
     "check:dependencies": "node scripts/check-no-pi.mjs",
     "brutalize": "node --import tsx scripts/soak.ts",
     "dev": "node --env-file-if-exists=../../.env --import tsx src/server.ts",
+    "dev:subscription": "node --import tsx scripts/dev-subscription.ts",
     "repl": "node --import tsx scripts/repl.ts",
     "smoke": "node --import tsx scripts/live-smoke.ts",
     "stress": "node --import tsx scripts/stress.ts",
