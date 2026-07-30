@@ -7,16 +7,20 @@
     "node": ">=22.13.0"
   },
   "scripts": {
+    "build:web": "esbuild web/app.ts --bundle --format=esm --minify --outfile=web/dist/app.js",
     "check": "npm run check:dependencies && npm run typecheck && npm test",
     "check:dependencies": "node scripts/check-no-pi.mjs",
     "brutalize": "node --import tsx scripts/soak.ts",
+    "predev": "npm run build:web",
     "dev": "node --env-file-if-exists=../../.env --import tsx src/server.ts",
+    "predev:subscription": "npm run build:web",
     "dev:subscription": "node --import tsx scripts/dev-subscription.ts",
     "repl": "node --import tsx scripts/repl.ts",
     "smoke": "node --import tsx scripts/live-smoke.ts",
     "stress": "node --import tsx scripts/stress.ts",
+    "pretest": "npm run build:web",
     "test": "node scripts/test.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p web/tsconfig.json --noEmit"
   },
   "dependencies": {
     "nanocodex": "file:../../js/bindings",
@@ -26,6 +30,7 @@
   "devDependencies": {
     "@types/node": "22.19.15",
     "@types/ws": "8.18.1",
+    "esbuild": "0.28.1",
     "tsx": "4.21.0",
     "typescript": "5.9.3",
     "vitest": "4.1.10"

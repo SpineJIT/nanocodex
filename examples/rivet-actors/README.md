@@ -57,6 +57,14 @@ codex login
 npm run dev:subscription --prefix examples/rivet-actors
 ```
 
+The process starts the actor engine on <http://127.0.0.1:6420> and a tiny web
+client on <http://127.0.0.1:6422>. (Rivet reserves 6421 for its local control
+plane.) The page uses RivetKit's browser client
+directly—there is no Nanocodex app-server protocol or model credential in the
+browser. It stores only the endpoint, actor key, bounded transcript, and any
+unfinished turn ID/input. Detach or close the tab during inference; reopening
+it reissues the same idempotent request and rejoins or replays the actor turn.
+
 This reads `~/.codex/auth.json` by default. Override it with
 `NANOCODEX_CODEX_AUTH_FILE` or `CODEX_HOME`. The access token is reread when a
 new socket opens, but the refresh token is never used or persisted by the
@@ -90,7 +98,13 @@ REPL resubmits the same turn from the last committed snapshot; a partial
 provider response cannot be resumed.
 
 The local Rivet endpoint is `http://127.0.0.1:6420`. Set
-`RIVET_PUBLIC_ENDPOINT` for another deployment.
+`RIVET_PUBLIC_ENDPOINT` for another deployment. Set `NANOCODEX_WEB_HOST` or
+`NANOCODEX_WEB_PORT` to move the static browser client; it binds to loopback by
+default.
+
+The smoke also forces the real model to invoke `runtimeInfo` and requires a
+completed Nanocodex `tool.call`/`tool.result` event pair, so it verifies the
+WASM tool loop rather than only a text response.
 
 The stress driver reuses persistent actor connections and bounds fan-out to
 avoid benchmarking the gateway's per-route rate limiter. Tune

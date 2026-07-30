@@ -30,6 +30,7 @@ js/bindings/pkg-web/
 examples/node/node_modules/
 examples/rivet-actors/node_modules/
 examples/react-vite/dist/
+examples/rivet-actors/web/dist/
 examples/react-vite/node_modules/
 examples/react-vite/test-results/
 jobs/

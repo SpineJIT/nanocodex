@@ -10,7 +10,19 @@ const session = client.nanocodex.getOrCreate([
 await session.reset();
 const events = session.connect();
 let eventCount = 0;
-events.on("agentEvent", () => eventCount += 1);
+let runtimeToolCallId: string | undefined;
+let runtimeToolCompleted = false;
+events.on("agentEvent", (event) => {
+  eventCount += 1;
+  if (event.type === "tool.call" && event.payload.tool === "runtimeInfo") {
+    runtimeToolCallId = String(event.payload.call_id);
+  }
+  if (event.type === "tool.result"
+    && event.payload.call_id === runtimeToolCallId
+    && event.payload.status === "completed") {
+    runtimeToolCompleted = true;
+  }
+});
 await events.ready;
 
 const firstRequest = {
@@ -42,6 +54,13 @@ try {
   if (restored.final_message !== "EDGE_OK") {
     throw new Error(`restored session lost history: ${restored.final_message}`);
   }
+  const toolTurn = await session.prompt({
+    id: randomUUID(),
+    input: "You must call runtimeInfo exactly once. Then reply with only the runtime value returned by that tool.",
+  });
+  if (!toolTurn.final_message.includes("rivet-actor") || !runtimeToolCompleted) {
+    throw new Error(`runtimeInfo tool proof failed: ${toolTurn.final_message}`);
+  }
   const status = await session.status();
   console.log(JSON.stringify({
     actor_session_id: status.session_id,
@@ -49,6 +68,7 @@ try {
     completed_turns: status.completed_turns,
     elapsed_ms: Math.round(performance.now() - started),
     events: eventCount,
+    tool_call: "runtimeInfo",
     restored: status.has_snapshot,
     status: "ok",
   }));
