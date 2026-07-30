@@ -309,5 +309,7 @@ fn definition_metadata(name: &str, definition: &ToolDefinition) -> Value {
         "tool_name": name,
         "description": definition.description(),
         "kind": kind,
+        "input_schema": definition.parameters().map(|schema| schema.as_value()),
+        "output_schema": definition.output_schema().map(|schema| schema.as_value()),
     })
 }

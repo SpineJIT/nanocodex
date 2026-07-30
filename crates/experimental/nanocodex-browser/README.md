@@ -17,7 +17,7 @@ use nanocodex_browser::BrowserTool;
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let browser = BrowserTool::new()?;
-let tools = Tools::builder().tool(browser).build()?;
+let tools = Tools::builder().provider(browser).build()?;
 let openai = OpenAi::new(std::env::var("OPENAI_API_KEY")?)?;
 let (agent, _events) = Nanocodex::builder(openai).tools(tools).build()?;
 
@@ -31,9 +31,11 @@ println!("{}", result.final_message());
 # }
 ```
 
-The model reaches the tool as `await tools.browser(...)` inside Code Mode; it
-is not exposed as a second top-level model tool. A runnable version lives at
-`examples/browser_agent.rs`.
+The model reaches the tool as `await tools.browser(...)` inside Code Mode. Its
+full contract is discoverable at runtime through `ALL_TOOLS`, but provider
+registration keeps that contract out of the model-facing tool prefix. A
+runnable version lives at `examples/browser_agent.rs`. Callers that deliberately
+want the eager schema can register the same value with `.tool(browser)`.
 
 For isolation, one non-cloneable VM owner keeps the disposable browser alive
 and gives the agent a tool handle:
@@ -59,7 +61,7 @@ browser
     .await?;
 
 let tool = browser.tool();
-// Pass `tool` to `Tools::builder().tool(tool)`.
+// Pass `tool` to `Tools::builder().provider(tool)`.
 drop(tool);
 browser.shutdown().await?;
 # Ok(())
@@ -114,8 +116,9 @@ or an explicitly managed CDP endpoint.
   prepared ext4 image, VMM entry point, gvproxy, and libkrun firmware. Its
   default network lease permits internet access; callers must supply their
   egress lease and browser policy when stronger restrictions are required.
-- All browser actions are advertised together. The current Code Mode
-  description is about 67 KiB and is not deferred or capability-filtered.
+- All browser actions remain available together. Their roughly 67 KiB contract
+  is runtime-only with provider registration, so enabling browser adds no model
+  warmup schema bytes. The contract is not capability-filtered after discovery.
 - Lighthouse, CrUX, and video require caller-supplied external tooling or
   credentials. Brave profile transfer is harness-only and intentionally absent
   from the model-callable schema.

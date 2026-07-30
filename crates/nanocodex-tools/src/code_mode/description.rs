@@ -3,8 +3,6 @@ use std::fmt::Write as _;
 use nanocodex_oai_api::{responses::JsonSchema, tools::ToolDefinition};
 use serde_json::Value;
 
-const DEFERRED_NESTED_TOOLS_GUIDANCE: &str = r"Some deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.
-To find one, filter `ALL_TOOLS` by `name` and `description`.";
 // Based on https://modelcontextprotocol.io/specification/draft/schema#calltoolresult.
 const MCP_TYPESCRIPT_PREAMBLE: &str = r#"type Role = "user" | "assistant";
 type MetaObject = Record<string, unknown>;
@@ -84,7 +82,7 @@ type CallToolResult<TStructured = { [key: string]: unknown }> = {
 };"#;
 const EXEC_DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose tool calls
 - Evaluates the provided JavaScript code in a fresh V8 isolate as an async module.
-- All nested tools are available on the global `tools` object, for example `await tools.exec_command(...)`. Tool names are exposed as normalized JavaScript identifiers, for example `await tools.mcp__ologs__get_profile(...)`.
+- All nested tools are on global `tools`. For configured or deferred capabilities omitted here, check `ALL_TOOLS` before searching the workspace, then call a match as `await tools[tool.name](...)`.
 - Nested tool methods take either a string or an object as their input argument.
 - Nested tools return either an object or a string, based on the description.
 - Runs raw JavaScript -- no Node, no file system, no network access, no console.
@@ -105,15 +103,15 @@ const EXEC_DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose too
 - `notify(value: string | number | boolean | undefined | null)`: immediately injects an extra `custom_tool_call_output` for the current `exec` call. Values are stringified like `text(...)`.
 - `setTimeout(callback: () => void, delayMs?: number)`: schedules a callback to run later and returns a timeout id. Pending timeouts do not keep `exec` alive by themselves; await an explicit promise if you need to wait for one.
 - `clearTimeout(timeoutId?: number)`: cancels a timeout created by `setTimeout`.
-- `ALL_TOOLS`: metadata for the enabled nested tools as `{ name, description }` entries.
+- `ALL_TOOLS`: enumerable `name`/`description` plus explicit `input_schema`/`output_schema`.
 - `yield_control()`: yields the accumulated output to the model immediately while the script keeps running."#;
 
-pub(super) fn exec_description(definitions: &[ToolDefinition], has_deferred_tools: bool) -> String {
+pub(super) fn exec_description(
+    definitions: &[ToolDefinition],
+    has_deferred_search: bool,
+) -> String {
     let mut description = EXEC_DESCRIPTION.to_owned();
-    if has_deferred_tools {
-        let _ = write!(description, "\n\n{DEFERRED_NESTED_TOOLS_GUIDANCE}");
-    }
-    if has_deferred_tools
+    if has_deferred_search
         || definitions.iter().any(|spec| {
             spec.output_schema()
                 .and_then(|schema| mcp_structured_content_schema(schema.as_value()))

@@ -9,7 +9,7 @@ pub mod vm;
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use async_trait::async_trait;
@@ -17,7 +17,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use nanocodex_oai_api::ImageDetail;
 use nanocodex_tools::{
     Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult,
-    contract::ToolOutputContent, runtime::schema_for,
+    contract::ToolOutputContent,
+    runtime::{DynamicToolProvider, schema_for},
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -3693,11 +3694,20 @@ impl BrowserTool {
     }
 }
 
+fn browser_tool_definition() -> ToolDefinition {
+    static DEFINITION: OnceLock<ToolDefinition> = OnceLock::new();
+    DEFINITION
+        .get_or_init(|| {
+            ToolDefinition::function("browser", TOOL_DESCRIPTION, schema_for::<BrowserAction>())
+                .with_output_schema(schema_for::<BrowserActionResult>())
+        })
+        .clone()
+}
+
 #[async_trait]
 impl Tool for BrowserTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function("browser", TOOL_DESCRIPTION, schema_for::<BrowserAction>())
-            .with_output_schema(schema_for::<BrowserActionResult>())
+        browser_tool_definition()
     }
 
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
@@ -3750,6 +3760,46 @@ impl Tool for BrowserTool {
             content.insert(0, ToolOutputContent::InputText { text: encoded });
             Ok(ToolOutput::content(content).with_code_mode_value(code_mode_value))
         }
+    }
+}
+
+#[async_trait]
+impl DynamicToolProvider for BrowserTool {
+    fn start(&self) {}
+
+    fn direct_tools(&self) -> Vec<Arc<dyn Tool>> {
+        Vec::new()
+    }
+
+    fn available_definitions(&self) -> Vec<ToolDefinition> {
+        vec![browser_tool_definition()]
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        name == "browser"
+    }
+
+    async fn execute(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+        context: ToolContext<'_>,
+    ) -> Option<ToolOutput> {
+        if name != "browser" {
+            return None;
+        }
+        let input = match serde_json::value::to_raw_value(&input) {
+            Ok(input) => ToolInput::Function(input),
+            Err(error) => {
+                return Some(ToolOutput::error(format!(
+                    "failed to encode browser input: {error}"
+                )));
+            }
+        };
+        Some(match Tool::execute(self, input, context).await {
+            Ok(output) => output,
+            Err(error) => ToolOutput::error(error.to_string()),
+        })
     }
 }
 

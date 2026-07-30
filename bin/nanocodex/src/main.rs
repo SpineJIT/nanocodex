@@ -1,4 +1,5 @@
 mod auth;
+mod browser;
 mod config;
 #[cfg(feature = "tempo")]
 mod credits;
@@ -222,6 +223,38 @@ mod tests {
             panic!("run command was not parsed");
         };
         assert!(run.vm.is_enabled());
+    }
+
+    #[test]
+    fn browser_tool_is_opt_in_for_tui_and_one_shot_runs() {
+        let tui = Cli::try_parse_from(["nanocodex"]).unwrap();
+        assert!(!tui.agent.browser_enabled());
+
+        let tui = Cli::try_parse_from(["nanocodex", "--browser"]).unwrap();
+        assert!(tui.agent.browser_enabled());
+
+        let run =
+            Cli::try_parse_from(["nanocodex", "run", "inspect example.com", "--browser"]).unwrap();
+        let Some(Command::Run(run)) = run.command else {
+            panic!("run command was not parsed");
+        };
+        assert!(run.agent.browser_enabled());
+    }
+
+    #[test]
+    fn browser_executable_requires_the_opt_in() {
+        let error = Cli::try_parse_from([
+            "nanocodex",
+            "--browser-executable",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ])
+        .err()
+        .unwrap();
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]

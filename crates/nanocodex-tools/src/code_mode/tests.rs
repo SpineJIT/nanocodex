@@ -316,18 +316,20 @@ text({
 }
 
 #[tokio::test]
-async fn all_tools_exposes_only_codex_metadata_fields() -> Result<()> {
+async fn all_tools_exposes_runtime_only_tool_contracts() -> Result<()> {
     let workspace = temporary_workspace("all-tools-metadata")?;
     let tools = test_tools(&workspace);
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r"
+            r#"
 text(ALL_TOOLS.map((tool) => ({
   keys: Object.keys(tool).sort(),
   frozen: Object.isFrozen(tool),
+  hasInputSchema: typeof tool.input_schema === "object",
+  serializedSchema: JSON.stringify(tool).includes("input_schema"),
 })));
-",
+"#,
             test_context(&history),
         )
         .await;
@@ -339,7 +341,10 @@ text(ALL_TOOLS.map((tool) => ({
         .ok_or_else(|| eyre!("ALL_TOOLS output was not an array"))?;
     assert!(!tools.is_empty());
     assert!(tools.iter().all(|tool| {
-        tool["keys"] == serde_json::json!(["description", "name"]) && tool["frozen"] == true
+        tool["keys"] == serde_json::json!(["description", "name"])
+            && tool["frozen"] == true
+            && tool["hasInputSchema"] == true
+            && tool["serializedSchema"] == false
     }));
     std::fs::remove_dir_all(workspace)?;
     Ok(())

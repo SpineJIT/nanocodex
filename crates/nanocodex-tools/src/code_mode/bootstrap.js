@@ -248,10 +248,17 @@
     const EXIT = Symbol("exit");
     function exit() { throw EXIT; }
 
-    const allTools = Object.freeze(definitions.map((tool) => Object.freeze({
-      name: tool.name,
-      description: tool.description,
-    })));
+    const allTools = Object.freeze(definitions.map((tool) => {
+      const metadata = {
+        name: tool.name,
+        description: tool.description,
+      };
+      Object.defineProperties(metadata, {
+        input_schema: { value: tool.input_schema },
+        output_schema: { value: tool.output_schema },
+      });
+      return Object.freeze(metadata);
+    }));
     try {
       const script = new AsyncFunction(
         "tools",

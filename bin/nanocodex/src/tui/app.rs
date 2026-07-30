@@ -2938,6 +2938,9 @@ fn summarize_tool_arguments(tool: &str, arguments: &Value) -> String {
         {
             return summary;
         }
+        if tool == "browser" {
+            return summarize_browser_arguments(object);
+        }
         if let Some(summary) = summarize_mcp_arguments(tool, object) {
             return summary;
         }
@@ -2963,6 +2966,12 @@ fn summarize_tool_arguments(tool: &str, arguments: &Value) -> String {
 }
 
 fn present_tool_name(tool: &str, arguments: &Value) -> String {
+    if tool == "browser" {
+        return arguments.get("action").and_then(Value::as_str).map_or_else(
+            || "Browser".to_owned(),
+            |action| format!("Browser › {}", present_browser_action(action)),
+        );
+    }
     if tool == "tool_search" {
         return "MCP discovery".to_owned();
     }
@@ -2992,6 +3001,53 @@ fn present_tool_name(tool: &str, arguments: &Value) -> String {
         "Web"
     };
     name.to_owned()
+}
+
+fn present_browser_action(action: &str) -> String {
+    action
+        .split('_')
+        .enumerate()
+        .map(|(index, word)| match word {
+            "cpu" => "CPU".to_owned(),
+            "dom" => "DOM".to_owned(),
+            "har" => "HAR".to_owned(),
+            "html" => "HTML".to_owned(),
+            "pdf" => "PDF".to_owned(),
+            "url" => "URL".to_owned(),
+            _ if index == 0 => {
+                let mut word = word.to_owned();
+                if let Some(first) = word.get_mut(..1) {
+                    first.make_ascii_uppercase();
+                }
+                word
+            }
+            _ => word.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn summarize_browser_arguments(object: &serde_json::Map<String, Value>) -> String {
+    for field in [
+        "url",
+        "url_contains",
+        "query",
+        "text",
+        "request_id",
+        "tab_id",
+        "frame_id",
+        "artifact_id",
+        "baseline_id",
+        "route_id",
+    ] {
+        if let Some(value) = object.get(field).and_then(Value::as_str) {
+            return compact_tool_text(value);
+        }
+    }
+    object
+        .get("target")
+        .map(compact_arguments)
+        .unwrap_or_default()
 }
 
 fn summarize_mcp_arguments(tool: &str, object: &serde_json::Map<String, Value>) -> Option<String> {
@@ -3277,6 +3333,42 @@ mod tests {
         assert_eq!(
             summarize_tool_arguments("web__run", &arguments),
             "Rust async cancellation · Tokio process groups"
+        );
+    }
+
+    #[test]
+    fn browser_tools_present_the_action_and_relevant_subject() {
+        let open = json!({
+            "action": "open",
+            "url": "https://example.com/products"
+        });
+        assert_eq!(present_tool_name("browser", &open), "Browser › Open");
+        assert_eq!(
+            summarize_tool_arguments("browser", &open),
+            "https://example.com/products"
+        );
+
+        let click = json!({
+            "action": "click",
+            "target": { "by": "ref", "reference": "@e7" }
+        });
+        assert_eq!(present_tool_name("browser", &click), "Browser › Click");
+        assert_eq!(
+            summarize_tool_arguments("browser", &click),
+            r#"{"by":"ref","reference":"@e7"}"#
+        );
+
+        assert_eq!(
+            present_tool_name("browser", &json!({ "action": "get_url" })),
+            "Browser › Get URL"
+        );
+        assert_eq!(
+            present_tool_name("browser", &json!({ "action": "get_html" })),
+            "Browser › Get HTML"
+        );
+        assert_eq!(
+            present_tool_name("browser", &json!({ "action": "cpu_profile_stop" })),
+            "Browser › CPU profile stop"
         );
     }
 
