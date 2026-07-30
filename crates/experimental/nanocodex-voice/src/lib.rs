@@ -1,10 +1,14 @@
 #![doc = include_str!("../README.md")]
 
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
 
 use futures_util::StreamExt;
 use nanocodex::{
-    Nanocodex, OpenAi, PromptRoute,
+    Nanocodex, NanocodexError, OpenAi, PromptRoute, TurnControl,
     agent::events::{AgentEvent, AgentEventData, AssistantEvent, RunEvent},
     oai::{
         auth::OpenAiAuthMode,
@@ -139,6 +143,7 @@ impl VoiceEvents {
 pub struct VoiceSession {
     stop: Option<oneshot::Sender<()>>,
     agent_events: mpsc::UnboundedSender<AgentEvent>,
+    agent_control: VoiceAgentControl,
     task: std::thread::JoinHandle<()>,
 }
 
@@ -156,6 +161,28 @@ impl VoiceSession {
         }
     }
 
+    /// Returns a reusable controller for coding turns started by this voice lifecycle.
+    ///
+    /// An embedding can retain this controller across voice reconnects and route its
+    /// normal interrupt gesture through [`VoiceAgentControl::cancel`].
+    #[must_use]
+    pub fn agent_control(&self) -> VoiceAgentControl {
+        self.agent_control.clone()
+    }
+
+    /// Cancels the unfinished coding turn started by this voice lifecycle, if any.
+    ///
+    /// Returns `true` when cancellation was accepted and `false` when no voice-owned
+    /// turn remains. A turn completing concurrently with cancellation is treated as
+    /// already settled rather than as an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the agent driver rejects cancellation for another reason.
+    pub async fn cancel_agent_turn(&self) -> Result<bool, NanocodexError> {
+        self.agent_control.cancel().await
+    }
+
     /// Mirrors one session-wide agent event into an active externally-started handoff.
     ///
     /// Embeddings whose typed UI can start a turn before voice is enabled should
@@ -165,6 +192,80 @@ impl VoiceSession {
     pub fn observe_agent_event(&self, event: AgentEvent) -> bool {
         self.agent_events.send(event).is_ok()
     }
+}
+
+/// Reusable interrupt capability for coding turns launched by a voice session.
+///
+/// Share one controller across replacement [`VoiceSession`]s when the embedding
+/// wants its normal interrupt action to keep targeting work started before a
+/// Realtime reconnect.
+#[derive(Clone, Default)]
+pub struct VoiceAgentControl {
+    active: Arc<Mutex<Option<ActiveVoiceAgentTurn>>>,
+}
+
+impl VoiceAgentControl {
+    /// Returns whether a voice-started coding turn is currently retained.
+    #[must_use]
+    pub fn has_active_turn(&self) -> bool {
+        self.active().is_some()
+    }
+
+    /// Cancels the retained voice-started coding turn, if any.
+    ///
+    /// Returns `true` when cancellation was accepted and `false` when no turn
+    /// remains. Completion racing with cancellation is an idempotent success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the agent driver rejects cancellation for another reason.
+    pub async fn cancel(&self) -> Result<bool, NanocodexError> {
+        let Some(active) = self.active() else {
+            return Ok(false);
+        };
+        match active.control.cancel().await {
+            Ok(()) => Ok(true),
+            Err(NanocodexError::TurnNotCancellable) => {
+                self.clear(active.generation);
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn active(&self) -> Option<ActiveVoiceAgentTurn> {
+        self.lock().clone()
+    }
+
+    fn set(&self, generation: u64, control: TurnControl) {
+        *self.lock() = Some(ActiveVoiceAgentTurn {
+            generation,
+            control,
+        });
+    }
+
+    fn clear(&self, generation: u64) {
+        let mut active = self.lock();
+        if active
+            .as_ref()
+            .is_some_and(|active| active.generation == generation)
+        {
+            *active = None;
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Option<ActiveVoiceAgentTurn>> {
+        match self.active.lock() {
+            Ok(active) => active,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ActiveVoiceAgentTurn {
+    generation: u64,
+    control: TurnControl,
 }
 
 impl Drop for VoiceSession {
@@ -183,6 +284,7 @@ pub struct VoiceSessionBuilder {
     voice: Option<RealtimeVoice>,
     initial_items: Vec<RealtimeInitialItem>,
     audio: AudioConfig,
+    agent_control: VoiceAgentControl,
 }
 
 impl VoiceSessionBuilder {
@@ -198,6 +300,7 @@ impl VoiceSessionBuilder {
             voice: None,
             initial_items: Vec::new(),
             audio: AudioConfig::default(),
+            agent_control: VoiceAgentControl::default(),
         }
     }
 
@@ -251,6 +354,16 @@ impl VoiceSessionBuilder {
         self
     }
 
+    /// Shares a voice-started turn controller with the embedding.
+    ///
+    /// Reuse the same controller for replacement sessions so an interrupt can
+    /// still cancel a coding turn launched before the voice transport changed.
+    #[must_use]
+    pub fn agent_control(mut self, control: VoiceAgentControl) -> Self {
+        self.agent_control = control;
+        self
+    }
+
     /// Spawns the owned desktop lifecycle and its independent event stream.
     ///
     /// # Errors
@@ -262,6 +375,7 @@ impl VoiceSessionBuilder {
         let (events, receiver) = mpsc::unbounded_channel();
         let (agent_events, observed_agent_events) = mpsc::unbounded_channel();
         let (stop, stopped) = oneshot::channel();
+        let agent_control = self.agent_control.clone();
         let task = std::thread::Builder::new()
             .name("nanocodex-voice".to_owned())
             .spawn(move || run_thread(self, events, observed_agent_events, stopped))
@@ -270,6 +384,7 @@ impl VoiceSessionBuilder {
             VoiceSession {
                 stop: Some(stop),
                 agent_events,
+                agent_control,
                 task,
             },
             VoiceEvents { receiver },
@@ -413,6 +528,7 @@ async fn run_voice(
         next_generation: 0,
         external_output: HandoffStream::default(),
         external_error: None,
+        control: builder.agent_control,
     };
     let mut external_flush = tokio::time::interval(HANDOFF_STREAM_FLUSH_INTERVAL);
     external_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -520,6 +636,7 @@ struct AgentBridge {
     next_generation: u64,
     external_output: HandoffStream,
     external_error: Option<String>,
+    control: VoiceAgentControl,
 }
 
 impl AgentBridge {
@@ -568,12 +685,14 @@ async fn handle_realtime_event(
                 Ok(PromptRoute::Started(turn)) => {
                     agent_bridge.next_generation = agent_bridge.next_generation.saturating_add(1);
                     let generation = agent_bridge.next_generation;
+                    agent_bridge.control.set(generation, turn.control());
                     agent_bridge.active = Some(ActiveAgentRequest {
                         generation,
                         call_id: call_id.clone(),
                         streamed_output: false,
                         external: false,
                     });
+                    let agent_control = agent_bridge.control.clone();
                     drop(tokio::spawn(async move {
                         let mut turn = turn;
                         let mut output = HandoffStream::default();
@@ -604,7 +723,7 @@ async fn handle_realtime_event(
                                                     text,
                                                 }).is_err()
                                             {
-                                                return;
+                                                break;
                                             }
                                             output = HandoffStream::default();
                                         }
@@ -616,7 +735,7 @@ async fn handle_realtime_event(
                                                     text: truncate_realtime_output(&message.text),
                                                 }).is_err() =>
                                         {
-                                            return;
+                                            break;
                                         }
                                         _ => {}
                                     }
@@ -628,22 +747,19 @@ async fn handle_realtime_event(
                                             text,
                                         }).is_err()
                                     {
-                                        return;
+                                        break;
                                     }
                                 }
                             }
                         }
-                        if let Some(text) = output.drain_final_chunk()
-                            && updates
-                                .send(AgentBridgeUpdate::Output { generation, text })
-                                .is_err()
-                        {
-                            return;
+                        if let Some(text) = output.drain_final_chunk() {
+                            drop(updates.send(AgentBridgeUpdate::Output { generation, text }));
                         }
                         let output = match turn.result().await {
                             Ok(result) => result.final_message().to_owned(),
                             Err(error) => format!("The coding agent failed: {error}"),
                         };
+                        agent_control.clear(generation);
                         drop(updates.send(AgentBridgeUpdate::Completed {
                             generation,
                             call_id,
@@ -959,7 +1075,7 @@ fn send_event(events: &mpsc::UnboundedSender<VoiceEvent>, event: VoiceEvent) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioConfig, HandoffStream, RealtimeTranscriptEntry, VoiceSpeaker,
+        AudioConfig, HandoffStream, RealtimeTranscriptEntry, VoiceAgentControl, VoiceSpeaker,
         codex_realtime_delegation, codex_realtime_delegation_with_transcript,
         codex_voice_instructions, realtime_output_byte_limit, truncate_realtime_output,
     };
@@ -976,6 +1092,20 @@ mod tests {
     fn transcript_speakers_have_stable_labels() {
         assert_eq!(VoiceSpeaker::User.to_string(), "user");
         assert_eq!(VoiceSpeaker::Assistant.to_string(), "assistant");
+    }
+
+    #[test]
+    fn unused_agent_control_is_an_idempotent_interrupt() {
+        let control = VoiceAgentControl::default();
+        assert!(!control.has_active_turn());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        assert!(
+            !runtime
+                .block_on(control.cancel())
+                .expect("cancel should be idle")
+        );
     }
 
     #[test]

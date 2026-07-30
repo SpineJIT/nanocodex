@@ -19,6 +19,13 @@ That lets the voice handoff attach to the already-running turn, stream its
 remaining output, and announce completion. The Nanocodex TUI wires this path
 automatically.
 
+Voice-started coding work remains independently controllable when the audio
+session stops or reconnects. Retain a `VoiceAgentControl`, pass it to each
+replacement session with `VoiceSessionBuilder::agent_control`, and route the
+embedding's normal interrupt gesture through `VoiceAgentControl::cancel`.
+Stopping voice disconnects Realtime; cancelling the controller interrupts the
+coding turn.
+
 The default conversational prompt, local first-name rendering, delegation
 markers, tool descriptions, and protocol-specific steering acknowledgement are
 ported from Codex's Realtime implementation. Callers can still replace the
@@ -28,10 +35,13 @@ rendered default and delegation envelope independently through
 
 ```rust,no_run
 use nanocodex::{Nanocodex, OpenAi};
-use nanocodex_voice::{VoiceEvent, VoiceSessionBuilder};
+use nanocodex_voice::{VoiceAgentControl, VoiceEvent, VoiceSessionBuilder};
 
 # async fn example(openai: OpenAi, agent: Nanocodex) -> Result<(), Box<dyn std::error::Error>> {
-let (mut voice, mut events) = VoiceSessionBuilder::new(openai, agent).spawn()?;
+let agent_control = VoiceAgentControl::default();
+let (mut voice, mut events) = VoiceSessionBuilder::new(openai, agent)
+    .agent_control(agent_control.clone())
+    .spawn()?;
 while let Some(event) = events.recv().await {
     match event {
         VoiceEvent::Transcript { speaker, text } => println!("{speaker}: {text}"),
@@ -41,6 +51,7 @@ while let Some(event) = events.recv().await {
     }
 }
 voice.stop();
+let _cancelled = agent_control.cancel().await?;
 # Ok(())
 # }
 ```
