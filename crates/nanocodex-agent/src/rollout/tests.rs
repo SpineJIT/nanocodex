@@ -341,6 +341,10 @@ async fn writes_codex_rollout_envelope_and_committed_items() {
     assert_eq!(lines[3]["payload"]["role"], "user");
     assert_eq!(lines[4]["type"], "world_state");
     assert_eq!(
+        lines[4]["payload"]["state"]["nanocodex_model"],
+        "gpt-5.6-sol"
+    );
+    assert_eq!(
         lines[4]["payload"]["state"]["nanocodex_context"]["kind"],
         "missing"
     );
@@ -399,42 +403,6 @@ async fn appends_only_the_new_committed_delta() {
             .count(),
         1,
         "an unchanged context baseline must not add rollout churn"
-    );
-}
-
-#[tokio::test]
-async fn records_model_changes_without_rewriting_unchanged_context() {
-    let home = tempdir().expect("temporary Codex home");
-    let recorder = recorder(home.path());
-    recorder
-        .persist_history(
-            ResponseHistory::new(vec![message("one")]),
-            0,
-            completed_turn("one", "first"),
-        )
-        .await
-        .expect("persist Sol turn");
-    recorder
-        .persist_history_with_model(
-            ResponseHistory::new(vec![message("one"), message("two")]),
-            0,
-            completed_turn("two", "second"),
-            Model::Luna,
-        )
-        .await
-        .expect("persist Luna turn");
-
-    let models = lines(&recorder)
-        .into_iter()
-        .filter(|line| line["type"] == "world_state")
-        .map(|line| line["payload"]["state"]["nanocodex_model"].clone())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        models,
-        [
-            serde_json::json!("gpt-5.6-sol"),
-            serde_json::json!("gpt-5.6-luna")
-        ]
     );
 }
 

@@ -220,19 +220,6 @@ impl WasmNanocodex {
         Ok(Self::from_parts(inner, events))
     }
 
-    /// Changes the model for subsequently accepted turns.
-    ///
-    /// # Errors
-    ///
-    /// Rejects an unsupported model or a stopped driver.
-    #[wasm_bindgen(js_name = setModel)]
-    pub async fn set_model(&self, model: &str) -> Result<(), JsValue> {
-        self.inner
-            .set_model(model.parse::<Model>().map_err(js_error)?)
-            .await
-            .map_err(js_error)
-    }
-
     /// Changes the reasoning effort for subsequently accepted turns.
     ///
     /// # Errors

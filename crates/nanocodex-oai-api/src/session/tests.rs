@@ -143,7 +143,6 @@ fn luna_usage_receives_a_model_specific_estimate() {
 
 #[derive(Debug)]
 struct AttemptObservation {
-    model: crate::Model,
     previous_response_id: Option<String>,
     full_replay: bool,
     input: Vec<serde_json::Value>,
@@ -173,7 +172,6 @@ impl Service<crate::ResponsesAttempt> for RecordingScripted {
     fn call(&mut self, request: crate::ResponsesAttempt) -> Self::Future {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
         self.observations.lock().unwrap().push(AttemptObservation {
-            model: request.model(),
             previous_response_id: request.previous_response_id().map(str::to_owned),
             full_replay: request.is_full_replay(),
             input: request
@@ -286,47 +284,6 @@ async fn sequential_creates_send_only_the_new_delta_after_completion() {
     assert_eq!(observations[1].input.len(), 1);
     assert_eq!(observations[1].input[0]["role"], "user");
     assert_eq!(session.history_len(), 4);
-}
-
-#[tokio::test]
-async fn changing_model_drops_the_checkpoint_and_replays_authoritative_history() {
-    let calls = Arc::new(AtomicU32::new(0));
-    let observations = Arc::new(Mutex::new(Vec::new()));
-    let factory_calls = Arc::clone(&calls);
-    let factory_observations = Arc::clone(&observations);
-    let openai = OpenAi::builder("test-key")
-        .service(move || RecordingScripted {
-            calls: Arc::clone(&factory_calls),
-            observations: Arc::clone(&factory_observations),
-            unmatched_first_call: false,
-            fail_on_second: false,
-        })
-        .build()
-        .unwrap();
-    let mut session = openai
-        .instructions("Remember deployment facts between calls.")
-        .build()
-        .unwrap();
-
-    session
-        .turn()
-        .create("The region is us-west-2.")
-        .await
-        .unwrap();
-    session.set_model(crate::Model::Luna);
-    session
-        .turn()
-        .create("What region did I give you?")
-        .await
-        .unwrap();
-
-    let observations = observations.lock().unwrap();
-    assert_eq!(observations.len(), 2);
-    assert_eq!(observations[0].model, crate::Model::Sol);
-    assert_eq!(observations[1].model, crate::Model::Luna);
-    assert!(observations[1].full_replay);
-    assert_eq!(observations[1].previous_response_id, None);
-    assert_eq!(observations[1].input.len(), 5);
 }
 
 #[tokio::test]
@@ -471,7 +428,6 @@ impl Service<crate::ResponsesAttempt> for CompactingScripted {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
         let is_compaction = matches!(request.kind(), ResponsesAttemptKind::Compaction);
         self.observations.lock().unwrap().push(AttemptObservation {
-            model: request.model(),
             previous_response_id: request.previous_response_id().map(str::to_owned),
             full_replay: request.is_full_replay(),
             input: request

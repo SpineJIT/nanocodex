@@ -66,7 +66,6 @@ that may affect the current run, while `Tab` creates a later queued turn.
 | `/close` | Close the `/btw` pane once it is idle. A busy pane is retained and reports why it cannot close. |
 | `/cancel` | Cancel the focused turn without the two-stage Escape gesture. |
 | `/trace` | Open Jaeger filtered to the focused session. A `/btw` trace becomes available after its fork has produced a session ID. |
-| `/model <sol\|luna>` | Select `gpt-5.6-sol` or `gpt-5.6-luna` for subsequent turns. |
 
 Unknown slash-prefixed input is sent to the model as an ordinary prompt.
 

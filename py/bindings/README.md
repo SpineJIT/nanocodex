@@ -91,7 +91,6 @@ latest, latest_events = agent.fork()
 sibling, sibling_events = agent.spawn()
 
 agent.compact()
-agent.set_model("gpt-5.6-sol")
 agent.set_thinking("high")
 agent.set_fast_mode(True)
 

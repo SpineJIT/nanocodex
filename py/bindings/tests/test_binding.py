@@ -34,7 +34,6 @@ class BindingTests(unittest.TestCase):
         self.assertTrue(callable(agent.fork_from))
         self.assertTrue(callable(agent.shutdown))
         self.assertEqual(events.request_id, agent.session_id)
-        agent.set_model("gpt-5.6-sol")
         agent.set_thinking("high")
         agent.set_fast_mode(True)
         self.assertTrue(callable(events.recv_json))
@@ -55,8 +54,6 @@ class BindingTests(unittest.TestCase):
         agent, _ = Nanocodex("test-key")
         with self.assertRaisesRegex(ValueError, "expected none"):
             agent.set_thinking("impossible")
-        with self.assertRaisesRegex(ValueError, "expected gpt-5.6-sol"):
-            agent.set_model("impossible")
         agent.shutdown()
 
         with self.assertRaisesRegex(RuntimeError, "OpenAI credentials are empty"):

@@ -20,7 +20,6 @@ async function check() {
   });
   await agent.session.compact();
   await agent.session.setFastMode(true);
-  await agent.session.setModel("gpt-5.6-sol");
   const options: Actions.turn.prompt.Options = { input: "hello" };
   const turn: Turn = agent.turn.prompt(options);
   const sameTurn: Actions.turn.prompt.ReturnType = Actions.turn.prompt(agent, options);

@@ -101,18 +101,9 @@ history, WebSocket, tools, shell sessions, and prompt-cache identity.
 returned `AgentEvents` stream is the session-wide event firehose.
 
 Nanocodex supports `gpt-5.6-sol` (the default) and `gpt-5.6-luna`. Select the
-initial model with `.model(Model::Luna)`. A completed turn is a safe boundary
-for changing subsequent work:
-
-```rust,ignore
-use nanocodex::Model;
-
-agent.set_model(Model::Luna).await?;
-let result = agent.prompt("Continue with Luna.").await?.await?;
-```
-
-An active turn and prompts already accepted into the driver's queue retain the
-model they captured at acceptance, just like reasoning effort.
+model with `.model(Model::Luna)` when creating an agent. The model is fixed for
+that thread: switching later would invalidate the provider checkpoint and
+require an inefficient replay of the complete retained context.
 
 ## Voice: devices or Unix pipes
 

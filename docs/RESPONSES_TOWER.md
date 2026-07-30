@@ -20,11 +20,8 @@ history, code-mode runtime, shell sessions, and prompt-cache identity across
 follow-on turns. A WebSocket policy also reuses its connection. The caller does
 not replay earlier results.
 
-`Nanocodex::set_model` changes the default for subsequently accepted turns.
-Each accepted prompt captures its model, so active and already queued turns,
-their retries, and their model/tool continuations remain stable. Client-owned
-typed history remains authoritative across a model change. This matches Codex
-behavior at upstream commit
+The selected Sol or Luna model is fixed when the thread is created. Upstream
+Codex permits model changes on later turns at commit
 [`acd540f1`](https://github.com/openai/codex/commit/acd540f1581bf30f963fccbcce43ac494102242c):
 
 - [`TurnStartParams::model`](https://github.com/openai/codex/blob/acd540f1581bf30f963fccbcce43ac494102242c/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L122-L136)
@@ -41,8 +38,11 @@ behavior at upstream commit
   no model request and that the next turn uses the updated model
   ([test](https://github.com/openai/codex/blob/acd540f1581bf30f963fccbcce43ac494102242c/codex-rs/app-server/tests/suite/v2/thread_settings_update.rs#L32-L92)).
 
-Nanocodex deliberately exposes the same sticky turn-boundary policy without
-otherwise widening its closed Sol/Luna model surface.
+Nanocodex deliberately does not expose that behavior. A model change cannot
+continue the prior provider checkpoint safely, so it would invalidate
+`previous_response_id` and replay the complete client-owned history. Keeping a
+thread on its creation-time model preserves incremental context reuse and
+avoids that inefficient replay.
 
 The standard policy is WebSocket plus incremental history and `store: false`
 for both API-key and ChatGPT subscription authentication. API-key callers can

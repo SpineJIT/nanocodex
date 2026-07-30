@@ -182,19 +182,6 @@ pub struct Session<S> {
 }
 
 impl<S> Session<S> {
-    /// Selects the model used by subsequently started turns.
-    ///
-    /// A turn that already borrowed this session retains the model it started
-    /// with. The complete client-owned history remains authoritative across a
-    /// model change.
-    pub fn set_model(&mut self, model: Model) {
-        if self.model == model {
-            return;
-        }
-        self.model = model;
-        self.state.reset_for_full_request();
-    }
-
     /// Returns the client-side session identity.
     #[must_use]
     pub const fn id(&self) -> SessionId {

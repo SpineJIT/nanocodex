@@ -6,6 +6,12 @@ use tokio::runtime::Runtime;
 use crate::error::runtime_error;
 
 static RUNTIME: OnceLock<Result<Arc<Runtime>, String>> = OnceLock::new();
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+/// Shares transport setup while each agent retains independent Tower and socket state.
+pub(crate) fn shared_http_client() -> reqwest::Client {
+    HTTP_CLIENT.get_or_init(reqwest::Client::new).clone()
+}
 
 pub(crate) fn runtime() -> PyResult<Arc<Runtime>> {
     RUNTIME

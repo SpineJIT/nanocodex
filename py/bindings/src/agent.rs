@@ -15,7 +15,7 @@ use tokio::runtime::Runtime;
 use crate::{
     error::{lock_error, runtime_error},
     events::AgentEvents,
-    runtime::runtime,
+    runtime::{runtime, shared_http_client},
     snapshot::SessionSnapshot,
     turn::{Turn, TurnResult},
 };
@@ -80,7 +80,8 @@ impl Nanocodex {
             .model(model)
             .thinking(thinking)
             .reasoning_mode(reasoning_mode)
-            .fast_mode(fast_mode);
+            .fast_mode(fast_mode)
+            .http_client(shared_http_client());
         if let Some(websocket_url) = websocket_url {
             openai = openai.websocket_url(websocket_url);
         }
@@ -130,15 +131,6 @@ impl Nanocodex {
             .detach(move || runtime.block_on(agent.prompt(prompt)))
             .map_err(runtime_error)?;
         Ok(Turn::new(Arc::clone(&self.runtime), turn))
-    }
-
-    /// Change the model for subsequently accepted turns.
-    fn set_model(&self, py: Python<'_>, model: &str) -> PyResult<()> {
-        let model = parse_model(model)?;
-        let runtime = Arc::clone(&self.runtime);
-        let agent = self.agent()?;
-        py.detach(move || runtime.block_on(agent.set_model(model)))
-            .map_err(runtime_error)
     }
 
     /// Change the reasoning effort for subsequently accepted turns.

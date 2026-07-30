@@ -41,9 +41,9 @@ reuse the same retained context and transport without asking the caller to
 manage response IDs or history.
 
 `gpt-5.6-sol` is the default; `.model(Model::Luna)` selects
-`gpt-5.6-luna`. `agent.set_model(...)` changes the model for subsequently
-accepted turns while active and already queued turns retain their captured
-policy.
+`gpt-5.6-luna` when creating the agent. The selected model remains fixed for
+the thread so follow-on turns can continue from the provider checkpoint without
+replaying the complete retained context.
 
 ## Usage and USD estimates
 

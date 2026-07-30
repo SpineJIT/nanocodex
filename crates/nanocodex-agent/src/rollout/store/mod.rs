@@ -339,19 +339,6 @@ impl RolloutRecorder {
             .await
     }
 
-    #[cfg(test)]
-    pub(in crate::rollout) async fn persist_history_with_model(
-        &self,
-        history: ResponseHistory,
-        revision: u64,
-        turn: RolloutTurn,
-        model: Model,
-    ) -> io::Result<()> {
-        let mut commit = RolloutCommit::from_history(history, revision, turn);
-        commit.model = model;
-        self.persist_commit(commit).await
-    }
-
     pub(crate) async fn flush(&self) -> io::Result<()> {
         let (result, receiver) = oneshot::channel();
         self.commands

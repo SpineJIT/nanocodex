@@ -39,13 +39,13 @@ where
     #[allow(clippy::too_many_lines)]
     pub(super) async fn run(mut self) -> Result<()> {
         let session_id = self.events.request_id().to_owned();
-        let mut default_model = self.spawner.config.model;
+        let thread_model = self.spawner.config.model;
         let mut default_thinking = self.spawner.config.thinking;
         let mut default_fast_mode = self.spawner.config.fast_mode;
         let inherited_checkpoint = self.initial_model.as_ref().map(|initial| {
             Arc::new(CommittedSession::new(
                 Arc::clone(&self.spawner.lineage_id),
-                default_model,
+                thread_model,
                 initial.checkpoint.clone(),
             ))
         });
@@ -93,7 +93,6 @@ where
                         QueuedTurn::Pending {
                             key,
                             prompt,
-                            model: queued_model,
                             thinking,
                             fast_mode,
                             parent,
@@ -103,7 +102,6 @@ where
                             break Command::Prompt {
                                 key,
                                 prompt,
-                                model: Some(queued_model),
                                 thinking: Some(thinking),
                                 fast_mode: Some(fast_mode),
                                 parent,
@@ -113,7 +111,6 @@ where
                         }
                         QueuedTurn::Cancelled {
                             prompt,
-                            model: queued_model,
                             thinking,
                             fast_mode,
                             parent,
@@ -133,7 +130,7 @@ where
                                 self.spawner.lineage_id.as_ref(),
                                 &self.origin,
                                 ReasoningSettings {
-                                    model: queued_model,
+                                    model: thread_model,
                                     mode: self.spawner.config.reasoning_mode,
                                     effort: thinking,
                                 },
@@ -158,7 +155,6 @@ where
                             model.emit_cancelled_before_start(
                                 &prompt,
                                 self.workspace.as_deref(),
-                                queued_model,
                                 thinking,
                                 fast_mode,
                             )?;
@@ -177,7 +173,6 @@ where
                         begin_shutdown(
                             &mut self.commands,
                             &mut queued_turns,
-                            default_model,
                             default_thinking,
                             default_fast_mode,
                         )
@@ -203,7 +198,6 @@ where
                     Command::Prompt {
                         key,
                         prompt,
-                        model: None,
                         thinking: None,
                         fast_mode: None,
                         parent,
@@ -216,7 +210,6 @@ where
             let Command::Prompt {
                 key,
                 prompt,
-                model: turn_model,
                 thinking,
                 fast_mode,
                 parent,
@@ -224,11 +217,6 @@ where
                 result,
             } = command
             else {
-                if let Command::SetModel { model, result } = command {
-                    default_model = model;
-                    drop(result.send(Ok(())));
-                    continue;
-                }
                 if let Command::SetThinking { thinking, result } = command {
                     default_thinking = thinking;
                     drop(result.send(Ok(())));
@@ -257,7 +245,6 @@ where
                         model
                             .compact(
                                 self.workspace.clone(),
-                                default_model,
                                 default_thinking,
                                 default_fast_mode,
                                 logical_turn_index,
@@ -277,7 +264,6 @@ where
                                     Some(Command::Prompt {
                                         key,
                                         prompt,
-                                        model: _,
                                         thinking: _,
                                         fast_mode: _,
                                         parent,
@@ -287,7 +273,6 @@ where
                                         queued_turns.push_back(QueuedTurn::Pending {
                                             key,
                                             prompt,
-                                            model: default_model,
                                             thinking: default_thinking,
                                             fast_mode: default_fast_mode,
                                             parent,
@@ -306,7 +291,6 @@ where
                                         queued_turns.push_back(QueuedTurn::Pending {
                                             key,
                                             prompt,
-                                            model: default_model,
                                             thinking: default_thinking,
                                             fast_mode: default_fast_mode,
                                             parent,
@@ -340,17 +324,13 @@ where
                                             latest_fork_checkpoint.as_ref(),
                                             &self.spawner,
                                             TurnDefaults {
-                                                model: default_model,
+                                                model: thread_model,
                                                 thinking: default_thinking,
                                                 fast_mode: default_fast_mode,
                                             },
                                             session_id.as_str(),
                                             self.workspace.clone(),
                                         );
-                                    }
-                                    Some(Command::SetModel { model, result }) => {
-                                        default_model = model;
-                                        drop(result.send(Ok(())));
                                     }
                                     Some(Command::SetThinking { thinking, result }) => {
                                         default_thinking = thinking;
@@ -367,7 +347,6 @@ where
                                         begin_shutdown(
                                             &mut self.commands,
                                             &mut queued_turns,
-                                            default_model,
                                             default_thinking,
                                             default_fast_mode,
                                         )
@@ -392,7 +371,7 @@ where
                         Ok(ModelCompactOutcome::Completed(checkpoint)) => {
                             let checkpoint = Arc::new(CommittedSession::new(
                                 Arc::clone(&self.spawner.lineage_id),
-                                default_model,
+                                thread_model,
                                 checkpoint,
                             ));
                             // The installed in-memory boundary is authoritative.
@@ -411,7 +390,7 @@ where
                         Ok(ModelCompactOutcome::Cancelled(checkpoint)) => {
                             let checkpoint = Arc::new(CommittedSession::new(
                                 Arc::clone(&self.spawner.lineage_id),
-                                default_model,
+                                thread_model,
                                 checkpoint,
                             ));
                             latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
@@ -433,7 +412,7 @@ where
                         Ok(ModelCompactOutcome::Failed { error, checkpoint }) => {
                             let checkpoint = Arc::new(CommittedSession::new(
                                 Arc::clone(&self.spawner.lineage_id),
-                                default_model,
+                                thread_model,
                                 checkpoint,
                             ));
                             latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
@@ -471,7 +450,7 @@ where
                     latest_fork_checkpoint.as_ref(),
                     &self.spawner,
                     TurnDefaults {
-                        model: default_model,
+                        model: thread_model,
                         thinking: default_thinking,
                         fast_mode: default_fast_mode,
                     },
@@ -480,7 +459,6 @@ where
                 );
                 continue;
             };
-            let turn_model = turn_model.unwrap_or(default_model);
             let thinking = thinking.unwrap_or(default_thinking);
             let fast_mode = fast_mode.unwrap_or(default_fast_mode);
             turn_index += 1;
@@ -497,7 +475,7 @@ where
                 self.spawner.lineage_id.as_ref(),
                 &self.origin,
                 ReasoningSettings {
-                    model: turn_model,
+                    model: thread_model,
                     mode: self.spawner.config.reasoning_mode,
                     effort: thinking,
                 },
@@ -528,7 +506,6 @@ where
                     .execute(
                         prompt,
                         self.workspace.clone(),
-                        turn_model,
                         thinking,
                         fast_mode,
                         logical_turn_index,
@@ -553,7 +530,7 @@ where
                         if let Some(snapshot) = snapshot {
                             latest_fork_checkpoint = Some(Arc::new(CommittedSession::new(
                                 Arc::clone(&self.spawner.lineage_id),
-                                turn_model,
+                                thread_model,
                                 snapshot,
                             )));
                         }
@@ -564,7 +541,6 @@ where
                             Some(Command::Prompt {
                                 key,
                                 prompt,
-                                model: _,
                                 thinking: _,
                                 fast_mode: _,
                                 parent,
@@ -574,7 +550,6 @@ where
                                 queued_turns.push_back(QueuedTurn::Pending {
                                     key,
                                     prompt,
-                                    model: default_model,
                                     thinking: default_thinking,
                                     fast_mode: default_fast_mode,
                                     parent,
@@ -645,7 +620,7 @@ where
                                     latest_fork_checkpoint =
                                         Some(Arc::new(CommittedSession::new(
                                             Arc::clone(&self.spawner.lineage_id),
-                                            turn_model,
+                                            thread_model,
                                             snapshot,
                                         )));
                                 }
@@ -654,17 +629,13 @@ where
                                     latest_fork_checkpoint.as_ref(),
                                     &self.spawner,
                                     TurnDefaults {
-                                        model: default_model,
+                                        model: thread_model,
                                         thinking: default_thinking,
                                         fast_mode: default_fast_mode,
                                     },
                                     session_id.as_str(),
                                     self.workspace.clone(),
                                 );
-                            }
-                            Some(Command::SetModel { model, result }) => {
-                                default_model = model;
-                                drop(result.send(Ok(())));
                             }
                             Some(Command::SetThinking { thinking, result }) => {
                                 default_thinking = thinking;
@@ -688,7 +659,6 @@ where
                                 begin_shutdown(
                                     &mut self.commands,
                                     &mut queued_turns,
-                                    default_model,
                                     default_thinking,
                                     default_fast_mode,
                                 )
@@ -717,7 +687,7 @@ where
                     } = completed;
                     let checkpoint = Arc::new(CommittedSession::new(
                         Arc::clone(&self.spawner.lineage_id),
-                        turn_model,
+                        thread_model,
                         checkpoint,
                     ));
                     let durability_turn = durability_turn.completed(final_message.clone());
@@ -738,7 +708,7 @@ where
                 Ok(ModelTurnOutcome::Cancelled(checkpoint)) => {
                     let checkpoint = Arc::new(CommittedSession::new(
                         Arc::clone(&self.spawner.lineage_id),
-                        turn_model,
+                        thread_model,
                         checkpoint,
                     ));
                     let durability_turn = durability_turn.interrupted();
@@ -753,7 +723,7 @@ where
                 Ok(ModelTurnOutcome::Failed { error, checkpoint }) => {
                     let checkpoint = Arc::new(CommittedSession::new(
                         Arc::clone(&self.spawner.lineage_id),
-                        turn_model,
+                        thread_model,
                         checkpoint,
                     ));
                     let durability_turn = durability_turn.failed();

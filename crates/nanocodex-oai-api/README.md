@@ -37,9 +37,10 @@ if let Some(cost) = completed.estimated_cost() {
 ```
 
 This crate supports `gpt-5.6-sol` (the default) and `gpt-5.6-luna`. Select a
-client default with `OpenAi::builder(auth).model(Model::Luna)`, or call
-`Session::set_model` between borrowed turn boundaries. A replayable attempt
-retains its selected model across retries.
+client default with `OpenAi::builder(auth).model(Model::Luna)`. A session keeps
+that model for its lifetime, and each replayable attempt retains it across
+retries. Changing models would invalidate the provider checkpoint and require
+an inefficient replay of the complete retained context.
 
 USD estimates require no pricing configuration. Each model applies its
 published standard rates, or its priority rates when

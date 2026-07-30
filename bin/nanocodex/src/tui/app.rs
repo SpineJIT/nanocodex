@@ -2594,15 +2594,6 @@ impl App {
         self.model
     }
 
-    pub(super) const fn model_changed(&mut self, model: Model) {
-        self.model = model;
-    }
-
-    pub(super) fn model_change_failed(&mut self, error: &str) {
-        self.push_active_error(format!("Could not change model: {error}"));
-        self.set_active_status("Model unchanged");
-    }
-
     pub(super) const fn reasoning_picker(&self) -> Option<ReasoningPicker> {
         self.reasoning_picker
     }

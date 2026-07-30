@@ -26,7 +26,7 @@ use crossterm::event::{
 use eyre::{Result, WrapErr};
 use futures_util::StreamExt;
 use nanocodex::{
-    AgentEvents, Model, Nanocodex, NanocodexError, OpenAi, Thinking, TurnControl, TurnResult,
+    AgentEvents, Nanocodex, NanocodexError, OpenAi, Thinking, TurnControl, TurnResult,
     agent::{
         events::{AgentEvent, TimedAgentEvent},
         rollout::DurableSession,
@@ -107,9 +107,6 @@ enum WorkerCommand {
     },
     SetThinking {
         thinking: Thinking,
-    },
-    SetModel {
-        model: Model,
     },
     McpLogin {
         name: String,
@@ -219,12 +216,6 @@ enum WorkerEvent {
         thinking: Thinking,
     },
     ThinkingChangeFailed {
-        error: String,
-    },
-    ModelChanged {
-        model: Model,
-    },
-    ModelChangeFailed {
         error: String,
     },
     McpLoginStarted {
@@ -546,7 +537,6 @@ enum Submission {
     Cancel,
     Trace,
     Fast(Option<bool>),
-    Model(Model),
     ReasoningPicker,
     Voice(VoiceControl),
     McpLogin(String),
@@ -1034,8 +1024,6 @@ fn handle_worker_update(
         WorkerEvent::FastModeChangeFailed { error } => app.fast_mode_change_failed(&error),
         WorkerEvent::ThinkingChanged { thinking } => app.thinking_changed(thinking),
         WorkerEvent::ThinkingChangeFailed { error } => app.thinking_change_failed(&error),
-        WorkerEvent::ModelChanged { model } => app.model_changed(model),
-        WorkerEvent::ModelChangeFailed { error } => app.model_change_failed(&error),
         WorkerEvent::McpLoginStarted { name } => {
             app.set_active_status(format!("Authorizing MCP server {name} in browser"));
         }
@@ -1206,7 +1194,6 @@ impl AgentWorker {
             WorkerCommand::SwitchMainBranch { id } => self.switch_main_branch(id),
             WorkerCommand::SetFastMode { enabled } => self.set_fast_mode(enabled).await,
             WorkerCommand::SetThinking { thinking } => self.set_thinking(thinking).await,
-            WorkerCommand::SetModel { model } => self.set_model(model).await,
             WorkerCommand::McpLogin { name } => self.mcp_login(name),
             WorkerCommand::McpReload { name } => self.mcp_reload(name),
             WorkerCommand::VoiceAgentEvent(event) => {
@@ -1404,28 +1391,6 @@ impl AgentWorker {
         let update = match result {
             Ok(()) => WorkerEvent::ThinkingChanged { thinking },
             Err(error) => WorkerEvent::ThinkingChangeFailed {
-                error: error.to_string(),
-            },
-        };
-        drop(self.updates.send(update));
-    }
-
-    async fn set_model(&mut self, model: Model) {
-        let mut result = self.main.agent.set_model(model).await;
-        for branch in &self.archived_main {
-            if result.is_ok() {
-                result = branch.agent.set_model(model).await;
-            }
-        }
-        if let Some(branch) = &self.btw
-            && result.is_ok()
-        {
-            result = branch.agent.set_model(model).await;
-        }
-
-        let update = match result {
-            Ok(()) => WorkerEvent::ModelChanged { model },
-            Err(error) => WorkerEvent::ModelChangeFailed {
                 error: error.to_string(),
             },
         };
@@ -2709,9 +2674,6 @@ fn submit(
             let enabled = enabled.unwrap_or(!app.fast_mode());
             send_command(commands, WorkerCommand::SetFastMode { enabled })?;
         }
-        Submission::Model(model) => {
-            send_command(commands, WorkerCommand::SetModel { model })?;
-        }
         Submission::ReasoningPicker => app.open_reasoning_picker(),
         Submission::Voice(control) => {
             send_command(commands, WorkerCommand::Voice(control))?;
@@ -2787,17 +2749,11 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
             _ => Submission::InvalidCommand("Usage: /fast [on|off]".to_owned()),
         };
     }
-    if trimmed == "/thinking" {
+    if matches!(trimmed, "/model" | "/thinking") {
         return Submission::ReasoningPicker;
     }
-    if let Some(argument) = trimmed.strip_prefix("/model ") {
-        return argument
-            .trim()
-            .parse::<Model>()
-            .map_or_else(Submission::InvalidCommand, Submission::Model);
-    }
-    if trimmed == "/model" || trimmed.starts_with("/thinking ") {
-        return Submission::InvalidCommand("Usage: /model <sol|luna> or /thinking".to_owned());
+    if trimmed.starts_with("/model ") || trimmed.starts_with("/thinking ") {
+        return Submission::InvalidCommand("Usage: /model or /thinking".to_owned());
     }
     if let Some(name) = trimmed.strip_prefix("/mcp login ") {
         let name = name.trim();
@@ -2896,8 +2852,7 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use futures_util::{SinkExt, StreamExt};
     use nanocodex::{
-        Model, Nanocodex, OpenAi, Thinking, agent::events::AgentEventKind,
-        oai::__private::EventSink,
+        Nanocodex, OpenAi, Thinking, agent::events::AgentEventKind, oai::__private::EventSink,
     };
     use nanocodex_voice::RealtimeVoice;
     use serde_json::{Value, json};
@@ -2905,11 +2860,11 @@ mod tests {
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
     use super::{
-        BTW_BOUNDARY, PaneId, RedrawPriority, Submission, SubmitIntent, TerminalAction, UiAction,
-        UiModel, UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, active_session_id,
+        BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
+        UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, active_session_id,
         apply_main_agent_event_batch, classify_submission, handle_key, handle_worker_update,
         paste_clipboard_image, prepare_btw_prompt, report_cancel_outcome, session_trace_url,
-        spawn_agent_worker, submit,
+        spawn_agent_worker,
     };
     use crate::tui::{
         app::App,
@@ -2984,30 +2939,13 @@ mod tests {
             Submission::InvalidCommand("Usage: /fast [on|off]".to_owned())
         );
         assert_eq!(
-            classify_submission("/model"),
-            Submission::InvalidCommand("Usage: /model <sol|luna> or /thinking".to_owned())
-        );
-        assert_eq!(
-            classify_submission("/model luna"),
-            Submission::Model(Model::Luna)
-        );
-        assert_eq!(
-            classify_submission(" /model gpt-5.6-sol "),
-            Submission::Model(Model::Sol)
-        );
-        assert_eq!(
-            classify_submission("/model terra"),
-            Submission::InvalidCommand(
-                "invalid model \"terra\"; expected gpt-5.6-sol or gpt-5.6-luna".to_owned()
-            )
-        );
-        assert_eq!(
             classify_submission(" /thinking "),
             Submission::ReasoningPicker
         );
+        assert_eq!(classify_submission(" /model "), Submission::ReasoningPicker);
         assert_eq!(
             classify_submission("/thinking high"),
-            Submission::InvalidCommand("Usage: /model <sol|luna> or /thinking".to_owned())
+            Submission::InvalidCommand("Usage: /model or /thinking".to_owned())
         );
         assert_eq!(
             classify_submission(" /mcp login centaur-tempo "),
@@ -3039,29 +2977,6 @@ mod tests {
             classify_submission("/modeling"),
             Submission::Prompt("/modeling".into())
         );
-    }
-
-    #[test]
-    fn model_command_changes_subsequent_turn_model_after_worker_confirmation() {
-        let (commands, mut worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
-        app.replace_input("/model luna".to_owned());
-
-        submit(&mut app, "main-session", &commands, SubmitIntent::Immediate).unwrap();
-
-        assert!(matches!(
-            worker.try_recv(),
-            Ok(WorkerCommand::SetModel { model: Model::Luna })
-        ));
-        assert_eq!(app.model(), Model::Sol);
-
-        handle_worker_update(
-            &mut app,
-            WorkerEvent::ModelChanged { model: Model::Luna },
-            &commands,
-        )
-        .unwrap();
-        assert_eq!(app.model(), Model::Luna);
     }
 
     #[test]

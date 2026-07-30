@@ -9,13 +9,11 @@ where
     pub(crate) async fn compact(
         &mut self,
         requested_workspace: Option<Arc<str>>,
-        model: Model,
         thinking: Thinking,
         fast_mode: bool,
         logical_turn: u64,
         cancel: &mut tokio::sync::oneshot::Receiver<()>,
     ) -> Result<ModelCompactOutcome> {
-        self.model = model;
         self.thinking = thinking;
         self.fast_mode = fast_mode;
         self.started_at = Instant::now();
@@ -99,11 +97,9 @@ where
         &mut self,
         task: &Prompt,
         workspace: Option<&str>,
-        model: Model,
         thinking: Thinking,
         fast_mode: bool,
     ) -> Result<()> {
-        self.model = model;
         self.thinking = thinking;
         self.fast_mode = fast_mode;
         self.started_at = Instant::now();
@@ -148,7 +144,6 @@ where
         &mut self,
         task: Prompt,
         workspace: Option<Arc<str>>,
-        model: Model,
         thinking: Thinking,
         fast_mode: bool,
         logical_turn: u64,
@@ -156,7 +151,6 @@ where
         mut cancel: tokio::sync::oneshot::Receiver<()>,
         fork_snapshots: watch::Sender<Option<ModelCheckpoint>>,
     ) -> Result<ModelTurnOutcome> {
-        self.model = model;
         self.thinking = thinking;
         self.fast_mode = fast_mode;
         self.started_at = Instant::now();

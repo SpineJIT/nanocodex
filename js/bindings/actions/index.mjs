@@ -12,7 +12,6 @@ export function agentActions() {
     session: {
       compact: () => session.compact(agent),
       fork: (options) => session.fork(agent, options),
-      setModel: (model) => session.setModel(agent, model),
       setFastMode: (enabled) => session.setFastMode(agent, enabled),
       setThinking: (thinking) => session.setThinking(agent, thinking),
       shutdown: () => session.shutdown(agent),

@@ -1,7 +1,6 @@
 import {
   compact as compactAgent,
   fork as forkAgent,
-  setModel as setAgentModel,
   setFastMode as setAgentFastMode,
   setThinking as setAgentThinking,
   shutdown as shutdownAgent,
@@ -22,10 +21,6 @@ export function spawn(agent) {
 
 export function setThinking(agent, thinking) {
   return setAgentThinking(agent, thinking);
-}
-
-export function setModel(agent, model) {
-  return setAgentModel(agent, model);
 }
 
 export function setFastMode(agent, enabled) {

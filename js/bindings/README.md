@@ -25,7 +25,6 @@ console.log(result.usage);
 console.log(result.usage.estimated_cost?.usd);
 console.log(result.usage.cost_status);
 
-await agent.session.setModel("gpt-5.6-sol");
 await agent.session.setThinking("high");
 await agent.session.setFastMode(true);
 await agent.session.compact();
