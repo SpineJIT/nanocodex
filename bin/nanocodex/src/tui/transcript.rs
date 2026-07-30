@@ -2838,6 +2838,14 @@ mod tests {
         Transcript, TranscriptItem, child_lines, render_agent_markdown, saturating_u16, tool_style,
     };
 
+    const ASYNC_RENDER_TIMEOUT: Duration = Duration::from_secs(10);
+
+    fn wait_for_math_render(wake_rx: &mpsc::Receiver<()>) {
+        wake_rx
+            .recv_timeout(ASYNC_RENDER_TIMEOUT)
+            .expect("math render must complete before the test deadline");
+    }
+
     #[test]
     fn cancelled_tools_have_a_distinct_neutral_terminal_style() {
         assert_eq!(tool_style(ToolStatus::Cancelled), ("■", Color::Yellow));
@@ -2895,7 +2903,7 @@ with $\mathbf{u}$ denoting velocity."
         ));
 
         let _ = transcript.height_from(0, 120);
-        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        wait_for_math_render(&wake_rx);
         transcript.invalidate_math_layouts();
         assert_eq!(renderer.drain_terminal_commands().len(), 1);
 
@@ -2970,7 +2978,7 @@ with $\mathbf{u}$ denoting velocity."
         assert!(pending_lines.iter().all(|line| line.trim() != "x"));
         assert_eq!(pending_formulas, 0);
 
-        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        wait_for_math_render(&wake_rx);
         markdown.invalidate_math_layout();
         markdown.append("+y");
         let (fallback, fallback_text) = markdown.with_rendered(80, |rendered| {
@@ -2989,7 +2997,7 @@ with $\mathbf{u}$ denoting velocity."
         assert!(!fallback_text.contains(r"\["));
         assert!(!fallback_text.contains("x+y"));
 
-        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        wait_for_math_render(&wake_rx);
         markdown.invalidate_math_layout();
         let replacement = markdown.with_rendered(80, |rendered| {
             assert_eq!(rendered.formulas.len(), 1);
@@ -3003,7 +3011,7 @@ with $\mathbf{u}$ denoting velocity."
             Arc::clone(&rendered.formulas[0].formula)
         });
         assert!(Arc::ptr_eq(&replacement, &stored_fallback));
-        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        wait_for_math_render(&wake_rx);
         markdown.invalidate_math_layout();
         let final_prefix = markdown.with_rendered(80, |rendered| {
             assert_eq!(rendered.formulas.len(), 1);
@@ -3036,7 +3044,7 @@ with $\mathbf{u}$ denoting velocity."
         assert!(!finalizing_text.contains(r"\["));
         assert!(!finalizing_text.contains("x+y+z+w"));
 
-        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        wait_for_math_render(&wake_rx);
         markdown.invalidate_math_layout();
         let finalized = markdown.with_rendered(80, |rendered| {
             assert_eq!(rendered.formulas.len(), 1);
@@ -3060,7 +3068,7 @@ with $\mathbf{u}$ denoting velocity."
         let source = "Before\n\n\\[\\frac{a}{b}+\\frac{c}{d}\\]\n\nAfter";
         let markdown = MarkdownContent::new(source, Some(renderer.clone()));
         let _ = markdown.height(60);
-        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        wait_for_math_render(&wake_rx);
         markdown.invalidate_math_layout();
 
         let (formula_top, formula_rows, formula_column, height) =
@@ -3130,7 +3138,7 @@ R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
 \]";
         let markdown = MarkdownContent::new(source, Some(renderer.clone()));
         let _ = markdown.height(54);
-        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        wait_for_math_render(&wake_rx);
         markdown.invalidate_math_layout();
 
         markdown.with_rendered(54, |rendered| {

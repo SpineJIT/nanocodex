@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsString,
+    future::Future,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{
@@ -35,6 +36,7 @@ use super::protocol::{
 
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONTROL_FILE_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(feature = "guest-runtime")]
 const FILESYSTEM_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 
@@ -71,6 +73,7 @@ pub(crate) async fn serve(workspace: &Path) -> Result<(), VmGuestError> {
     serve_io(workspace, tokio::io::stdin(), tokio::io::stdout()).await
 }
 
+#[cfg(feature = "guest-runtime")]
 async fn serve_io(
     workspace: &Path,
     input: impl AsyncRead + Unpin,
@@ -79,12 +82,28 @@ async fn serve_io(
     serve_io_with_frame_limit(workspace, input, output, MAX_FRAME_BYTES).await
 }
 
+#[cfg(feature = "guest-runtime")]
 async fn serve_io_with_frame_limit(
+    workspace: &Path,
+    input: impl AsyncRead + Unpin,
+    output: impl AsyncWrite + Unpin,
+    max_frame_bytes: usize,
+) -> Result<(), VmGuestError> {
+    serve_io_with_frame_limit_and_sync(workspace, input, output, max_frame_bytes, sync_filesystems)
+        .await
+}
+
+async fn serve_io_with_frame_limit_and_sync<Sync, SyncFuture>(
     workspace: &Path,
     input: impl AsyncRead + Unpin,
     mut output: impl AsyncWrite + Unpin,
     max_frame_bytes: usize,
-) -> Result<(), VmGuestError> {
+    sync: Sync,
+) -> Result<(), VmGuestError>
+where
+    Sync: FnOnce(ShutdownRequest) -> SyncFuture,
+    SyncFuture: Future<Output = ControlResponse>,
+{
     let runtime = Arc::new(
         WorkspaceToolRuntime::with_environment_and_view_image_wire_limit(
             workspace.to_path_buf(),
@@ -157,10 +176,41 @@ async fn serve_io_with_frame_limit(
 
     runtime.control().cancel().await;
     if let Some(request) = result? {
-        let response = SessionResponse::Shutdown(sync_filesystems(request).await);
+        let response = SessionResponse::Shutdown(sync(request).await);
         write_response(&mut output, &response, max_frame_bytes).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+async fn serve_test_io(
+    workspace: &Path,
+    input: impl AsyncRead + Unpin,
+    output: impl AsyncWrite + Unpin,
+) -> Result<(), VmGuestError> {
+    serve_test_io_with_frame_limit(workspace, input, output, MAX_FRAME_BYTES).await
+}
+
+#[cfg(test)]
+async fn serve_test_io_with_frame_limit(
+    workspace: &Path,
+    input: impl AsyncRead + Unpin,
+    output: impl AsyncWrite + Unpin,
+    max_frame_bytes: usize,
+) -> Result<(), VmGuestError> {
+    serve_io_with_frame_limit_and_sync(
+        workspace,
+        input,
+        output,
+        max_frame_bytes,
+        |request| async move {
+            ControlResponse {
+                id: request.id,
+                error: None,
+            }
+        },
+    )
+    .await
 }
 
 async fn execute_request(
@@ -325,6 +375,7 @@ async fn read_frame(
     }
 }
 
+#[cfg(feature = "guest-runtime")]
 async fn sync_filesystems(request: ShutdownRequest) -> ControlResponse {
     let mut command = Command::new("/bin/sync");
     command.kill_on_drop(true);
@@ -707,7 +758,7 @@ mod tests {
     };
     use super::{
         atomic_write_file, command_environment, create_directory_path, execute_command, read_file,
-        serve_io, serve_io_with_frame_limit,
+        serve_test_io, serve_test_io_with_frame_limit,
     };
 
     const DEFAULT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
@@ -847,7 +898,7 @@ mod tests {
         let (guest_read, guest_write) = tokio::io::split(guest);
         let guest_task = tokio::spawn({
             let workspace = workspace.path().to_owned();
-            async move { serve_io(&workspace, guest_read, guest_write).await }
+            async move { serve_test_io(&workspace, guest_read, guest_write).await }
         });
 
         for request in [
@@ -914,7 +965,7 @@ mod tests {
         let (guest_read, guest_write) = tokio::io::split(guest);
         let guest_task = tokio::spawn({
             let workspace = workspace.path().to_owned();
-            async move { serve_io(&workspace, guest_read, guest_write).await }
+            async move { serve_test_io(&workspace, guest_read, guest_write).await }
         });
         for request in [
             SessionRequest::Execute(ExecuteRequest {
@@ -957,7 +1008,7 @@ mod tests {
         let (guest_read, guest_write) = tokio::io::split(guest);
         let guest_task = tokio::spawn({
             let workspace = workspace.path().to_owned();
-            async move { serve_io(&workspace, guest_read, guest_write).await }
+            async move { serve_test_io(&workspace, guest_read, guest_write).await }
         });
         for request in [
             SessionRequest::Execute(ExecuteRequest {
@@ -1037,8 +1088,13 @@ mod tests {
         let guest_task = tokio::spawn({
             let workspace = workspace.path().to_owned();
             async move {
-                serve_io_with_frame_limit(&workspace, guest_read, guest_write, TEST_FRAME_BYTES)
-                    .await
+                serve_test_io_with_frame_limit(
+                    &workspace,
+                    guest_read,
+                    guest_write,
+                    TEST_FRAME_BYTES,
+                )
+                .await
             }
         });
         let oversized = SessionRequest::Tool(ToolRequest {
@@ -1119,7 +1175,7 @@ mod tests {
         let (guest_read, guest_write) = tokio::io::split(guest);
         let guest_task = tokio::spawn({
             let workspace = workspace.path().to_owned();
-            async move { serve_io(&workspace, guest_read, guest_write).await }
+            async move { serve_test_io(&workspace, guest_read, guest_write).await }
         });
         let view_image = SessionRequest::Tool(ToolRequest {
             id: 0,
