@@ -16,6 +16,10 @@
     "./browser": {
       "types": "./browser/index.d.mts",
       "import": "./browser/index.mjs"
+    },
+    "./wasm": {
+      "types": "./wasm.d.mts",
+      "import": "./pkg-web/nanocodex_bg.wasm"
     }
   },
   "files": [
@@ -28,6 +32,7 @@
     "internal.mjs",
     "index.d.mts",
     "index.mjs",
+    "wasm.d.mts",
     "types.d.mts",
     "README.md"
   ],
