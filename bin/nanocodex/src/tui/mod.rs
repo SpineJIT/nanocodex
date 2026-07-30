@@ -34,8 +34,8 @@ use nanocodex::{
     tools::mcp::McpHandle,
 };
 use nanocodex_voice::{
-    CHATGPT_REALTIME_VOICES, PLATFORM_REALTIME_VOICES, RealtimeVoice, VoiceEvent, VoiceEvents,
-    VoiceSession, VoiceSessionBuilder, VoiceSpeaker,
+    CHATGPT_REALTIME_VOICES, PLATFORM_REALTIME_VOICES, RealtimeVoice, VoiceAgentControl,
+    VoiceEvent, VoiceEvents, VoiceSession, VoiceSessionBuilder, VoiceSpeaker,
 };
 use ratatex::{Ratatex, TerminalProfile};
 use tokio::{
@@ -148,6 +148,9 @@ enum WorkerEvent {
         error: String,
     },
     CancelAccepted {
+        target: PaneId,
+    },
+    CancelSettled {
         target: PaneId,
     },
     CancelFailed {
@@ -952,6 +955,7 @@ fn handle_worker_update(
         }
         WorkerEvent::SteerFailed { target, id, error } => app.steer_failed(target, id, error),
         WorkerEvent::CancelAccepted { target } => app.cancel_accepted(target),
+        WorkerEvent::CancelSettled { target } => app.cancel_settled(target),
         WorkerEvent::CancelFailed { target, error } => app.cancel_failed(target, error),
         WorkerEvent::InterruptedSteersResubmitted {
             target,
@@ -1085,6 +1089,7 @@ fn spawn_agent_worker(
             mcp,
             realtime,
             voice: None,
+            voice_agent_control: VoiceAgentControl::default(),
         };
         loop {
             tokio::select! {
@@ -1141,6 +1146,7 @@ struct AgentWorker {
     mcp: Option<McpHandle>,
     realtime: Option<OpenAi>,
     voice: Option<VoiceSession>,
+    voice_agent_control: VoiceAgentControl,
 }
 
 impl AgentWorker {
@@ -1245,7 +1251,8 @@ impl AgentWorker {
             return;
         };
         let mut builder = VoiceSessionBuilder::new(realtime, self.main.agent.clone())
-            .session_id(Arc::clone(&self.main.request_id));
+            .session_id(Arc::clone(&self.main.request_id))
+            .agent_control(self.voice_agent_control.clone());
         if let Some(voice) = voice {
             builder = builder.voice(voice);
         }
@@ -1514,7 +1521,11 @@ impl AgentWorker {
                     (Some(&branch.turns), branch.request_id.as_ref())
                 }),
         };
-        let _ = cancel_turn(turns, session_id, target, &self.updates).await;
+        let mut outcome = cancel_turn(turns, session_id, target).await;
+        if matches!(outcome, Ok(false)) && matches!(target, PaneId::Main) {
+            outcome = self.voice_agent_control.cancel().await;
+        }
+        let _ = report_cancel_outcome(outcome, target, &self.updates);
     }
 
     async fn interrupt_for_steers(
@@ -1559,7 +1570,11 @@ impl AgentWorker {
                     (Some(&branch.turns), branch.request_id.as_ref())
                 }),
         };
-        if !cancel_turn(turns, session_id, target, &self.updates).await {
+        if !report_cancel_outcome(
+            cancel_turn(turns, session_id, target).await,
+            target,
+            &self.updates,
+        ) {
             drop(
                 self.updates
                     .send(WorkerEvent::InterruptedSteersKept { target, prompt_id }),
@@ -1684,13 +1699,11 @@ impl AgentWorker {
             return;
         };
         if !self.main.turns.is_empty()
-            && !cancel_turn(
-                Some(&self.main.turns),
-                &self.main.request_id,
+            && !report_cancel_outcome(
+                cancel_turn(Some(&self.main.turns), &self.main.request_id, PaneId::Main).await,
                 PaneId::Main,
                 &self.updates,
             )
-            .await
         {
             drop(self.updates.send(WorkerEvent::MainBranchOpenFailed {
                 id: new_branch_id,
@@ -2012,9 +2025,7 @@ async fn cancel_turn(
     turns: Option<&VecDeque<TrackedTurn>>,
     session_id: &str,
     target: PaneId,
-    updates: &mpsc::UnboundedSender<WorkerEvent>,
-) -> bool {
-    let mut outcome = Err(NanocodexError::TurnNotCancellable);
+) -> Result<bool, NanocodexError> {
     for turn in turns.into_iter().flatten() {
         let started_at = Instant::now();
         let span = info_span!(
@@ -2045,14 +2056,22 @@ async fn cancel_turn(
                     "otel.status_code",
                     if result.is_ok() { "OK" } else { "ERROR" },
                 );
-                outcome = result;
-                break;
+                return result.map(|()| true);
             }
         }
     }
-    let accepted = outcome.is_ok();
+    Ok(false)
+}
+
+fn report_cancel_outcome(
+    outcome: Result<bool, NanocodexError>,
+    target: PaneId,
+    updates: &mpsc::UnboundedSender<WorkerEvent>,
+) -> bool {
+    let accepted = matches!(outcome, Ok(true));
     let event = match outcome {
-        Ok(()) => WorkerEvent::CancelAccepted { target },
+        Ok(true) => WorkerEvent::CancelAccepted { target },
+        Ok(false) => WorkerEvent::CancelSettled { target },
         Err(error) => WorkerEvent::CancelFailed {
             target,
             error: error.to_string(),
@@ -2839,7 +2858,8 @@ mod tests {
         BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
         UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, active_session_id,
         apply_main_agent_event_batch, classify_submission, handle_key, handle_worker_update,
-        paste_clipboard_image, prepare_btw_prompt, session_trace_url, spawn_agent_worker,
+        paste_clipboard_image, prepare_btw_prompt, report_cancel_outcome, session_trace_url,
+        spawn_agent_worker,
     };
     use crate::tui::{
         app::App,
@@ -3688,6 +3708,32 @@ mod tests {
             })
         ));
         assert_eq!(app.input, "preserved draft");
+    }
+
+    #[test]
+    fn already_settled_cancel_is_quiet() -> eyre::Result<()> {
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        assert!(!report_cancel_outcome(Ok(false), PaneId::Main, &updates));
+        assert!(matches!(
+            update_rx.try_recv(),
+            Ok(WorkerEvent::CancelSettled {
+                target: PaneId::Main
+            })
+        ));
+
+        let (commands, _) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        app.cancel_pending(PaneId::Main);
+        handle_worker_update(
+            &mut app,
+            WorkerEvent::CancelSettled {
+                target: PaneId::Main,
+            },
+            &commands,
+        )?;
+        assert_eq!(app.main.status, "Ready");
+        assert!(app.main.transcript.is_empty());
+        Ok(())
     }
 
     #[test]

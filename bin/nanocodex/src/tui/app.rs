@@ -2262,6 +2262,16 @@ impl App {
         }
     }
 
+    pub(super) fn cancel_settled(&mut self, target: PaneId) {
+        if let Some(conversation) = self.conversation_mut(target) {
+            conversation.status = if conversation.running {
+                "Working".to_owned()
+            } else {
+                "Ready".to_owned()
+            };
+        }
+    }
+
     pub(super) fn cancel_failed(&mut self, target: PaneId, error: String) {
         if let Some(conversation) = self.conversation_mut(target) {
             conversation.push_output(TranscriptItem::Error(error));
