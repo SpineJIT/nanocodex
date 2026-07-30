@@ -28,6 +28,7 @@ js/tui-react/dist/
 js/bindings/pkg-node/
 js/bindings/pkg-web/
 examples/node/node_modules/
+examples/rivet-actors/node_modules/
 examples/react-vite/dist/
 examples/react-vite/node_modules/
 examples/react-vite/test-results/

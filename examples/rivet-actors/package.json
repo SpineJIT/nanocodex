@@ -1,0 +1,35 @@
+{
+  "name": "nanocodex-rivet-actors-example",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "check": "npm run typecheck && npm test",
+    "brutalize": "node --import tsx scripts/soak.ts",
+    "dev": "node --env-file-if-exists=../../.env --import tsx src/server.ts",
+    "smoke": "node --import tsx scripts/live-smoke.ts",
+    "stress": "node --import tsx scripts/stress.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@rivet-dev/agentos": "0.2.15",
+    "nanocodex": "file:../../js/bindings",
+    "rivetkit": "2.3.9",
+    "ws": "8.21.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.15",
+    "@types/ws": "8.18.1",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  },
+  "overrides": {
+    "esbuild": "0.28.1",
+    "ws": "8.21.1"
+  }
+}
