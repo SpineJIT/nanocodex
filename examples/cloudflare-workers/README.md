@@ -42,41 +42,30 @@ just build-wasm
 npm ci --prefix examples/cloudflare-workers
 ```
 
-Create `examples/cloudflare-workers/.dev.vars` (it is ignored by Git). API-key
-mode is the default:
+Sign in once with Codex, then start the subscription-backed Worker:
 
-```dotenv
-OPENAI_API_KEY=your-key
-NANOCODEX_ADMIN_TOKEN=local-admin-token
-AGENT_IDLE_TIMEOUT_MS=1000
+```sh
+codex login
+npm run dev:subscription --prefix examples/cloudflare-workers
 ```
 
-To use an existing ChatGPT/Codex subscription instead, set
-`NANOCODEX_AUTH_MODE=chatgpt` in `wrangler.jsonc` and provide the three values
-from a Codex login:
-
-```dotenv
-CHATGPT_ACCESS_TOKEN=your-access-token
-CHATGPT_REFRESH_TOKEN=your-refresh-token
-CHATGPT_ACCOUNT_ID=your-account-id
-# CHATGPT_FEDRAMP=true
-NANOCODEX_ADMIN_TOKEN=local-admin-token
-AGENT_IDLE_TIMEOUT_MS=1000
-```
+The launcher securely reads `$CODEX_HOME/auth.json` (normally
+`~/.codex/auth.json`), requires it to be mode `0600`, and gives workerd only the
+current access token and account metadata through a temporary mode-`0600` env
+file. It never reads, copies, rotates, or persists the Codex CLI refresh token.
+The temporary file is removed when Wrangler exits. If the access token expires,
+run `codex login` and restart this command.
 
 The access token is sent only by the Worker host during the upstream WebSocket
-upgrade; it never crosses into WASM or a client event. A singleton auth Durable
-Object stores rotated credentials in SQLite, refreshes JWTs five minutes before
-expiry, and performs one revision-guarded refresh-and-retry when an upstream
-upgrade returns 401. This avoids a refresh-token race when many session objects
-reconnect together. `GET /auth/chatgpt` reports non-secret status and
-`DELETE /auth/chatgpt` clears the durable copy so changed secrets are re-seeded;
-both routes require the admin bearer token.
+upgrade; it never crosses into WASM or a client event. Local workerd keeps the
+access token behind the singleton auth Durable Object and the launcher clears
+any credential retained by an older run before accepting the new login.
+`GET /auth/chatgpt` reports non-secret status and `DELETE /auth/chatgpt` clears
+the durable copy; both routes require the admin bearer token.
 
 Start workerd in one terminal and run the live probes in another:
 
 ```sh
-npm run dev --prefix examples/cloudflare-workers
 npm run repl --prefix examples/cloudflare-workers
 npm run smoke --prefix examples/cloudflare-workers
 npm run stress --prefix examples/cloudflare-workers
@@ -114,25 +103,16 @@ it also validates the bearer/account headers and serves rotating OAuth tokens,
 so the full Rust/WASM driver, snapshot, idle shutdown, restore, and auth-retry
 paths execute.
 
-The local workerd runtime can itself be denied by `chatgpt.com`'s edge even
-when the same credential opens the native WebSocket successfully. Use the mock
-for deterministic local validation and run the real subscription smoke from a
-deployed Worker. Treat that deployed edge check as a release gate.
+If `chatgpt.com` denies the local workerd runtime even though the same login
+works in Codex, use the mock for deterministic local validation and run the
+real subscription smoke from a deployed Worker. Treat the deployed edge check
+as the release gate.
 
 ## Validate and deploy
 
 ```sh
 npm run check --prefix examples/cloudflare-workers
 cd examples/cloudflare-workers
-npx wrangler secret put OPENAI_API_KEY
-npx wrangler secret put NANOCODEX_ADMIN_TOKEN
-npx wrangler deploy
-```
-
-For ChatGPT mode, omit `OPENAI_API_KEY` and upload the subscription credentials
-as secrets instead:
-
-```sh
 npx wrangler secret put CHATGPT_ACCESS_TOKEN
 npx wrangler secret put CHATGPT_REFRESH_TOKEN
 npx wrangler secret put CHATGPT_ACCOUNT_ID
@@ -140,14 +120,19 @@ npx wrangler secret put NANOCODEX_ADMIN_TOKEN
 npx wrangler deploy
 ```
 
-Codex stores these fields under `tokens.access_token`, `tokens.refresh_token`,
-and `tokens.account_id` in `$CODEX_HOME/auth.json` (normally
-`~/.codex/auth.json`). Do not commit, log, or paste that file wholesale. These
-are bearer credentials for the subscription account; restrict Worker and
-Durable Object access accordingly and follow the account's applicable terms.
-Refresh tokens rotate: bootstrap the Worker from a dedicated login and do not
-let another Codex installation or Worker deployment keep refreshing the same
-credential, or one of them will eventually retain an invalidated token.
+For a long-lived deployment, the singleton auth Durable Object stores the
+dedicated credential in SQLite, refreshes it five minutes before expiry, and
+performs one revision-guarded refresh-and-retry when an upstream upgrade returns
+401. This avoids a refresh-token race when many sessions reconnect together.
+Use a dedicated Codex subscription login for the deployment: refresh tokens
+rotate, so sharing one between a local Codex installation and a Worker can
+invalidate either copy. Do not commit, log, or paste `auth.json` wholesale;
+restrict Worker and Durable Object access and follow the account's applicable
+terms.
+
+API-key mode remains available as an explicit alternative by setting
+`NANOCODEX_AUTH_MODE=api_key` and providing `OPENAI_API_KEY`, but it is not used
+by this demo.
 
 `npm run check` type-checks, runs the Worker-native Durable Object suite
 (including forced eviction with a live hibernatable client socket), and asks

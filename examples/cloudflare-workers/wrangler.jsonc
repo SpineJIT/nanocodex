@@ -38,6 +38,6 @@
   ],
   "vars": {
     "AGENT_IDLE_TIMEOUT_MS": "30000",
-    "NANOCODEX_AUTH_MODE": "api_key"
+    "NANOCODEX_AUTH_MODE": "chatgpt"
   }
 }

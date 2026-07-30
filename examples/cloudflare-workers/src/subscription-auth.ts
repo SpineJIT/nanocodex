@@ -104,7 +104,7 @@ export class NanocodexSubscriptionAuth extends DurableObject<SubscriptionAuthEnv
 
   #seed(): CredentialRow {
     const accessToken = requiredSecret(this.env.CHATGPT_ACCESS_TOKEN, "CHATGPT_ACCESS_TOKEN");
-    const refreshToken = requiredSecret(this.env.CHATGPT_REFRESH_TOKEN, "CHATGPT_REFRESH_TOKEN");
+    const refreshToken = optionalString(this.env.CHATGPT_REFRESH_TOKEN) ?? "";
     const accountId = requiredSecret(this.env.CHATGPT_ACCOUNT_ID, "CHATGPT_ACCOUNT_ID");
     const now = Date.now();
     const expiresAt = jwtExpiration(accessToken);
@@ -147,6 +147,11 @@ export class NanocodexSubscriptionAuth extends DurableObject<SubscriptionAuthEnv
   }
 
   async #performRefresh(current: CredentialRow): Promise<CredentialRow> {
+    if (!current.refresh_token) {
+      throw new Error(
+        "ChatGPT access token needs rotation; run `codex login` and restart the local subscription demo",
+      );
+    }
     const response = await fetch(this.env.CHATGPT_TOKEN_ENDPOINT ?? DEFAULT_TOKEN_ENDPOINT, {
       method: "POST",
       headers: { "content-type": "application/json" },

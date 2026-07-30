@@ -11,6 +11,7 @@
     "build": "wrangler deploy --dry-run --outdir dist",
     "check": "npm run typecheck && npm test && npm run build",
     "dev": "wrangler dev",
+    "dev:subscription": "node scripts/dev-subscription.mjs",
     "fanout": "node scripts/fanout.mjs",
     "mock:openai": "node scripts/mock-openai.mjs",
     "repl": "node scripts/repl.mjs",
@@ -18,7 +19,9 @@
     "soak": "node scripts/soak.mjs",
     "stress": "node scripts/stress.mjs",
     "pretest": "node scripts/prepare-wasm.mjs",
-    "test": "vitest run",
+    "test": "npm run test:node && npm run test:worker",
+    "test:node": "node --test test-node/*.test.mjs",
+    "test:worker": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
