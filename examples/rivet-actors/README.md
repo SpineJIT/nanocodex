@@ -64,6 +64,9 @@ directly—there is no Nanocodex app-server protocol or model credential in the
 browser. It stores only the endpoint, actor key, bounded transcript, and any
 unfinished turn ID/input. Detach or close the tab during inference; reopening
 it reissues the same idempotent request and rejoins or replays the actor turn.
+The local launcher keeps the web listener alive after engine readiness and
+reaps only its recorded `rivet-engine` child if npm or the app exits abruptly,
+so Ctrl-C does not leave the reserved ports occupied.
 
 This reads `~/.codex/auth.json` by default. Override it with
 `NANOCODEX_CODEX_AUTH_FILE` or `CODEX_HOME`. The access token is reread when a
