@@ -98,7 +98,7 @@ mod turn;
 
 pub use builder::NanocodexBuilder;
 pub use handle::{AgentHandle, Nanocodex};
-pub use turn::{Turn, TurnControl, TurnResult};
+pub use turn::{PromptRoute, Turn, TurnControl, TurnResult};
 
 use builder::{CodexCompatibility, PromptCacheConfig};
 pub(crate) use context_source::ContextSource;
@@ -109,4 +109,4 @@ pub(crate) use executor::{AgentFactory, AgentSend};
 use executor::{ServiceFactory, spawn_driver};
 use handle::request_command;
 use spawn::{build_agent, spawn_agent_driver, validate};
-use turn::{Command, QueuedTurn, TurnKey};
+use turn::{Command, PromptRouteKind, QueuedTurn, TurnKey};

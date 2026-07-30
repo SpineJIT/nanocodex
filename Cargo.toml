@@ -139,6 +139,7 @@ wasm-bindgen = "0.2.105"
 wasm-bindgen-futures = "0.4.55"
 web-time = "1.1.0"
 webrtc = "0.17.0"
+whoami = "1.6.1"
 zstd = "0.13"
 
 [workspace.lints.rust]

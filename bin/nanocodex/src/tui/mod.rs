@@ -114,6 +114,7 @@ enum WorkerCommand {
     McpReload {
         name: String,
     },
+    VoiceAgentEvent(AgentEvent),
     Voice(VoiceControl),
 }
 
@@ -332,6 +333,7 @@ struct UiModel {
     root_session_id: Arc<str>,
     agent_events_open: bool,
     worker_updates_open: bool,
+    voice_observing: bool,
     terminal_focused: bool,
     pending_notification: Option<String>,
     pending_mouse_scroll: Option<MouseScrollBurst>,
@@ -382,6 +384,7 @@ impl UiModel {
             root_session_id,
             agent_events_open: true,
             worker_updates_open: true,
+            voice_observing: false,
             terminal_focused: true,
             pending_notification: None,
             pending_mouse_scroll: None,
@@ -453,6 +456,9 @@ impl UiModel {
                 }
             }
             UiAction::Agent(event) => {
+                if self.voice_observing {
+                    drop(commands.send(WorkerCommand::VoiceAgentEvent(event.clone())));
+                }
                 let updated = self.app.on_main_agent_event(0, &event);
                 request_navigated_branch_switch(&mut self.app, commands)?;
                 if updated {
@@ -467,6 +473,15 @@ impl UiModel {
                 Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
             }
             UiAction::Worker(update) => {
+                match &update {
+                    WorkerEvent::VoiceConnecting | WorkerEvent::VoiceStarted { .. } => {
+                        self.voice_observing = true;
+                    }
+                    WorkerEvent::VoiceFailed { .. } | WorkerEvent::VoiceStopped => {
+                        self.voice_observing = false;
+                    }
+                    _ => {}
+                }
                 if !self.terminal_focused
                     && let WorkerEvent::TurnFinished { target, error, .. } = &update
                 {
@@ -1170,6 +1185,11 @@ impl AgentWorker {
             WorkerCommand::SetThinking { thinking } => self.set_thinking(thinking).await,
             WorkerCommand::McpLogin { name } => self.mcp_login(name),
             WorkerCommand::McpReload { name } => self.mcp_reload(name),
+            WorkerCommand::VoiceAgentEvent(event) => {
+                if let Some(voice) = &self.voice {
+                    let _ = voice.observe_agent_event(event);
+                }
+            }
             WorkerCommand::Voice(control) => self.control_voice(control),
         }
     }

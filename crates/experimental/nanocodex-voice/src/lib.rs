@@ -2,11 +2,16 @@
 
 use std::{io, sync::Arc, time::Duration};
 
+use futures_util::StreamExt;
 use nanocodex::{
-    Nanocodex, OpenAi,
+    Nanocodex, OpenAi, PromptRoute,
+    agent::events::{AgentEvent, AgentEventData, AssistantEvent, RunEvent},
     oai::{
         auth::OpenAiAuthMode,
-        realtime::{RealtimeError, RealtimeEvent, RealtimeSession},
+        realtime::{
+            RealtimeAgentSteer, RealtimeError, RealtimeEvent, RealtimeSession,
+            RealtimeTranscriptEntry,
+        },
     },
 };
 use tokio::sync::{mpsc, oneshot};
@@ -24,12 +29,13 @@ pub use nanocodex::oai::realtime::{
 
 use audio::VoiceAudio;
 
-/// Default developer instructions for the conversational coding-agent bridge.
-pub const DEFAULT_VOICE_INSTRUCTIONS: &str = r"You are the voice interface for a coding agent.
-Be concise and conversational. Use background_agent whenever the user asks for repository work,
-code changes, investigation, commands, or a factual answer that depends on the active coding
-session. Preserve the user's own request in the tool argument. When its result arrives, summarize
-the result accurately for speech. Do not claim work happened unless background_agent returned it.";
+const CODEX_BACKEND_PROMPT: &str = include_str!("backend_prompt.md");
+const USER_FIRST_NAME_PLACEHOLDER: &str = "{{ user_first_name }}";
+const DEFAULT_USER_FIRST_NAME: &str = "there";
+const HANDOFF_STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
+const REALTIME_ASSISTANT_OUTPUT_TOKEN_BUDGET: usize = 1_000;
+const APPROX_BYTES_PER_TOKEN: usize = 4;
+const HANDOFF_STREAM_TRUNCATION_MARKER: &str = "\n…output truncated…\n";
 
 /// Desktop capture and playback policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,6 +137,7 @@ impl VoiceEvents {
 /// A running desktop voice lifecycle.
 pub struct VoiceSession {
     stop: Option<oneshot::Sender<()>>,
+    agent_events: mpsc::UnboundedSender<AgentEvent>,
     task: std::thread::JoinHandle<()>,
 }
 
@@ -146,6 +153,16 @@ impl VoiceSession {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
+    }
+
+    /// Mirrors one session-wide agent event into an active externally-started handoff.
+    ///
+    /// Embeddings whose typed UI can start a turn before voice is enabled should
+    /// pass that agent's normal [`AgentEvent`] stream here. Events for turns
+    /// started by this voice session are already mirrored internally.
+    #[must_use]
+    pub fn observe_agent_event(&self, event: AgentEvent) -> bool {
+        self.agent_events.send(event).is_ok()
     }
 }
 
@@ -173,7 +190,7 @@ impl VoiceSessionBuilder {
         Self {
             openai,
             agent,
-            instructions: Arc::from(DEFAULT_VOICE_INSTRUCTIONS),
+            instructions: Arc::from(codex_voice_instructions()),
             session_id: None,
             attestation_header: None,
             voice: None,
@@ -225,19 +242,37 @@ impl VoiceSessionBuilder {
     /// [`VoiceEvent::Failed`].
     pub fn spawn(self) -> Result<(VoiceSession, VoiceEvents), VoiceError> {
         let (events, receiver) = mpsc::unbounded_channel();
+        let (agent_events, observed_agent_events) = mpsc::unbounded_channel();
         let (stop, stopped) = oneshot::channel();
         let task = std::thread::Builder::new()
             .name("nanocodex-voice".to_owned())
-            .spawn(move || run_thread(self, events, stopped))
+            .spawn(move || run_thread(self, events, observed_agent_events, stopped))
             .map_err(VoiceError::Spawn)?;
         Ok((
             VoiceSession {
                 stop: Some(stop),
+                agent_events,
                 task,
             },
             VoiceEvents { receiver },
         ))
     }
+}
+
+/// Renders Codex's default Realtime backend prompt for the local user.
+#[must_use]
+pub fn codex_voice_instructions() -> String {
+    CODEX_BACKEND_PROMPT
+        .trim_end()
+        .replace(USER_FIRST_NAME_PLACEHOLDER, &current_user_first_name())
+}
+
+fn current_user_first_name() -> String {
+    [whoami::realname(), whoami::username()]
+        .into_iter()
+        .filter_map(|name| name.split_whitespace().next().map(str::to_owned))
+        .find(|name| !name.is_empty())
+        .unwrap_or_else(|| DEFAULT_USER_FIRST_NAME.to_owned())
 }
 
 /// Failure to create the owned desktop voice lifecycle.
@@ -298,6 +333,7 @@ pub enum AudioError {
 fn run_thread(
     builder: VoiceSessionBuilder,
     events: mpsc::UnboundedSender<VoiceEvent>,
+    observed_agent_events: mpsc::UnboundedReceiver<AgentEvent>,
     stopped: oneshot::Receiver<()>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -315,16 +351,18 @@ fn run_thread(
             return;
         }
     };
-    let terminal = match runtime.block_on(run_voice(builder, &events, stopped)) {
-        Ok(()) => VoiceEvent::Stopped,
-        Err(error) => VoiceEvent::Failed { error },
-    };
+    let terminal =
+        match runtime.block_on(run_voice(builder, &events, observed_agent_events, stopped)) {
+            Ok(()) => VoiceEvent::Stopped,
+            Err(error) => VoiceEvent::Failed { error },
+        };
     send_event(&events, terminal);
 }
 
 async fn run_voice(
     builder: VoiceSessionBuilder,
     events: &mpsc::UnboundedSender<VoiceEvent>,
+    mut observed_agent_events: mpsc::UnboundedReceiver<AgentEvent>,
     mut stopped: oneshot::Receiver<()>,
 ) -> Result<(), VoiceFailure> {
     send_event(events, VoiceEvent::Connecting);
@@ -345,7 +383,18 @@ async fn run_voice(
         _ = &mut stopped => return Ok(()),
     };
     let (mut audio, mut microphone) = VoiceAudio::open(builder.audio)?;
-    let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+    let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel();
+    let mut agent_bridge = AgentBridge {
+        agent: builder.agent.clone(),
+        updates: bridge_tx,
+        active: None,
+        next_generation: 0,
+        external_output: HandoffStream::default(),
+        external_error: None,
+    };
+    let mut external_flush = tokio::time::interval(HANDOFF_STREAM_FLUSH_INTERVAL);
+    external_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    external_flush.tick().await;
     send_event(events, VoiceEvent::Started { voice });
 
     let result = loop {
@@ -367,20 +416,55 @@ async fn run_voice(
                     event,
                     &session,
                     &mut audio,
-                    &builder.agent,
                     events,
-                    &completed_tx,
+                    &mut agent_bridge,
                 ).await {
                     break Err(error);
                 }
             }
-            completed = completed_rx.recv() => {
-                let Some(CompletedAgentRequest { call_id, output }) = completed else {
+            update = bridge_rx.recv() => {
+                let Some(update) = update else {
                     break Ok(());
                 };
-                if let Err(error) = session.complete_agent_request(call_id, output).await {
-                    break Err(error.into());
+                match update {
+                    AgentBridgeUpdate::Output { generation, text } => {
+                        if let Some(active) = &mut agent_bridge.active
+                            && active.generation == generation
+                        {
+                            session.append_agent_output(&active.call_id, text).await?;
+                            active.streamed_output = true;
+                        }
+                    }
+                    AgentBridgeUpdate::Completed {
+                        generation,
+                        call_id,
+                        output,
+                    } => {
+                        let (call_id, streamed_output) = match agent_bridge.active.take() {
+                            Some(active) if active.generation == generation => {
+                                (active.call_id, active.streamed_output)
+                            }
+                            Some(active) => {
+                                agent_bridge.active = Some(active);
+                                (call_id, false)
+                            }
+                            None => (call_id, false),
+                        };
+                        if !streamed_output && !output.trim().is_empty() {
+                            session.append_agent_output(&call_id, output).await?;
+                        }
+                        session.complete_agent_run(call_id).await?;
+                    }
                 }
+            }
+            event = observed_agent_events.recv() => {
+                let Some(event) = event else {
+                    continue;
+                };
+                handle_observed_agent_event(event, &session, &mut agent_bridge).await?;
+            }
+            _ = external_flush.tick(), if agent_bridge.has_external_stream_output() => {
+                flush_observed_agent_output(&session, &mut agent_bridge).await?;
             }
         }
     };
@@ -388,18 +472,47 @@ async fn run_voice(
     result
 }
 
-struct CompletedAgentRequest {
+enum AgentBridgeUpdate {
+    Output {
+        generation: u64,
+        text: String,
+    },
+    Completed {
+        generation: u64,
+        call_id: String,
+        output: String,
+    },
+}
+
+struct ActiveAgentRequest {
+    generation: u64,
     call_id: String,
-    output: String,
+    streamed_output: bool,
+    external: bool,
+}
+
+struct AgentBridge {
+    agent: Nanocodex,
+    updates: mpsc::UnboundedSender<AgentBridgeUpdate>,
+    active: Option<ActiveAgentRequest>,
+    next_generation: u64,
+    external_output: HandoffStream,
+    external_error: Option<String>,
+}
+
+impl AgentBridge {
+    fn has_external_stream_output(&self) -> bool {
+        self.active.as_ref().is_some_and(|active| active.external)
+            && !self.external_output.is_empty()
+    }
 }
 
 async fn handle_realtime_event(
     event: RealtimeEvent,
     session: &RealtimeSession,
     audio: &mut VoiceAudio,
-    agent: &Nanocodex,
     events: &mpsc::UnboundedSender<VoiceEvent>,
-    completed: &mpsc::UnboundedSender<CompletedAgentRequest>,
+    agent_bridge: &mut AgentBridge,
 ) -> Result<(), VoiceFailure> {
     match event {
         RealtimeEvent::SessionReady { .. }
@@ -415,19 +528,137 @@ async fn handle_realtime_event(
             send_transcript(events, VoiceSpeaker::Assistant, text);
         }
         RealtimeEvent::Audio(frame) => audio.play(&frame),
-        RealtimeEvent::AgentRequest { call_id, prompt } => {
-            let agent = agent.clone();
-            let completed = completed.clone();
-            drop(tokio::spawn(async move {
-                let output = match agent.prompt(prompt).await {
-                    Ok(turn) => match turn.await {
-                        Ok(result) => result.final_message().to_owned(),
-                        Err(error) => format!("The coding agent failed: {error}"),
-                    },
-                    Err(error) => format!("The coding agent rejected the request: {error}"),
-                };
-                drop(completed.send(CompletedAgentRequest { call_id, output }));
-            }));
+        RealtimeEvent::AgentRequest {
+            call_id,
+            prompt,
+            transcript,
+        } => {
+            let agent = agent_bridge.agent.clone();
+            let updates = agent_bridge.updates.clone();
+            let streams_agent_output = session.streams_agent_output();
+            match agent
+                .route_prompt(codex_realtime_delegation_with_transcript(
+                    &prompt,
+                    &transcript,
+                ))
+                .await
+            {
+                Ok(PromptRoute::Started(turn)) => {
+                    agent_bridge.next_generation = agent_bridge.next_generation.saturating_add(1);
+                    let generation = agent_bridge.next_generation;
+                    agent_bridge.active = Some(ActiveAgentRequest {
+                        generation,
+                        call_id: call_id.clone(),
+                        streamed_output: false,
+                        external: false,
+                    });
+                    drop(tokio::spawn(async move {
+                        let mut turn = turn;
+                        let mut output = HandoffStream::default();
+                        let mut flush = tokio::time::interval(HANDOFF_STREAM_FLUSH_INTERVAL);
+                        flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        flush.tick().await;
+                        loop {
+                            tokio::select! {
+                                event = turn.next() => {
+                                    let Some(event) = event else {
+                                        break;
+                                    };
+                                    match event.data() {
+                                        Ok(AgentEventData::Assistant(AssistantEvent::Delta(delta)))
+                                            if streams_agent_output =>
+                                        {
+                                            output.push_text(&delta.text);
+                                        }
+                                        Ok(AgentEventData::Assistant(AssistantEvent::Message(message)))
+                                            if streams_agent_output =>
+                                        {
+                                            if !output.has_output() {
+                                                output.push_text(&message.text);
+                                            }
+                                            if let Some(text) = output.drain_final_chunk()
+                                                && updates.send(AgentBridgeUpdate::Output {
+                                                    generation,
+                                                    text,
+                                                }).is_err()
+                                            {
+                                                return;
+                                            }
+                                            output = HandoffStream::default();
+                                        }
+                                        Ok(AgentEventData::Assistant(AssistantEvent::Message(message)))
+                                            if !streams_agent_output
+                                                && !message.text.is_empty()
+                                                && updates.send(AgentBridgeUpdate::Output {
+                                                    generation,
+                                                    text: truncate_realtime_output(&message.text),
+                                                }).is_err() =>
+                                        {
+                                            return;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                _ = flush.tick(), if streams_agent_output && !output.is_empty() => {
+                                    if let Some(text) = output.drain_stream_chunk()
+                                        && updates.send(AgentBridgeUpdate::Output {
+                                            generation,
+                                            text,
+                                        }).is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(text) = output.drain_final_chunk()
+                            && updates
+                                .send(AgentBridgeUpdate::Output { generation, text })
+                                .is_err()
+                        {
+                            return;
+                        }
+                        let output = match turn.result().await {
+                            Ok(result) => result.final_message().to_owned(),
+                            Err(error) => format!("The coding agent failed: {error}"),
+                        };
+                        drop(updates.send(AgentBridgeUpdate::Completed {
+                            generation,
+                            call_id,
+                            output,
+                        }));
+                    }));
+                }
+                Ok(PromptRoute::Steered) => {
+                    if agent_bridge.active.is_none() {
+                        agent_bridge.next_generation =
+                            agent_bridge.next_generation.saturating_add(1);
+                        agent_bridge.active = Some(ActiveAgentRequest {
+                            generation: agent_bridge.next_generation,
+                            call_id: call_id.clone(),
+                            streamed_output: false,
+                            external: true,
+                        });
+                        agent_bridge.external_output = HandoffStream::default();
+                        agent_bridge.external_error = None;
+                    }
+                    if session.steer_agent_request(&call_id).await?
+                        == RealtimeAgentSteer::ReplacedDelegation
+                        && let Some(active) = &mut agent_bridge.active
+                    {
+                        active.call_id = call_id;
+                    }
+                }
+                Err(error) => {
+                    session
+                        .append_agent_output(
+                            &call_id,
+                            format!("The coding agent rejected the request: {error}"),
+                        )
+                        .await?;
+                    session.complete_agent_run(call_id).await?;
+                }
+            }
         }
         RealtimeEvent::RemainSilent { call_id } => {
             session.complete_silent_request(call_id).await?;
@@ -437,6 +668,223 @@ async fn handle_realtime_event(
         }
     }
     Ok(())
+}
+
+async fn handle_observed_agent_event(
+    event: AgentEvent,
+    session: &RealtimeSession,
+    agent_bridge: &mut AgentBridge,
+) -> Result<(), VoiceFailure> {
+    if !agent_bridge
+        .active
+        .as_ref()
+        .is_some_and(|active| active.external)
+    {
+        return Ok(());
+    }
+
+    match event.data() {
+        Ok(AgentEventData::Assistant(AssistantEvent::Delta(delta)))
+            if session.streams_agent_output() =>
+        {
+            agent_bridge.external_output.push_text(&delta.text);
+        }
+        Ok(AgentEventData::Assistant(AssistantEvent::Message(message))) => {
+            let output = if session.streams_agent_output() {
+                if !agent_bridge.external_output.has_output() {
+                    agent_bridge.external_output.push_text(&message.text);
+                }
+                let output = agent_bridge.external_output.drain_final_chunk();
+                agent_bridge.external_output = HandoffStream::default();
+                output
+            } else if message.text.is_empty() {
+                None
+            } else {
+                Some(truncate_realtime_output(&message.text))
+            };
+            if let Some(output) = output {
+                append_observed_agent_output(session, agent_bridge, output).await?;
+            }
+        }
+        Ok(AgentEventData::Run(RunEvent::Error(error))) => {
+            agent_bridge.external_error = Some(error.message);
+        }
+        Ok(AgentEventData::Run(RunEvent::Completed(_))) => {
+            complete_observed_agent_run(session, agent_bridge, false).await?;
+        }
+        Ok(AgentEventData::Run(RunEvent::Failed(_))) => {
+            complete_observed_agent_run(session, agent_bridge, true).await?;
+        }
+        Ok(_) | Err(_) => {}
+    }
+    Ok(())
+}
+
+async fn flush_observed_agent_output(
+    session: &RealtimeSession,
+    agent_bridge: &mut AgentBridge,
+) -> Result<(), RealtimeError> {
+    if let Some(output) = agent_bridge.external_output.drain_stream_chunk() {
+        append_observed_agent_output(session, agent_bridge, output).await?;
+    }
+    Ok(())
+}
+
+async fn append_observed_agent_output(
+    session: &RealtimeSession,
+    agent_bridge: &mut AgentBridge,
+    output: String,
+) -> Result<(), RealtimeError> {
+    let Some(call_id) = agent_bridge
+        .active
+        .as_ref()
+        .filter(|active| active.external)
+        .map(|active| active.call_id.clone())
+    else {
+        return Ok(());
+    };
+    session.append_agent_output(&call_id, output).await?;
+    if let Some(active) = &mut agent_bridge.active
+        && active.external
+        && active.call_id == call_id
+    {
+        active.streamed_output = true;
+    }
+    Ok(())
+}
+
+async fn complete_observed_agent_run(
+    session: &RealtimeSession,
+    agent_bridge: &mut AgentBridge,
+    failed: bool,
+) -> Result<(), RealtimeError> {
+    if let Some(output) = agent_bridge.external_output.drain_final_chunk() {
+        append_observed_agent_output(session, agent_bridge, output).await?;
+    }
+    agent_bridge.external_output = HandoffStream::default();
+
+    let Some(active) = agent_bridge.active.take().filter(|active| active.external) else {
+        return Ok(());
+    };
+    if failed && !active.streamed_output {
+        let error = agent_bridge
+            .external_error
+            .take()
+            .unwrap_or_else(|| "The coding agent failed.".to_owned());
+        session.append_agent_output(&active.call_id, error).await?;
+    } else {
+        agent_bridge.external_error = None;
+    }
+    session.complete_agent_run(active.call_id).await
+}
+
+#[derive(Default)]
+struct HandoffStream {
+    sent_bytes: usize,
+    buffered_text: String,
+    tail_text: String,
+    truncated: bool,
+}
+
+impl HandoffStream {
+    const fn has_output(&self) -> bool {
+        self.sent_bytes > 0 || !self.is_empty()
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.buffered_text.is_empty() && self.tail_text.is_empty()
+    }
+
+    const fn stream_head_byte_limit(&self) -> usize {
+        realtime_output_byte_limit().saturating_sub(HANDOFF_STREAM_TRUNCATION_MARKER.len()) / 2
+    }
+
+    const fn tail_byte_limit(&self) -> usize {
+        realtime_output_byte_limit()
+            .saturating_sub(self.stream_head_byte_limit())
+            .saturating_sub(HANDOFF_STREAM_TRUNCATION_MARKER.len())
+    }
+
+    const fn streamable_text_bytes(&self) -> usize {
+        self.stream_head_byte_limit()
+            .saturating_sub(self.sent_bytes)
+    }
+
+    fn push_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.truncated {
+            self.tail_text.push_str(text);
+            self.tail_text = take_last_bytes(&self.tail_text, self.tail_byte_limit()).to_owned();
+            return;
+        }
+
+        self.buffered_text.push_str(text);
+        let remaining = realtime_output_byte_limit().saturating_sub(self.sent_bytes);
+        if self.buffered_text.len() <= remaining {
+            return;
+        }
+
+        let head_bytes = take_first_bytes(&self.buffered_text, self.streamable_text_bytes()).len();
+        self.tail_text = take_last_bytes(&self.buffered_text, self.tail_byte_limit()).to_owned();
+        self.buffered_text.truncate(head_bytes);
+        self.truncated = true;
+    }
+
+    fn drain_stream_chunk(&mut self) -> Option<String> {
+        let requested = self.streamable_text_bytes().min(self.buffered_text.len());
+        let split_at = take_first_bytes(&self.buffered_text, requested).len();
+        if split_at == 0 {
+            return None;
+        }
+        let text = self.buffered_text.drain(..split_at).collect::<String>();
+        self.sent_bytes = self.sent_bytes.saturating_add(text.len());
+        Some(text)
+    }
+
+    fn drain_final_chunk(&mut self) -> Option<String> {
+        if !self.truncated {
+            if self.buffered_text.is_empty() {
+                return None;
+            }
+            let text = self.buffered_text.drain(..).collect::<String>();
+            self.sent_bytes = self.sent_bytes.saturating_add(text.len());
+            return Some(text);
+        }
+
+        let head = self.buffered_text.drain(..).collect::<String>();
+        let tail = self.tail_text.drain(..).collect::<String>();
+        let text = format!("{head}{HANDOFF_STREAM_TRUNCATION_MARKER}{tail}");
+        self.sent_bytes = self.sent_bytes.saturating_add(text.len());
+        Some(text)
+    }
+}
+
+const fn realtime_output_byte_limit() -> usize {
+    REALTIME_ASSISTANT_OUTPUT_TOKEN_BUDGET.saturating_mul(APPROX_BYTES_PER_TOKEN)
+}
+
+fn truncate_realtime_output(text: &str) -> String {
+    let mut output = HandoffStream::default();
+    output.push_text(text);
+    output.drain_final_chunk().unwrap_or_default()
+}
+
+fn take_first_bytes(text: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn take_last_bytes(text: &str, max_bytes: usize) -> &str {
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 fn send_transcript(
@@ -449,13 +897,50 @@ fn send_transcript(
     }
 }
 
+/// Wraps delegated speech in Codex's model-visible Realtime input markers.
+#[must_use]
+pub fn codex_realtime_delegation(input: &str) -> String {
+    codex_realtime_delegation_with_transcript(input, &[])
+}
+
+/// Wraps delegated speech and its new conversation transcript using Codex's markers.
+#[must_use]
+pub fn codex_realtime_delegation_with_transcript(
+    input: &str,
+    transcript: &[RealtimeTranscriptEntry],
+) -> String {
+    let input = input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let transcript = transcript
+        .iter()
+        .map(|entry| format!("{}: {}", entry.role, entry.text))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    if transcript.is_empty() {
+        format!("<realtime_delegation>\n  <input>{input}</input>\n</realtime_delegation>")
+    } else {
+        format!(
+            "<realtime_delegation>\n  <input>{input}</input>\n  <transcript_delta>{transcript}</transcript_delta>\n</realtime_delegation>"
+        )
+    }
+}
+
 fn send_event(events: &mpsc::UnboundedSender<VoiceEvent>, event: VoiceEvent) {
     drop(events.send(event));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioConfig, VoiceSpeaker};
+    use super::{
+        AudioConfig, HandoffStream, RealtimeTranscriptEntry, VoiceSpeaker,
+        codex_realtime_delegation, codex_realtime_delegation_with_transcript,
+        codex_voice_instructions, realtime_output_byte_limit, truncate_realtime_output,
+    };
     use std::time::Duration;
 
     #[test]
@@ -469,5 +954,54 @@ mod tests {
     fn transcript_speakers_have_stable_labels() {
         assert_eq!(VoiceSpeaker::User.to_string(), "user");
         assert_eq!(VoiceSpeaker::Assistant.to_string(), "assistant");
+    }
+
+    #[test]
+    fn codex_backend_prompt_is_rendered_for_the_local_user() {
+        let prompt = codex_voice_instructions();
+        assert!(prompt.starts_with("## Identity, tone, and role"));
+        assert!(prompt.contains("Running backend work remains steerable."));
+        assert!(!prompt.contains("{{ user_first_name }}"));
+    }
+
+    #[test]
+    fn delegated_input_uses_codex_markers_and_xml_escaping() {
+        assert_eq!(
+            codex_realtime_delegation("fix <x> & ship"),
+            "<realtime_delegation>\n  <input>fix &lt;x&gt; &amp; ship</input>\n</realtime_delegation>"
+        );
+        assert_eq!(
+            codex_realtime_delegation_with_transcript(
+                "ship it",
+                &[
+                    RealtimeTranscriptEntry {
+                        role: "assistant".to_owned(),
+                        text: "Use <main>".to_owned(),
+                    },
+                    RealtimeTranscriptEntry {
+                        role: "user".to_owned(),
+                        text: "yes & now".to_owned(),
+                    },
+                ],
+            ),
+            "<realtime_delegation>\n  <input>ship it</input>\n  <transcript_delta>assistant: Use &lt;main&gt;\nuser: yes &amp; now</transcript_delta>\n</realtime_delegation>"
+        );
+    }
+
+    #[test]
+    fn codex_handoff_stream_is_bounded_and_preserves_head_and_tail() {
+        let text = format!("HEAD{}TAIL", "x".repeat(8_000));
+        let truncated = truncate_realtime_output(&text);
+        assert!(truncated.len() <= realtime_output_byte_limit());
+        assert!(truncated.starts_with("HEAD"));
+        assert!(truncated.ends_with("TAIL"));
+        assert!(truncated.contains("\n…output truncated…\n"));
+
+        let mut stream = HandoffStream::default();
+        let short = "é".repeat(1_500);
+        stream.push_text(&short);
+        let head = stream.drain_stream_chunk().unwrap();
+        let tail = stream.drain_final_chunk().unwrap();
+        assert_eq!(format!("{head}{tail}"), short);
     }
 }

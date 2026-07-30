@@ -17,12 +17,13 @@ futures-util.workspace = true
 http.workspace = true
 nanocodex = { workspace = true, features = ["realtime"] }
 nanocodex-browser.workspace = true
+nanocodex-voice.workspace = true
 nanocodex-vm.workspace = true
 reqwest.workspace = true
 reflink-copy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite.workspace = true
 tower.workspace = true
 tempfile.workspace = true
@@ -86,6 +87,10 @@ path = "browser_agent.rs"
 [[bin]]
 name = "realtime-pipe"
 path = "realtime_pipe.rs"
+
+[[bin]]
+name = "voice"
+path = "voice.rs"
 
 [lints]
 workspace = true

@@ -108,7 +108,9 @@ migration, and it must be independently mergeable.
     subscription credential and frameless sideband; when no host attestation
     exists, it sends Codex's accepted unavailable-token envelope. The TUI
     exposes Codex's current voice catalog through `/voice list` and named
-    starts, with Codex's current `cove` default and Frameless model.
+    starts, with Codex's current `cove` default and Frameless model. Realtime
+    coding handoffs atomically steer an active regular turn or start a new turn,
+    so spoken follow-ups remain interactive during tool execution.
 
 ## Current non-goals
 

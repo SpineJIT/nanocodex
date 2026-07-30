@@ -77,7 +77,13 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_CAPACITY: usize = 256;
 const EVENT_CAPACITY: usize = 256;
 const BACKGROUND_AGENT_TOOL: &str = "background_agent";
+const BACKGROUND_AGENT_TOOL_DESCRIPTION: &str = "Send a user request to the background agent. Use this as the default action. Do not rephrase the user's ask or rewrite it in your own words; pass along the user's own words. If the background agent is idle, this starts a new task and returns the final result to the user. If the background agent is already working on a task, this sends the request as guidance to steer that previous task. If the user asks to do something next, later, after this, or once current work finishes, call this tool so the work is actually queued instead of merely promising to do it later.";
 const REMAIN_SILENT_TOOL: &str = "remain_silent";
+const REMAIN_SILENT_TOOL_DESCRIPTION: &str = "Call this when the best response is to say nothing. Use it instead of speaking after hidden system/control messages, after background agent updates in silent modes, or whenever acknowledging aloud would be distracting. This tool has no user-visible effect.";
+const STEER_ACKNOWLEDGEMENT: &str = "This was sent to steer the previous background agent task.";
+const AGENT_COMPLETE_ACKNOWLEDGEMENT: &str =
+    "Background agent finished. Use the preceding [BACKEND] messages as the result.";
+const BACKEND_TEXT_PREFIX: &str = "[BACKEND] ";
 const CONTEXT_APPEND_MAX_BYTES: usize = 500;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -304,6 +310,8 @@ pub enum RealtimeEvent {
         call_id: String,
         /// User request selected by the realtime model for delegation.
         prompt: String,
+        /// Voice transcript entries added since the previous delegation.
+        transcript: Vec<RealtimeTranscriptEntry>,
     },
     /// Realtime requested an intentionally silent tool result.
     RemainSilent {
@@ -316,6 +324,15 @@ pub enum RealtimeEvent {
     ResponseDone,
     /// The provider reported a session error.
     Error(String),
+}
+
+/// One role-bearing voice transcript entry associated with a Realtime delegation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealtimeTranscriptEntry {
+    /// Transcript participant as the Realtime wire role (`user` or `assistant`).
+    pub role: String,
+    /// Complete transcript text for this contiguous role entry.
+    pub text: String,
 }
 
 /// Receiver for the independent typed event stream of a realtime session.
@@ -339,9 +356,29 @@ impl RealtimeEvents {
 #[derive(Clone)]
 pub struct RealtimeSession {
     commands: mpsc::Sender<Command>,
+    protocol: RealtimeProtocol,
+}
+
+/// Protocol-specific handling applied after live input steers an active agent turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RealtimeAgentSteer {
+    /// Realtime V2 received the steering tool result immediately.
+    Acknowledged,
+    /// Frameless moved the active delegation target to the newest request.
+    ReplacedDelegation,
 }
 
 impl RealtimeSession {
+    /// Returns whether this protocol accepts incremental background-agent appends.
+    ///
+    /// Codex streams agent message deltas into Frameless delegations. Realtime
+    /// V2 instead receives each completed agent message as one `[BACKEND]`
+    /// conversation item.
+    #[must_use]
+    pub const fn streams_agent_output(&self) -> bool {
+        matches!(self.protocol, RealtimeProtocol::Frameless)
+    }
+
     /// Appends one owned 24 kHz mono PCM16 input chunk.
     ///
     /// # Errors
@@ -364,6 +401,72 @@ impl RealtimeSession {
         self.send(CommandKind::AgentOutput {
             call_id: call_id.into(),
             output: output.into(),
+        })
+        .await
+    }
+
+    /// Applies Codex's protocol-specific acknowledgement for a steering request.
+    ///
+    /// Realtime V2 completes the new tool call with Codex's steering
+    /// acknowledgement and creates a response. Frameless keeps the delegation
+    /// open and makes the newest delegation item the target for subsequent
+    /// background-agent output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the V2 acknowledgement cannot be delivered.
+    pub async fn steer_agent_request(
+        &self,
+        call_id: impl Into<String>,
+    ) -> Result<RealtimeAgentSteer, RealtimeError> {
+        match self.protocol {
+            RealtimeProtocol::Direct => {
+                self.complete_agent_request(call_id, STEER_ACKNOWLEDGEMENT)
+                    .await?;
+                Ok(RealtimeAgentSteer::Acknowledged)
+            }
+            RealtimeProtocol::Frameless => {
+                drop(call_id.into());
+                Ok(RealtimeAgentSteer::ReplacedDelegation)
+            }
+        }
+    }
+
+    /// Appends streamed background-agent output to the active voice handoff.
+    ///
+    /// Realtime V2 receives a `[BACKEND]` user item. Frameless appends text to
+    /// the active delegation context without asking for a separate response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the output cannot be delivered.
+    pub async fn append_agent_output(
+        &self,
+        call_id: impl Into<String>,
+        output: impl Into<String>,
+    ) -> Result<(), RealtimeError> {
+        self.send(CommandKind::AgentProgress {
+            call_id: call_id.into(),
+            output: output.into(),
+        })
+        .await
+    }
+
+    /// Completes a streamed background-agent handoff using Codex's protocol behavior.
+    ///
+    /// Realtime V2 completes the original tool call with Codex's completion
+    /// acknowledgement and creates a response. Frameless requires no terminal
+    /// wire item after the final delegation context append.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the V2 completion cannot be delivered.
+    pub async fn complete_agent_run(
+        &self,
+        call_id: impl Into<String>,
+    ) -> Result<(), RealtimeError> {
+        self.send(CommandKind::AgentComplete {
+            call_id: call_id.into(),
         })
         .await
     }
@@ -568,6 +671,7 @@ impl RealtimeSessionBuilder {
         Ok((
             RealtimeSession {
                 commands: command_tx,
+                protocol,
             },
             RealtimeEvents { receiver: event_rx },
         ))
@@ -632,6 +736,8 @@ struct Command {
 enum CommandKind {
     Audio(RealtimeAudio),
     AgentOutput { call_id: String, output: String },
+    AgentProgress { call_id: String, output: String },
+    AgentComplete { call_id: String },
     SilentOutput { call_id: String },
     Close,
 }
@@ -739,12 +845,25 @@ struct SessionTool {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum ConversationItem<'a> {
+    Message {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        role: &'static str,
+        content: [ConversationInputText<'a>; 1],
+    },
     FunctionOutput {
         #[serde(rename = "type")]
         kind: &'static str,
         call_id: &'a str,
         output: &'a str,
     },
+}
+
+#[derive(Serialize)]
+struct ConversationInputText<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
 }
 
 fn session_update(instructions: &str, voice: RealtimeVoice) -> ClientEvent<'_> {
@@ -780,7 +899,7 @@ fn session_update(instructions: &str, voice: RealtimeVoice) -> ClientEvent<'_> {
                 SessionTool {
                     kind: "function",
                     name: BACKGROUND_AGENT_TOOL,
-                    description: "Send the user's coding request to the background agent. Preserve the user's own words and use this tool for work that requires repository context or tools.",
+                    description: BACKGROUND_AGENT_TOOL_DESCRIPTION,
                     parameters: json!({
                         "type": "object",
                         "properties": {
@@ -793,7 +912,7 @@ fn session_update(instructions: &str, voice: RealtimeVoice) -> ClientEvent<'_> {
                 SessionTool {
                     kind: "function",
                     name: REMAIN_SILENT_TOOL,
-                    description: "Use this when the best response is to say nothing.",
+                    description: REMAIN_SILENT_TOOL_DESCRIPTION,
                     parameters: json!({
                         "type": "object",
                         "properties": {},
@@ -814,6 +933,8 @@ async fn run_socket(
     mut media: Option<webrtc::WebRtcMedia>,
 ) {
     let media_input = media.as_ref().map(webrtc::WebRtcMedia::input);
+    let mut active_transcript = ActiveTranscript::default();
+    let mut response_create = ResponseCreateQueue::default();
     loop {
         tokio::select! {
             command = commands.recv() => {
@@ -828,6 +949,7 @@ async fn run_socket(
                     command.kind,
                     protocol,
                     media_input.as_ref(),
+                    &mut response_create,
                 ).await;
                 let should_close = matches!(result, Ok(true));
                 if let Err(error) = &result {
@@ -840,7 +962,14 @@ async fn run_socket(
                 }
             }
             message = socket.next() => {
-                match handle_server_message(&mut socket, message, &events, protocol).await {
+                match handle_server_message(
+                    &mut socket,
+                    message,
+                    &events,
+                    protocol,
+                    &mut active_transcript,
+                    &mut response_create,
+                ).await {
                     Ok(true) => break,
                     Ok(false) => {}
                     Err(error) => {
@@ -885,6 +1014,7 @@ async fn handle_command(
     command: CommandKind,
     protocol: RealtimeProtocol,
     media_input: Option<&mpsc::Sender<RealtimeAudio>>,
+    response_create: &mut ResponseCreateQueue,
 ) -> Result<bool, RealtimeError> {
     match command {
         CommandKind::Audio(audio) => {
@@ -918,11 +1048,29 @@ async fn handle_command(
             match protocol {
                 RealtimeProtocol::Direct => {
                     send_function_output(socket, &call_id, &output).await?;
-                    send_json(socket, &ClientEvent::ResponseCreate).await?;
+                    response_create.request(socket).await?;
                 }
                 RealtimeProtocol::Frameless => {
                     send_delegation_context(socket, &call_id, &output).await?;
                 }
+            }
+            Ok(false)
+        }
+        CommandKind::AgentProgress { call_id, output } => {
+            match protocol {
+                RealtimeProtocol::Direct => {
+                    send_backend_output(socket, &output).await?;
+                }
+                RealtimeProtocol::Frameless => {
+                    send_delegation_context(socket, &call_id, &output).await?;
+                }
+            }
+            Ok(false)
+        }
+        CommandKind::AgentComplete { call_id } => {
+            if matches!(protocol, RealtimeProtocol::Direct) {
+                send_function_output(socket, &call_id, AGENT_COMPLETE_ACKNOWLEDGEMENT).await?;
+                response_create.request(socket).await?;
             }
             Ok(false)
         }
@@ -1009,6 +1157,24 @@ async fn send_function_output(
     .await
 }
 
+async fn send_backend_output(socket: &mut Socket, output: &str) -> Result<(), RealtimeError> {
+    let text = format!("{BACKEND_TEXT_PREFIX}{output}");
+    send_json(
+        socket,
+        &ClientEvent::ItemCreate {
+            item: ConversationItem::Message {
+                kind: "message",
+                role: "user",
+                content: [ConversationInputText {
+                    kind: "input_text",
+                    text: &text,
+                }],
+            },
+        },
+    )
+    .await
+}
+
 async fn send_json(socket: &mut Socket, value: &ClientEvent<'_>) -> Result<(), RealtimeError> {
     let payload =
         serde_json::to_string(value).map_err(|error| RealtimeError::Message(error.to_string()))?;
@@ -1024,6 +1190,8 @@ async fn handle_server_message(
     message: Option<Result<Message, WebSocketError>>,
     events: &mpsc::Sender<RealtimeEvent>,
     protocol: RealtimeProtocol,
+    active_transcript: &mut ActiveTranscript,
+    response_create: &mut ResponseCreateQueue,
 ) -> Result<bool, RealtimeError> {
     let Some(message) = message else {
         return Ok(true);
@@ -1031,10 +1199,20 @@ async fn handle_server_message(
     match message.map_err(map_websocket_error)? {
         Message::Text(payload) => {
             trace!(target: "nanocodex_oai_api::realtime::wire", payload = %payload, "GPT Realtime event");
-            if let Some(event) = parse_event(&payload, protocol)?
-                && events.send(event).await.is_err()
-            {
-                return Ok(true);
+            if let Some(mut event) = parse_event(&payload, protocol)? {
+                active_transcript.update(&mut event);
+                if matches!(protocol, RealtimeProtocol::Direct) {
+                    match &event {
+                        RealtimeEvent::ResponseStarted => response_create.mark_started(),
+                        RealtimeEvent::ResponseDone => {
+                            response_create.mark_finished(socket).await?
+                        }
+                        _ => {}
+                    }
+                }
+                if events.send(event).await.is_err() {
+                    return Ok(true);
+                }
             }
             Ok(false)
         }
@@ -1051,6 +1229,148 @@ async fn handle_server_message(
             "unexpected binary WebSocket frame".to_owned(),
         )),
     }
+}
+
+#[derive(Default)]
+struct ResponseCreateQueue {
+    active: bool,
+    pending: bool,
+}
+
+impl ResponseCreateQueue {
+    async fn request(&mut self, socket: &mut Socket) -> Result<(), RealtimeError> {
+        if self.active {
+            self.pending = true;
+            return Ok(());
+        }
+        send_json(socket, &ClientEvent::ResponseCreate).await?;
+        self.active = true;
+        Ok(())
+    }
+
+    const fn mark_started(&mut self) {
+        self.active = true;
+    }
+
+    async fn mark_finished(&mut self, socket: &mut Socket) -> Result<(), RealtimeError> {
+        self.active = false;
+        if !self.pending {
+            return Ok(());
+        }
+        self.pending = false;
+        self.request(socket).await
+    }
+}
+
+#[derive(Default)]
+struct ActiveTranscript {
+    entries: Vec<RealtimeTranscriptEntry>,
+    last_handoff_entry_count: usize,
+    new_input_entry: bool,
+    new_output_entry: bool,
+}
+
+impl ActiveTranscript {
+    fn update(&mut self, event: &mut RealtimeEvent) {
+        match event {
+            RealtimeEvent::SpeechStarted => self.new_input_entry = true,
+            RealtimeEvent::InputTranscriptDelta(delta) => {
+                append_transcript_delta(&mut self.entries, "user", delta, self.new_input_entry);
+                self.new_input_entry = false;
+            }
+            RealtimeEvent::OutputTranscriptDelta(delta) => {
+                append_transcript_delta(
+                    &mut self.entries,
+                    "assistant",
+                    delta,
+                    self.new_output_entry,
+                );
+                self.new_output_entry = false;
+            }
+            RealtimeEvent::InputTranscriptDone(text) => {
+                apply_transcript_done(&mut self.entries, "user", text, self.new_input_entry);
+                self.new_input_entry = false;
+            }
+            RealtimeEvent::OutputTranscriptDone(text) => {
+                apply_transcript_done(&mut self.entries, "assistant", text, self.new_output_entry);
+                self.new_output_entry = false;
+            }
+            RealtimeEvent::AgentRequest {
+                prompt, transcript, ..
+            } => {
+                append_handoff_input(&mut self.entries, prompt);
+                *transcript = self.entries[self.last_handoff_entry_count..].to_vec();
+                self.last_handoff_entry_count = self.entries.len();
+                self.new_input_entry = true;
+                self.new_output_entry = true;
+            }
+            RealtimeEvent::ResponseStarted => self.new_output_entry = true,
+            RealtimeEvent::SessionReady { .. }
+            | RealtimeEvent::Audio(_)
+            | RealtimeEvent::RemainSilent { .. }
+            | RealtimeEvent::ResponseDone
+            | RealtimeEvent::Error(_) => {}
+        }
+    }
+}
+
+fn append_transcript_delta(
+    entries: &mut Vec<RealtimeTranscriptEntry>,
+    role: &str,
+    delta: &str,
+    force_new: bool,
+) {
+    if delta.is_empty() {
+        return;
+    }
+    if !force_new
+        && let Some(last) = entries.last_mut()
+        && last.role == role
+    {
+        last.text.push_str(delta);
+        return;
+    }
+    entries.push(RealtimeTranscriptEntry {
+        role: role.to_owned(),
+        text: delta.to_owned(),
+    });
+}
+
+fn apply_transcript_done(
+    entries: &mut Vec<RealtimeTranscriptEntry>,
+    role: &str,
+    text: &str,
+    force_new: bool,
+) {
+    if text.is_empty() {
+        return;
+    }
+    if !force_new
+        && let Some(last) = entries.last_mut()
+        && last.role == role
+    {
+        last.text = text.to_owned();
+        return;
+    }
+    entries.push(RealtimeTranscriptEntry {
+        role: role.to_owned(),
+        text: text.to_owned(),
+    });
+}
+
+fn append_handoff_input(entries: &mut Vec<RealtimeTranscriptEntry>, input: &str) {
+    let input = input.trim();
+    if input.is_empty()
+        || entries
+            .iter()
+            .any(|entry| entry.role == "user" && entry.text.trim() == input)
+    {
+        return;
+    }
+    entries.push(RealtimeTranscriptEntry {
+        role: "user".to_owned(),
+        text: input.to_owned(),
+    });
 }
 
 fn parse_event(
@@ -1186,6 +1506,7 @@ fn parse_frameless_delegation(value: &Value) -> Option<RealtimeEvent> {
     Some(RealtimeEvent::AgentRequest {
         call_id: item.get("id")?.as_str()?.to_owned(),
         prompt,
+        transcript: Vec::new(),
     })
 }
 
@@ -1215,6 +1536,7 @@ fn parse_completed_item(value: &Value) -> Option<RealtimeEvent> {
         BACKGROUND_AGENT_TOOL => Some(RealtimeEvent::AgentRequest {
             call_id,
             prompt: delegated_prompt(item.get("arguments").and_then(Value::as_str)),
+            transcript: Vec::new(),
         }),
         REMAIN_SILENT_TOOL => Some(RealtimeEvent::RemainSilent { call_id }),
         _ => None,
@@ -1277,10 +1599,10 @@ mod tests {
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
     use super::{
-        CHATGPT_REALTIME_MODEL, CHATGPT_REALTIME_VOICE, CHATGPT_REALTIME_VOICES,
-        PLATFORM_REALTIME_VOICE, PLATFORM_REALTIME_VOICES, RealtimeAudio, RealtimeEvent,
-        RealtimeProtocol, RealtimeVoice, context_append_chunks, delegated_prompt, parse_event,
-        realtime_endpoint, session_update,
+        ActiveTranscript, CHATGPT_REALTIME_MODEL, CHATGPT_REALTIME_VOICE, CHATGPT_REALTIME_VOICES,
+        PLATFORM_REALTIME_VOICE, PLATFORM_REALTIME_VOICES, RealtimeAgentSteer, RealtimeAudio,
+        RealtimeEvent, RealtimeProtocol, RealtimeTranscriptEntry, RealtimeVoice,
+        context_append_chunks, delegated_prompt, parse_event, realtime_endpoint, session_update,
     };
     use crate::OpenAi;
 
@@ -1362,6 +1684,7 @@ mod tests {
             Some(RealtimeEvent::AgentRequest {
                 call_id: "call_1".to_owned(),
                 prompt: "inspect the tests".to_owned(),
+                transcript: Vec::new(),
             })
         );
     }
@@ -1377,6 +1700,7 @@ mod tests {
             Some(RealtimeEvent::AgentRequest {
                 call_id: "delegation_1".to_owned(),
                 prompt: "run the tests".to_owned(),
+                transcript: Vec::new(),
             })
         );
         assert_eq!(
@@ -1402,6 +1726,64 @@ mod tests {
             )
             .unwrap(),
             Some(RealtimeEvent::OutputTranscriptDone("all done".to_owned()))
+        );
+    }
+
+    #[test]
+    fn attaches_only_new_active_transcript_to_each_delegation() {
+        let mut transcript = ActiveTranscript::default();
+        transcript.update(&mut RealtimeEvent::InputTranscriptDelta(
+            "delegate ".to_owned(),
+        ));
+        transcript.update(&mut RealtimeEvent::InputTranscriptDone(
+            "delegate this".to_owned(),
+        ));
+        let mut first = RealtimeEvent::AgentRequest {
+            call_id: "call_1".to_owned(),
+            prompt: "delegate this".to_owned(),
+            transcript: Vec::new(),
+        };
+        transcript.update(&mut first);
+        assert_eq!(
+            first,
+            RealtimeEvent::AgentRequest {
+                call_id: "call_1".to_owned(),
+                prompt: "delegate this".to_owned(),
+                transcript: vec![RealtimeTranscriptEntry {
+                    role: "user".to_owned(),
+                    text: "delegate this".to_owned(),
+                }],
+            }
+        );
+
+        transcript.update(&mut RealtimeEvent::OutputTranscriptDone(
+            "On it.".to_owned(),
+        ));
+        transcript.update(&mut RealtimeEvent::InputTranscriptDone(
+            "also run tests".to_owned(),
+        ));
+        let mut second = RealtimeEvent::AgentRequest {
+            call_id: "call_2".to_owned(),
+            prompt: "also run tests".to_owned(),
+            transcript: Vec::new(),
+        };
+        transcript.update(&mut second);
+        assert_eq!(
+            second,
+            RealtimeEvent::AgentRequest {
+                call_id: "call_2".to_owned(),
+                prompt: "also run tests".to_owned(),
+                transcript: vec![
+                    RealtimeTranscriptEntry {
+                        role: "assistant".to_owned(),
+                        text: "On it.".to_owned(),
+                    },
+                    RealtimeTranscriptEntry {
+                        role: "user".to_owned(),
+                        text: "also run tests".to_owned(),
+                    },
+                ],
+            }
         );
     }
 
@@ -1450,6 +1832,42 @@ mod tests {
             let create = socket.next().await.unwrap().unwrap().into_text().unwrap();
             let create: serde_json::Value = serde_json::from_str(&create).unwrap();
             assert_eq!(create["type"], "response.create");
+            socket
+                .send(Message::Text(r#"{"type":"response.done"}"#.into()))
+                .await
+                .unwrap();
+
+            let progress = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let progress: serde_json::Value = serde_json::from_str(&progress).unwrap();
+            assert_eq!(progress["item"]["type"], "message");
+            assert_eq!(progress["item"]["role"], "user");
+            assert_eq!(progress["item"]["content"][0]["text"], "[BACKEND] working");
+
+            let complete = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let complete: serde_json::Value = serde_json::from_str(&complete).unwrap();
+            assert_eq!(complete["item"]["call_id"], "call_1");
+            assert_eq!(
+                complete["item"]["output"],
+                "Background agent finished. Use the preceding [BACKEND] messages as the result."
+            );
+            let create = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let create: serde_json::Value = serde_json::from_str(&create).unwrap();
+            assert_eq!(create["type"], "response.create");
+            socket
+                .send(Message::Text(r#"{"type":"response.done"}"#.into()))
+                .await
+                .unwrap();
+
+            let steer = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let steer: serde_json::Value = serde_json::from_str(&steer).unwrap();
+            assert_eq!(steer["item"]["call_id"], "call_2");
+            assert_eq!(
+                steer["item"]["output"],
+                "This was sent to steer the previous background agent task."
+            );
+            let create = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let create: serde_json::Value = serde_json::from_str(&create).unwrap();
+            assert_eq!(create["type"], "response.create");
         });
 
         let openai = OpenAi::new("test-key").unwrap();
@@ -1473,6 +1891,15 @@ mod tests {
             .complete_agent_request("call_1", "done")
             .await
             .unwrap();
+        session
+            .append_agent_output("call_1", "working")
+            .await
+            .unwrap();
+        session.complete_agent_run("call_1").await.unwrap();
+        assert_eq!(
+            session.steer_agent_request("call_2").await.unwrap(),
+            RealtimeAgentSteer::Acknowledged
+        );
         server.await.unwrap();
     }
 }

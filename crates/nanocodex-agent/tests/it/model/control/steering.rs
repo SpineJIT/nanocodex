@@ -259,7 +259,10 @@ async fn steering_during_a_tool_call_joins_after_the_tool_result() -> Result<()>
         .workspace(&workspace)
         .session_id(test_session_id())
         .build()?;
-    let turn = agent.prompt("print shit a lot of times").await?;
+    let turn = match agent.route_prompt("print shit a lot of times").await? {
+        PromptRoute::Started(turn) => turn,
+        PromptRoute::Steered => return Err(eyre!("idle live input unexpectedly steered a turn")),
+    };
     timeout(std::time::Duration::from_secs(5), async {
         while !workspace.join("tool-started").exists() {
             tokio::task::yield_now().await;
@@ -268,7 +271,10 @@ async fn steering_during_a_tool_call_joins_after_the_tool_result() -> Result<()>
     .await
     .map_err(|_| eyre!("tool process did not start"))?;
 
-    turn.steer("print shat instead").await?;
+    assert!(matches!(
+        agent.route_prompt("print shat instead").await?,
+        PromptRoute::Steered
+    ));
     assert!(!workspace.join("release-tool").exists());
     std::fs::write(workspace.join("release-tool"), [])?;
     assert_eq!(turn.result().await?.final_message(), "done");

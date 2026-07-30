@@ -181,6 +181,28 @@ where
                 model.shutdown().await;
                 return Ok(());
             };
+            let command = match command {
+                Command::RoutePrompt {
+                    key,
+                    prompt,
+                    parent,
+                    events,
+                    turn_result,
+                    route_result,
+                } => {
+                    drop(route_result.send(Ok(PromptRouteKind::Started)));
+                    Command::Prompt {
+                        key,
+                        prompt,
+                        thinking: None,
+                        fast_mode: None,
+                        parent,
+                        events,
+                        result: turn_result,
+                    }
+                }
+                command => command,
+            };
             let Command::Prompt {
                 key,
                 prompt,
@@ -253,6 +275,25 @@ where
                                             events,
                                             result,
                                         });
+                                    }
+                                    Some(Command::RoutePrompt {
+                                        key,
+                                        prompt,
+                                        parent,
+                                        events,
+                                        turn_result,
+                                        route_result,
+                                    }) => {
+                                        queued_turns.push_back(QueuedTurn::Pending {
+                                            key,
+                                            prompt,
+                                            thinking: default_thinking,
+                                            fast_mode: default_fast_mode,
+                                            parent,
+                                            events,
+                                            result: turn_result,
+                                        });
+                                        drop(route_result.send(Ok(PromptRouteKind::Started)));
                                     }
                                     Some(Command::Compact { parent, result }) => {
                                         compact_replaced = true;
@@ -515,6 +556,26 @@ where
                                     }
                                 });
                                 drop(result.send(outcome));
+                            }
+                            Some(Command::RoutePrompt {
+                                prompt,
+                                route_result,
+                                ..
+                            }) => {
+                                let outcome = steers.try_send(prompt).map_or_else(
+                                    |error| {
+                                        Err(match error {
+                                            mpsc::error::TrySendError::Full(_) => {
+                                                NanocodexError::SteerQueueFull
+                                            }
+                                            mpsc::error::TrySendError::Closed(_) => {
+                                                NanocodexError::TurnNotSteerable
+                                            }
+                                        })
+                                    },
+                                    |()| Ok(PromptRouteKind::Steered),
+                                );
+                                drop(route_result.send(outcome));
                             }
                             Some(Command::Cancel { key: target, result: cancellation }) => {
                                 if target != key {

@@ -194,6 +194,64 @@ impl Nanocodex {
         })
     }
 
+    /// Routes live input into the active turn or starts a new turn when idle.
+    ///
+    /// The driver makes the decision atomically. If a regular turn is active,
+    /// the prompt is appended to its bounded steering queue and
+    /// [`PromptRoute::Steered`] is returned. Otherwise the prompt starts a new
+    /// turn and is returned as [`PromptRoute::Started`].
+    ///
+    /// This is intended for live input adapters such as voice sessions. Normal
+    /// queued request/response consumers should continue to use [`Self::prompt`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty prompt, a full steering queue, or if the
+    /// agent driver stopped.
+    pub async fn route_prompt(&self, prompt: impl Into<Prompt>) -> Result<PromptRoute> {
+        let prompt = prompt.into();
+        if prompt.instruction.is_empty() {
+            return Err(NanocodexError::InvalidRequest(
+                "prompt instruction must not be empty".to_owned(),
+            ));
+        }
+        let key = TurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
+        let parent = tracing::Span::current();
+        let parent = (!parent.is_disabled()).then_some(parent);
+        let (events, event_stream) = self.events.mirrored_channel();
+        let (turn_result, turn_receiver) = oneshot::channel();
+        let (route_result, route_receiver) = oneshot::channel();
+        if self
+            .commands
+            .send(Command::RoutePrompt {
+                key,
+                prompt,
+                parent,
+                events,
+                turn_result,
+                route_result,
+            })
+            .await
+            .is_err()
+        {
+            return Err(NanocodexError::AgentStopped);
+        }
+        match route_receiver
+            .await
+            .map_err(|_| NanocodexError::AgentStopped)??
+        {
+            PromptRouteKind::Started => Ok(PromptRoute::Started(Turn {
+                control: TurnControl {
+                    key,
+                    commands: self.commands.clone(),
+                },
+                events: event_stream,
+                result: turn_receiver,
+            })),
+            PromptRouteKind::Steered => Ok(PromptRoute::Steered),
+        }
+    }
+
     /// Changes the reasoning effort for subsequently accepted turns.
     ///
     /// An active turn and prompts already queued by the driver retain the

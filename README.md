@@ -100,6 +100,33 @@ history, WebSocket, tools, shell sessions, and prompt-cache identity.
 `agent.clone()` is a cheap handle to that same session; the independently
 returned `AgentEvents` stream is the session-wide event firehose.
 
+## Voice: devices or Unix pipes
+
+The non-TUI desktop example owns the default microphone and speaker directly
+in Rust, using the same `VoiceSessionBuilder` as the production TUI:
+
+```sh
+nanocodex auth login # once; shares ~/.codex/auth.json with Codex
+cargo run -p nanocodex-examples --bin voice
+```
+
+The lower adapter leaves device and media ownership outside Nanocodex. It reads
+24 kHz mono PCM16 little-endian audio from stdin, writes the same format to
+stdout, and keeps transcripts and agent events on stderr:
+
+```sh
+cargo run -p nanocodex-examples --bin realtime-pipe < microphone.pcm > speaker.pcm
+
+# Equivalently, compose any live capture/decoder and playback/encoder:
+capture-s16le | cargo run --quiet -p nanocodex-examples --bin realtime-pipe | play-s16le
+```
+
+Both retain one coding-agent session. A spoken request starts work while idle;
+a follow-up received during that work atomically steers the active turn at its
+next safe model boundary. Both use shared Codex/ChatGPT subscription auth, not
+an API key. Set `NANOCODEX_AUTH_FILE` to override the normal Codex credential
+path.
+
 ## Thesis
 
 ### Small, excellent building blocks

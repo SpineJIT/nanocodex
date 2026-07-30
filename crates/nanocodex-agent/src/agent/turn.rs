@@ -15,6 +15,19 @@ pub struct Turn {
     pub(super) result: oneshot::Receiver<Result<TurnResult>>,
 }
 
+/// Outcome of routing live user input into an agent session.
+///
+/// Live consumers such as voice interfaces normally want to steer the current
+/// regular turn when one exists and start a new turn only when the agent is
+/// idle. [`Nanocodex::route_prompt`](crate::Nanocodex::route_prompt) performs
+/// that decision atomically in the agent driver and returns this outcome.
+pub enum PromptRoute {
+    /// The agent was idle, so the prompt started a new independently awaitable turn.
+    Started(Turn),
+    /// The prompt was admitted to the current turn's steering queue.
+    Steered,
+}
+
 impl Turn {
     /// Returns a cheap cloneable capability targeting this exact turn.
     #[must_use]
@@ -190,6 +203,14 @@ pub(super) enum Command {
         prompt: Prompt,
         result: oneshot::Sender<Result<()>>,
     },
+    RoutePrompt {
+        key: TurnKey,
+        prompt: Prompt,
+        parent: Option<tracing::Span>,
+        events: EventSink,
+        turn_result: oneshot::Sender<Result<TurnResult>>,
+        route_result: oneshot::Sender<Result<PromptRouteKind>>,
+    },
     Cancel {
         key: TurnKey,
         result: oneshot::Sender<Result<()>>,
@@ -214,6 +235,12 @@ pub(super) enum Command {
         result: oneshot::Sender<Result<()>>,
     },
     Shutdown,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum PromptRouteKind {
+    Started,
+    Steered,
 }
 
 pub(super) enum QueuedTurn {
