@@ -1891,11 +1891,13 @@ mod tests {
             .complete_agent_request("call_1", "done")
             .await
             .unwrap();
+        assert_eq!(events.recv().await, Some(RealtimeEvent::ResponseDone));
         session
             .append_agent_output("call_1", "working")
             .await
             .unwrap();
         session.complete_agent_run("call_1").await.unwrap();
+        assert_eq!(events.recv().await, Some(RealtimeEvent::ResponseDone));
         assert_eq!(
             session.steer_agent_request("call_2").await.unwrap(),
             RealtimeAgentSteer::Acknowledged

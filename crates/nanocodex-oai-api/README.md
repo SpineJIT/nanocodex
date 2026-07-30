@@ -133,7 +133,7 @@ ChatGPT backend and join its sideband control WebSocket with the same bearer
 and account identity. When no host attestation is available, Nanocodex sends
 the same unavailable-token envelope Codex uses when attestation generation
 times out; hosts that own an attestation integration may override it with
-[`RealtimeSessionBuilder::attestation_header`].
+[`realtime::RealtimeSessionBuilder::attestation_header`].
 The library accepts and emits signed 16-bit little-endian, 24 kHz mono PCM through a cheap
 [`realtime::RealtimeSession`] handle and an independent
 [`realtime::RealtimeEvents`] stream. It does not open audio devices, so callers
