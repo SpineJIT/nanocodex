@@ -16,6 +16,7 @@ eyre.workspace = true
 futures-util.workspace = true
 http.workspace = true
 nanocodex.workspace = true
+nanocodex-browser.workspace = true
 nanocodex-vm.workspace = true
 reqwest.workspace = true
 reflink-copy.workspace = true
@@ -77,6 +78,10 @@ path = "rollout_resume_bench.rs"
 [[bin]]
 name = "vm-tools"
 path = "vm_tools.rs"
+
+[[bin]]
+name = "browser-agent"
+path = "browser_agent.rs"
 
 [lints]
 workspace = true
