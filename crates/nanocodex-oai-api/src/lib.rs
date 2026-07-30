@@ -148,6 +148,7 @@ pub const MODEL: &str = Model::Sol.as_str();
 /// Supported models in the GPT-5.6 coding-model family.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum Model {
     /// GPT-5.6 Sol.
     #[default]

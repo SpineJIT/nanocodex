@@ -237,10 +237,15 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
                 })?;
                 context_baseline = None;
             }
-            Some("world_state") => {
-                if let Some(selected) = model_from_world_state(&value)? {
+            Some("turn_context") => {
+                if let Some(selected) = value["payload"]["model"]
+                    .as_str()
+                    .and_then(|model| model.parse().ok())
+                {
                     model = selected;
                 }
+            }
+            Some("world_state") => {
                 if let Some(state) = value["payload"]["state"].get("nanocodex_context") {
                     context_baseline =
                         Some(serde_json::from_value(state.clone()).map_err(|error| {
@@ -296,26 +301,6 @@ struct MaterializedRollout {
     history: Vec<ResponseItem>,
     transcript: Vec<RolloutTranscriptItem>,
     context_baseline: Option<ContextBaseline>,
-}
-
-pub(in crate::rollout) fn model_from_world_state(
-    value: &serde_json::Value,
-) -> io::Result<Option<Model>> {
-    let Some(value) = value["payload"]["state"].get("nanocodex_model") else {
-        return Ok(None);
-    };
-    let model = value.as_str().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Nanocodex rollout model must be a string",
-        )
-    })?;
-    model.parse().map(Some).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Nanocodex rollout model is unsupported: {error}"),
-        )
-    })
 }
 
 pub(in crate::rollout) fn visible_rollout_event(

@@ -237,7 +237,7 @@ where
                     );
                     drop(parent);
                     let compact_started = web_time::Instant::now();
-                    let durability_turn = self.durability.start_compaction();
+                    let durability_turn = self.durability.start_compaction(default_thinking);
                     let mut compact_replaced = false;
                     let (cancel_compaction, mut cancel_compaction_rx) = oneshot::channel();
                     let mut cancel_compaction = Some(cancel_compaction);
@@ -493,7 +493,7 @@ where
                     );
                 });
             }
-            let durability_turn = self.durability.start_turn(&prompt);
+            let durability_turn = self.durability.start_turn(&prompt, thinking);
             let (steers, steer_rx) = mpsc::channel(STEER_CAPACITY);
             let (cancel, cancel_rx) = oneshot::channel();
             let (fork_snapshots, mut fork_snapshot_rx) = watch::channel(None);

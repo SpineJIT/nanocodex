@@ -26,11 +26,18 @@ impl DurabilityConfig {
 pub(crate) struct Durability;
 
 impl Durability {
-    pub(crate) const fn start_turn(&self, _prompt: &nanocodex_oai_api::Prompt) -> DurabilityTurn {
+    pub(crate) const fn start_turn(
+        &self,
+        _prompt: &nanocodex_oai_api::Prompt,
+        _effort: nanocodex_oai_api::Thinking,
+    ) -> DurabilityTurn {
         DurabilityTurn
     }
 
-    pub(crate) const fn start_compaction(&self) -> DurabilityTurn {
+    pub(crate) const fn start_compaction(
+        &self,
+        _effort: nanocodex_oai_api::Thinking,
+    ) -> DurabilityTurn {
         DurabilityTurn
     }
 

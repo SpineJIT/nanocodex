@@ -21,7 +21,11 @@ fn message(text: &str) -> ResponseItem {
 }
 
 fn completed_turn(prompt: &str, final_message: &str) -> RolloutTurn {
-    RolloutTurn::started(&Prompt::new(prompt)).completed(final_message.to_owned())
+    completed_turn_with_effort(prompt, final_message, Thinking::High)
+}
+
+fn completed_turn_with_effort(prompt: &str, final_message: &str, effort: Thinking) -> RolloutTurn {
+    RolloutTurn::started(&Prompt::new(prompt), effort).completed(final_message.to_owned())
 }
 
 #[test]
@@ -75,6 +79,18 @@ fn loads_codex_rollout_without_a_nanocodex_sidecar() {
                 "originator": "codex-tui",
                 "history_mode": "legacy",
                 "context_window": {"window_id": "window-1"}
+            }
+        }),
+        serde_json::json!({
+            "timestamp": "2026-07-24T12:00:01Z",
+            "type": "turn_context",
+            "payload": {
+                "cwd": home.path(),
+                "approval_policy": "on-request",
+                "sandbox_policy": {"type": "workspace-write"},
+                "model": "gpt-5.5",
+                "effort": "high",
+                "summary": "auto"
             }
         }),
         serde_json::json!({
@@ -138,6 +154,7 @@ fn loads_codex_rollout_without_a_nanocodex_sidecar() {
         home.path().canonicalize().unwrap()
     );
     assert_eq!(session.rollout_path(), path.canonicalize().unwrap());
+    assert_eq!(session.model(), Model::Sol);
     let snapshot = serde_json::to_value(session.snapshot()).expect("encode snapshot");
     assert!(snapshot.get("request_prefix").is_none());
     assert_eq!(snapshot["history"].as_array().map(Vec::len), Some(2));
@@ -156,7 +173,7 @@ fn loads_codex_rollout_without_a_nanocodex_sidecar() {
 }
 
 #[test]
-fn loads_the_latest_model_from_nanocodex_rollout_state() {
+fn loads_the_latest_supported_model_from_codex_turn_context() {
     let home = tempdir().expect("temporary Codex home");
     let thread_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
     let directory = home.path().join("sessions/2026/07/24");
@@ -185,18 +202,26 @@ fn loads_the_latest_model_from_nanocodex_rollout_state() {
         }),
         serde_json::json!({
             "timestamp": "2026-07-24T12:00:02Z",
-            "type": "world_state",
+            "type": "turn_context",
             "payload": {
-                "full": true,
-                "state": {"nanocodex_model": "gpt-5.6-sol"}
+                "cwd": home.path(),
+                "approval_policy": "on-request",
+                "sandbox_policy": {"type": "workspace-write"},
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+                "summary": "auto"
             }
         }),
         serde_json::json!({
             "timestamp": "2026-07-24T12:00:03Z",
-            "type": "world_state",
+            "type": "turn_context",
             "payload": {
-                "full": true,
-                "state": {"nanocodex_model": "gpt-5.6-luna"}
+                "cwd": home.path(),
+                "approval_policy": "on-request",
+                "sandbox_policy": {"type": "workspace-write"},
+                "model": "gpt-5.6-luna",
+                "effort": "high",
+                "summary": "auto"
             }
         }),
     ] {
@@ -323,7 +348,7 @@ async fn writes_codex_rollout_envelope_and_committed_items() {
         .expect("persist rollout");
 
     let lines = lines(&recorder);
-    assert_eq!(lines.len(), 7);
+    assert_eq!(lines.len(), 8);
     assert_eq!(lines[0]["type"], "session_meta");
     assert_eq!(
         lines[0]["payload"]["id"],
@@ -336,24 +361,29 @@ async fn writes_codex_rollout_envelope_and_committed_items() {
     assert_eq!(lines[1]["payload"]["type"], "task_started");
     assert_eq!(lines[2]["payload"]["type"], "user_message");
     assert_eq!(lines[2]["payload"]["message"], "remember amber");
-    assert_eq!(lines[3]["type"], "response_item");
-    assert_eq!(lines[3]["payload"]["type"], "message");
-    assert_eq!(lines[3]["payload"]["role"], "user");
-    assert_eq!(lines[4]["type"], "world_state");
-    assert_eq!(
-        lines[4]["payload"]["state"]["nanocodex_model"],
-        "gpt-5.6-sol"
+    assert_eq!(lines[3]["type"], "turn_context");
+    assert_eq!(lines[3]["payload"]["cwd"], "/worktree");
+    assert_eq!(lines[3]["payload"]["model"], "gpt-5.6-sol");
+    assert_eq!(lines[3]["payload"]["effort"], "high");
+    assert_eq!(lines[4]["type"], "response_item");
+    assert_eq!(lines[4]["payload"]["type"], "message");
+    assert_eq!(lines[4]["payload"]["role"], "user");
+    assert_eq!(lines[5]["type"], "world_state");
+    assert!(
+        lines[5]["payload"]["state"]
+            .get("nanocodex_model")
+            .is_none()
     );
     assert_eq!(
-        lines[4]["payload"]["state"]["nanocodex_context"]["kind"],
+        lines[5]["payload"]["state"]["nanocodex_context"]["kind"],
         "missing"
     );
-    assert_eq!(lines[5]["payload"]["type"], "agent_message");
-    assert_eq!(lines[5]["payload"]["message"], "stored");
-    assert_eq!(lines[5]["payload"]["phase"], "final_answer");
-    assert_eq!(lines[6]["payload"]["type"], "task_complete");
+    assert_eq!(lines[6]["payload"]["type"], "agent_message");
+    assert_eq!(lines[6]["payload"]["message"], "stored");
+    assert_eq!(lines[6]["payload"]["phase"], "final_answer");
+    assert_eq!(lines[7]["payload"]["type"], "task_complete");
     assert_eq!(
-        lines[6]["payload"]["turn_id"],
+        lines[7]["payload"]["turn_id"],
         lines[1]["payload"]["turn_id"]
     );
 }
@@ -380,7 +410,7 @@ async fn appends_only_the_new_committed_delta() {
         .persist_history(
             ResponseHistory::new(vec![message("one"), message("two")]),
             0,
-            completed_turn("two", "second"),
+            completed_turn_with_effort("two", "second", Thinking::Low),
         )
         .await
         .expect("persist second turn");
@@ -392,10 +422,12 @@ async fn appends_only_the_new_committed_delta() {
         .expect("read complete rollout");
     assert!(complete.starts_with(&prefix));
     let lines = lines(&recorder);
-    assert_eq!(lines.len(), 12);
-    assert_eq!(lines[8]["payload"]["message"], "two");
-    assert_eq!(lines[9]["type"], "response_item");
-    assert_eq!(lines[10]["payload"]["message"], "second");
+    assert_eq!(lines.len(), 14);
+    assert_eq!(lines[9]["payload"]["message"], "two");
+    assert_eq!(lines[10]["type"], "turn_context");
+    assert_eq!(lines[10]["payload"]["effort"], "low");
+    assert_eq!(lines[11]["type"], "response_item");
+    assert_eq!(lines[12]["payload"]["message"], "second");
     assert_eq!(
         lines
             .iter()
@@ -492,7 +524,7 @@ async fn records_compaction_as_a_replacement_history_boundary() {
         .iter()
         .find(|line| line["type"] == "compacted")
         .expect("compacted record");
-    assert_eq!(lines.len(), 14);
+    assert_eq!(lines.len(), 16);
     assert_eq!(compacted["payload"]["window_number"], 1);
     assert_eq!(
         compacted["payload"]["replacement_history"][0]["content"][0]["text"],
@@ -531,6 +563,7 @@ async fn failed_append_remains_pending_and_retries_without_duplicates() {
     let mut writer = RolloutWriter::new(
         tokio::fs::File::from_std(file),
         uuid::Uuid::now_v7().to_string(),
+        PathBuf::from("/worktree"),
     );
     writer.pending = Some(RolloutCommit::from_history(
         ResponseHistory::new(vec![message("retry me")]),
@@ -548,5 +581,5 @@ async fn failed_append_remains_pending_and_retries_without_duplicates() {
         .lines()
         .collect::<io::Result<Vec<_>>>()
         .expect("read retried rollout");
-    assert_eq!(lines.len(), 6);
+    assert_eq!(lines.len(), 7);
 }

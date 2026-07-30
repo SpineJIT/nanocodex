@@ -79,15 +79,23 @@ impl Durability {
         }
     }
 
-    pub(crate) fn start_turn(&self, prompt: &nanocodex_oai_api::Prompt) -> DurabilityTurn {
-        DurabilityTurn(self.recorder.as_ref().map(|_| RolloutTurn::started(prompt)))
-    }
-
-    pub(crate) fn start_compaction(&self) -> DurabilityTurn {
+    pub(crate) fn start_turn(
+        &self,
+        prompt: &nanocodex_oai_api::Prompt,
+        effort: nanocodex_oai_api::Thinking,
+    ) -> DurabilityTurn {
         DurabilityTurn(
             self.recorder
                 .as_ref()
-                .map(|_| RolloutTurn::compaction_started()),
+                .map(|_| RolloutTurn::started(prompt, effort)),
+        )
+    }
+
+    pub(crate) fn start_compaction(&self, effort: nanocodex_oai_api::Thinking) -> DurabilityTurn {
+        DurabilityTurn(
+            self.recorder
+                .as_ref()
+                .map(|_| RolloutTurn::compaction_started(effort)),
         )
     }
 

@@ -128,17 +128,18 @@ async fn manual_compaction_before_first_prompt_reinjects_cached_context_and_pers
             "session_meta",
             "event_msg",
             "compacted",
+            "turn_context",
             "world_state",
             "event_msg"
         ]
     );
     assert_eq!(lines[1]["payload"]["type"], "task_started");
-    assert_eq!(lines[4]["payload"]["type"], "task_complete");
+    assert_eq!(lines[5]["payload"]["type"], "task_complete");
     let compact_turn_id = lines[1]["payload"]["turn_id"]
         .as_str()
         .ok_or_else(|| eyre!("compact task_started omitted its turn ID"))?;
     assert_eq!(
-        lines[4]["payload"]["turn_id"].as_str(),
+        lines[5]["payload"]["turn_id"].as_str(),
         Some(compact_turn_id)
     );
     assert_ne!(compact_turn_id, TEST_SESSION_ID);

@@ -2938,11 +2938,11 @@ mod tests {
             classify_submission("/fast turbo"),
             Submission::InvalidCommand("Usage: /fast [on|off]".to_owned())
         );
+        assert_eq!(classify_submission("/model"), Submission::ReasoningPicker);
         assert_eq!(
             classify_submission(" /thinking "),
             Submission::ReasoningPicker
         );
-        assert_eq!(classify_submission(" /model "), Submission::ReasoningPicker);
         assert_eq!(
             classify_submission("/thinking high"),
             Submission::InvalidCommand("Usage: /model or /thinking".to_owned())
