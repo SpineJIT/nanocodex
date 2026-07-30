@@ -235,6 +235,13 @@ const hostBridge = Object.freeze({
   executeCode(source, sessionId, callId) {
     return requiredSessionHost(sessionId).executeCode(source, sessionId, callId);
   },
+  executeTool(name, input, sessionId, callId) {
+    return requiredSessionHost(sessionId).executeTool(name, input, sessionId, callId);
+  },
+  toolMode(sessionId) {
+    // The WASM constructor asks before its session is adopted.
+    return (hostSessions.get(sessionId) ?? requiredActiveHost()).toolMode();
+  },
   toolDefinitions(sessionId) {
     // ModelRun builds its stable tool prefix inside the WASM constructor,
     // immediately before the returned session can be adopted. Runtime

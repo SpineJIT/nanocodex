@@ -14,6 +14,10 @@ export function createBrowserHost(options = {}) {
   }
   const connections = new Map();
   const code = createCodeRuntime(options.tools);
+  const toolMode = options.toolMode ?? "code";
+  if (toolMode !== "code" && toolMode !== "direct") {
+    throw new TypeError("toolMode must be code or direct");
+  }
   const onEvent = options.onEvent || (() => {});
   const maxQueuedMessages = options.maxQueuedMessages ?? DEFAULT_MAX_QUEUED_MESSAGES;
   const maxQueuedBytes = options.maxQueuedBytes ?? DEFAULT_MAX_QUEUED_BYTES;
@@ -220,6 +224,8 @@ export function createBrowserHost(options = {}) {
     close,
     sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
     executeCode: code.executeCode,
+    executeTool: code.executeTool,
+    toolMode: () => toolMode,
     toolDefinitions: code.toolDefinitions,
     emitEvent: onEvent,
     reset: code.reset,

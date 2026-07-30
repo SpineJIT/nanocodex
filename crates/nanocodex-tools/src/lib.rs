@@ -78,8 +78,8 @@ pub mod image {
 pub mod runtime {
     pub use crate::{
         hosted::{
-            HostedToolRuntime as ToolRuntime, HostedToolRuntimeControl as ToolRuntimeControl,
-            HostedTools as Tools, OwnedToolContext,
+            HostedToolMode, HostedToolRuntime as ToolRuntime,
+            HostedToolRuntimeControl as ToolRuntimeControl, HostedTools as Tools, OwnedToolContext,
         },
         runtime_config::{ImageGenerationConfig, WebSearchConfig},
     };

@@ -41,6 +41,27 @@ test("browser host carries ordered frames and application tools", async () => {
   assert.deepEqual(events, ["event"]);
 });
 
+test("browser host directly dispatches tools without dynamic code evaluation", async () => {
+  const host = createBrowserHost({
+    toolMode: "direct",
+    tools: {
+      runtimeInfo: {
+        parameters: { type: "object", additionalProperties: false },
+        handler: (_input, context) => ({ runtime: "worker", call_id: context.callId }),
+      },
+    },
+  });
+  assert.equal(host.toolMode(), "direct");
+  const result = JSON.parse(await host.executeTool(
+    "runtimeInfo",
+    "{}",
+    "session-1",
+    "call-1",
+  ));
+  assert.equal(result.success, true);
+  assert.deepEqual(JSON.parse(result.output), { runtime: "worker", call_id: "call-1" });
+});
+
 test("browser host opens application sockets through MPP", async () => {
   const socket = new FakeWebSocket("wss://paid.test");
   socket.readyState = FakeWebSocket.OPEN;

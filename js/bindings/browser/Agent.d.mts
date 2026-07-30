@@ -28,6 +28,8 @@ export declare namespace create {
     ): WebSocket | BrowserWebSocketConnection | Promise<WebSocket | BrowserWebSocketConnection>;
     module?: unknown;
     tools?: ToolMap | undefined;
+    /** Direct dispatch is CSP-safe; Code Mode requires dynamic JavaScript evaluation. */
+    toolMode?: "code" | "direct" | undefined;
     websocketUrl?: string | undefined;
   };
   type ReturnType = Agent;

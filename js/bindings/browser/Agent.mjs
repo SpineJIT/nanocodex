@@ -32,6 +32,7 @@ export function create(options = {}) {
     WebSocketImpl,
     createWebSocket,
     tools,
+    toolMode,
   } = options;
   if (mpp !== undefined && apiKey !== undefined) {
     throw new TypeError("apiKey and mpp are mutually exclusive");
@@ -47,6 +48,7 @@ export function create(options = {}) {
     mpp,
     onEvent: events.emit,
     tools,
+    toolMode,
   });
   activateHost(host);
   const runtime = defineRuntime({

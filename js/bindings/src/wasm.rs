@@ -9,8 +9,12 @@ use nanocodex::{
         session::{SessionId, SessionSnapshot},
     },
     tools::{
-        ToolContext, ToolDefinition,
-        hosted::{CodeModeExecution, CodeModeHost, CodeModeHostError, HostFuture, HostedTools},
+        ToolContext, ToolDefinition, ToolInput, ToolOutput,
+        contract::ToolOutputWire,
+        hosted::{
+            CodeModeExecution, CodeModeHost, CodeModeHostError, HostFuture, HostedToolMode,
+            HostedTools,
+        },
     },
 };
 use serde::Deserialize;
@@ -31,13 +35,42 @@ extern "C" {
     fn host_execute_code(source: &str, session_id: &str, call_id: &str)
     -> Result<Promise, JsValue>;
 
+    #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = executeTool)]
+    fn host_execute_tool(
+        name: &str,
+        input: &str,
+        session_id: &str,
+        call_id: &str,
+    ) -> Result<Promise, JsValue>;
+
+    #[wasm_bindgen(js_namespace = ["globalThis", "nanocodexHost"], js_name = toolMode)]
+    fn host_tool_mode(session_id: &str) -> String;
+
     #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = toolDefinitions)]
     fn host_tool_definitions(session_id: &str) -> Result<String, JsValue>;
 }
 
-struct JavaScriptCodeModeHost;
+struct JavaScriptCodeModeHost {
+    mode: HostedToolMode,
+}
+
+impl JavaScriptCodeModeHost {
+    fn new() -> Self {
+        Self {
+            mode: if host_tool_mode("") == "direct" {
+                HostedToolMode::Direct
+            } else {
+                HostedToolMode::Code
+            },
+        }
+    }
+}
 
 impl CodeModeHost for JavaScriptCodeModeHost {
+    fn tool_mode(&self) -> HostedToolMode {
+        self.mode
+    }
+
     fn tool_definitions(&self, session_id: &str) -> Result<Vec<ToolDefinition>, CodeModeHostError> {
         let encoded = host_tool_definitions(session_id)
             .map_err(|error| CodeModeHostError::new(host_error_message(&error)))?;
@@ -66,6 +99,38 @@ impl CodeModeHost for JavaScriptCodeModeHost {
                 CodeModeHostError::new(format!(
                     "JavaScript Code Mode host returned invalid execution JSON: {error}"
                 ))
+            })
+        })
+    }
+
+    fn execute_tool<'a>(
+        &'a self,
+        name: &'a str,
+        input: ToolInput,
+        context: ToolContext<'a>,
+    ) -> HostFuture<'a, Result<ToolOutput, CodeModeHostError>> {
+        Box::pin(async move {
+            let input = match input {
+                ToolInput::Function(input) => input.get().to_owned(),
+                ToolInput::Freeform(input) => serde_json::to_string(&input).map_err(|error| {
+                    CodeModeHostError::new(format!("failed to encode hosted tool input: {error}"))
+                })?,
+            };
+            let promise = host_execute_tool(name, &input, context.session_id(), context.call_id())
+                .map_err(|error| CodeModeHostError::new(host_error_message(&error)))?;
+            let value = JsFuture::from(promise)
+                .await
+                .map_err(|error| CodeModeHostError::new(host_error_message(&error)))?;
+            let encoded = value.as_string().ok_or_else(|| {
+                CodeModeHostError::new("JavaScript tool host returned a non-string result")
+            })?;
+            let wire = serde_json::from_str::<ToolOutputWire>(&encoded).map_err(|error| {
+                CodeModeHostError::new(format!(
+                    "JavaScript tool host returned invalid execution JSON: {error}"
+                ))
+            })?;
+            ToolOutput::from_wire(wire).map_err(|error| {
+                CodeModeHostError::new(format!("JavaScript tool result was invalid: {error}"))
             })
         })
     }
@@ -129,7 +194,7 @@ impl WasmNanocodex {
             .build()
             .map_err(js_error)?;
         let mut builder =
-            RustNanocodex::builder(openai).tools(HostedTools::new(JavaScriptCodeModeHost));
+            RustNanocodex::builder(openai).tools(HostedTools::new(JavaScriptCodeModeHost::new()));
         if let Some(instructions) = config.instructions {
             builder = builder.instructions(instructions);
         }

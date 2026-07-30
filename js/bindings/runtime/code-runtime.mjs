@@ -23,6 +23,24 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
   Object.freeze(configuredTools);
   Object.freeze(definitions);
   const encodedDefinitions = JSON.stringify(definitions);
+  const toolByName = new Map(configuredTools.map((tool) => [tool.name, tool]));
+
+  async function executeTool(name, encodedInput, sessionId = "default", callId = "tool") {
+    const tool = toolByName.get(name);
+    if (!tool) return encodeToolOutput(`unknown application tool: ${name}`, false, null);
+    let input;
+    try {
+      input = JSON.parse(encodedInput);
+    } catch (error) {
+      return encodeToolOutput(`invalid tool input: ${errorMessage(error)}`, false, null);
+    }
+    try {
+      const result = await tool.handler(input, { sessionId, parentCallId: "", callId });
+      return encodeToolOutput(outputBody(result), true, clone(result) ?? null);
+    } catch (error) {
+      return encodeToolOutput(errorMessage(error), false, null);
+    }
+  }
 
   async function executeCode(source, sessionId = "default", parentCallId = "exec") {
     const startedAt = performance.now();
@@ -151,10 +169,21 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
 
   return Object.freeze({
     executeCode,
+    executeTool,
     toolDefinitions: () => encodedDefinitions,
     reset() {
       stores.clear();
     },
+  });
+}
+
+function encodeToolOutput(output, success, codeModeValue) {
+  return JSON.stringify({
+    output,
+    success,
+    code_mode_value: codeModeValue,
+    metadata: null,
+    process_trace: null,
   });
 }
 
