@@ -26,11 +26,14 @@ export function createBrowserHost(options = {}) {
     const authorization = options.hostAuth
       ? { authorization: "host_managed" }
       : { authorization: "bearer", bearerToken: apiKey };
-    const opened = await createWebSocket(endpoint, sessionId, { ...metadata, ...authorization });
+    const request = { ...metadata };
+    delete request.authorization;
+    delete request.bearerToken;
+    Object.assign(request, authorization);
+    const opened = await createWebSocket(endpoint, sessionId, request);
     const { socket, ...handshake } = normalizeWebSocketConnection(opened);
     return new Promise((resolve, reject) => {
       let settled = false;
-      const handle = nextHandle++;
       const connection = {
         socket,
         queue: [],
@@ -42,6 +45,7 @@ export function createBrowserHost(options = {}) {
       const resolveOpen = () => {
         if (settled) return;
         settled = true;
+        const handle = nextHandle++;
         connections.set(handle, connection);
         resolve(JSON.stringify({
           handle,

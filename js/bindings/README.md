@@ -276,7 +276,9 @@ const agent = await Agent.create({
 
 `hostAuth` is useful when the embedding runtime owns rotating credentials. The
 callback can acquire a fresh token, attempt the upgrade, and refresh-and-retry
-on 401. `apiKey`, `hostAuth`, and `mpp` are mutually exclusive.
+on 401. Bound and reject upgrade work in the callback: until it returns a
+socket, there is no connection handle for Nanocodex to close. `apiKey`,
+`hostAuth`, and `mpp` are mutually exclusive.
 
 After publication, a browser can load the same entrypoint without a package
 manager or build step:

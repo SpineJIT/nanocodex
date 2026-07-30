@@ -162,7 +162,10 @@ test("browser host never exposes its host-managed credential marker", async () =
     },
   });
 
-  await host.connect(socket.url, "host-managed", "session-1");
+  await host.connect(socket.url, "host-managed", "session-1", {
+    authorization: "bearer",
+    bearerToken: "metadata-must-not-override-auth",
+  });
   assert.deepEqual(request, { authorization: "host_managed" });
 });
 
@@ -177,11 +180,71 @@ test("an API key equal to the old host marker remains a bearer credential", asyn
     },
   });
 
-  await host.connect(socket.url, "host-managed", "session-1");
+  await host.connect(socket.url, "host-managed", "session-1", {
+    authorization: "host_managed",
+  });
   assert.deepEqual(request, {
     authorization: "bearer",
     bearerToken: "host-managed",
   });
+});
+
+test("browser host rejects failed upgrades without consuming handles", async () => {
+  const closed = new FakeWebSocket("wss://closed.test");
+  closed.readyState = 3;
+  const opened = new FakeWebSocket("wss://opened.test");
+  opened.readyState = FakeWebSocket.OPEN;
+  const results = [
+    Promise.reject(new Error("upgrade denied")),
+    {},
+    closed,
+    opened,
+  ];
+  const host = createBrowserHost({
+    createWebSocket() {
+      return results.shift();
+    },
+  });
+
+  await assert.rejects(
+    host.connect("wss://example.test", "secret", "session"),
+    /upgrade denied/,
+  );
+  await assert.rejects(
+    host.connect("wss://example.test", "secret", "session"),
+    /must return a WebSocket or a connection descriptor/,
+  );
+  await assert.rejects(
+    host.connect("wss://example.test", "secret", "session"),
+    /closed during connection/,
+  );
+  assert.equal(
+    JSON.parse(await host.connect("wss://example.test", "secret", "session")).handle,
+    1,
+  );
+});
+
+test("browser host settles a pre-opened socket exactly once", async () => {
+  const first = new FakeWebSocket("wss://first.test");
+  first.readyState = FakeWebSocket.OPEN;
+  const second = new FakeWebSocket("wss://second.test");
+  second.readyState = FakeWebSocket.OPEN;
+  const sockets = [first, second];
+  const host = createBrowserHost({
+    createWebSocket() {
+      return sockets.shift();
+    },
+  });
+
+  assert.equal(
+    JSON.parse(await host.connect(first.url, "secret", "session")).handle,
+    1,
+  );
+  first.open();
+  assert.equal(
+    JSON.parse(await host.connect(second.url, "secret", "session")).handle,
+    2,
+  );
 });
 
 test("browser host bounds queued receives and buffered sends", async () => {
