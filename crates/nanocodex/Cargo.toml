@@ -20,6 +20,7 @@ rustdoc-args = ["-D", "warnings"]
 [features]
 default = []
 observability = ["dep:nanocodex-observability"]
+realtime = ["nanocodex-oai-api/realtime"]
 
 [dependencies]
 nanocodex-agent.workspace = true

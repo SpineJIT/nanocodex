@@ -24,6 +24,8 @@ cargo run -p nanocodex-examples --bin subagents -- \
   "Review the retry policy using whatever clean or context-bearing workers you need"
 NANOCODEX_SUBAGENT_JSONL=1 cargo run -p nanocodex-examples --bin subagents
 cargo run -p nanocodex-examples --bin mcp
+# stdin/stdout are raw 24 kHz mono signed-16-bit little-endian PCM:
+cargo run -p nanocodex-examples --bin realtime-pipe < microphone.pcm > speaker.pcm
 just build-vm-example
 target/debug/vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4]
 just smoke-python
@@ -31,8 +33,14 @@ just smoke-wasm-node
 just build-react-example
 ```
 
-The live programs require `OPENAI_API_KEY`. The browser example instead asks
-the embedding application for an already-authorized Responses WebSocket URL;
+The command-line examples use `OPENAI_API_KEY` by default. The Nanocodex TUI's
+`/voice [voice]` command reuses its managed ChatGPT subscription authentication
+(`/voice list` shows the Codex voice set), and
+`realtime-pipe` can do the same when `NANOCODEX_AUTH_FILE` points at a Codex
+credential file. `realtime-pipe` demonstrates the device-neutral voice API and
+delegates spoken coding requests to the same retained `Nanocodex` agent handle.
+The browser example instead asks the
+embedding application for an already-authorized Responses WebSocket URL;
 standard browser WebSockets cannot attach the upgrade authorization header.
 
 `vm-tools` does not call the model. It proves all VM-backed standard workspace

@@ -211,17 +211,18 @@ directly.
 [Observability guide](crates/nanocodex-observability/README.md) ·
 [API documentation](https://docs.rs/nanocodex-observability)
 
-### Experimental systems components
+### Experimental components
 
-VM components live under [`crates/experimental/`](crates/experimental/README.md)
-while their public contracts mature:
+Components whose public contracts are still maturing live under
+[`crates/experimental/`](crates/experimental/README.md):
 
 | Package | Responsibility |
 | --- | --- |
+| [`nanocodex-voice`](crates/experimental/nanocodex-voice/README.md) | Desktop GPT Realtime audio and reusable voice-to-agent lifecycle |
 | [`nanocodex-vm`](crates/experimental/nanocodex-vm/README.md) | VM lifecycle and images plus retained guest-backed workspace tools |
 
-The CLI is a consumer of this crate. VM-backed tools remain opt-in for normal
-agent sessions.
+The CLI is a consumer of these crates. Voice and VM-backed tools remain thin,
+opt-in adapters over the stable library contracts.
 
 ### CLI and language bindings
 

@@ -6,6 +6,7 @@ members = [
     "crates/nanocodex",
     "crates/nanocodex-agent",
     "crates/experimental/nanocodex-browser",
+    "crates/experimental/nanocodex-voice",
     "crates/experimental/nanocodex-vm",
     "crates/nanocodex-oai-api",
     "crates/nanocodex-observability",
@@ -45,6 +46,7 @@ bm25 = { version = "2.3.2", default-features = false }
 chrono = { version = "0.4.43", default-features = false, features = ["clock", "std", "wasmbind"] }
 chromiumoxide = "0.9.1"
 clap = { version = "4.5.54", features = ["derive", "env"] }
+cpal = "0.16.0"
 crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"] }
 criterion = { version = "0.7.0", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
 dotenvy = "0.15.7"
@@ -65,6 +67,7 @@ mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "
 nanocodex = { version = "0.3.0", path = "crates/nanocodex" }
 nanocodex-agent = { version = "0.3.0", path = "crates/nanocodex-agent" }
 nanocodex-browser = { version = "0.3.0", path = "crates/experimental/nanocodex-browser" }
+nanocodex-voice = { version = "0.3.0", path = "crates/experimental/nanocodex-voice" }
 nanocodex-vm = { version = "0.3.0", path = "crates/experimental/nanocodex-vm" }
 nanocodex-oai-api = { version = "0.3.0", path = "crates/nanocodex-oai-api" }
 nanocodex-observability = { version = "0.3.0", path = "crates/nanocodex-observability" }
@@ -87,6 +90,7 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = ["
 opentelemetry-semantic-conventions = "0.32"
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["experimental_trace_batch_span_processor_with_async_runtime", "rt-tokio", "trace"] }
 percent-encoding = "2.3.2"
+opusic-c = "1.6.1"
 pyo3 = "0.29.0"
 proc-macro-crate = "3"
 proc-macro2 = "1.0.106"
@@ -94,6 +98,7 @@ quote = "1.0.46"
 ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
 ratatex = "0.1.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+rustls = { version = "0.23.42", default-features = false, features = ["aws_lc_rs"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 rquickjs = "0.12.1"
 rmcp = { version = "1.8.0", default-features = false, features = ["auth", "client", "reqwest-tls-no-provider", "transport-async-rw", "transport-streamable-http-client-reqwest"] }
@@ -133,6 +138,7 @@ vergen = { version = "8", default-features = false }
 wasm-bindgen = "0.2.105"
 wasm-bindgen-futures = "0.4.55"
 web-time = "1.1.0"
+webrtc = "0.17.0"
 zstd = "0.13"
 
 [workspace.lints.rust]

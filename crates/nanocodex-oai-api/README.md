@@ -122,6 +122,40 @@ assert!(!completed.output_text().is_empty());
 # }
 ```
 
+## GPT Realtime voice
+
+> **Available on native targets with the `realtime` feature.**
+
+[`OpenAi::realtime`] opens an independent GPT Realtime conversation using the
+same credential and API base. Platform API keys use a direct Realtime
+WebSocket. Managed ChatGPT credentials create the media call through the
+ChatGPT backend and join its sideband control WebSocket with the same bearer
+and account identity. When no host attestation is available, Nanocodex sends
+the same unavailable-token envelope Codex uses when attestation generation
+times out; hosts that own an attestation integration may override it with
+[`RealtimeSessionBuilder::attestation_header`].
+The library accepts and emits signed 16-bit little-endian, 24 kHz mono PCM through a cheap
+[`realtime::RealtimeSession`] handle and an independent
+[`realtime::RealtimeEvents`] stream. It does not open audio devices, so callers
+can connect a microphone, files, or ordinary stdin and stdout pipes.
+The experimental `nanocodex-voice` crate packages default desktop devices and
+background-agent delegation without moving those policies into this transport
+boundary.
+
+Both transports expose background-agent delegation as
+[`realtime::RealtimeEvent::AgentRequest`]. An embedding handles that event with
+its existing agent or tool loop, then calls
+[`realtime::RealtimeSession::complete_agent_request`] with the typed result.
+The `nanocodex` Ratatui consumer is one concrete desktop adapter: on macOS and
+Windows, `/voice` connects the default microphone and speaker while preserving
+the coding agent's normal history and lifecycle. `/voice list` prints the
+available voice names, `/voice cove` starts a named voice, and `/voice off`
+stops it. Managed ChatGPT sessions use Codex's current voice set and default to
+`cove`; Platform sessions default to `marin`. The TUI uses either the coding
+session's ChatGPT subscription credential or its Platform API key directly; no
+second credential is required. Other native hosts can use the device-neutral
+`realtime-pipe` example with their audio stack.
+
 ## Ownership and replay
 
 A session owns authoritative typed history and one concrete Tower service.
@@ -168,6 +202,7 @@ prominent:
   persistence, refresh, and logout.
 - [`pricing`] and [`events`] expose automatic `gpt-5.6-sol` cost estimates and
   lifecycle-event components.
+- [`realtime`] exposes native GPT Realtime PCM streams and typed voice events.
 - [`tower`] contains the generic attempt, response, and retry contracts.
 - [`transport`] contains WebSocket/HTTPS selection, replay policy, transport
   failures, and connection statistics.

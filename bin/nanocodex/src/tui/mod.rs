@@ -26,12 +26,16 @@ use crossterm::event::{
 use eyre::{Result, WrapErr};
 use futures_util::StreamExt;
 use nanocodex::{
-    AgentEvents, Nanocodex, NanocodexError, Thinking, TurnControl, TurnResult,
+    AgentEvents, Nanocodex, NanocodexError, OpenAi, Thinking, TurnControl, TurnResult,
     agent::{
         events::{AgentEvent, TimedAgentEvent},
         rollout::DurableSession,
     },
     tools::mcp::McpHandle,
+};
+use nanocodex_voice::{
+    CHATGPT_REALTIME_VOICES, PLATFORM_REALTIME_VOICES, RealtimeVoice, VoiceEvent, VoiceEvents,
+    VoiceSession, VoiceSessionBuilder, VoiceSpeaker,
 };
 use ratatex::{Ratatex, TerminalProfile};
 use tokio::{
@@ -110,6 +114,7 @@ enum WorkerCommand {
     McpReload {
         name: String,
     },
+    Voice(VoiceControl),
 }
 
 enum WorkerEvent {
@@ -221,6 +226,21 @@ enum WorkerEvent {
         name: String,
         error: String,
     },
+    VoiceConnecting,
+    VoiceStarted {
+        voice: RealtimeVoice,
+    },
+    VoiceTranscript {
+        speaker: VoiceSpeaker,
+        text: String,
+    },
+    VoiceInfo {
+        message: String,
+    },
+    VoiceFailed {
+        error: String,
+    },
+    VoiceStopped,
 }
 
 struct MainWorkerBranch {
@@ -500,9 +520,18 @@ enum Submission {
     Trace,
     Fast(Option<bool>),
     ReasoningPicker,
+    Voice(VoiceControl),
     McpLogin(String),
     McpReload(String),
     InvalidCommand(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VoiceControl {
+    Toggle,
+    Start(Option<RealtimeVoice>),
+    Stop,
+    List,
 }
 
 #[allow(
@@ -531,6 +560,7 @@ pub(crate) async fn run(
     };
     let agent = configured.handle;
     let mut agent_events = configured.events;
+    let realtime = configured.realtime;
     let root_session_id = Arc::<str>::from(agent_events.request_id());
     let child_agents = configured.child_agents;
     let mpp_adapter = configured.mpp_adapter;
@@ -542,6 +572,7 @@ pub(crate) async fn run(
     let worker = spawn_agent_worker(
         agent,
         Arc::clone(&root_session_id),
+        realtime,
         mcp,
         worker_rx,
         update_tx,
@@ -987,6 +1018,27 @@ fn handle_worker_update(
         WorkerEvent::McpFailed { name, error } => {
             app.push_active_error(format!("MCP server {name}: {error}"));
         }
+        WorkerEvent::VoiceConnecting => app.set_active_status("Connecting voice…"),
+        WorkerEvent::VoiceStarted { voice } => {
+            app.set_active_status(format!("Voice active ({voice}) — /voice off to stop"));
+        }
+        WorkerEvent::VoiceTranscript { speaker, text } => {
+            let label = match speaker {
+                VoiceSpeaker::User => "🎙 You",
+                VoiceSpeaker::Assistant => "🔊 Voice",
+            };
+            app.main
+                .push_output(TranscriptItem::Assistant(format!("**{label}:** {text}")));
+        }
+        WorkerEvent::VoiceInfo { message } => {
+            app.main
+                .push_output(TranscriptItem::Assistant(format!("**Voice:** {message}")));
+        }
+        WorkerEvent::VoiceFailed { error } => {
+            app.push_active_error(format!("Voice: {error}"));
+            app.set_active_status("Voice unavailable");
+        }
+        WorkerEvent::VoiceStopped => app.set_active_status("Voice stopped"),
     }
     Ok(())
 }
@@ -994,6 +1046,7 @@ fn handle_worker_update(
 fn spawn_agent_worker(
     root: Nanocodex,
     root_session_id: Arc<str>,
+    realtime: Option<OpenAi>,
     mcp: Option<McpHandle>,
     mut commands: mpsc::UnboundedReceiver<WorkerCommand>,
     updates: mpsc::UnboundedSender<WorkerEvent>,
@@ -1015,6 +1068,8 @@ fn spawn_agent_worker(
             finished: finished_tx,
             updates,
             mcp,
+            realtime,
+            voice: None,
         };
         loop {
             tokio::select! {
@@ -1032,6 +1087,35 @@ fn spawn_agent_worker(
     })
 }
 
+fn voice_names(voices: &[RealtimeVoice]) -> String {
+    voices
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn forward_voice_events(mut events: VoiceEvents, updates: mpsc::UnboundedSender<WorkerEvent>) {
+    drop(tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            let update = match event {
+                VoiceEvent::Connecting => WorkerEvent::VoiceConnecting,
+                VoiceEvent::Started { voice } => WorkerEvent::VoiceStarted { voice },
+                VoiceEvent::Transcript { speaker, text } => {
+                    WorkerEvent::VoiceTranscript { speaker, text }
+                }
+                VoiceEvent::Failed { error } => WorkerEvent::VoiceFailed {
+                    error: error.to_string(),
+                },
+                VoiceEvent::Stopped => WorkerEvent::VoiceStopped,
+            };
+            if updates.send(update).is_err() {
+                break;
+            }
+        }
+    }));
+}
+
 struct AgentWorker {
     main: MainWorkerBranch,
     archived_main: Vec<MainWorkerBranch>,
@@ -1040,6 +1124,8 @@ struct AgentWorker {
     finished: mpsc::UnboundedSender<FinishedTurn>,
     updates: mpsc::UnboundedSender<WorkerEvent>,
     mcp: Option<McpHandle>,
+    realtime: Option<OpenAi>,
+    voice: Option<VoiceSession>,
 }
 
 impl AgentWorker {
@@ -1084,7 +1170,78 @@ impl AgentWorker {
             WorkerCommand::SetThinking { thinking } => self.set_thinking(thinking).await,
             WorkerCommand::McpLogin { name } => self.mcp_login(name),
             WorkerCommand::McpReload { name } => self.mcp_reload(name),
+            WorkerCommand::Voice(control) => self.control_voice(control),
         }
+    }
+
+    fn control_voice(&mut self, control: VoiceControl) {
+        let running = self.voice_running();
+        match control {
+            VoiceControl::List => {
+                let chatgpt = voice_names(CHATGPT_REALTIME_VOICES);
+                let platform = voice_names(PLATFORM_REALTIME_VOICES);
+                drop(self.updates.send(WorkerEvent::VoiceInfo {
+                    message: format!(
+                        "Codex/ChatGPT voices (default cove): {chatgpt}. Platform voices (default marin): {platform}"
+                    ),
+                }));
+                return;
+            }
+            VoiceControl::Stop => {
+                if let Some(active) = self.voice.as_mut() {
+                    active.stop();
+                }
+                return;
+            }
+            VoiceControl::Toggle if running => {
+                if let Some(active) = self.voice.as_mut() {
+                    active.stop();
+                }
+                return;
+            }
+            VoiceControl::Start(_) if running => {
+                drop(self.updates.send(WorkerEvent::VoiceFailed {
+                    error: "voice is already active; use /voice off before changing it".to_owned(),
+                }));
+                return;
+            }
+            VoiceControl::Toggle | VoiceControl::Start(_) => {}
+        }
+        let voice = match control {
+            VoiceControl::Start(voice) => voice,
+            VoiceControl::Toggle => None,
+            VoiceControl::Stop | VoiceControl::List => return,
+        };
+        if self.btw.is_some() {
+            drop(self.updates.send(WorkerEvent::VoiceFailed {
+                error: "close /btw before starting voice".to_owned(),
+            }));
+            return;
+        }
+        let Some(realtime) = self.realtime.clone() else {
+            drop(self.updates.send(WorkerEvent::VoiceFailed {
+                error: "voice is unavailable with the selected paid provider".to_owned(),
+            }));
+            return;
+        };
+        let mut builder = VoiceSessionBuilder::new(realtime, self.main.agent.clone())
+            .session_id(Arc::clone(&self.main.request_id));
+        if let Some(voice) = voice {
+            builder = builder.voice(voice);
+        }
+        match builder.spawn() {
+            Ok((session, events)) => {
+                forward_voice_events(events, self.updates.clone());
+                self.voice = Some(session);
+            }
+            Err(error) => drop(self.updates.send(WorkerEvent::VoiceFailed {
+                error: format!("failed to start voice thread: {error}"),
+            })),
+        }
+    }
+
+    fn voice_running(&self) -> bool {
+        self.voice.as_ref().is_some_and(VoiceSession::is_running)
     }
 
     fn mcp_login(&self, name: String) {
@@ -1402,6 +1559,13 @@ impl AgentWorker {
     }
 
     async fn open_btw(&mut self, id: u64, prompt_id: Option<u64>, prompt: Option<SubmittedPrompt>) {
+        if self.voice_running() {
+            drop(self.updates.send(WorkerEvent::BtwOpenFailed {
+                id,
+                error: "stop /voice before opening /btw".to_owned(),
+            }));
+            return;
+        }
         self.btw = None;
         let span = info_span!(
             target: "nanocodex",
@@ -1473,6 +1637,13 @@ impl AgentWorker {
     }
 
     async fn edit_historical(&mut self, source_branch_id: u64, new_branch_id: u64, prompt_id: u64) {
+        if self.voice_running() {
+            drop(self.updates.send(WorkerEvent::MainBranchOpenFailed {
+                id: new_branch_id,
+                error: "stop /voice before editing history".to_owned(),
+            }));
+            return;
+        }
         if self.main.id != source_branch_id || self.btw.is_some() {
             drop(self.updates.send(WorkerEvent::MainBranchOpenFailed {
                 id: new_branch_id,
@@ -1567,6 +1738,13 @@ impl AgentWorker {
             drop(self.updates.send(WorkerEvent::MainBranchSwitched {
                 id,
                 request_id: Arc::clone(&self.main.request_id),
+            }));
+            return;
+        }
+        if self.voice_running() {
+            drop(self.updates.send(WorkerEvent::MainBranchSwitchFailed {
+                id,
+                error: "stop /voice before switching branches".to_owned(),
             }));
             return;
         }
@@ -2453,6 +2631,9 @@ fn submit(
             send_command(commands, WorkerCommand::SetFastMode { enabled })?;
         }
         Submission::ReasoningPicker => app.open_reasoning_picker(),
+        Submission::Voice(control) => {
+            send_command(commands, WorkerCommand::Voice(control))?;
+        }
         Submission::McpLogin(name) => {
             send_command(commands, WorkerCommand::McpLogin { name })?;
         }
@@ -2495,6 +2676,24 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
     }
     if trimmed == "/trace" {
         return Submission::Trace;
+    }
+    if trimmed == "/voice" {
+        return Submission::Voice(VoiceControl::Toggle);
+    }
+    if let Some(argument) = trimmed.strip_prefix("/voice ") {
+        let argument = argument.trim();
+        return match argument {
+            "on" => Submission::Voice(VoiceControl::Start(None)),
+            "off" => Submission::Voice(VoiceControl::Stop),
+            "list" => Submission::Voice(VoiceControl::List),
+            _ if argument.split_whitespace().count() == 1 => match argument.parse() {
+                Ok(voice) => Submission::Voice(VoiceControl::Start(Some(voice))),
+                Err(_) => Submission::InvalidCommand(
+                    "Unknown voice. Use /voice list to see Codex voices.".to_owned(),
+                ),
+            },
+            _ => Submission::InvalidCommand("Usage: /voice [on|off|list|<voice>]".to_owned()),
+        };
     }
     if trimmed == "/fast" {
         return Submission::Fast(None);
@@ -2611,15 +2810,16 @@ mod tests {
     use nanocodex::{
         Nanocodex, OpenAi, Thinking, agent::events::AgentEventKind, oai::__private::EventSink,
     };
+    use nanocodex_voice::RealtimeVoice;
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, sync::mpsc, time::timeout};
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
     use super::{
         BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
-        UiUpdate, WorkerCommand, WorkerEvent, active_session_id, apply_main_agent_event_batch,
-        classify_submission, handle_key, handle_worker_update, paste_clipboard_image,
-        prepare_btw_prompt, session_trace_url, spawn_agent_worker,
+        UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, active_session_id,
+        apply_main_agent_event_batch, classify_submission, handle_key, handle_worker_update,
+        paste_clipboard_image, prepare_btw_prompt, session_trace_url, spawn_agent_worker,
     };
     use crate::tui::{
         app::App,
@@ -2657,6 +2857,28 @@ mod tests {
         assert_eq!(
             classify_submission(" /trace ".to_owned()),
             Submission::Trace
+        );
+        assert_eq!(
+            classify_submission(" /voice "),
+            Submission::Voice(VoiceControl::Toggle)
+        );
+        assert_eq!(
+            classify_submission("/voice marin"),
+            Submission::Voice(VoiceControl::Start(Some(RealtimeVoice::Marin)))
+        );
+        assert_eq!(
+            classify_submission("/voice cove"),
+            Submission::Voice(VoiceControl::Start(Some(RealtimeVoice::Cove)))
+        );
+        assert_eq!(
+            classify_submission("/voice list"),
+            Submission::Voice(VoiceControl::List)
+        );
+        assert_eq!(
+            classify_submission("/voice junk"),
+            Submission::InvalidCommand(
+                "Unknown voice. Use /voice list to see Codex voices.".to_owned()
+            )
         );
         assert_eq!(classify_submission("/fast"), Submission::Fast(None));
         assert_eq!(
@@ -3088,6 +3310,7 @@ mod tests {
             agent,
             Arc::from(session_id.to_string()),
             None,
+            None,
             worker_rx,
             updates,
         );
@@ -3182,6 +3405,7 @@ mod tests {
         spawn_agent_worker(
             agent,
             std::sync::Arc::from(session_id.to_string()),
+            None,
             None,
             worker_rx,
             updates,
@@ -3300,6 +3524,7 @@ mod tests {
         spawn_agent_worker(
             agent,
             std::sync::Arc::from(session_id.to_string()),
+            None,
             None,
             worker_rx,
             updates,
