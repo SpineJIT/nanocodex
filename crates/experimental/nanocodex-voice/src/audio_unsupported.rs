@@ -6,13 +6,13 @@ use crate::{AudioConfig, AudioError};
 pub(crate) struct VoiceAudio;
 
 impl VoiceAudio {
-    pub(crate) fn open(
+    pub(crate) const fn open(
         _policy: AudioConfig,
     ) -> Result<(Self, mpsc::Receiver<RealtimeAudio>), AudioError> {
         Err(AudioError::UnsupportedPlatform)
     }
 
-    pub(crate) fn play(&mut self, _audio: &RealtimeAudio) {}
+    pub(crate) const fn play(&mut self, _audio: &RealtimeAudio) {}
 
-    pub(crate) fn interrupt(&mut self) {}
+    pub(crate) const fn interrupt(&mut self) {}
 }

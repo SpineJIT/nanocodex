@@ -43,7 +43,9 @@ async fn main() -> Result<()> {
             },
             signal = tokio::signal::ctrl_c() => {
                 signal.wrap_err("failed to listen for Ctrl-C")?;
+                eprintln!("stopping voice...");
                 voice.stop();
+                break Ok(());
             }
         }
     };
