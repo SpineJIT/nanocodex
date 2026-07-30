@@ -100,14 +100,26 @@ migration, and it must be independently mergeable.
    than adding `Session::tools`.
 10. [ ] Rerun required PR checks after the closeout changes and confirm the new
     remote head is mergeable.
+11. [x] Add the library-first GPT Realtime voice slice: typed 24 kHz PCM
+    input/output, API-key WebSocket and Codex-compatible ChatGPT WebRTC
+    transports, plus an experimental `nanocodex-voice` default-device and
+    background-agent lifecycle consumed by the thin Ratatui `/voice` adapter.
+    ChatGPT voice uses the coding session's
+    subscription credential and frameless sideband; when no host attestation
+    exists, it sends Codex's accepted unavailable-token envelope. The TUI
+    exposes Codex's current voice catalog through `/voice list` and named
+    starts, with Codex's current `cove` default and Frameless model. Realtime
+    coding handoffs atomically steer an active regular turn or start a new turn,
+    so spoken follow-ups remain interactive during tool execution.
 
 ## Current non-goals
 
 - No provider abstraction, generic app server, compatibility layer, approval
   subsystem, or alternate agent runtime.
-- No audio implementation work.
+- No browser audio-device ownership or generic realtime/app-server protocol in
+  the core library.
 - No new `.service(...)` transport design without a concrete consumer.
 - No cosmetic CLI/TUI lifecycle rewrite when existing behavior is accepted.
-- No VM, browser, managed-agent, proxy, or experimental-crate work.
+- No further VM, browser, managed-agent, proxy, or experimental-crate work.
 - No benchmark, task, or verifier modification made solely to improve an eval
   score.

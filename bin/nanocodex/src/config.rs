@@ -28,6 +28,7 @@ use crate::vm::{ConfiguredVm, VmArgs};
 pub(crate) struct ConfiguredAgent {
     pub(crate) handle: Nanocodex,
     pub(crate) events: AgentEvents,
+    pub(crate) realtime: Option<OpenAi>,
     pub(crate) child_agents: Option<Arc<ChildAgents>>,
     pub(crate) mpp_adapter: Option<MppAdapter>,
     pub(crate) mcp: Option<McpHandle>,
@@ -221,6 +222,7 @@ impl AgentArgs {
             openai = openai.http_client(mpp_adapter.responses_http_client()?);
         }
         let openai = openai.build()?;
+        let realtime = (!mpp_enabled).then(|| openai.clone());
         let configured_vm = vm.start().await?;
         let mut tools = configured_vm
             .as_ref()
@@ -274,6 +276,7 @@ impl AgentArgs {
         Ok(ConfiguredAgent {
             handle,
             events,
+            realtime,
             child_agents,
             mpp_adapter,
             mcp: mcp_handle,

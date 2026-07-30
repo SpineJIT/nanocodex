@@ -57,6 +57,36 @@ impl<F> OpenAi<F>
 where
     F: ResponsesServiceFactory,
 {
+    /// Returns the authentication mode used by this client recipe.
+    #[must_use]
+    pub const fn auth_mode(&self) -> OpenAiAuthMode {
+        self.config.auth.mode()
+    }
+
+    /// Starts configuring a native GPT Realtime voice session.
+    ///
+    /// Realtime uses this client's authentication and API base while owning an
+    /// independent conversation lifecycle. Platform API keys connect directly
+    /// over WebSocket. Managed ChatGPT credentials create a WebRTC media call
+    /// and attach its sideband control socket. Audio remains exposed as 24 kHz
+    /// mono PCM16 so embeddings retain device policy.
+    #[cfg(all(feature = "realtime", not(target_family = "wasm")))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(feature = "realtime", not(target_family = "wasm"))))
+    )]
+    #[must_use]
+    pub fn realtime(
+        &self,
+        instructions: impl Into<Arc<str>>,
+    ) -> crate::realtime::RealtimeSessionBuilder {
+        crate::realtime::RealtimeSessionBuilder::new(
+            self.config.auth.clone(),
+            self.config.api_base_url.clone(),
+            instructions.into(),
+        )
+    }
+
     /// Starts a client-side managed session with stable developer
     /// instructions.
     ///

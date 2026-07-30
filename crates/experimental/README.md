@@ -3,6 +3,8 @@
 This directory contains complete Nanocodex components whose APIs are still
 being exercised and revised:
 
+- [`nanocodex-voice`](nanocodex-voice/README.md): default-device desktop audio
+  and an owned GPT Realtime voice-to-agent lifecycle.
 - [`nanocodex-vm`](nanocodex-vm/README.md): VM lifecycle and image preparation
   plus retained guest-backed workspace tools.
 - [`nanocodex-browser`](nanocodex-browser/README.md): deterministic browser

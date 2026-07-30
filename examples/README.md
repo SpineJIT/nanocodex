@@ -2,9 +2,10 @@
 
 All language consumers live at this repository boundary:
 
-- Rust: `minimal.rs`, `follow_on.rs`, `lifecycle.rs`, `custom_tool.rs`, `subagents.rs`,
-  `resume.rs`, `fork_conversations.rs`, `fork_checkpoint_bench.rs`, and `mcp.rs` are binaries
-  in the `nanocodex-examples` package.
+- Rust: `minimal.rs`, `voice.rs`, `realtime_pipe.rs`, `follow_on.rs`, `lifecycle.rs`,
+  `custom_tool.rs`, `subagents.rs`, `resume.rs`, `fork_conversations.rs`,
+  `fork_checkpoint_bench.rs`, and `mcp.rs` are binaries in the
+  `nanocodex-examples` package.
 - Python: `python/` uses the native PyO3 binding (`follow_on.py`, `events.py`,
   `lifecycle.py`).
 - Node.js: `node/` uses the shared Rust/WASM package with a Node WebSocket host.
@@ -17,6 +18,10 @@ From the repository root:
 
 ```sh
 cargo run -p nanocodex-examples --bin minimal
+# Own the default microphone and speaker directly in Rust:
+cargo run -p nanocodex-examples --bin voice
+# Or keep devices outside the process and compose raw PCM with Unix pipes:
+cargo run -p nanocodex-examples --bin realtime-pipe < microphone.pcm > speaker.pcm
 cargo run -p nanocodex-examples --bin lifecycle
 cargo run -p nanocodex-examples --bin fork-conversations
 cargo run -p nanocodex-examples --bin subagents
@@ -31,8 +36,26 @@ just smoke-wasm-node
 just build-react-example
 ```
 
-The live programs require `OPENAI_API_KEY`. The browser example instead asks
-the embedding application for an already-authorized Responses WebSocket URL;
+`voice` is the dead-simple non-TUI desktop consumer. It uses the same
+`VoiceSessionBuilder` as the production TUI, owns the default microphone and
+speaker directly in Rust, prints completed transcripts, and logs the retained
+coding agent's ordered events. Spoken coding follow-ups atomically steer work
+that is still running; speech while idle starts a new turn. It supports the
+default devices on macOS and Windows.
+
+`realtime-pipe` demonstrates the lower, device-neutral boundary. Stdin and
+stdout are raw 24 kHz mono signed-16-bit little-endian PCM, so capture,
+playback, files, sockets, `ffmpeg`, or another media stack can be composed
+without Nanocodex owning a device. The desktop and pipe examples are two thin
+adapters over the same typed Realtime events and retained agent lifecycle.
+Both use the shared Codex/ChatGPT subscription credentials at
+`$CODEX_HOME/auth.json` or `~/.codex/auth.json`; `NANOCODEX_AUTH_FILE` overrides
+that path. Run `nanocodex auth login` once if the shared credential does not
+exist.
+
+The other command-line examples use `OPENAI_API_KEY` by default. The browser
+example instead asks the
+embedding application for an already-authorized Responses WebSocket URL;
 standard browser WebSockets cannot attach the upgrade authorization header.
 
 `vm-tools` does not call the model. It proves all VM-backed standard workspace

@@ -561,7 +561,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         )
     } else {
         format!(
-            "  /btw <question> side fork · {tool_help} · Ctrl+V image · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit"
+            "  /btw <question> side fork · /voice [voice] · {tool_help} · Ctrl+V image · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit"
         )
     };
     let model_width = nanocodex::oai::MODEL.len() + 3 + "default".len() + 7 + 1;

@@ -156,6 +156,14 @@ pub(super) async fn begin_shutdown(
                     result,
                 });
             }
+            Command::RoutePrompt {
+                route_result,
+                turn_result,
+                ..
+            } => {
+                drop(route_result.send(Err(NanocodexError::AgentStopped)));
+                drop(turn_result);
+            }
             Command::Fork { result, .. } | Command::Spawn { result } => {
                 drop(result.send(Err(NanocodexError::AgentStopped)));
             }
@@ -200,6 +208,14 @@ pub(super) fn handle_idle_command<S>(
         }
         Command::Steer { result, .. } => {
             drop(result.send(Err(NanocodexError::TurnNotSteerable)));
+        }
+        Command::RoutePrompt {
+            route_result,
+            turn_result,
+            ..
+        } => {
+            drop(route_result.send(Err(NanocodexError::AgentStopped)));
+            drop(turn_result);
         }
         Command::Cancel { result, .. } => {
             drop(result.send(Err(NanocodexError::TurnNotCancellable)));

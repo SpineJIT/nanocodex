@@ -19,6 +19,13 @@ mod openai;
 /// Automatic `gpt-5.6-sol` USD estimates from provider token usage.
 #[cfg(feature = "client")]
 pub mod pricing;
+/// Bidirectional GPT Realtime audio sessions and typed conversation events.
+#[cfg(all(feature = "realtime", not(target_family = "wasm")))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(all(feature = "realtime", not(target_family = "wasm"))))
+)]
+pub mod realtime;
 /// Complete typed request, event, and item model for the Responses protocol.
 pub mod responses;
 /// Managed session identities, inputs, and compaction results.

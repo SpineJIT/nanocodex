@@ -23,7 +23,9 @@ pub mod session;
 /// Per-turn token accounting and USD estimates.
 pub mod usage;
 
-pub use agent::{AgentHandle, Nanocodex, NanocodexBuilder, Turn, TurnControl, TurnResult};
+pub use agent::{
+    AgentHandle, Nanocodex, NanocodexBuilder, PromptRoute, Turn, TurnControl, TurnResult,
+};
 pub use error::{NanocodexError, Result};
 pub use nanocodex_oai_api::{
     OpenAi, ReasoningMode, ResponseError, ResponseErrorKind, Thinking, events::AgentEvents,

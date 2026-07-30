@@ -38,17 +38,17 @@ claims.
 
 | Classification | Count |
 | --- | ---: |
-| `port` | 33 |
+| `port` | 34 |
 | `evaluate` | 21 |
 | `defer` | 2 |
-| `out-of-scope` | 267 |
+| `out-of-scope` | 266 |
 | Total | 323 |
 
 ## First range: `35eaf3ff..8431dc59`
 
 | # | Codex commit | Classification | Decision |
 | ---: | --- | --- | --- |
-| 1 | `312caf176a8f` Seed realtime V3 sessions with initial text items | `out-of-scope` | Realtime V3, Frameless Bidi, WebRTC, and app-server bootstrap are not Nanocodex surfaces. The owned Responses session already accepts typed initial history without adopting a realtime protocol. |
+| 1 | `312caf176a8f` Seed realtime V3 sessions with initial text items | `port` | `P31`: the experimental Realtime library accepts bounded typed initial items, rejects them for direct V2 sessions, and serializes exact role-bearing Frameless WebRTC bootstrap messages. Codex app-server request plumbing remains out-of-scope. |
 | 2 | `643de86a190a` Add audio output support to dynamic tools and code mode | `defer` | Preserve the existing model-visible Code Mode audio shape, but do not claim the commit's full dynamic-tool, app-server, history, analytics, and model-modality support. The supported model contract remains text/image, so broader audio input/output stays deferred. |
 | 3 | `0fb559f0f6e2` Support legacy views for paginated thread history | `out-of-scope` | This is app-server projection, resume, and pagination behavior. It is distinct from row 22: Nanocodex consumes legacy Codex rollouts and deliberately rejects a canonical paginated rollout rather than implementing app-server views. |
 | 4 | `9dc372fbafb1` Avoid cloning thread data when rendering transcripts | `evaluate` | Nanocodex uses shared `Arc` transcript entries, but there is no allocation regression proving that resume-to-transcript construction avoids the clones removed by this Codex change. Profile the retained resume path before claiming adoption. |
@@ -347,7 +347,30 @@ the exact boundary without allocating a production-sized fixture. The newer
 MCP discovery protocol, pagination, and dual lifecycle mode from the upstream
 commit are not imported.
 
+### P31 — bounded Frameless initial items
+
+[`RealtimeSessionBuilder`](../crates/nanocodex-oai-api/src/realtime.rs) exposes
+owned role-bearing startup items and applies Codex's V3-only, 128-item, and
+8,192-estimated-token limits before transport work. The ChatGPT WebRTC call
+serializes developer/user text as `input_text`, assistant text as
+`output_text`, and omits the field when empty. Focused wire and policy tests
+cover the public contract; the experimental voice lifecycle forwards the same
+items without introducing app-server protocol types.
+
 ## Reviewed baseline behavior
+
+### Realtime voice delegation
+
+The experimental Realtime boundary matches Codex's V2 and Frameless behavior:
+current model/voice catalogs, byte-identical backend instructions, exact tool
+descriptions and acknowledgements, transcript-aware handoffs, atomic steering,
+queued `response.create`, 200 ms bounded agent updates, 500-byte Frameless
+context appends, and server-side V2 audio truncation when user speech interrupts
+playback. ChatGPT sessions create a genuine WebRTC/Opus media call and use a
+sideband WebSocket; the host owns device-attestation generation and passes the
+opaque value into the reusable session builder. Nanocodex deliberately uses a
+native Rust media/device stack instead of importing Chromium or Codex's
+app-server protocol.
 
 ### Responses Lite parallel-tool scheduling
 
@@ -387,7 +410,8 @@ The 11 later evaluations are named `E2` through `E11` in the
 behavior, Codex-only live exec rendering, side-pane navigation, and exact item
 start timing require their corresponding workload before adoption.
 
-The two audio rows remain deferred until the supported model contract includes
-the modality and there is a real embeddable consumer. No app-server, realtime,
-provider abstraction, approval, Guardian, exec-policy, shell-snapshot, plugin,
-skills, or generic multi-agent surface is implied by completing this review.
+The two model-tool audio rows remain deferred until the supported Responses
+model contract includes that modality; they are distinct from the experimental
+Realtime voice transport. No app-server, provider abstraction, approval,
+Guardian, exec-policy, shell-snapshot, plugin, skills, or generic multi-agent
+surface is implied by completing this review.
