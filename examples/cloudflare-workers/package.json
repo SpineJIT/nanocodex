@@ -7,10 +7,13 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "prebuild": "node scripts/prepare-wasm.mjs",
+    "prepare:wasm": "node scripts/prepare-wasm.mjs",
+    "prebuild": "npm run prepare:wasm",
     "build": "wrangler deploy --dry-run --outdir dist",
     "check": "npm run typecheck && npm test && npm run build",
+    "predev": "npm run prepare:wasm",
     "dev": "wrangler dev",
+    "predev:subscription": "npm run prepare:wasm",
     "dev:subscription": "node scripts/dev-subscription.mjs",
     "fanout": "node scripts/fanout.mjs",
     "mock:openai": "node scripts/mock-openai.mjs",
@@ -18,7 +21,7 @@
     "smoke": "node scripts/live-smoke.mjs",
     "soak": "node scripts/soak.mjs",
     "stress": "node scripts/stress.mjs",
-    "pretest": "node scripts/prepare-wasm.mjs",
+    "pretest": "npm run prepare:wasm",
     "test": "npm run test:node && npm run test:worker",
     "test:node": "node --test test-node/*.test.mjs",
     "test:worker": "vitest run",

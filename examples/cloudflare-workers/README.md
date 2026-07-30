@@ -49,6 +49,13 @@ codex login
 npm run dev:subscription --prefix examples/cloudflare-workers
 ```
 
+Open <http://127.0.0.1:8787> for the deliberately thin browser client, or use
+the REPL below. The page stores its session capability, bounded transcript, and
+unfinished turn in browser local storage. Reloading resubmits the same
+idempotent turn ID and rejoins or replays the Durable Object result. Enter
+`local-admin-token` once to create a local session; this is the example's
+router token, not a model credential.
+
 The launcher securely reads `$CODEX_HOME/auth.json` (normally
 `~/.codex/auth.json`), requires it to be mode `0600`, and gives workerd only the
 current access token and account metadata through a temporary mode-`0600` env
@@ -62,6 +69,14 @@ access token behind the singleton auth Durable Object and the launcher clears
 any credential retained by an older run before accepting the new login.
 `GET /auth/chatgpt` reports non-secret status and `DELETE /auth/chatgpt` clears
 the durable copy; both routes require the admin bearer token.
+
+Local workerd's outbound TLS/WebSocket fingerprint can be rejected by
+`chatgpt.com` even when the same subscription succeeds in Codex and from a
+deployed Worker. `dev:subscription` therefore starts a random-capability,
+loopback-only WebSocket bridge for model egress. The bridge forwards bounded
+frames and only the explicit Codex handshake headers; it does not read the
+Codex auth file or persist credentials. Deployed Workers do not use this local
+bridge and connect directly from Cloudflare's edge.
 
 Start workerd in one terminal and run the live probes in another:
 
@@ -88,9 +103,10 @@ inference. If the Worker process itself dies before a turn commits, reopening
 the REPL resubmits the same turn from the last committed snapshot; a partial
 provider response cannot be resumed.
 
-The smoke performs a real model turn, verifies duplicate suppression, waits for
-idle teardown, then proves that a follow-on remembers history after the agent
-is reconstructed. `stress` drives ping round trips through one object, `soak`
+The smoke performs real model turns, verifies duplicate suppression and a
+completed `runtimeInfo` tool call/result pair, waits for idle teardown, then
+proves that a follow-on remembers history after the agent is reconstructed.
+`stress` drives ping round trips through one object, `soak`
 checks parallel sessions for cross-session leakage and duplicate model calls,
 and `fanout` broadcasts a bursty model stream to 64 attached clients. Override
 their `NANOCODEX_*` environment variables to change the workload.
@@ -103,10 +119,10 @@ it also validates the bearer/account headers and serves rotating OAuth tokens,
 so the full Rust/WASM driver, snapshot, idle shutdown, restore, and auth-retry
 paths execute.
 
-If `chatgpt.com` denies the local workerd runtime even though the same login
-works in Codex, use the mock for deterministic local validation and run the
-real subscription smoke from a deployed Worker. Treat the deployed edge check
-as the release gate.
+The Worker selects the WASM binding's CSP-safe direct-tool mode because Workers
+forbid `eval` and `new Function`. This retains Nanocodex's typed Rust tool
+lifecycle and caller-defined handlers without shipping a JavaScript evaluator.
+Node-based consumers may continue to use Code Mode when their host permits it.
 
 ## Validate and deploy
 

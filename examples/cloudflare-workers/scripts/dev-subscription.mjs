@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { readCodexSubscription } from "./codex-auth-file.mjs";
+import { startSubscriptionEgressProxy } from "./subscription-egress-proxy.mjs";
 
 const exampleRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const codexHome = process.env.CODEX_HOME ?? join(homedir(), ".codex");
@@ -14,6 +15,9 @@ const adminToken = process.env.NANOCODEX_ADMIN_TOKEN ?? "local-admin-token";
 const auth = await readCodexSubscription(authPath);
 const temporaryDirectory = await mkdtemp(join(tmpdir(), "nanocodex-cloudflare-subscription-"));
 const envPath = join(temporaryDirectory, "subscription.env");
+const egress = await startSubscriptionEgressProxy({
+  upstreamUrl: process.env.OPENAI_WEBSOCKET_URL,
+});
 
 await writeFile(envPath, [
   envLine("CHATGPT_ACCESS_TOKEN", auth.accessToken),
@@ -21,6 +25,7 @@ await writeFile(envPath, [
   envLine("CHATGPT_FEDRAMP", String(auth.fedramp)),
   envLine("NANOCODEX_ADMIN_TOKEN", adminToken),
   envLine("NANOCODEX_AUTH_MODE", "chatgpt"),
+  envLine("OPENAI_WEBSOCKET_URL", egress.url),
   envLine("AGENT_IDLE_TIMEOUT_MS", process.env.AGENT_IDLE_TIMEOUT_MS ?? "1000"),
   "",
 ].join("\n"), { mode: 0o600 });
@@ -45,12 +50,14 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 try {
   await resetStoredCredential(child);
   process.stderr.write(
-    `Using the Codex subscription login at ${authPath}; its refresh token is not used or copied.\n`,
+    `Using the Codex subscription login at ${authPath}; its refresh token is not used or copied.\n` +
+    "Local model egress uses a capability-protected loopback bridge; deployed Workers connect directly.\n",
   );
   const [code, signal] = await childExit;
   process.exitCode = code ?? signalExitCode(signal ?? parentSignal);
 } finally {
   if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+  await egress.close();
   await rm(temporaryDirectory, { recursive: true, force: true });
 }
 

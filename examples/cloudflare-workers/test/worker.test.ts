@@ -8,6 +8,21 @@ const authorization = { authorization: "Bearer test-admin-token" };
 const workerEnv = env as unknown as Env;
 
 describe("Nanocodex Durable Object Worker", () => {
+  it("serves a thin resumable browser client without model credentials", async () => {
+    const page = await SELF.fetch("https://example.test/");
+    expect(page.status).toBe(200);
+    expect(page.headers.get("content-security-policy")).toContain("connect-src 'self' ws: wss:");
+    expect(await page.text()).toContain("Durable agent, disposable client.");
+
+    const script = await SELF.fetch("https://example.test/app.js");
+    const source = await script.text();
+    expect(script.headers.get("content-type")).toContain("text/javascript");
+    expect(source).toContain("localStorage");
+    expect(source).toContain("crypto.randomUUID()");
+    expect(source).not.toContain("OPENAI_API_KEY");
+    expect(source).not.toContain("CHATGPT_ACCESS_TOKEN");
+  });
+
   it("protects creation and keeps session state across eviction", async () => {
     const denied = await SELF.fetch("https://example.test/sessions", { method: "POST" });
     expect(denied.status).toBe(401);

@@ -8,6 +8,7 @@ import type {
 } from "nanocodex";
 import { Agent } from "nanocodex/browser";
 import nanocodexWasm from "./nanocodex.wasm";
+import { webAsset } from "./web";
 import {
   NanocodexSubscriptionAuth,
   type SubscriptionSnapshot,
@@ -82,6 +83,10 @@ const json = (body: unknown, init: ResponseInit = {}) => Response.json(body, {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    if (request.method === "GET") {
+      const asset = webAsset(url.pathname);
+      if (asset) return asset;
+    }
     if (request.method === "GET" && url.pathname === "/health") {
       return json({ service: "nanocodex", runtime: "cloudflare-durable-objects", status: "ok" });
     }
@@ -355,6 +360,10 @@ export class NanocodexSession extends DurableObject<Env> {
       resume,
       workspace: "/workspace",
       instructions: "You are Nanocodex running inside a Cloudflare Durable Object.",
+      // Workers forbid eval/new Function. Direct mode keeps caller-defined
+      // tools in the WASM lifecycle while dispatching handlers through the
+      // typed host bridge without dynamic code generation.
+      toolMode: "direct",
       createWebSocket: authMode === "api_key"
         ? openAiWebSocket
         : (endpoint, id, request) => openSubscriptionWebSocket(auth, endpoint, id, request),

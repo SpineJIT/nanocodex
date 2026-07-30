@@ -7,7 +7,10 @@ const terminalTimeoutMs = Number(process.env.NANOCODEX_SMOKE_TIMEOUT_MS ?? 180_0
 
 const session = await createSession();
 const socket = new WebSocket(session.websocket_url);
-const inbox = createInbox(socket);
+const agentEvents = [];
+const inbox = createInbox(socket, (message) => {
+  if (message.type === "event") agentEvents.push(message.event);
+});
 
 try {
   await inbox.next((message) => message.type === "ready", 10_000);
@@ -56,8 +59,26 @@ try {
     throw new Error(`restored turn lost conversation history: ${second.final_message}`);
   }
 
+  const toolId = randomUUID();
+  socket.send(JSON.stringify({
+    type: "prompt",
+    id: toolId,
+    input: "You must call runtimeInfo exactly once. Then reply with only the runtime value returned by that tool.",
+  }));
+  const toolTurn = await terminal(inbox, toolId, terminalTimeoutMs);
+  if (!String(toolTurn.final_message).includes("cloudflare-durable-object")) {
+    throw new Error(`runtimeInfo tool returned an unexpected answer: ${toolTurn.final_message}`);
+  }
+  const toolCall = agentEvents.find((event) =>
+    event.type === "tool.call" && event.payload?.tool === "runtimeInfo");
+  const toolResult = agentEvents.find((event) =>
+    event.type === "tool.result" && event.payload?.call_id === toolCall?.payload?.call_id);
+  if (!toolCall || !toolResult || toolResult.payload?.status !== "completed") {
+    throw new Error("runtimeInfo did not produce a completed tool.call/tool.result event pair");
+  }
+
   const finalState = await state();
-  if (finalState.completed_turns !== 2 || finalState.has_snapshot !== true) {
+  if (finalState.completed_turns !== 3 || finalState.has_snapshot !== true) {
     throw new Error(`unexpected final state: ${JSON.stringify(finalState)}`);
   }
 
@@ -67,6 +88,8 @@ try {
     first_turn_ms: Math.round(firstMs),
     idle_shutdown_ms: Math.round(idleShutdownMs),
     restored_turn_ms: Math.round(restoreMs),
+    agent_events: agentEvents.length,
+    tool_call: toolCall.payload.tool,
     completed_turns: finalState.completed_turns,
     idle_state: idleState.agent_loaded ? "loaded" : "unloaded",
     ...(authStatus === undefined ? {} : { auth_revision: authStatus.revision }),
@@ -120,11 +143,12 @@ async function terminal(inbox, id, timeoutMs) {
   return message;
 }
 
-function createInbox(ws) {
+function createInbox(ws, observe = () => {}) {
   const queued = [];
   const waiters = [];
   const onMessage = (data) => {
     const message = JSON.parse(String(data));
+    observe(message);
     const index = waiters.findIndex(({ predicate }) => predicate(message));
     if (index === -1) queued.push(message);
     else waiters.splice(index, 1)[0].resolve(message);
