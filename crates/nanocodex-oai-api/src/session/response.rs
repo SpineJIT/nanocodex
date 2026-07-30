@@ -159,8 +159,9 @@ impl CompletedResponse {
 
     /// Returns the automatic local USD estimate.
     ///
-    /// Nanocodex applies the built-in standard or priority
-    /// [`crate::MODEL`] rates. `None` means the provider omitted usage.
+    /// Nanocodex applies the selected model's built-in standard or priority
+    /// rates. `None` means the provider omitted usage; [`Self::cost_status`]
+    /// distinguishes that from a genuine zero-token estimate.
     #[must_use]
     pub const fn estimated_cost(&self) -> Option<&crate::EstimatedUsdCost> {
         self.estimated_cost.as_ref()
@@ -566,6 +567,7 @@ where
         candidate.shared_history(),
         candidate.delta_start(),
         previous_response_id.as_deref(),
+        session.model,
         session.thinking,
         session.fast_mode,
     );
@@ -597,7 +599,8 @@ where
         .final_message
         .unwrap_or_else(|| output_text(&output))
         .into();
-    let (estimated_cost, cost_status) = estimate_cost(response.usage.as_ref(), session.fast_mode);
+    let (estimated_cost, cost_status) =
+        estimate_cost(response.usage.as_ref(), session.model, session.fast_mode);
     let completed = CompletedResponse {
         output,
         output_text,
@@ -698,6 +701,7 @@ where
         session.state.delta_start(),
         session.state.previous_response_id(),
         compaction::trigger(),
+        session.model,
         session.thinking,
         session.fast_mode,
     );
@@ -721,7 +725,8 @@ where
     session.state = candidate;
     session.canonical_context_reinjection_pending = !mid_turn;
 
-    let (estimated_cost, cost_status) = estimate_cost(response.usage.as_ref(), session.fast_mode);
+    let (estimated_cost, cost_status) =
+        estimate_cost(response.usage.as_ref(), session.model, session.fast_mode);
     Ok(CompletedCompaction {
         usage: response.usage,
         estimated_cost,
@@ -872,12 +877,14 @@ fn finish_response_span(span: &tracing::Span, started_at: Instant, error: Option
 
 pub(super) fn estimate_cost(
     usage: Option<&Usage>,
+    model: crate::Model,
     fast_mode: bool,
 ) -> (Option<crate::EstimatedUsdCost>, crate::CostStatus) {
     match usage {
         Some(usage) => (
-            Some(crate::pricing::estimate(
+            Some(crate::pricing::estimate_for_model(
                 usage,
+                model,
                 if fast_mode {
                     crate::pricing::ServiceTier::Priority
                 } else {

@@ -39,8 +39,14 @@ pub(crate) struct TurnUsageCounts {
 }
 
 impl TurnUsage {
-    pub(crate) fn from_counts(counts: TurnUsageCounts, fast_mode: bool) -> Self {
-        let (estimated_cost, cost_status) = if counts.reported {
+    pub(crate) fn from_counts(
+        counts: TurnUsageCounts,
+        model: nanocodex_oai_api::Model,
+        fast_mode: bool,
+    ) -> Self {
+        let (estimated_cost, cost_status) = if !counts.reported {
+            (None, CostStatus::UsageNotReported)
+        } else {
             let usage = Usage {
                 input_tokens: counts.input_tokens,
                 input_tokens_details: Some(InputTokenDetails {
@@ -52,8 +58,9 @@ impl TurnUsage {
                 total_tokens: counts.total_tokens,
             };
             (
-                Some(Box::new(pricing::estimate(
+                Some(Box::new(pricing::estimate_for_model(
                     &usage,
+                    model,
                     if fast_mode {
                         ServiceTier::Priority
                     } else {
@@ -62,8 +69,6 @@ impl TurnUsage {
                 ))),
                 CostStatus::EstimatedFromUsage,
             )
-        } else {
-            (None, CostStatus::UsageNotReported)
         };
         Self {
             input_tokens: counts.input_tokens,
@@ -115,9 +120,9 @@ impl TurnUsage {
 
     /// Returns the automatic local USD estimate.
     ///
-    /// Nanocodex applies the built-in standard or priority `gpt-5.6-sol`
-    /// rates. `None` means the provider omitted usage; absence is never
-    /// serialized as a misleading zero.
+    /// Nanocodex applies the selected model's built-in standard or priority
+    /// rates. `None` means the provider omitted usage; [`Self::cost_status`]
+    /// distinguishes that from a genuine zero-token estimate.
     #[must_use]
     pub fn estimated_cost(&self) -> Option<&EstimatedUsdCost> {
         self.estimated_cost.as_deref()

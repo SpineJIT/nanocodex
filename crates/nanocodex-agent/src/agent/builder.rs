@@ -29,6 +29,16 @@ pub(super) struct CodexCompatibility {
 }
 
 impl<F> NanocodexBuilder<F> {
+    /// Overrides the `OpenAi` recipe's model for this agent.
+    ///
+    /// Without this call the agent inherits the client default. A later
+    /// [`Nanocodex::set_model`] call affects subsequently accepted turns.
+    #[must_use]
+    pub const fn model(mut self, model: Model) -> Self {
+        self.config.model = model;
+        self
+    }
+
     /// Replaces the stable system/developer instructions.
     #[must_use]
     pub fn instructions(mut self, instructions: impl Into<Arc<str>>) -> Self {

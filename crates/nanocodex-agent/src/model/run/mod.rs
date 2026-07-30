@@ -23,9 +23,9 @@ use nanocodex_oai_api::{
         EventSink, ManagedSessionState, ModelConfig, ResponsesAttemptFactory,
         assign_missing_response_item_id, compaction, with_code_mode_tool_names,
     },
-    CONTEXT_WINDOW_TOKENS, MODEL, Prompt, Thinking,
+    CONTEXT_WINDOW_TOKENS, Model, Prompt, Thinking,
     events::AgentEventKind,
-    pricing::{ServiceTier, estimate},
+    pricing::{ServiceTier, estimate_for_model},
     responses::{ContentItem, MessageRole, RequestProfile, ResponseItem, ToolDefinition, Usage},
     tower::{
         CodeCall, CodeCallKind, GenerationOutput as TurnResult, ResponsesAttempt, ResponsesClient,
@@ -72,6 +72,7 @@ use nanocodex_tools::{
 pub(crate) struct ModelRun<S> {
     events: EventSink,
     config: Arc<ModelConfig>,
+    model: Model,
     thinking: Thinking,
     fast_mode: bool,
     client: ResponsesClient<S>,
@@ -207,12 +208,14 @@ impl<S> ModelRun<S> {
         prompt_cache: ModelPromptCache,
         context_source: ContextSource,
     ) -> Self {
+        let model = config.model;
         let thinking = config.thinking;
         let fast_mode = config.fast_mode;
         let global_instructions = context_source.global_instructions();
         Self {
             events,
             config,
+            model,
             thinking,
             fast_mode,
             client,
@@ -261,6 +264,7 @@ impl<S> ModelRun<S> {
             events.clone(),
             Arc::clone(&transport_stats),
         );
+        let model = config.model;
         let thinking = config.thinking;
         let fast_mode = config.fast_mode;
         let context_source =
@@ -269,6 +273,7 @@ impl<S> ModelRun<S> {
         Self {
             events,
             config,
+            model,
             thinking,
             fast_mode,
             client,

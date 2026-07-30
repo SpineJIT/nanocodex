@@ -49,7 +49,11 @@ import threading
 
 from nanocodex import Nanocodex
 
-agent, events = Nanocodex(os.environ["OPENAI_API_KEY"], thinking="low")
+agent, events = Nanocodex(
+    os.environ["OPENAI_API_KEY"],
+    model="gpt-5.6-luna",
+    thinking="low",
+)
 
 
 def print_events() -> None:
@@ -87,6 +91,7 @@ latest, latest_events = agent.fork()
 sibling, sibling_events = agent.spawn()
 
 agent.compact()
+agent.set_model("gpt-5.6-sol")
 agent.set_thinking("high")
 agent.set_fast_mode(True)
 

@@ -6,7 +6,7 @@ use std::{
 };
 
 use nanocodex::{
-    Thinking,
+    Model, Thinking,
     agent::{
         events::{
             AgentEvent, AgentEventData, AgentEventKind, AssistantEvent, ReasoningEvent, RunEvent,
@@ -1164,6 +1164,7 @@ pub(super) struct App {
     screen_selection: ScreenSelection,
     tool_details_expanded: bool,
     fast_mode: bool,
+    model: Model,
     thinking: Thinking,
     reasoning_picker: Option<ReasoningPicker>,
 }
@@ -1215,6 +1216,7 @@ impl App {
             screen_selection: ScreenSelection::default(),
             tool_details_expanded: true,
             fast_mode: false,
+            model: Model::default(),
             thinking: Thinking::default(),
             reasoning_picker: None,
         }
@@ -1246,6 +1248,11 @@ impl App {
 
     pub(super) const fn with_thinking(mut self, thinking: Thinking) -> Self {
         self.thinking = thinking;
+        self
+    }
+
+    pub(super) const fn with_model(mut self, model: Model) -> Self {
+        self.model = model;
         self
     }
 
@@ -2581,6 +2588,19 @@ impl App {
 
     pub(super) const fn thinking(&self) -> Thinking {
         self.thinking
+    }
+
+    pub(super) const fn model(&self) -> Model {
+        self.model
+    }
+
+    pub(super) const fn model_changed(&mut self, model: Model) {
+        self.model = model;
+    }
+
+    pub(super) fn model_change_failed(&mut self, error: &str) {
+        self.push_active_error(format!("Could not change model: {error}"));
+        self.set_active_status("Model unchanged");
     }
 
     pub(super) const fn reasoning_picker(&self) -> Option<ReasoningPicker> {

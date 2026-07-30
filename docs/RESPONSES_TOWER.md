@@ -4,11 +4,11 @@ Status: implemented.
 
 ## Ownership and public composition
 
-`OpenAi::new(auth)` creates the standard fixed-model client recipe.
-`OpenAi::builder(auth)` exposes transport, storage, history, reasoning, and
-Tower policy. `Nanocodex::builder(openai)` then adds agent instructions, tools,
-workspace, session identity, and lifecycle policy while keeping driver
-mechanics private.
+`OpenAi::new(auth)` creates the standard client recipe with `gpt-5.6-sol`.
+`OpenAi::builder(auth)` exposes the closed Sol/Luna model choice plus transport,
+storage, history, reasoning, and Tower policy. `Nanocodex::builder(openai)`
+then adds agent instructions, tools, workspace, session identity, and lifecycle
+policy while keeping driver mechanics private.
 
 `build()` requires an active Tokio runtime, spawns one stateful driver, and
 returns `(Nanocodex, AgentEvents)`. The driver owns mutable conversation,
@@ -19,6 +19,30 @@ One driver reuses its selected transport policy, server response chain, typed
 history, code-mode runtime, shell sessions, and prompt-cache identity across
 follow-on turns. A WebSocket policy also reuses its connection. The caller does
 not replay earlier results.
+
+`Nanocodex::set_model` changes the default for subsequently accepted turns.
+Each accepted prompt captures its model, so active and already queued turns,
+their retries, and their model/tool continuations remain stable. Client-owned
+typed history remains authoritative across a model change. This matches Codex
+behavior at upstream commit
+[`acd540f1`](https://github.com/openai/codex/commit/acd540f1581bf30f963fccbcce43ac494102242c):
+
+- [`TurnStartParams::model`](https://github.com/openai/codex/blob/acd540f1581bf30f963fccbcce43ac494102242c/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L122-L136)
+  applies to the current and subsequent turns, exactly like reasoning effort.
+- [`ThreadSettingsUpdateParams::model`](https://github.com/openai/codex/blob/acd540f1581bf30f963fccbcce43ac494102242c/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L236-L251)
+  updates subsequent turns without starting a turn.
+- On `turn/start`, Codex folds the requested model into thread settings, applies
+  those settings while constructing the new turn, and stores the resulting
+  session configuration for later turns
+  ([request mapping](https://github.com/openai/codex/blob/acd540f1581bf30f963fccbcce43ac494102242c/codex-rs/app-server/src/request_processors/turn_processor.rs#L542-L560),
+  [turn-boundary application](https://github.com/openai/codex/blob/acd540f1581bf30f963fccbcce43ac494102242c/codex-rs/core/src/session/handlers.rs#L184-L205),
+  [persistent state update](https://github.com/openai/codex/blob/acd540f1581bf30f963fccbcce43ac494102242c/codex-rs/core/src/session/turn_context.rs#L597-L627)).
+- Codex's own integration test verifies that a settings-only model update sends
+  no model request and that the next turn uses the updated model
+  ([test](https://github.com/openai/codex/blob/acd540f1581bf30f963fccbcce43ac494102242c/codex-rs/app-server/tests/suite/v2/thread_settings_update.rs#L32-L92)).
+
+Nanocodex deliberately exposes the same sticky turn-boundary policy without
+otherwise widening its closed Sol/Luna model surface.
 
 The standard policy is WebSocket plus incremental history and `store: false`
 for both API-key and ChatGPT subscription authentication. API-key callers can

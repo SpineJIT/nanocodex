@@ -192,6 +192,7 @@ pub(super) enum Command {
     Prompt {
         key: TurnKey,
         prompt: Prompt,
+        model: Option<Model>,
         thinking: Option<Thinking>,
         fast_mode: Option<bool>,
         parent: Option<tracing::Span>,
@@ -226,6 +227,10 @@ pub(super) enum Command {
         thinking: Thinking,
         result: oneshot::Sender<Result<()>>,
     },
+    SetModel {
+        model: Model,
+        result: oneshot::Sender<Result<()>>,
+    },
     SetFastMode {
         enabled: bool,
         result: oneshot::Sender<Result<()>>,
@@ -247,6 +252,7 @@ pub(super) enum QueuedTurn {
     Pending {
         key: TurnKey,
         prompt: Prompt,
+        model: Model,
         thinking: Thinking,
         fast_mode: bool,
         parent: Option<tracing::Span>,
@@ -255,6 +261,7 @@ pub(super) enum QueuedTurn {
     },
     Cancelled {
         prompt: Prompt,
+        model: Model,
         thinking: Thinking,
         fast_mode: bool,
         parent: Option<tracing::Span>,

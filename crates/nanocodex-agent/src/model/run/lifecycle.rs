@@ -43,7 +43,9 @@ where
         context: CompactionContext<'_>,
     ) -> Result<bool> {
         let CompactionContext { snapshot, phase } = context;
-        let Some(auto_compact_token_limit) = compaction::auto_compact_token_limit(MODEL) else {
+        let Some(auto_compact_token_limit) =
+            compaction::auto_compact_token_limit(self.model.as_str())
+        else {
             return Ok(false);
         };
         let active_context_tokens = conversation.active_context_tokens();
@@ -98,17 +100,17 @@ where
         self.events.emit(
             AgentEventKind::ModelWarmupStarted,
             WarmupStarted {
-                model: MODEL,
+                model: self.model.as_str(),
                 prompt_cache_key: factory.profile().prompt_cache_key(),
             },
         )?;
-        let span = warmup_span(&self.config);
+        let span = warmup_span(&self.config, self.model);
         if let Some(content) = serialize_trace_content(factory.profile().prefix()) {
             record_span_content(&span, "model.input", &content);
         }
         let shared_prompt_cache = self.prompt_cache.shared().cloned();
         let outcome = if let Some(cache) = shared_prompt_cache {
-            match cache.entry(factory.profile()).await {
+            match cache.entry(self.model, factory.profile()).await {
                 Ok(entry) => {
                     let mut execution = None;
                     let initialized = entry
@@ -153,7 +155,7 @@ where
             };
         span.record("warmup.source", source);
         if let Some(usage) = &usage {
-            record_usage(&span, usage, self.fast_mode);
+            record_usage(&span, usage, self.model, self.fast_mode);
         }
         span.record("status", "completed");
         span.record("otel.status_code", "OK");
@@ -184,7 +186,7 @@ where
     ) -> Result<WarmupExecution> {
         let success = self
             .client
-            .execute(factory.warmup(self.thinking, self.fast_mode))
+            .execute(factory.warmup(self.model, self.thinking, self.fast_mode))
             .instrument(span.clone())
             .await
             .map_err(|error| NanocodexError::Response(error.into()))?;
@@ -260,6 +262,7 @@ where
             incremental_start,
             previous_response_id,
             trigger,
+            self.model,
             self.thinking,
             self.fast_mode,
         );
@@ -304,7 +307,7 @@ where
         self.stats.model_duration_ns += duration_ns;
         self.stats.compaction_duration_ns += duration_ns;
         if let Some(usage) = &response.usage {
-            record_usage(&span, usage, self.fast_mode);
+            record_usage(&span, usage, self.model, self.fast_mode);
             self.stats.usage.add(usage);
         }
         self.stats.last_response_id = Some(response.id.clone());

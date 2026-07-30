@@ -1,21 +1,33 @@
 use serde::{Deserialize, Serialize};
 
 use super::UsdAmount;
-use crate::Usage;
+use crate::{Model, Usage};
 
 // OpenAI publishes rates per one million tokens. All supported rates convert
 // exactly to nano-USD per token, avoiding floating point and division.
-const STANDARD: TokenRates = TokenRates {
+const SOL_STANDARD: TokenRates = TokenRates {
     input: 5_000,
     cached_input: 500,
     cache_write_input: 6_250,
     output: 30_000,
 };
-const PRIORITY: TokenRates = TokenRates {
+const SOL_PRIORITY: TokenRates = TokenRates {
     input: 10_000,
     cached_input: 1_000,
     cache_write_input: 12_500,
     output: 60_000,
+};
+const LUNA_STANDARD: TokenRates = TokenRates {
+    input: 200,
+    cached_input: 20,
+    cache_write_input: 250,
+    output: 1_200,
+};
+const LUNA_PRIORITY: TokenRates = TokenRates {
+    input: 400,
+    cached_input: 40,
+    cache_write_input: 500,
+    output: 2_400,
 };
 
 #[derive(Clone, Copy)]
@@ -27,10 +39,12 @@ struct TokenRates {
 }
 
 impl TokenRates {
-    const fn for_service_tier(service_tier: ServiceTier) -> Self {
-        match service_tier {
-            ServiceTier::Standard => STANDARD,
-            ServiceTier::Priority => PRIORITY,
+    const fn for_model(model: Model, service_tier: ServiceTier) -> Self {
+        match (model, service_tier) {
+            (Model::Sol, ServiceTier::Standard) => SOL_STANDARD,
+            (Model::Sol, ServiceTier::Priority) => SOL_PRIORITY,
+            (Model::Luna, ServiceTier::Standard) => LUNA_STANDARD,
+            (Model::Luna, ServiceTier::Priority) => LUNA_PRIORITY,
         }
     }
 }
@@ -59,9 +73,9 @@ impl ServiceTier {
 
 /// Exact estimated USD cost for provider-reported token usage.
 ///
-/// Nanocodex calculates this automatically using the documented
-/// [`crate::MODEL`] standard or priority rates. This is a local estimate, not a
-/// charge reported by the Responses API.
+/// Nanocodex calculates this automatically using the selected model's built-in
+/// standard or priority rates. This is a local estimate, not a charge reported
+/// by the Responses API.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EstimatedUsdCost {
     #[serde(rename = "usd")]
@@ -144,6 +158,19 @@ impl EstimatedUsdCost {
 /// ```
 #[must_use]
 pub fn estimate(usage: &Usage, service_tier: ServiceTier) -> EstimatedUsdCost {
+    estimate_for_model(usage, Model::Sol, service_tier)
+}
+
+/// Estimates one provider operation using the selected model's built-in rates.
+///
+/// This is the model-aware form of [`estimate`]. Managed sessions use it so
+/// both supported GPT-5.6 models receive an estimate from reported usage.
+#[must_use]
+pub fn estimate_for_model(
+    usage: &Usage,
+    model: Model,
+    service_tier: ServiceTier,
+) -> EstimatedUsdCost {
     let cached_input_tokens = usage
         .input_tokens_details
         .as_ref()
@@ -157,6 +184,7 @@ pub fn estimate(usage: &Usage, service_tier: ServiceTier) -> EstimatedUsdCost {
         cached_input_tokens,
         cache_write_input_tokens,
         usage.output_tokens,
+        model,
         service_tier,
     )
 }
@@ -166,9 +194,10 @@ pub(crate) fn estimate_tokens(
     cached_input_tokens: u64,
     cache_write_input_tokens: u64,
     output_tokens: u64,
+    model: Model,
     service_tier: ServiceTier,
 ) -> EstimatedUsdCost {
-    let rates = TokenRates::for_service_tier(service_tier);
+    let rates = TokenRates::for_model(model, service_tier);
     let cached_input_tokens = cached_input_tokens.min(input_tokens);
     let remaining_input = input_tokens.saturating_sub(cached_input_tokens);
     let cache_write_input_tokens = cache_write_input_tokens.min(remaining_input);
@@ -196,8 +225,11 @@ pub(crate) fn estimate_tokens(
 
 #[cfg(test)]
 mod tests {
-    use super::{ServiceTier, estimate, estimate_tokens};
-    use crate::responses::{InputTokenDetails, OutputTokenDetails, Usage};
+    use super::{ServiceTier, estimate, estimate_for_model, estimate_tokens};
+    use crate::{
+        Model,
+        responses::{InputTokenDetails, OutputTokenDetails, Usage},
+    };
 
     #[test]
     fn standard_rates_price_each_input_class_once() {
@@ -226,8 +258,22 @@ mod tests {
 
     #[test]
     fn priority_rates_are_selected_by_fast_mode() {
-        let standard = estimate_tokens(1_000_000, 0, 0, 1_000_000, ServiceTier::Standard);
-        let priority = estimate_tokens(1_000_000, 0, 0, 1_000_000, ServiceTier::Priority);
+        let standard = estimate_tokens(
+            1_000_000,
+            0,
+            0,
+            1_000_000,
+            Model::Sol,
+            ServiceTier::Standard,
+        );
+        let priority = estimate_tokens(
+            1_000_000,
+            0,
+            0,
+            1_000_000,
+            Model::Sol,
+            ServiceTier::Priority,
+        );
 
         assert_eq!(standard.amount().decimal(), "35");
         assert_eq!(priority.amount().decimal(), "70");
@@ -236,8 +282,31 @@ mod tests {
     }
 
     #[test]
+    fn luna_rates_cover_standard_and_priority_usage() {
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            input_tokens_details: Some(InputTokenDetails {
+                cached_tokens: 200_000,
+                cache_write_tokens: 100_000,
+            }),
+            output_tokens: 1_000_000,
+            ..Usage::default()
+        };
+
+        let standard = estimate_for_model(&usage, Model::Luna, ServiceTier::Standard);
+        let priority = estimate_for_model(&usage, Model::Luna, ServiceTier::Priority);
+
+        assert_eq!(standard.input().decimal(), "0.14");
+        assert_eq!(standard.cached_input().decimal(), "0.004");
+        assert_eq!(standard.cache_write_input().decimal(), "0.025");
+        assert_eq!(standard.output().decimal(), "1.2");
+        assert_eq!(standard.amount().decimal(), "1.369");
+        assert_eq!(priority.amount().decimal(), "2.738");
+    }
+
+    #[test]
     fn malformed_detail_counts_do_not_double_charge_input() {
-        let estimate = estimate_tokens(10, 8, 8, 0, ServiceTier::Standard);
+        let estimate = estimate_tokens(10, 8, 8, 0, Model::Sol, ServiceTier::Standard);
 
         assert_eq!(estimate.input().nano_usd(), 0);
         assert_eq!(estimate.cached_input().nano_usd(), 4_000);

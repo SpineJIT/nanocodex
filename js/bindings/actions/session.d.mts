@@ -1,4 +1,4 @@
-import type { Agent, DefaultAgent, ForkOptions, Thinking } from "../types.mjs";
+import type { Agent, DefaultAgent, ForkOptions, Model, Thinking } from "../types.mjs";
 
 /** Compacts retained history immediately without fabricating a user prompt. */
 export function compact(agent: Agent<object>): Promise<void>;
@@ -18,6 +18,9 @@ export declare namespace spawn {
 
 /** Changes the reasoning effort for subsequently accepted turns. */
 export function setThinking(agent: Agent<object>, thinking: Thinking): Promise<void>;
+
+/** Changes the model for subsequently accepted turns. */
+export function setModel(agent: Agent<object>, model: Model): Promise<void>;
 
 /** Enables or disables priority processing for subsequently accepted turns. */
 export function setFastMode(agent: Agent<object>, enabled: boolean): Promise<void>;

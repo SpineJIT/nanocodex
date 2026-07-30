@@ -2,7 +2,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use js_sys::Promise;
 use nanocodex::{
-    AgentEvents, Nanocodex as RustNanocodex, OpenAi, ReasoningMode, Thinking, TurnControl,
+    AgentEvents, Model, Nanocodex as RustNanocodex, OpenAi, ReasoningMode, Thinking, TurnControl,
     TurnResult,
     agent::{
         input::{Prompt, UserInput},
@@ -75,6 +75,8 @@ impl CodeModeHost for JavaScriptCodeModeHost {
 #[serde(deny_unknown_fields)]
 struct WasmConfig {
     api_key: String,
+    #[serde(default = "default_model")]
+    model: String,
     #[serde(default = "default_thinking")]
     thinking: String,
     #[serde(default = "default_reasoning_mode")]
@@ -114,12 +116,14 @@ impl WasmNanocodex {
             .map_err(|error| js_error(format!("invalid Nanocodex configuration: {error}")))?;
         validate(&config)?;
 
+        let model = config.model.parse::<Model>().map_err(js_error)?;
         let thinking = config.thinking.parse::<Thinking>().map_err(js_error)?;
         let reasoning_mode = config
             .reasoning_mode
             .parse::<ReasoningMode>()
             .map_err(js_error)?;
         let openai = OpenAi::builder(config.api_key)
+            .model(model)
             .thinking(thinking)
             .reasoning_mode(reasoning_mode)
             .fast_mode(config.fast_mode)
@@ -214,6 +218,19 @@ impl WasmNanocodex {
     pub async fn spawn(&self) -> Result<Self, JsValue> {
         let (inner, events) = self.inner.spawn().await.map_err(js_error)?;
         Ok(Self::from_parts(inner, events))
+    }
+
+    /// Changes the model for subsequently accepted turns.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unsupported model or a stopped driver.
+    #[wasm_bindgen(js_name = setModel)]
+    pub async fn set_model(&self, model: &str) -> Result<(), JsValue> {
+        self.inner
+            .set_model(model.parse::<Model>().map_err(js_error)?)
+            .await
+            .map_err(js_error)
     }
 
     /// Changes the reasoning effort for subsequently accepted turns.
@@ -503,6 +520,10 @@ fn validate(config: &WasmConfig) -> Result<(), JsValue> {
 
 fn default_thinking() -> String {
     "high".to_owned()
+}
+
+fn default_model() -> String {
+    Model::default().to_string()
 }
 
 fn default_reasoning_mode() -> String {

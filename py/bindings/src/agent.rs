@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use nanocodex::{
-    Nanocodex as RustNanocodex, OpenAi, ReasoningMode, Thinking,
+    Model, Nanocodex as RustNanocodex, OpenAi, ReasoningMode, Thinking,
     agent::session::SessionId,
     oai::auth::{OpenAiAuth, load_chatgpt_auth},
 };
@@ -35,6 +35,7 @@ impl Nanocodex {
         api_key = None,
         *,
         auth_file = None,
+        model = "gpt-5.6-sol",
         thinking = "high",
         reasoning_mode = "standard",
         fast_mode = false,
@@ -54,6 +55,7 @@ impl Nanocodex {
         py: Python<'_>,
         api_key: Option<String>,
         auth_file: Option<String>,
+        model: &str,
         thinking: &str,
         reasoning_mode: &str,
         fast_mode: bool,
@@ -66,6 +68,7 @@ impl Nanocodex {
         api_base_url: Option<String>,
     ) -> PyResult<(Self, AgentEvents)> {
         let auth = parse_auth(api_key, auth_file)?;
+        let model = parse_model(model)?;
         let thinking = parse_thinking(thinking)?;
         let reasoning_mode = parse_reasoning_mode(reasoning_mode)?;
         let session_id = session_id
@@ -74,6 +77,7 @@ impl Nanocodex {
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let resume = resume.map(|snapshot| snapshot.borrow(py).inner().clone());
         let mut openai = OpenAi::builder(auth)
+            .model(model)
             .thinking(thinking)
             .reasoning_mode(reasoning_mode)
             .fast_mode(fast_mode);
@@ -126,6 +130,15 @@ impl Nanocodex {
             .detach(move || runtime.block_on(agent.prompt(prompt)))
             .map_err(runtime_error)?;
         Ok(Turn::new(Arc::clone(&self.runtime), turn))
+    }
+
+    /// Change the model for subsequently accepted turns.
+    fn set_model(&self, py: Python<'_>, model: &str) -> PyResult<()> {
+        let model = parse_model(model)?;
+        let runtime = Arc::clone(&self.runtime);
+        let agent = self.agent()?;
+        py.detach(move || runtime.block_on(agent.set_model(model)))
+            .map_err(runtime_error)
     }
 
     /// Change the reasoning effort for subsequently accepted turns.
@@ -241,6 +254,10 @@ fn parse_auth(api_key: Option<String>, auth_file: Option<String>) -> PyResult<Op
 }
 
 fn parse_thinking(value: &str) -> PyResult<Thinking> {
+    value.parse().map_err(PyValueError::new_err)
+}
+
+fn parse_model(value: &str) -> PyResult<Model> {
     value.parse().map_err(PyValueError::new_err)
 }
 

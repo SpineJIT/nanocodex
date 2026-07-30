@@ -115,7 +115,7 @@ fn render_reasoning_picker(frame: &mut Frame<'_>, app: &App) {
     match picker {
         ReasoningPicker::Standard { selected } => {
             lines.push(Line::styled(
-                format!("  Select Reasoning Level for {}", nanocodex::oai::MODEL),
+                format!("  Select Reasoning Level for {}", app.model()),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
             lines.push(Line::default());
@@ -564,7 +564,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             "  /btw <question> side fork · /voice [voice] · {tool_help} · Ctrl+V image · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit"
         )
     };
-    let model_width = nanocodex::oai::MODEL.len() + 3 + "default".len() + 7 + 1;
+    let model_width = app.model().as_str().len() + 3 + "default".len() + 7 + 1;
     let model_width = saturating_u16(model_width).min(area.width);
     let [left, right] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(model_width)]).areas(area);
@@ -579,7 +579,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         left,
     );
     let mut model = vec![Span::styled(
-        nanocodex::oai::MODEL,
+        app.model().as_str(),
         Style::default().fg(Color::Cyan),
     )];
     let thinking = if app.thinking() == nanocodex::Thinking::None {

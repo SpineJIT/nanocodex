@@ -156,5 +156,6 @@ pub(super) struct WorldStateItem<'a> {
 
 #[derive(Serialize)]
 pub(super) struct PersistedContextState<'a> {
+    pub(super) nanocodex_model: &'a str,
     pub(super) nanocodex_context: &'a ContextBaseline,
 }

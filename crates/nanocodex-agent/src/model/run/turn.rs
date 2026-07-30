@@ -9,11 +9,13 @@ where
     pub(crate) async fn compact(
         &mut self,
         requested_workspace: Option<Arc<str>>,
+        model: Model,
         thinking: Thinking,
         fast_mode: bool,
         logical_turn: u64,
         cancel: &mut tokio::sync::oneshot::Receiver<()>,
     ) -> Result<ModelCompactOutcome> {
+        self.model = model;
         self.thinking = thinking;
         self.fast_mode = fast_mode;
         self.started_at = Instant::now();
@@ -38,8 +40,8 @@ where
             .conversation
             .previous_response_id()
             .map(str::to_owned);
-        let auto_compact_token_limit =
-            compaction::auto_compact_token_limit(MODEL).unwrap_or(CONTEXT_WINDOW_TOKENS);
+        let auto_compact_token_limit = compaction::auto_compact_token_limit(self.model.as_str())
+            .unwrap_or(CONTEXT_WINDOW_TOKENS);
         let compacted = {
             let compaction = self.perform_compaction(
                 self.stats.model_calls,
@@ -97,9 +99,11 @@ where
         &mut self,
         task: &Prompt,
         workspace: Option<&str>,
+        model: Model,
         thinking: Thinking,
         fast_mode: bool,
     ) -> Result<()> {
+        self.model = model;
         self.thinking = thinking;
         self.fast_mode = fast_mode;
         self.started_at = Instant::now();
@@ -108,7 +112,7 @@ where
             AgentEventKind::RunStarted,
             RunStarted {
                 mode: "openai_model",
-                model: MODEL,
+                model: self.model.as_str(),
                 reasoning_mode: self.config.reasoning_mode.as_str(),
                 effort: self.thinking.as_str(),
                 transport: self.config.responses_transport.as_str(),
@@ -122,7 +126,7 @@ where
         let message = error.to_string();
         self.events
             .emit(AgentEventKind::RunError, RunError { message: &message })?;
-        let usage = self.stats.turn_usage(self.fast_mode);
+        let usage = self.stats.turn_usage(self.model, self.fast_mode);
         record_turn_usage(&tracing::Span::current(), &usage);
         self.events.emit(
             AgentEventKind::RunFailed,
@@ -130,6 +134,7 @@ where
                 "cancelled",
                 self.started_at.elapsed(),
                 &self.config,
+                self.model,
                 self.thinking,
                 &self.stats,
                 &usage,
@@ -143,6 +148,7 @@ where
         &mut self,
         task: Prompt,
         workspace: Option<Arc<str>>,
+        model: Model,
         thinking: Thinking,
         fast_mode: bool,
         logical_turn: u64,
@@ -150,6 +156,7 @@ where
         mut cancel: tokio::sync::oneshot::Receiver<()>,
         fork_snapshots: watch::Sender<Option<ModelCheckpoint>>,
     ) -> Result<ModelTurnOutcome> {
+        self.model = model;
         self.thinking = thinking;
         self.fast_mode = fast_mode;
         self.started_at = Instant::now();
@@ -162,7 +169,7 @@ where
             AgentEventKind::RunStarted,
             RunStarted {
                 mode: "openai_model",
-                model: MODEL,
+                model: self.model.as_str(),
                 reasoning_mode: self.config.reasoning_mode.as_str(),
                 effort: self.thinking.as_str(),
                 transport: self.config.responses_transport.as_str(),
@@ -188,7 +195,7 @@ where
             Ok(ModelTaskOutcome::Completed(message)) => {
                 self.stats
                     .apply_transport(self.transport_stats.since(transport_before));
-                let usage = self.stats.turn_usage(self.fast_mode);
+                let usage = self.stats.turn_usage(self.model, self.fast_mode);
                 record_turn_usage(&tracing::Span::current(), &usage);
                 self.events.emit(
                     AgentEventKind::RunCompleted,
@@ -196,6 +203,7 @@ where
                         "completed",
                         elapsed,
                         &self.config,
+                        self.model,
                         self.thinking,
                         &self.stats,
                         &usage,
@@ -220,7 +228,7 @@ where
                     .emit(AgentEventKind::RunError, RunError { message: &message })?;
                 self.stats
                     .apply_transport(self.transport_stats.since(transport_before));
-                let usage = self.stats.turn_usage(self.fast_mode);
+                let usage = self.stats.turn_usage(self.model, self.fast_mode);
                 record_turn_usage(&tracing::Span::current(), &usage);
                 self.events.emit(
                     AgentEventKind::RunFailed,
@@ -228,6 +236,7 @@ where
                         "cancelled",
                         elapsed,
                         &self.config,
+                        self.model,
                         self.thinking,
                         &self.stats,
                         &usage,
@@ -277,7 +286,7 @@ where
                     .emit(AgentEventKind::RunError, RunError { message: &message })?;
                 self.stats
                     .apply_transport(self.transport_stats.since(transport_before));
-                let usage = self.stats.turn_usage(self.fast_mode);
+                let usage = self.stats.turn_usage(self.model, self.fast_mode);
                 record_turn_usage(&tracing::Span::current(), &usage);
                 self.events.emit(
                     AgentEventKind::RunFailed,
@@ -285,6 +294,7 @@ where
                         "failed",
                         elapsed,
                         &self.config,
+                        self.model,
                         self.thinking,
                         &self.stats,
                         &usage,
@@ -492,6 +502,7 @@ where
 
     pub(super) const fn continuation_policy(&self) -> ContinuationPolicy {
         ContinuationPolicy {
+            model: self.model,
             thinking: self.thinking,
             fast_mode: self.fast_mode,
         }

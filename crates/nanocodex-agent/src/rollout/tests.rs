@@ -156,6 +156,64 @@ fn loads_codex_rollout_without_a_nanocodex_sidecar() {
 }
 
 #[test]
+fn loads_the_latest_model_from_nanocodex_rollout_state() {
+    let home = tempdir().expect("temporary Codex home");
+    let thread_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    let directory = home.path().join("sessions/2026/07/24");
+    std::fs::create_dir_all(&directory).expect("create rollout directory");
+    let path = directory.join(format!("rollout-2026-07-24T12-00-00-{thread_id}.jsonl"));
+    let mut file = File::create(&path).expect("create Nanocodex rollout");
+    for value in [
+        serde_json::json!({
+            "timestamp": "2026-07-24T12:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "cwd": home.path(),
+                "history_mode": "legacy",
+                "context_window": {"window_id": "window-1"}
+            }
+        }),
+        serde_json::json!({
+            "timestamp": "2026-07-24T12:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "use Luna"}]
+            }
+        }),
+        serde_json::json!({
+            "timestamp": "2026-07-24T12:00:02Z",
+            "type": "world_state",
+            "payload": {
+                "full": true,
+                "state": {"nanocodex_model": "gpt-5.6-sol"}
+            }
+        }),
+        serde_json::json!({
+            "timestamp": "2026-07-24T12:00:03Z",
+            "type": "world_state",
+            "payload": {
+                "full": true,
+                "state": {"nanocodex_model": "gpt-5.6-luna"}
+            }
+        }),
+    ] {
+        write_line(&mut file, &value).expect("write rollout line");
+    }
+    file.flush().expect("flush rollout");
+
+    let session = RolloutConfig::new(home.path())
+        .load_session(thread_id)
+        .expect("load Nanocodex rollout");
+    let snapshot = serde_json::to_value(session.snapshot()).expect("encode snapshot");
+
+    assert_eq!(session.model(), Model::Luna);
+    assert_eq!(snapshot["model"], "gpt-5.6-luna");
+}
+
+#[test]
 fn rejects_rollouts_with_paginated_history() {
     let home = tempdir().expect("temporary Codex home");
     let thread_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
@@ -341,6 +399,42 @@ async fn appends_only_the_new_committed_delta() {
             .count(),
         1,
         "an unchanged context baseline must not add rollout churn"
+    );
+}
+
+#[tokio::test]
+async fn records_model_changes_without_rewriting_unchanged_context() {
+    let home = tempdir().expect("temporary Codex home");
+    let recorder = recorder(home.path());
+    recorder
+        .persist_history(
+            ResponseHistory::new(vec![message("one")]),
+            0,
+            completed_turn("one", "first"),
+        )
+        .await
+        .expect("persist Sol turn");
+    recorder
+        .persist_history_with_model(
+            ResponseHistory::new(vec![message("one"), message("two")]),
+            0,
+            completed_turn("two", "second"),
+            Model::Luna,
+        )
+        .await
+        .expect("persist Luna turn");
+
+    let models = lines(&recorder)
+        .into_iter()
+        .filter(|line| line["type"] == "world_state")
+        .map(|line| line["payload"]["state"]["nanocodex_model"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        models,
+        [
+            serde_json::json!("gpt-5.6-sol"),
+            serde_json::json!("gpt-5.6-luna")
+        ]
     );
 }
 

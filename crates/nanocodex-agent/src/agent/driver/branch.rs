@@ -47,6 +47,7 @@ where
         &self,
         checkpoint: &CommittedSession,
         parent_session_id: &str,
+        model: Model,
         thinking: Thinking,
         fast_mode: bool,
     ) -> Result<(Nanocodex, AgentEvents)> {
@@ -55,6 +56,7 @@ where
         let mut spawner = self.clone();
         spawner.context_source = spawner.context_config.build();
         let mut config = (*spawner.config).clone();
+        config.model = model;
         config.thinking = thinking;
         config.fast_mode = fast_mode;
         spawner.config = Arc::new(config);
@@ -77,6 +79,7 @@ where
         &self,
         workspace: Option<Arc<str>>,
         parent_session_id: &str,
+        model: Model,
         thinking: Thinking,
         fast_mode: bool,
     ) -> Result<(Nanocodex, AgentEvents)> {
@@ -84,6 +87,7 @@ where
         let session_id_text = session_id.to_string();
         let depth = self.depth.saturating_add(1);
         let mut config = (*self.config).clone();
+        config.model = model;
         config.thinking = thinking;
         config.fast_mode = fast_mode;
         let prompt_cache_key = self

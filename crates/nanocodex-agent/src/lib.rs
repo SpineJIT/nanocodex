@@ -28,7 +28,7 @@ pub use agent::{
 };
 pub use error::{NanocodexError, Result};
 pub use nanocodex_oai_api::{
-    OpenAi, ReasoningMode, ResponseError, ResponseErrorKind, Thinking, events::AgentEvents,
+    Model, OpenAi, ReasoningMode, ResponseError, ResponseErrorKind, Thinking, events::AgentEvents,
 };
 #[cfg(not(target_family = "wasm"))]
 #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]

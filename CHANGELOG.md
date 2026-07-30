@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- [model] Support `gpt-5.6-luna` and sticky turn-boundary model changes across
+  Rust, CLI, Python, JavaScript, and Harbor adapters.
 - [vm] Add persistent VM-backed workspace tools, immutable root-image
   preparation, and provider-neutral composable egress leases.
 

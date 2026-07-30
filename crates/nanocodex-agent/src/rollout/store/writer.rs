@@ -1,4 +1,7 @@
-use super::super::{load::validate_legacy_history_mode, wire::*};
+use super::super::{
+    load::{model_from_world_state, validate_legacy_history_mode},
+    wire::*,
+};
 use super::*;
 
 pub(in crate::rollout) struct RolloutWriter {
@@ -7,6 +10,7 @@ pub(in crate::rollout) struct RolloutWriter {
     written_revision: Option<u64>,
     written_len: usize,
     written_context_baseline: Option<ContextBaseline>,
+    written_model: Option<Model>,
     window_number: u64,
     first_window_id: String,
     current_window_id: String,
@@ -22,6 +26,7 @@ impl RolloutWriter {
             written_revision: None,
             written_len: 0,
             written_context_baseline: None,
+            written_model: None,
             window_number: 0,
             first_window_id: initial_window_id.clone(),
             current_window_id: initial_window_id,
@@ -37,6 +42,7 @@ impl RolloutWriter {
             written_revision: Some(0),
             written_len: state.written_len,
             written_context_baseline: state.context_baseline,
+            written_model: state.model,
             window_number: state.window_number,
             first_window_id: state.first_window_id,
             current_window_id: state.current_window_id,
@@ -141,8 +147,9 @@ impl RolloutWriter {
                         id: window_id,
                     }),
                     turn: commit.turn.clone(),
+                    model: commit.model,
                     context_baseline: commit.context_baseline.clone(),
-                    write_context: true,
+                    write_state: true,
                 })
             }
             None => Ok(PreparedAppend {
@@ -154,9 +161,9 @@ impl RolloutWriter {
                 len,
                 window: None,
                 turn: commit.turn.clone(),
+                model: commit.model,
                 context_baseline: commit.context_baseline.clone(),
-                write_context: self.written_context_baseline.as_ref()
-                    != Some(&commit.context_baseline),
+                write_state: self.state_changed(commit),
             }),
             Some(revision) if revision == commit.revision => {
                 if len < self.written_len {
@@ -174,9 +181,9 @@ impl RolloutWriter {
                     len,
                     window: None,
                     turn: commit.turn.clone(),
+                    model: commit.model,
                     context_baseline: commit.context_baseline.clone(),
-                    write_context: self.written_context_baseline.as_ref()
-                        != Some(&commit.context_baseline),
+                    write_state: self.state_changed(commit),
                 })
             }
             Some(_) => {
@@ -198,13 +205,19 @@ impl RolloutWriter {
                         id: window_id,
                     }),
                     turn: commit.turn.clone(),
+                    model: commit.model,
                     context_baseline: commit.context_baseline.clone(),
                     // A compaction starts a new history window, whose context
                     // baseline must be independently reconstructable.
-                    write_context: true,
+                    write_state: true,
                 })
             }
         }
+    }
+
+    fn state_changed(&self, commit: &RolloutCommit) -> bool {
+        self.written_model != Some(commit.model)
+            || self.written_context_baseline.as_ref() != Some(&commit.context_baseline)
     }
 
     async fn write_prepared(&mut self, prepared: &PreparedAppend) -> io::Result<()> {
@@ -250,7 +263,7 @@ impl RolloutWriter {
                 .await?;
             }
         }
-        if prepared.write_context {
+        if prepared.write_state {
             write_async_line(
                 &mut self.file,
                 &RolloutLine {
@@ -258,6 +271,7 @@ impl RolloutWriter {
                     item: RolloutItem::WorldState(&WorldStateItem {
                         full: true,
                         state: PersistedContextState {
+                            nanocodex_model: prepared.model.as_str(),
                             nanocodex_context: &prepared.context_baseline,
                         },
                     }),
@@ -341,7 +355,8 @@ impl RolloutWriter {
     fn apply_prepared(&mut self, prepared: PreparedAppend) {
         self.written_revision = Some(prepared.revision);
         self.written_len = prepared.len;
-        if prepared.write_context {
+        if prepared.write_state {
+            self.written_model = Some(prepared.model);
             self.written_context_baseline = Some(prepared.context_baseline);
         }
         if let Some(window) = prepared.window {
@@ -368,8 +383,9 @@ struct PreparedAppend {
     len: usize,
     window: Option<WindowAdvance>,
     turn: RolloutTurn,
+    model: Model,
     context_baseline: ContextBaseline,
-    write_context: bool,
+    write_state: bool,
 }
 
 enum PreparedRecords {
@@ -387,6 +403,7 @@ struct WindowAdvance {
 
 pub(super) struct ResumeWriterState {
     pub(super) written_len: usize,
+    model: Option<Model>,
     context_baseline: Option<ContextBaseline>,
     window_number: u64,
     first_window_id: String,
@@ -402,6 +419,7 @@ pub(super) fn read_resume_writer_state(
     let mut window_number = 0;
     let mut written_len = 0;
     let mut context_baseline = None;
+    let mut model = None;
     for line in BufReader::new(File::open(path)?).lines() {
         let line = line?;
         let value: serde_json::Value = serde_json::from_str(&line).map_err(io::Error::other)?;
@@ -459,6 +477,9 @@ pub(super) fn read_resume_writer_state(
             }
             Some("response_item") => written_len = written_len.saturating_add(1),
             Some("world_state") => {
+                if let Some(selected) = model_from_world_state(&value)? {
+                    model = Some(selected);
+                }
                 if let Some(state) = value["payload"]["state"].get("nanocodex_context") {
                     context_baseline =
                         Some(serde_json::from_value(state.clone()).map_err(io::Error::other)?);
@@ -475,6 +496,7 @@ pub(super) fn read_resume_writer_state(
     })?;
     Ok(ResumeWriterState {
         written_len,
+        model,
         context_baseline,
         window_number,
         current_window_id: current_window_id.unwrap_or_else(|| first_window_id.clone()),

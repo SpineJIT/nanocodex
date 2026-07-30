@@ -173,6 +173,7 @@ impl Nanocodex {
             .send(Command::Prompt {
                 key,
                 prompt,
+                model: None,
                 thinking: None,
                 fast_mode: None,
                 parent,
@@ -192,6 +193,18 @@ impl Nanocodex {
             events: event_stream,
             result: receiver,
         })
+    }
+
+    /// Changes the model for subsequently accepted turns.
+    ///
+    /// An active turn and prompts already queued by the driver retain the
+    /// model they captured when accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the agent driver has stopped.
+    pub async fn set_model(&self, model: Model) -> Result<()> {
+        request_command(&self.commands, |result| Command::SetModel { model, result }).await
     }
 
     /// Routes live input into the active turn or starts a new turn when idle.

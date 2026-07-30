@@ -81,6 +81,7 @@ pub(super) fn cancel_queued_turn(queued_turns: &mut VecDeque<QueuedTurn>, target
     };
     let QueuedTurn::Pending {
         prompt,
+        model,
         thinking,
         fast_mode,
         parent,
@@ -95,6 +96,7 @@ pub(super) fn cancel_queued_turn(queued_turns: &mut VecDeque<QueuedTurn>, target
         position,
         QueuedTurn::Cancelled {
             prompt,
+            model,
             thinking,
             fast_mode,
             parent,
@@ -110,6 +112,7 @@ pub(super) fn mark_all_queued_turns_cancelled(queued_turns: &mut VecDeque<Queued
     queued_turns.extend(accepted.into_iter().map(|queued| match queued {
         QueuedTurn::Pending {
             prompt,
+            model,
             thinking,
             fast_mode,
             parent,
@@ -118,6 +121,7 @@ pub(super) fn mark_all_queued_turns_cancelled(queued_turns: &mut VecDeque<Queued
             ..
         } => QueuedTurn::Cancelled {
             prompt,
+            model,
             thinking,
             fast_mode,
             parent,
@@ -131,6 +135,7 @@ pub(super) fn mark_all_queued_turns_cancelled(queued_turns: &mut VecDeque<Queued
 pub(super) async fn begin_shutdown(
     commands: &mut mpsc::Receiver<Command>,
     queued_turns: &mut VecDeque<QueuedTurn>,
+    default_model: Model,
     default_thinking: Thinking,
     default_fast_mode: bool,
 ) {
@@ -140,6 +145,7 @@ pub(super) async fn begin_shutdown(
             Command::Prompt {
                 key,
                 prompt,
+                model,
                 thinking,
                 fast_mode,
                 parent,
@@ -149,6 +155,7 @@ pub(super) async fn begin_shutdown(
                 queued_turns.push_back(QueuedTurn::Pending {
                     key,
                     prompt,
+                    model: model.unwrap_or(default_model),
                     thinking: thinking.unwrap_or(default_thinking),
                     fast_mode: fast_mode.unwrap_or(default_fast_mode),
                     parent,
@@ -169,6 +176,7 @@ pub(super) async fn begin_shutdown(
             }
             Command::Steer { result, .. }
             | Command::Cancel { result, .. }
+            | Command::SetModel { result, .. }
             | Command::SetThinking { result, .. }
             | Command::SetFastMode { result, .. }
             | Command::Compact { result, .. } => {
@@ -180,12 +188,18 @@ pub(super) async fn begin_shutdown(
     mark_all_queued_turns_cancelled(queued_turns);
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct TurnDefaults {
+    pub(super) model: Model,
+    pub(super) thinking: Thinking,
+    pub(super) fast_mode: bool,
+}
+
 pub(super) fn handle_idle_command<S>(
     command: Command,
     latest: Option<&Arc<CommittedSession>>,
     spawner: &BranchSpawner<S>,
-    thinking: Thinking,
-    fast_mode: bool,
+    defaults: TurnDefaults,
     session_id: &str,
     workspace: Option<Arc<str>>,
 ) where
@@ -199,12 +213,24 @@ pub(super) fn handle_idle_command<S>(
             let outcome = checkpoint
                 .ok_or(NanocodexError::ForkBeforeCompletedTurn)
                 .and_then(|checkpoint| {
-                    spawner.spawn_fork(&checkpoint, session_id, thinking, fast_mode)
+                    spawner.spawn_fork(
+                        &checkpoint,
+                        session_id,
+                        defaults.model,
+                        defaults.thinking,
+                        defaults.fast_mode,
+                    )
                 });
             drop(result.send(outcome));
         }
         Command::Spawn { result } => {
-            drop(result.send(spawner.spawn_clean(workspace, session_id, thinking, fast_mode)));
+            drop(result.send(spawner.spawn_clean(
+                workspace,
+                session_id,
+                defaults.model,
+                defaults.thinking,
+                defaults.fast_mode,
+            )));
         }
         Command::Steer { result, .. } => {
             drop(result.send(Err(NanocodexError::TurnNotSteerable)));
@@ -220,7 +246,9 @@ pub(super) fn handle_idle_command<S>(
         Command::Cancel { result, .. } => {
             drop(result.send(Err(NanocodexError::TurnNotCancellable)));
         }
-        Command::SetThinking { result, .. } | Command::SetFastMode { result, .. } => {
+        Command::SetModel { result, .. }
+        | Command::SetThinking { result, .. }
+        | Command::SetFastMode { result, .. } => {
             drop(result.send(Ok(())));
         }
         Command::Shutdown => {}

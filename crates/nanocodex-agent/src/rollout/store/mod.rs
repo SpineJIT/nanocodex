@@ -54,6 +54,7 @@ pub(super) struct RolloutCommit {
     history: ResponseHistory,
     revision: u64,
     turn: RolloutTurn,
+    model: Model,
     context_baseline: ContextBaseline,
 }
 
@@ -63,6 +64,7 @@ impl RolloutCommit {
             history: session.rollout_history(),
             revision: session.history_revision(),
             turn,
+            model: session.selected_model(),
             context_baseline: session.context_baseline().clone(),
         }
     }
@@ -72,6 +74,7 @@ impl RolloutCommit {
             history: session.rollout_history(),
             revision: session.history_revision(),
             turn,
+            model: session.selected_model(),
             context_baseline: session.context_baseline().clone(),
         }
     }
@@ -86,6 +89,7 @@ impl RolloutCommit {
             history,
             revision,
             turn,
+            model: Model::Sol,
             context_baseline: ContextBaseline::Missing,
         }
     }
@@ -333,6 +337,19 @@ impl RolloutRecorder {
     ) -> io::Result<()> {
         self.persist_commit(RolloutCommit::from_history(history, revision, turn))
             .await
+    }
+
+    #[cfg(test)]
+    pub(in crate::rollout) async fn persist_history_with_model(
+        &self,
+        history: ResponseHistory,
+        revision: u64,
+        turn: RolloutTurn,
+        model: Model,
+    ) -> io::Result<()> {
+        let mut commit = RolloutCommit::from_history(history, revision, turn);
+        commit.model = model;
+        self.persist_commit(commit).await
     }
 
     pub(crate) async fn flush(&self) -> io::Result<()> {

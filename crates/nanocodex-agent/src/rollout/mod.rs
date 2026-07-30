@@ -18,7 +18,7 @@ use std::{
 
 use chrono::{Local, SecondsFormat, Utc};
 use nanocodex_oai_api::{
-    ImageDetail, Prompt, PromptInput, UserInput,
+    ImageDetail, Model, Prompt, PromptInput, UserInput,
     responses::{ResponseHistory, ResponseItem},
 };
 use serde::Serialize;

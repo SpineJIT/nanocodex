@@ -1,5 +1,5 @@
 use eyre::{Result, WrapErr};
-use nanocodex::{Nanocodex, OpenAi, Thinking, Tools};
+use nanocodex::{Model, Nanocodex, OpenAi, Thinking, Tools};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
     let first = first.result().await?;
     println!("first result: {}", first.final_message());
 
+    agent.set_model(Model::Luna).await?;
     agent.set_thinking(Thinking::High).await?;
     let second = agent
         .prompt(

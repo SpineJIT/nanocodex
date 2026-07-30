@@ -540,6 +540,7 @@ impl<'a> ResponseCreate<'a> {
     #[must_use]
     pub(crate) fn warmup(
         config: &'a ModelConfig,
+        model: crate::Model,
         thinking: Thinking,
         fast_mode: bool,
         profile: &'a RequestProfile,
@@ -549,6 +550,7 @@ impl<'a> ResponseCreate<'a> {
             config,
             CreatePolicy {
                 transport: config.responses_transport,
+                model,
                 thinking,
                 fast_mode,
             },
@@ -591,7 +593,7 @@ impl<'a> ResponseCreate<'a> {
         let websocket = matches!(policy.transport, crate::ResponsesTransport::WebSocket);
         Self {
             kind: websocket.then_some("response.create"),
-            model: crate::MODEL,
+            model: policy.model.as_str(),
             previous_response_id,
             input: RequestInput { input },
             tool_choice: "auto",
@@ -628,6 +630,7 @@ impl<'a> ResponseCreate<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct CreatePolicy {
     transport: crate::ResponsesTransport,
+    model: crate::Model,
     thinking: Thinking,
     fast_mode: bool,
 }
@@ -635,11 +638,13 @@ pub(crate) struct CreatePolicy {
 impl CreatePolicy {
     pub(crate) const fn new(
         transport: crate::ResponsesTransport,
+        model: crate::Model,
         thinking: Thinking,
         fast_mode: bool,
     ) -> Self {
         Self {
             transport,
+            model,
             thinking,
             fast_mode,
         }
@@ -700,7 +705,7 @@ impl Serialize for SerializedCodeModeTurnMetadata<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContentItem, MessageRole, ReasoningMode, Thinking};
+    use crate::{ContentItem, MessageRole, Model, ReasoningMode, Thinking};
     use serde_json::json;
 
     #[test]
@@ -717,7 +722,8 @@ mod tests {
             }],
         )]);
         let profile = RequestProfile::new("branch-a", "lineage-a", prefix);
-        let request = ResponseCreate::warmup(&config, Thinking::Low, false, &profile, None);
+        let request =
+            ResponseCreate::warmup(&config, Model::Sol, Thinking::Low, false, &profile, None);
         let request = serde_json::to_value(request).expect("request should serialize");
 
         assert_eq!(request["prompt_cache_key"], json!("lineage-a"));
@@ -750,6 +756,7 @@ mod tests {
             ]);
         let request = serde_json::to_value(ResponseCreate::warmup(
             &config,
+            Model::Sol,
             Thinking::Low,
             false,
             &profile,
@@ -807,7 +814,12 @@ mod tests {
 
         let stored_request = serde_json::to_value(ResponseCreate::generation_with_policy(
             &stored_config,
-            CreatePolicy::new(stored_config.responses_transport, Thinking::Medium, false),
+            CreatePolicy::new(
+                stored_config.responses_transport,
+                Model::Sol,
+                Thinking::Medium,
+                false,
+            ),
             ResponsesInput::history(&[], &history, None),
             None,
             &profile,
@@ -826,6 +838,7 @@ mod tests {
             &ephemeral_config,
             CreatePolicy::new(
                 ephemeral_config.responses_transport,
+                Model::Sol,
                 Thinking::Medium,
                 false,
             ),
@@ -855,6 +868,23 @@ mod tests {
     }
 
     #[test]
+    fn luna_serializes_as_the_selected_model() {
+        let config = ModelConfig::default();
+        let profile = RequestProfile::new("luna-agent", "luna-lineage", Arc::from([]));
+        let request = serde_json::to_value(ResponseCreate::warmup(
+            &config,
+            Model::Luna,
+            Thinking::Medium,
+            false,
+            &profile,
+            None,
+        ))
+        .expect("request should serialize");
+
+        assert_eq!(request["model"], json!("gpt-5.6-luna"));
+    }
+
+    #[test]
     fn pro_mode_and_every_effort_serialize_independently() {
         let prefix: Arc<[ResponseItem]> = Arc::from([ResponseItem::message(
             MessageRole::Developer,
@@ -879,7 +909,12 @@ mod tests {
                 ..ModelConfig::default()
             };
             let request = serde_json::to_value(ResponseCreate::warmup(
-                &config, thinking, false, &profile, None,
+                &config,
+                Model::Sol,
+                thinking,
+                false,
+                &profile,
+                None,
             ))
             .expect("request should serialize");
 
@@ -901,6 +936,7 @@ mod tests {
         let profile = RequestProfile::new("fast-agent", "fast-lineage", Arc::from([]));
         let standard = serde_json::to_value(ResponseCreate::warmup(
             &config,
+            Model::Sol,
             Thinking::Medium,
             false,
             &profile,
@@ -909,6 +945,7 @@ mod tests {
         .expect("standard request should serialize");
         let fast = serde_json::to_value(ResponseCreate::warmup(
             &config,
+            Model::Sol,
             Thinking::Medium,
             true,
             &profile,

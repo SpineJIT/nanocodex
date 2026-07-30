@@ -86,6 +86,10 @@ export function setThinking(agent, thinking) {
   return agentState(agent).raw.setThinking(thinking);
 }
 
+export function setModel(agent, model) {
+  return agentState(agent).raw.setModel(model);
+}
+
 export function setFastMode(agent, enabled) {
   return agentState(agent).raw.setFastMode(enabled);
 }
@@ -141,6 +145,7 @@ export function toWasmConfig(options = {}) {
     throw new TypeError("apiKey must be a non-empty string");
   }
   const config = { api_key: apiKey };
+  copy(config, "model", options.model);
   copy(config, "thinking", options.thinking);
   copy(config, "reasoning_mode", options.reasoningMode);
   copy(config, "fast_mode", options.fastMode);
