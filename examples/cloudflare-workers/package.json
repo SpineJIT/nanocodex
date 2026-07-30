@@ -13,6 +13,7 @@
     "dev": "wrangler dev",
     "fanout": "node scripts/fanout.mjs",
     "mock:openai": "node scripts/mock-openai.mjs",
+    "repl": "node scripts/repl.mjs",
     "smoke": "node scripts/live-smoke.mjs",
     "soak": "node scripts/soak.mjs",
     "stress": "node scripts/stress.mjs",

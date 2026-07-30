@@ -77,11 +77,27 @@ Start workerd in one terminal and run the live probes in another:
 
 ```sh
 npm run dev --prefix examples/cloudflare-workers
+npm run repl --prefix examples/cloudflare-workers
 npm run smoke --prefix examples/cloudflare-workers
 npm run stress --prefix examples/cloudflare-workers
 npm run soak --prefix examples/cloudflare-workers
 npm run fanout --prefix examples/cloudflare-workers
 ```
+
+The REPL is intentionally disposable. It stores only the session capability
+URL and an unfinished turn ID/input in `.nanocodex/cloudflare-repl.json`; the
+WASM agent, model socket, history, and execution remain in the Durable Object.
+The file is mode `0600` because the session URL is a bearer capability. Press
+Ctrl-C during inference to drop only the local WebSocket. Re-running the same
+command reconnects and resubmits the idempotent turn ID, which either joins the
+active turn or replays its committed terminal result. Use `/status` or `/exit`
+at the prompt. Set `NANOCODEX_REPL_STATE` to isolate another local REPL state
+file.
+
+This demonstrates durable client detachment, not distributed exactly-once
+inference. If the Worker process itself dies before a turn commits, reopening
+the REPL resubmits the same turn from the last committed snapshot; a partial
+provider response cannot be resumed.
 
 The smoke performs a real model turn, verifies duplicate suppression, waits for
 idle teardown, then proves that a follow-on remembers history after the agent

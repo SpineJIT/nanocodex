@@ -1,8 +1,12 @@
 import { createServer } from "node:http";
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 
 const port = Number(process.env.NANOCODEX_MOCK_OPENAI_PORT ?? 8790);
+const responseDelayMs = Number(process.env.NANOCODEX_MOCK_DELAY_MS ?? 0);
 const accountId = process.env.NANOCODEX_MOCK_CHATGPT_ACCOUNT_ID ?? "local-chatgpt-account";
+if (!Number.isFinite(responseDelayMs) || responseDelayMs < 0 || responseDelayMs > 60_000) {
+  throw new Error("NANOCODEX_MOCK_DELAY_MS must be between 0 and 60000");
+}
 const accessToken = jwt({ exp: Math.floor(Date.now() / 1000) + 3_600 });
 const idToken = jwt({
   exp: Math.floor(Date.now() / 1000) + 3_600,
@@ -51,7 +55,7 @@ server.on("upgrade", (request, socket, head) => {
 });
 
 sockets.on("connection", (socket) => {
-  socket.on("message", (data) => {
+  socket.on("message", async (data) => {
     const request = JSON.parse(data.toString("utf8"));
     const encoded = JSON.stringify(request.input ?? []);
     const exactToken = encoded.match(/Reply with exactly ([A-Z0-9_-]{1,128})/)?.[1];
@@ -78,6 +82,10 @@ sockets.on("connection", (socket) => {
       } : {}),
       usage: null,
     };
+    if (responseDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, responseDelayMs));
+    }
+    if (socket.readyState !== WebSocket.OPEN) return;
     socket.send(JSON.stringify({ type: "response.completed", response }));
   });
 });
