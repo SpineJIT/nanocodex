@@ -9,7 +9,7 @@ ARG VERGEN_GIT_SHA=unknown
 ENV TAG_NAME=${TAG_NAME} \
     VERGEN_GIT_SHA=${VERGEN_GIT_SHA}
 WORKDIR /build
-RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf
+RUN apk add --no-cache cmake make musl-dev openssl-dev openssl-libs-static pkgconf
 
 COPY Cargo.toml Cargo.lock ./
 COPY bin/nanocodex/Cargo.toml bin/nanocodex/Cargo.toml
@@ -20,6 +20,9 @@ COPY js/bindings/Cargo.toml js/bindings/Cargo.toml
 COPY py/bindings/Cargo.toml py/bindings/Cargo.toml
 COPY crates/nanocodex/Cargo.toml crates/nanocodex/Cargo.toml
 COPY crates/nanocodex-agent/Cargo.toml crates/nanocodex-agent/Cargo.toml
+COPY crates/experimental/nanocodex-browser/Cargo.toml crates/experimental/nanocodex-browser/Cargo.toml
+COPY crates/experimental/nanocodex-voice/Cargo.toml crates/experimental/nanocodex-voice/Cargo.toml
+COPY crates/experimental/nanocodex-vm/Cargo.toml crates/experimental/nanocodex-vm/Cargo.toml
 COPY crates/nanocodex-oai-api/Cargo.toml crates/nanocodex-oai-api/Cargo.toml
 COPY crates/nanocodex-observability/Cargo.toml crates/nanocodex-observability/Cargo.toml
 COPY crates/nanocodex-tools/Cargo.toml crates/nanocodex-tools/Cargo.toml
@@ -27,7 +30,7 @@ COPY crates/nanocodex-tools/macros/Cargo.toml crates/nanocodex-tools/macros/Carg
 COPY examples/Cargo.toml examples/Cargo.toml
 # Keep dependency compilation in a manifest-only layer. Source-only edits reuse
 # this layer, while the cache mounts retain Cargo downloads and target outputs.
-RUN mkdir bin/nanocodex/src \
+RUN mkdir -p bin/nanocodex/src \
         bin/nanocodex/benches \
         bin/nanousd/src \
         bin/nanousd-api/src \
@@ -36,6 +39,12 @@ RUN mkdir bin/nanocodex/src \
         crates/nanocodex/src \
         crates/nanocodex-agent/src \
         crates/nanocodex-agent/benches \
+        crates/experimental/nanocodex-browser/src \
+        crates/experimental/nanocodex-browser/benches \
+        crates/experimental/nanocodex-voice/src \
+        crates/experimental/nanocodex-vm/src/bin \
+        crates/experimental/nanocodex-vm/benches \
+        crates/experimental/nanocodex-vm/tests \
         crates/nanocodex-oai-api/src \
         crates/nanocodex-oai-api/benches \
         crates/nanocodex-observability/src \
@@ -51,6 +60,15 @@ RUN mkdir bin/nanocodex/src \
     printf '\n' > crates/nanocodex/src/lib.rs && \
     printf '\n' > crates/nanocodex-agent/src/lib.rs && \
     printf 'fn main() {}\n' > crates/nanocodex-agent/benches/agent_lifecycle.rs && \
+    printf '\n' > crates/experimental/nanocodex-browser/src/lib.rs && \
+    printf 'fn main() {}\n' > crates/experimental/nanocodex-browser/benches/browser_protocol.rs && \
+    printf 'fn main() {}\n' > crates/experimental/nanocodex-browser/benches/browser_vm.rs && \
+    printf '\n' > crates/experimental/nanocodex-voice/src/lib.rs && \
+    printf '\n' > crates/experimental/nanocodex-vm/src/lib.rs && \
+    printf 'fn main() {}\n' > crates/experimental/nanocodex-vm/src/bin/nanocodex-vm-guest.rs && \
+    printf 'fn main() {}\n' > crates/experimental/nanocodex-vm/benches/image_cache.rs && \
+    printf 'fn main() {}\n' > crates/experimental/nanocodex-vm/benches/vm_session.rs && \
+    printf 'fn main() {}\n' > crates/experimental/nanocodex-vm/tests/image_live_build.rs && \
     printf '\n' > crates/nanocodex-oai-api/src/lib.rs && \
     printf 'fn main() {}\n' > crates/nanocodex-oai-api/benches/fork_history.rs && \
     printf 'fn main() {}\n' > crates/nanocodex-oai-api/benches/session_lifecycle.rs && \
@@ -86,6 +104,9 @@ RUN --mount=type=cache,id=nanocodex-cargo-registry,target=/usr/local/cargo/regis
         bin/nanousd-api/src/main.rs \
         crates/nanocodex/src/lib.rs \
         crates/nanocodex-agent/src/lib.rs \
+        crates/experimental/nanocodex-browser/src/lib.rs \
+        crates/experimental/nanocodex-voice/src/lib.rs \
+        crates/experimental/nanocodex-vm/src/lib.rs \
         crates/nanocodex-oai-api/src/lib.rs \
         crates/nanocodex-observability/src/lib.rs \
         crates/nanocodex-tools/src/lib.rs \

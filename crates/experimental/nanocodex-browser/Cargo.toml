@@ -27,7 +27,6 @@ futures-util.workspace = true
 image.workspace = true
 nanocodex-oai-api.workspace = true
 nanocodex-tools.workspace = true
-nanocodex-vm.workspace = true
 percent-encoding.workspace = true
 reflink-copy.workspace = true
 reqwest = { workspace = true, features = ["query", "stream"] }
@@ -42,6 +41,9 @@ tokio = { workspace = true, features = ["fs", "io-util", "process", "rt", "sync"
 tracing.workspace = true
 url.workspace = true
 v8-heap-parser.workspace = true
+
+[target.'cfg(any(all(target_os = "linux", not(target_env = "musl")), all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
+nanocodex-vm.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

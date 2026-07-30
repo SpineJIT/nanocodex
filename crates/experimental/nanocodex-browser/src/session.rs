@@ -1,9 +1,11 @@
 use std::{
-    env,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::env;
 
 use rusqlite::{Connection, OpenFlags, backup::Backup};
 use url::Url;
@@ -31,27 +33,33 @@ impl BraveSession {
     /// Returns an error when the platform has no standard location, the home
     /// directory is unavailable, or Brave is not installed there.
     pub fn standard() -> Result<Self, BraveSessionError> {
-        let home = env::var_os("HOME").ok_or(BraveSessionError::HomeDirectoryUnavailable)?;
-        #[cfg(target_os = "macos")]
-        let (executable, user_data_dir) = (
-            PathBuf::from("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
-            PathBuf::from(home).join("Library/Application Support/BraveSoftware/Brave-Browser"),
-        );
-        #[cfg(target_os = "linux")]
-        let (executable, user_data_dir) = (
-            ["/usr/bin/brave-browser", "/usr/bin/brave-browser-stable"]
-                .into_iter()
-                .map(PathBuf::from)
-                .find(|path| path.is_file())
-                .ok_or(BraveSessionError::StandardInstallationUnavailable)?,
-            PathBuf::from(home).join(".config/BraveSoftware/Brave-Browser"),
-        );
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        return Err(BraveSessionError::StandardInstallationUnavailable);
+        {
+            Err(BraveSessionError::StandardInstallationUnavailable)
+        }
 
-        let session = Self::new(executable, user_data_dir);
-        session.validate_paths()?;
-        Ok(session)
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let home = env::var_os("HOME").ok_or(BraveSessionError::HomeDirectoryUnavailable)?;
+            #[cfg(target_os = "macos")]
+            let (executable, user_data_dir) = (
+                PathBuf::from("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+                PathBuf::from(home).join("Library/Application Support/BraveSoftware/Brave-Browser"),
+            );
+            #[cfg(target_os = "linux")]
+            let (executable, user_data_dir) = (
+                ["/usr/bin/brave-browser", "/usr/bin/brave-browser-stable"]
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .find(|path| path.is_file())
+                    .ok_or(BraveSessionError::StandardInstallationUnavailable)?,
+                PathBuf::from(home).join(".config/BraveSoftware/Brave-Browser"),
+            );
+
+            let session = Self::new(executable, user_data_dir);
+            session.validate_paths()?;
+            Ok(session)
+        }
     }
 
     /// Creates a Brave session from explicit executable and user-data paths.

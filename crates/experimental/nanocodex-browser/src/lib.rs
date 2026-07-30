@@ -4,7 +4,10 @@
 mod features;
 mod native;
 mod session;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 pub mod vm;
 
 use std::{

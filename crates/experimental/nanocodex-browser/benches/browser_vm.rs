@@ -1,4 +1,7 @@
-#![cfg(any(target_os = "linux", target_os = "macos"))]
+#![cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 
 use std::{ffi::OsString, hint::black_box, path::PathBuf, time::Duration};
 

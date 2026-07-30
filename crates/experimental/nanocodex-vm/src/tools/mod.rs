@@ -7,7 +7,13 @@
 //! compiles the companion server over the canonical workspace-tool runtime.
 
 #![cfg_attr(
-    all(feature = "host", any(target_os = "linux", target_os = "macos")),
+    all(
+        feature = "host",
+        any(
+            all(target_os = "linux", not(target_env = "musl")),
+            all(target_os = "macos", target_arch = "aarch64")
+        )
+    ),
     doc = r#"
 # Compose VM-backed tools
 
@@ -68,19 +74,49 @@ serve_guest("/workspace").await?;
 #[cfg(any(feature = "guest-runtime", test))]
 mod guest;
 mod protocol;
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 mod runtime_disk;
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 mod session;
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 pub(crate) use session::{DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_STARTUP_TIMEOUT};
 
 #[cfg(feature = "guest-runtime")]
 use std::path::Path;
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 use std::sync::Arc;
 
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 use nanocodex_tools::{
     Tool, ToolContext, ToolDefinition, ToolInput, ToolResult, Tools, ToolsBuilder,
     standard::{StandardTool, UpdatePlanTool},
@@ -88,9 +124,21 @@ use nanocodex_tools::{
 
 #[cfg(feature = "guest-runtime")]
 pub use guest::VmGuestError;
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 pub use runtime_disk::{GuestRuntimeDisk, GuestRuntimeDiskError, GuestRuntimeDiskStatus};
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 pub use session::{
     VmCommand, VmCommandOutput, VmCommandPartialOutput, VmToolSession, VmToolSessionError,
     VmToolSessionHandle,
@@ -101,7 +149,13 @@ pub use session::{
 /// The concrete client owns transport, guest session routing, cancellation,
 /// and conversion of the guest's typed result into Nanocodex's `ToolResult`.
 #[async_trait::async_trait]
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 pub trait VmToolClient: Send + Sync {
     /// Executes one standard tool through the client-owned VM capability.
     async fn execute(
@@ -114,12 +168,24 @@ pub trait VmToolClient: Send + Sync {
 
 /// Clone-cheap factory for the standard tools whose effects belong in a VM.
 #[derive(Clone)]
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 pub struct VmTools {
     client: Arc<dyn VmToolClient>,
 }
 
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 impl VmTools {
     /// Creates a VM tool family over one clone-cheap execution capability.
     #[must_use]
@@ -181,13 +247,25 @@ impl VmTools {
 
 /// One standard Nanocodex tool whose execution is forwarded into a VM.
 #[derive(Clone)]
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 pub struct VmTool {
     standard: StandardTool,
     client: Arc<dyn VmToolClient>,
 }
 
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 impl VmTool {
     /// Returns which canonical standard tool this adapter implements.
     #[must_use]
@@ -197,7 +275,13 @@ impl VmTool {
 }
 
 #[async_trait::async_trait]
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 impl Tool for VmTool {
     fn definition(&self) -> ToolDefinition {
         self.standard.definition()
@@ -228,7 +312,14 @@ pub async fn serve_guest(workspace: impl AsRef<Path>) -> Result<(), VmGuestError
     guest::serve(workspace.as_ref()).await
 }
 
-#[cfg(all(test, feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    test,
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 mod tests {
     use std::sync::Mutex;
 

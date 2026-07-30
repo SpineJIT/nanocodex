@@ -48,7 +48,6 @@ nanocodex.workspace = true
 nanocodex-browser.workspace = true
 nanocodex-observability.workspace = true
 nanocodex-voice.workspace = true
-nanocodex-vm.workspace = true
 nix = { workspace = true, optional = true }
 nanousd = { workspace = true, optional = true }
 pulldown-cmark.workspace = true
@@ -73,6 +72,9 @@ tempo-alloy = { workspace = true, optional = true }
 tracing.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+
+[target.'cfg(any(all(target_os = "linux", not(target_env = "musl")), all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
+nanocodex-vm.workspace = true
 
 [build-dependencies]
 chrono.workspace = true

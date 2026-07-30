@@ -2,24 +2,88 @@
 #![cfg_attr(not(feature = "host"), doc = include_str!("../GUEST_RUNTIME.md"))]
 #![deny(unsafe_code, missing_docs, rustdoc::broken_intra_doc_links)]
 
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 mod capabilities;
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 mod command;
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 mod config;
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 mod egress;
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 mod gvproxy;
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 pub mod image;
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 mod krun;
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 mod process;
+#[cfg(any(
+    feature = "guest-runtime",
+    all(
+        feature = "host",
+        any(
+            all(target_os = "linux", not(target_env = "musl")),
+            all(target_os = "macos", target_arch = "aarch64")
+        )
+    )
+))]
 pub mod tools;
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 mod workspace;
 
 /// Low-level host-side VM configuration and lifecycle components.
@@ -27,7 +91,13 @@ mod workspace;
 /// Most applications should start with [`crate::VmWorkspaceBuilder`]. This
 /// module is for custom VMM entry points, network/egress policy, and direct
 /// libkrun lifecycle ownership.
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 pub mod host {
     pub use crate::{
         capabilities::{Capabilities, KrunFeature},
@@ -43,5 +113,11 @@ pub mod host {
     };
 }
 
-#[cfg(all(feature = "host", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    feature = "host",
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 pub use workspace::{VmWorkspace, VmWorkspaceBuilder, VmWorkspaceError};

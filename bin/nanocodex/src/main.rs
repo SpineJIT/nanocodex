@@ -12,6 +12,16 @@ mod subagents;
 mod tui;
 mod update;
 mod version;
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+mod vm;
+#[cfg(not(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+)))]
+#[path = "vm_unsupported.rs"]
 mod vm;
 
 use std::path::PathBuf;
