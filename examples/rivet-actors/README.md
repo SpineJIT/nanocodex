@@ -1,15 +1,12 @@
-# Nanocodex on AgentOS and Rivet Actors
+# Nanocodex on Rivet Actors
 
 This example runs the real Rust/WASM Nanocodex harness as a durable
-[Rivet Actor](https://rivet.dev/docs/actors/). It also registers an
-[agentOS](https://agentos-sdk.dev/docs/core/) workspace actor that delegates
-model turns to Nanocodex with actor-to-actor RPC.
-
-Nanocodex is already an agent harness, so it runs directly in the actor host.
-It is not wrapped in a second ACP harness inside the agentOS VM. This keeps one
-owner for model history, tools, retries, and cancellation while retaining
-AgentOS filesystem, process, workflow, and multiplayer capabilities in a peer
-actor.
+[Rivet Actor](https://rivet.dev/docs/actors/). Nanocodex is already an agent
+harness, so it runs directly in the actor host with one owner for model history,
+tools, retries, and cancellation. The example depends directly on RivetKit and
+does not install `@rivet-dev/agentos`, Pi, or another agent harness. RivetKit
+itself currently retains a separate legacy `@rivet-dev/agent-os-core` runtime
+dependency; it has no Pi packages in its dependency tree.
 
 ## Architecture
 
@@ -35,18 +32,7 @@ The singleton `nanocodexAuth` actor owns ChatGPT subscription credentials. It
 persists rotating refresh tokens in its own SQLite database, refreshes five
 minutes early, single-flights concurrent refreshes, and retries one WebSocket
 upgrade after a revision-guarded 401 recovery. Bearer credentials remain in
-host code and never enter Nanocodex WASM or the agentOS guest VM.
-
-`nanocodexWorkspace` is a normal `agentOS()` actor in the same registry. Its
-`nanocodex.prompt` action demonstrates composition without nesting harnesses:
-
-```ts
-const workspace = client.nanocodexWorkspace.getOrCreate(["project"]);
-const result = await workspace.nanocodex.prompt("conversation", {
-  id: crypto.randomUUID(),
-  input: "Review the current plan",
-});
-```
+host code and never enter Nanocodex WASM.
 
 ## Build and run
 
@@ -58,13 +44,21 @@ npm ci --prefix examples/rivet-actors
 npm run check --prefix examples/rivet-actors
 ```
 
+The dependency check fails if the lockfile acquires AgentOS's Pi adapter or any
+of the upstream Pi harness packages.
+
 For API-key authentication, set:
 
 ```sh
 export NANOCODEX_AUTH_MODE=api_key
 export OPENAI_API_KEY=sk-...
+export RIVET__file_system__path=/tmp/nanocodex-rivet-demo/engine-db
 npm run dev --prefix examples/rivet-actors
 ```
+
+The explicit database path isolates the demo from other local Rivet versions
+and persists actor state across server restarts. Do not point an older Rivet
+Engine at a database created by a newer version.
 
 In another terminal:
 
@@ -117,6 +111,7 @@ export NANOCODEX_AUTH_CAPABILITY=a-separate-random-secret-of-at-least-32-bytes
 export CHATGPT_ACCESS_TOKEN=...
 export CHATGPT_REFRESH_TOKEN=...
 export CHATGPT_ACCOUNT_ID=...
+export RIVET__file_system__path=/tmp/nanocodex-rivet-demo/engine-db
 npm run dev --prefix examples/rivet-actors
 ```
 
@@ -155,19 +150,13 @@ Rivet automatically sleeps idle actors after 30 seconds.
 
 ## Deployment
 
-Rivet Actors and agentOS can run on Rivet Compute or a self-hosted Rivet
-platform. Build Nanocodex WASM as part of the image, start `src/server.ts`, and
-provide the selected authentication secrets to the runner. Rivet's current CLI
-deploy path is:
+Rivet Actors can run on Rivet Compute or a self-hosted Rivet platform. Build
+Nanocodex WASM as part of the image, start `src/server.ts`, and provide the
+selected authentication secrets to the runner. Rivet's current CLI deploy path
+is:
 
 ```sh
 npx @rivetkit/cli deploy --token cloud_api_xxxxx
 ```
 
-See the official [Rivet deployment guide](https://rivet.dev/docs/deploy/) and
-[agentOS deployment options](https://agentos-sdk.dev/docs/deployment/).
-
-The published agentOS 0.2.15 package uses `skipLibCheck` in its own TypeScript
-configuration, so this example mirrors that setting. Its current dependency
-tree also contains upstream audit advisories even with no Pi software enabled;
-review those advisories against your deployment threat model when upgrading.
+See the official [Rivet deployment guide](https://rivet.dev/docs/deploy/).

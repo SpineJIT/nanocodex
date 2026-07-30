@@ -7,19 +7,19 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "check": "npm run typecheck && npm test",
+    "check": "npm run check:dependencies && npm run typecheck && npm test",
+    "check:dependencies": "node scripts/check-no-pi.mjs",
     "brutalize": "node --import tsx scripts/soak.ts",
     "dev": "node --env-file-if-exists=../../.env --import tsx src/server.ts",
     "repl": "node --import tsx scripts/repl.ts",
     "smoke": "node --import tsx scripts/live-smoke.ts",
     "stress": "node --import tsx scripts/stress.ts",
-    "test": "vitest run",
+    "test": "node scripts/test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@rivet-dev/agentos": "0.2.15",
     "nanocodex": "file:../../js/bindings",
-    "rivetkit": "2.3.9",
+    "rivetkit": "2.3.10",
     "ws": "8.21.1"
   },
   "devDependencies": {

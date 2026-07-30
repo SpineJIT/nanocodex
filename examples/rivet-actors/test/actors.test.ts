@@ -90,6 +90,7 @@ afterAll(async () => {
   for (const socket of sockets.clients) socket.terminate();
   await new Promise<void>((resolve) => sockets.close(() => resolve()));
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  await registry.shutdown();
 });
 
 describe.sequential("Nanocodex Rivet Actors", () => {
@@ -198,19 +199,6 @@ describe.sequential("Nanocodex Rivet Actors", () => {
       revision: 2,
     });
     expect((await session.status()).auth_mode).toBe("chatgpt");
-  });
-
-  test("runs through an AgentOS actor-to-actor bridge without nesting ACP harnesses", async (context) => {
-    resetMock();
-    configureApiKey();
-    const { client } = await setupTest(context, registry);
-    const workspace = client.nanocodexWorkspace.getOrCreate([`workspace-${crypto.randomUUID()}`]);
-    const result = await workspace.nanocodex.prompt(
-      `delegated-${crypto.randomUUID()}`,
-      { id: "delegated-turn", input: "Reply with exactly AGENTOS_OK" },
-    );
-    expect(result.final_message).toBe("AGENTOS_OK");
-    expect(modelRequests).toBeGreaterThanOrEqual(1);
   });
 
   test("bounds prompt size and active turn fan-in", async (context) => {

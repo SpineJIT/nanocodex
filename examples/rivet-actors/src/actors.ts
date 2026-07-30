@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
-import { agentOS } from "@rivet-dev/agentos";
 import type {
   AgentEvent,
   DefaultAgent,
@@ -100,11 +99,6 @@ type InternalActorClient = {
   nanocodexAuth: {
     getOrCreate(key: string[]): AuthActorHandle;
   };
-  nanocodex: {
-    getOrCreate(key: string[]): {
-      prompt(request: PromptRequest): Promise<TurnCompleted>;
-    };
-  };
 };
 
 type SessionContext = {
@@ -115,11 +109,6 @@ type SessionContext = {
   broadcast(name: string, payload: unknown): void;
   client(): unknown;
   keepAwake<T>(promise: Promise<T>): Promise<T>;
-};
-
-type WorkspaceContext = {
-  state: { delegatedTurns: number };
-  client(): unknown;
 };
 
 export const nanocodex = actor({
@@ -250,32 +239,6 @@ function startPrompt(
   return { ...inFlight, replayed: false };
 }
 
-// AgentOS actors and ordinary Rivet Actors share one registry and actor-to-actor
-// client. This actor keeps AgentOS filesystem/process/session capabilities while
-// delegating model work to the lighter Nanocodex actor instead of nesting one
-// complete harness inside another ACP VM.
-export const nanocodexWorkspace = agentOS({
-  defaultSoftware: false,
-  software: [],
-  state: { delegatedTurns: 0 },
-  actions: {
-    nanocodex: {
-      prompt: async (
-        c: WorkspaceContext,
-        sessionKey: string,
-        request: PromptRequest,
-      ): Promise<TurnCompleted> => {
-        validateSessionKey(sessionKey);
-        const client = c.client() as InternalActorClient;
-        const peer = client.nanocodex.getOrCreate([sessionKey]);
-        const result = await peer.prompt(request);
-        c.state.delegatedTurns += 1;
-        return result;
-      },
-    },
-  },
-});
-
 async function runPrompt(
   context: SessionContext,
   request: PromptRequest,
@@ -382,7 +345,7 @@ async function createAgent(context: SessionContext): Promise<DefaultAgent> {
   const mode = modelAuthMode();
   const common = {
     apiBaseUrl: mode === "chatgpt" ? CHATGPT_API_BASE_URL : undefined,
-    instructions: "You are Nanocodex running as a durable Rivet Actor alongside AgentOS.",
+    instructions: "You are Nanocodex running as a durable Rivet Actor.",
     module: await wasmBytes,
     resume,
     sessionId: sessionUuid(context.actorId),
@@ -500,12 +463,6 @@ function validateInput(input: string): void {
   if (typeof input !== "string" || input.length === 0) throw userError("prompt input must be a non-empty string");
   if (Buffer.byteLength(input, "utf8") > MAX_PROMPT_BYTES) {
     throw userError("prompt input exceeds 1 MiB");
-  }
-}
-
-function validateSessionKey(key: string): void {
-  if (typeof key !== "string" || key.length === 0 || key.length > 128) {
-    throw userError("session key must be 1-128 characters");
   }
 }
 

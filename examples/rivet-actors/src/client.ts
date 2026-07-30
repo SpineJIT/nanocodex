@@ -1,4 +1,4 @@
-import { createClient } from "@rivet-dev/agentos/client";
+import { createClient } from "rivetkit/client";
 
 import type { registry } from "./registry.js";
 

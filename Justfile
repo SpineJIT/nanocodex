@@ -84,7 +84,7 @@ smoke-wasm-node: build-wasm
 build-react-example: build-wasm
     npm run build --prefix examples/react-vite
 
-# Type-check and test the Rivet Actors + AgentOS WASM consumer.
+# Type-check and test the Rivet Actors WASM consumer.
 build-rivet-example: build-wasm
     npm ci --prefix examples/rivet-actors
     npm run check --prefix examples/rivet-actors
