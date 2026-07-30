@@ -5,6 +5,7 @@ members = [
     "bin/nanousd-api",
     "crates/nanocodex",
     "crates/nanocodex-agent",
+    "crates/experimental/nanocodex-browser",
     "crates/experimental/nanocodex-vm",
     "crates/nanocodex-oai-api",
     "crates/nanocodex-observability",
@@ -42,6 +43,7 @@ arcbox-ext4 = "0.1.2"
 axum = { version = "0.8.9", default-features = false, features = ["form", "http1", "json", "query", "tokio"] }
 bm25 = { version = "2.3.2", default-features = false }
 chrono = { version = "0.4.43", default-features = false, features = ["clock", "std", "wasmbind"] }
+chromiumoxide = "0.9.1"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"] }
 criterion = { version = "0.7.0", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
@@ -62,6 +64,7 @@ krun = { package = "libkrun", version = "=2.0.0-dev", git = "https://github.com/
 mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "5caad442edeab796821b7f3bb009ab6945106e35", default-features = false }
 nanocodex = { version = "0.3.0", path = "crates/nanocodex" }
 nanocodex-agent = { version = "0.3.0", path = "crates/nanocodex-agent" }
+nanocodex-browser = { version = "0.3.0", path = "crates/experimental/nanocodex-browser" }
 nanocodex-vm = { version = "0.3.0", path = "crates/experimental/nanocodex-vm" }
 nanocodex-oai-api = { version = "0.3.0", path = "crates/nanocodex-oai-api" }
 nanocodex-observability = { version = "0.3.0", path = "crates/nanocodex-observability" }
@@ -83,6 +86,7 @@ opentelemetry = { version = "0.32", default-features = false, features = ["trace
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-client", "trace"] }
 opentelemetry-semantic-conventions = "0.32"
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["experimental_trace_batch_span_processor_with_async_runtime", "rt-tokio", "trace"] }
+percent-encoding = "2.3.2"
 pyo3 = "0.29.0"
 proc-macro-crate = "3"
 proc-macro2 = "1.0.106"
@@ -105,6 +109,7 @@ shlex = "2.0.1"
 simd-json = "=0.15.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 sonic-rs = "0.5.8"
+sourcemap = "9.3.2"
 syn = { version = "2.0.119", features = ["full"] }
 thiserror = "2.0.17"
 tempfile = "3.27.0"
@@ -123,6 +128,7 @@ unicode-segmentation = "1.13"
 unicode-width = "0.2"
 url = "2.5.7"
 uuid = { version = "1", features = ["js", "serde", "v5", "v7"] }
+v8-heap-parser = "1.1.0"
 vergen = { version = "8", default-features = false }
 wasm-bindgen = "0.2.105"
 wasm-bindgen-futures = "0.4.55"
