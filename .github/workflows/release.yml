@@ -107,7 +107,7 @@ jobs:
     name: build ${{ matrix.target }}
     needs: prepare-release
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
     strategy:
