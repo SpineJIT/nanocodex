@@ -47,6 +47,29 @@ test("subscription egress proxy is capability-gated and relays headers and frame
   }
 });
 
+test("an upstream rejection settles once and leaves the proxy alive", async () => {
+  const upstream = createServer((_request, response) => {
+    response.writeHead(403, { "content-type": "text/plain" });
+    response.end("denied");
+  });
+  upstream.on("upgrade", (_request, socket) => {
+    socket.end("HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndenied");
+  });
+  await listen(upstream);
+  const address = upstream.address();
+  assert(address && typeof address !== "string");
+  const proxy = await startSubscriptionEgressProxy({
+    upstreamUrl: `ws://127.0.0.1:${address.port}/responses`,
+  });
+  try {
+    assert.equal(await rejected(proxy.url), 403);
+    assert.equal(await rejected(proxy.url.replace(/\/v1\/[^/]+$/, "/wrong")), 404);
+  } finally {
+    await proxy.close();
+    await new Promise((resolve, reject) => upstream.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 function listen(server) {
   return new Promise((resolve, reject) => {
     server.once("error", reject);

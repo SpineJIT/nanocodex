@@ -17,6 +17,7 @@
     "dev:subscription": "node scripts/dev-subscription.mjs",
     "fanout": "node scripts/fanout.mjs",
     "mock:openai": "node scripts/mock-openai.mjs",
+    "relay:subscription": "node scripts/subscription-egress-relay.mjs",
     "repl": "node scripts/repl.mjs",
     "smoke": "node scripts/live-smoke.mjs",
     "soak": "node scripts/soak.mjs",

@@ -4,17 +4,20 @@ import WebSocket from "ws";
 const baseUrl = process.env.NANOCODEX_WORKER_URL ?? "http://127.0.0.1:8787";
 const adminToken = process.env.NANOCODEX_ADMIN_TOKEN ?? "local-admin-token";
 const terminalTimeoutMs = Number(process.env.NANOCODEX_SMOKE_TIMEOUT_MS ?? 180_000);
+const idleTimeoutMs = Number(process.env.NANOCODEX_SMOKE_IDLE_TIMEOUT_MS ?? 45_000);
+let currentStage = "create-session";
 
 const session = await createSession();
-const socket = new WebSocket(session.websocket_url);
+progress("session-created");
 const agentEvents = [];
-const inbox = createInbox(socket, (message) => {
-  if (message.type === "event") agentEvents.push(message.event);
-});
+let { socket, inbox } = connectClient();
 
 try {
+  currentStage = "websocket-ready";
   await inbox.next((message) => message.type === "ready", 10_000);
+  progress("websocket-ready");
 
+  currentStage = "first-turn";
   const firstId = randomUUID();
   const firstStarted = performance.now();
   socket.send(JSON.stringify({
@@ -28,24 +31,41 @@ try {
     input: "This in-flight duplicate must not reach the model.",
   }));
   const first = await terminal(inbox, firstId, terminalTimeoutMs);
+  progress("first-turn-completed");
   const firstMs = performance.now() - firstStarted;
   if (!String(first.final_message).includes("EDGE_OK")) {
     throw new Error(`first turn returned an unexpected answer: ${first.final_message}`);
   }
 
+  currentStage = "terminal-replay";
   socket.send(JSON.stringify({ type: "prompt", id: firstId, input: "must not run" }));
   const replay = await terminal(inbox, firstId, 10_000);
   if (replay.final_message !== first.final_message) {
     throw new Error("completed turn replay changed its terminal result");
   }
+  progress("terminal-replay-verified");
 
+  currentStage = "client-detach";
+  inbox.close();
+  await disconnect(socket);
+  progress("client-detached");
+
+  currentStage = "idle-unload";
   const idleStarted = performance.now();
   const idleState = await pollState(
     (state) => state.completed_turns === 1 && state.agent_loaded === false,
-    20_000,
+    idleTimeoutMs,
   );
   const idleShutdownMs = performance.now() - idleStarted;
+  progress("idle-unload-verified");
 
+  currentStage = "client-reconnect";
+  ({ socket, inbox } = connectClient());
+  const resumed = await inbox.next((message) => message.type === "ready", 10_000);
+  if (resumed.restored !== true) throw new Error("reconnected session was not restored from a snapshot");
+  progress("client-reconnected");
+
+  currentStage = "restored-turn";
   const secondId = randomUUID();
   const secondStarted = performance.now();
   socket.send(JSON.stringify({
@@ -54,11 +74,13 @@ try {
     input: "What exact token did I ask you to return previously? Reply with only that token.",
   }));
   const second = await terminal(inbox, secondId, terminalTimeoutMs);
+  progress("restored-turn-completed");
   const restoreMs = performance.now() - secondStarted;
   if (!String(second.final_message).includes("EDGE_OK")) {
     throw new Error(`restored turn lost conversation history: ${second.final_message}`);
   }
 
+  currentStage = "tool-turn";
   const toolId = randomUUID();
   socket.send(JSON.stringify({
     type: "prompt",
@@ -66,6 +88,7 @@ try {
     input: "You must call runtimeInfo exactly once. Then reply with only the runtime value returned by that tool.",
   }));
   const toolTurn = await terminal(inbox, toolId, terminalTimeoutMs);
+  progress("tool-turn-completed");
   if (!String(toolTurn.final_message).includes("cloudflare-durable-object")) {
     throw new Error(`runtimeInfo tool returned an unexpected answer: ${toolTurn.final_message}`);
   }
@@ -95,10 +118,31 @@ try {
     ...(authStatus === undefined ? {} : { auth_revision: authStatus.revision }),
     status: "ok",
   }));
+} catch (error) {
+  const diagnosticState = await state().catch((stateError) => ({ error: errorMessage(stateError) }));
+  const eventTypes = Object.entries(Object.groupBy(agentEvents, (event) => event.type))
+    .map(([type, events]) => [type, events.length]);
+  console.error(JSON.stringify({
+    stage: currentStage,
+    error: errorMessage(error),
+    state: diagnosticState,
+    event_types: Object.fromEntries(eventTypes),
+    last_event: agentEvents.at(-1)?.type,
+  }));
+  throw error;
 } finally {
   inbox.close();
   socket.close(1000, "smoke complete");
   await fetch(`${baseUrl}/sessions/${session.session_id}`, { method: "DELETE" }).catch(() => {});
+}
+
+function progress(stage) {
+  currentStage = stage;
+  process.stderr.write(`[smoke] ${stage}\n`);
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function createSession() {
@@ -112,7 +156,12 @@ async function createSession() {
 
 async function state() {
   const response = await fetch(`${baseUrl}/sessions/${session.session_id}`);
-  if (!response.ok) throw new Error(`state failed with HTTP ${response.status}: ${await response.text()}`);
+  if (!response.ok) {
+    throw Object.assign(
+      new Error(`state failed with HTTP ${response.status}: ${await response.text()}`),
+      { status: response.status },
+    );
+  }
   return response.json();
 }
 
@@ -126,12 +175,45 @@ async function subscriptionStatus() {
 
 async function pollState(predicate, timeoutMs) {
   const deadline = performance.now() + timeoutMs;
+  let lastError;
   while (performance.now() < deadline) {
-    const current = await state();
-    if (predicate(current)) return current;
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    try {
+      const current = await state();
+      if (predicate(current)) return current;
+      lastError = undefined;
+    } catch (error) {
+      if (Number(error?.status) < 500) throw error;
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  throw new Error(`state did not reach the expected condition within ${timeoutMs}ms`);
+  throw new Error(
+    `state did not reach the expected condition within ${timeoutMs}ms` +
+      (lastError ? `: ${errorMessage(lastError)}` : ""),
+  );
+}
+
+function connectClient() {
+  const socket = new WebSocket(session.websocket_url);
+  const inbox = createInbox(socket, (message) => {
+    if (message.type === "event") agentEvents.push(message.event);
+  });
+  return { socket, inbox };
+}
+
+function disconnect(socket) {
+  if (socket.readyState === WebSocket.CLOSED) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      socket.terminate();
+      resolve();
+    }, 2_000);
+    socket.once("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    socket.close(1000, "smoke detach");
+  });
 }
 
 async function terminal(inbox, id, timeoutMs) {

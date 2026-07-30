@@ -605,6 +605,10 @@ async function upgradeOpenAiWebSocket(
     }
     throw error;
   }
+  // Workers compatibility dates on or after 2026-03-17 deliver binary
+  // WebSocket frames as Blob by default. The WASM host accepts text and
+  // ArrayBuffer frames, so pin the stable representation before accept().
+  socket.binaryType = "arraybuffer";
   socket.accept();
   return {
     socket,

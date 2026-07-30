@@ -29,6 +29,7 @@ export async function startSubscriptionEgressProxy(options = {}) {
     response.end("not found\n");
   });
   const websocketServer = new WebSocketServer({ noServer: true, maxPayload: MAX_BUFFERED_BYTES });
+  const emit = (type, detail = {}) => options.onEvent?.({ type, ...detail });
 
   server.on("connection", (socket) => {
     sockets.add(socket);
@@ -43,12 +44,14 @@ export async function startSubscriptionEgressProxy(options = {}) {
       return;
     }
     if (pathname !== path) {
+      emit("client.rejected", { status: 404 });
       rejectUpgrade(socket, 404, "not found");
       return;
     }
 
     const authorization = request.headers.authorization;
     if (typeof authorization !== "string" || !authorization.startsWith("Bearer ")) {
+      emit("client.rejected", { status: 401 });
       rejectUpgrade(socket, 401, "missing authorization");
       return;
     }
@@ -59,19 +62,32 @@ export async function startSubscriptionEgressProxy(options = {}) {
       maxPayload: MAX_BUFFERED_BYTES,
     });
     let upgraded = false;
+    let settled = false;
     upstream.once("open", () => {
+      if (settled || socket.destroyed) {
+        upstream.terminate();
+        return;
+      }
+      settled = true;
+      emit("upstream.open");
       websocketServer.handleUpgrade(request, socket, head, (client) => {
         upgraded = true;
-        bridge(client, upstream);
+        emit("client.open");
+        bridge(client, upstream, emit);
       });
     });
     upstream.once("unexpected-response", (_upstreamRequest, response) => {
-      if (upgraded || socket.destroyed) return;
+      if (settled || socket.destroyed) return;
+      settled = true;
+      emit("upstream.rejected", { status: response.statusCode ?? 502 });
       rejectUpgrade(socket, response.statusCode ?? 502, "upstream WebSocket rejected");
       upstream.terminate();
     });
     upstream.once("error", () => {
-      if (!upgraded && !socket.destroyed) rejectUpgrade(socket, 502, "upstream WebSocket failed");
+      if (settled || socket.destroyed) return;
+      settled = true;
+      emit("upstream.error");
+      rejectUpgrade(socket, 502, "upstream WebSocket failed");
     });
     socket.once("close", () => {
       if (!upgraded && upstream.readyState !== WebSocket.CLOSED) upstream.terminate();
@@ -105,7 +121,7 @@ function forwardedHeaders(source) {
   return headers;
 }
 
-function bridge(left, right) {
+function bridge(left, right, emit) {
   let closed = false;
   const relay = (source, destination) => (data, isBinary) => {
     if (closed || destination.readyState !== WebSocket.OPEN) return;
@@ -125,14 +141,26 @@ function bridge(left, right) {
   };
   left.on("message", relay(left, right));
   right.on("message", relay(right, left));
-  left.once("close", (code, reason) => closePeer(right, code, reason));
-  right.once("close", (code, reason) => closePeer(left, code, reason));
-  left.once("error", () => right.terminate());
-  right.once("error", () => left.terminate());
+  left.once("close", (code) => {
+    emit("client.close", { code });
+    closePeer(right, code);
+  });
+  right.once("close", (code) => {
+    emit("upstream.close", { code });
+    closePeer(left, code);
+  });
+  left.once("error", () => {
+    emit("client.error");
+    right.terminate();
+  });
+  right.once("error", () => {
+    emit("upstream.error");
+    left.terminate();
+  });
 }
 
-function closePeer(peer, code, reason) {
-  if (peer.readyState === WebSocket.OPEN) peer.close(safeCloseCode(code), reason.toString().slice(0, 120));
+function closePeer(peer, code) {
+  if (peer.readyState === WebSocket.OPEN) peer.close(safeCloseCode(code), "relay peer closed");
   else if (peer.readyState === WebSocket.CONNECTING) peer.terminate();
 }
 
@@ -142,7 +170,9 @@ function safeCloseCode(code) {
 }
 
 function rejectUpgrade(socket, status, message) {
+  if (socket.destroyed || socket.writableEnded) return;
   const body = `${message}\n`;
+  socket.once("error", () => {});
   socket.end(
     `HTTP/1.1 ${status} ${message}\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`,
   );

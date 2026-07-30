@@ -17,6 +17,10 @@ const temporaryDirectory = await mkdtemp(join(tmpdir(), "nanocodex-cloudflare-su
 const envPath = join(temporaryDirectory, "subscription.env");
 const egress = await startSubscriptionEgressProxy({
   upstreamUrl: process.env.OPENAI_WEBSOCKET_URL,
+  onEvent: ({ type, status, code }) => {
+    const detail = status === undefined ? (code === undefined ? "" : ` code=${code}`) : ` status=${status}`;
+    process.stderr.write(`[subscription-egress] ${type}${detail}\n`);
+  },
 });
 
 await writeFile(envPath, [
@@ -51,7 +55,7 @@ try {
   await resetStoredCredential(child);
   process.stderr.write(
     `Using the Codex subscription login at ${authPath}; its refresh token is not used or copied.\n` +
-    "Local model egress uses a capability-protected loopback bridge; deployed Workers connect directly.\n",
+    "Model egress uses a capability-protected loopback bridge.\n",
   );
   const [code, signal] = await childExit;
   process.exitCode = code ?? signalExitCode(signal ?? parentSignal);

@@ -70,13 +70,11 @@ any credential retained by an older run before accepting the new login.
 `GET /auth/chatgpt` reports non-secret status and `DELETE /auth/chatgpt` clears
 the durable copy; both routes require the admin bearer token.
 
-Local workerd's outbound TLS/WebSocket fingerprint can be rejected by
-`chatgpt.com` even when the same subscription succeeds in Codex and from a
-deployed Worker. `dev:subscription` therefore starts a random-capability,
-loopback-only WebSocket bridge for model egress. The bridge forwards bounded
-frames and only the explicit Codex handshake headers; it does not read the
-Codex auth file or persist credentials. Deployed Workers do not use this local
-bridge and connect directly from Cloudflare's edge.
+`chatgpt.com` can reject serverless-provider egress even when the same
+subscription succeeds in Codex. `dev:subscription` therefore starts a
+random-capability, loopback-only WebSocket bridge for model egress. The bridge
+forwards bounded frames and only the explicit Codex handshake headers; it does
+not read the Codex auth file or persist credentials.
 
 Start workerd in one terminal and run the live probes in another:
 
@@ -103,9 +101,10 @@ inference. If the Worker process itself dies before a turn commits, reopening
 the REPL resubmits the same turn from the last committed snapshot; a partial
 provider response cannot be resumed.
 
-The smoke performs real model turns, verifies duplicate suppression and a
-completed `runtimeInfo` tool call/result pair, waits for idle teardown, then
-proves that a follow-on remembers history after the agent is reconstructed.
+The smoke performs real model turns, verifies duplicate suppression, detaches
+its client, waits for idle teardown, reconnects to the durable snapshot, proves
+that a follow-on remembers history, and requires a completed `runtimeInfo` tool
+call/result pair.
 `stress` drives ping round trips through one object, `soak`
 checks parallel sessions for cross-session leakage and duplicate model calls,
 and `fanout` broadcasts a bursty model stream to 64 attached clients. Override
@@ -135,6 +134,31 @@ npx wrangler secret put CHATGPT_ACCOUNT_ID
 npx wrangler secret put NANOCODEX_ADMIN_TOKEN
 npx wrangler deploy
 ```
+
+At the time this example was validated, the ChatGPT edge rejected direct
+Cloudflare Worker egress with HTTP 403. That is an upstream egress-policy
+boundary, not a WASM or Durable Object failure. A deployed subscription demo
+therefore needs a non-Cloudflare WebSocket relay. Run the included bounded,
+capability-gated relay on such a host:
+
+```sh
+NANOCODEX_EGRESS_PORT=8791 \
+  npm run relay:subscription --prefix examples/cloudflare-workers
+```
+
+Expose port 8791 with TLS, preserve the printed `/v1/<capability>` path, and set
+the complete public `wss://` URL as `OPENAI_WEBSOCKET_URL` before deployment.
+For a disposable personal demo, a Cloudflare Quick Tunnel can expose the local
+port; use a stable relay under your control for anything long-lived. The relay
+still requires the Worker's bearer credential in addition to the unguessable
+path, never reads `auth.json`, bounds queued data, and forwards only the
+allowlisted handshake headers. Rotate the route by restarting it.
+
+The real edge validation for this example used only the current subscription
+access token and account ID—no API key and no refresh token—and completed three
+turns across client detach, object unload, snapshot restore, and a hosted tool
+call. That access-token-only deployment naturally stops authenticating when the
+token expires. Configure a dedicated refresh token only for a long-lived demo.
 
 For a long-lived deployment, the singleton auth Durable Object stores the
 dedicated credential in SQLite, refreshes it five minutes before expiry, and
