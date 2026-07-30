@@ -4703,6 +4703,7 @@ dependencies = [
  "futures-util",
  "http",
  "nanocodex",
+ "nanocodex-browser",
  "nanocodex-vm",
  "reflink-copy",
  "reqwest",

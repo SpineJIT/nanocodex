@@ -232,6 +232,11 @@ async fn code_mode_description_exposes_browser_action_schema() -> Result<()> {
         .first()
         .map(nanocodex_tools::ToolDefinition::description)
         .ok_or_else(|| eyre!("missing Code Mode tool definition"))?;
+    assert!(
+        description.len() <= 128 * 1024,
+        "browser Code Mode description grew to {} bytes",
+        description.len()
+    );
 
     assert!(description.contains("await tools.browser"));
     assert!(description.contains("declare const tools: { browser("));
