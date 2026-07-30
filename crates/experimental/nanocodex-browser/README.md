@@ -11,7 +11,7 @@ browser concerns with `nanocodex-vm`; it does not own a second VM runtime.
 The primary consumer is a Nanocodex agent. `BrowserTool` is caller-owned and is
 not installed by default:
 
-```no_run
+```rust,ignore
 use nanocodex::{Nanocodex, OpenAi, Tools};
 use nanocodex_browser::BrowserTool;
 
