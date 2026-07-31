@@ -24,7 +24,8 @@ pub mod session;
 pub mod usage;
 
 pub use agent::{
-    AgentHandle, Nanocodex, NanocodexBuilder, PromptRoute, Turn, TurnControl, TurnResult,
+    AgentHandle, AgentSessionContext, Nanocodex, NanocodexBuilder, PromptRoute, Turn, TurnControl,
+    TurnResult,
 };
 pub use error::{NanocodexError, Result};
 pub use nanocodex_oai_api::{

@@ -201,8 +201,8 @@ impl Nanocodex {
     /// [`PromptRoute::Steered`] is returned. Otherwise the prompt starts a new
     /// turn and is returned as [`PromptRoute::Started`].
     ///
-    /// This is intended for live input adapters such as voice sessions. Normal
-    /// queued request/response consumers should continue to use [`Self::prompt`].
+    /// This is intended for live input adapters. Normal queued request/response
+    /// consumers should continue to use [`Self::prompt`].
     ///
     /// # Errors
     ///
@@ -319,6 +319,33 @@ impl Nanocodex {
         let parent = tracing::Span::current();
         let parent = (!parent.is_disabled()).then_some(parent);
         request_command(&self.commands, |result| Command::Compact { parent, result }).await
+    }
+
+    /// Appends adapter-owned developer context at the next safe model boundary.
+    ///
+    /// The returned read-only view is captured from the latest safe boundary
+    /// and is suitable for building adapter bootstrap context. If a turn is
+    /// active, the message is retained immediately and becomes model-visible
+    /// before the next turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty text or after the agent driver has stopped.
+    pub async fn append_developer_message(
+        &self,
+        text: impl Into<String>,
+    ) -> Result<AgentSessionContext> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(NanocodexError::InvalidRequest(
+                "developer message must not be empty".to_owned(),
+            ));
+        }
+        request_command(&self.commands, |result| Command::AppendDeveloperMessage {
+            text,
+            result,
+        })
+        .await
     }
 
     /// Starts a clean sibling agent with the same private configuration,

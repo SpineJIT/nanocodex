@@ -17,10 +17,10 @@ pub struct Turn {
 
 /// Outcome of routing live user input into an agent session.
 ///
-/// Live consumers such as voice interfaces normally want to steer the current
-/// regular turn when one exists and start a new turn only when the agent is
-/// idle. [`Nanocodex::route_prompt`](crate::Nanocodex::route_prompt) performs
-/// that decision atomically in the agent driver and returns this outcome.
+/// Live input adapters normally want to steer the current regular turn when
+/// one exists and start a new turn only when the agent is idle.
+/// [`Nanocodex::route_prompt`](crate::Nanocodex::route_prompt) performs that
+/// decision atomically in the agent driver and returns this outcome.
 pub enum PromptRoute {
     /// The agent was idle, so the prompt started a new independently awaitable turn.
     Started(Turn),
@@ -233,6 +233,10 @@ pub(super) enum Command {
     Compact {
         parent: Option<tracing::Span>,
         result: oneshot::Sender<Result<()>>,
+    },
+    AppendDeveloperMessage {
+        text: String,
+        result: oneshot::Sender<Result<AgentSessionContext>>,
     },
     Shutdown,
 }

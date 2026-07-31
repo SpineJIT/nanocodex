@@ -11,12 +11,16 @@ use opusic_c::{
 };
 use reqwest::{Client, StatusCode, header::LOCATION};
 use serde::Serialize;
-use tokio::{sync::mpsc, time::timeout};
+use serde_json::{Value, json};
+use tokio::{
+    sync::mpsc,
+    time::{sleep, timeout},
+};
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest,
     http::{HeaderValue, header},
 };
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use url::Url;
 use webrtc::{
     api::{
@@ -37,7 +41,7 @@ use webrtc::{
 
 use super::{
     CONNECT_TIMEOUT, EVENT_CAPACITY, RealtimeAudio, RealtimeError, RealtimeInitialItem,
-    RealtimeVoice, Socket, map_websocket_error,
+    RealtimeVersion, RealtimeVoice, Socket, map_websocket_error,
 };
 use crate::{OpenAiAuth, OpenAiAuthSnapshot, connector::connect_async};
 
@@ -91,6 +95,7 @@ pub(super) struct ConnectConfig<'a> {
     pub(super) voice: RealtimeVoice,
     pub(super) session_id: Option<&'a str>,
     pub(super) initial_items: &'a [RealtimeInitialItem],
+    pub(super) version: RealtimeVersion,
 }
 
 pub(super) async fn connect(config: ConnectConfig<'_>) -> Result<WebRtcConnection, RealtimeError> {
@@ -111,21 +116,98 @@ pub(super) async fn connect(config: ConnectConfig<'_>) -> Result<WebRtcConnectio
     .map_err(|error| RealtimeError::WebRtc(error.to_string()))?;
     debug!(call_id = %call.id, "applied GPT Realtime WebRTC answer");
 
-    let endpoint = sideband_endpoint(config.websocket_url, &call.id)?;
+    let (mut socket, response) = connect_sideband(&config, &auth, &call.id).await?;
+    debug!(
+        status = response.status().as_u16(),
+        "connected GPT Realtime WebRTC sideband"
+    );
+    if config.version == RealtimeVersion::V1 {
+        let update = json!({
+            "type": "session.update",
+            "session": {
+                "type": "quicksilver",
+                "instructions": config.instructions,
+                "audio": {
+                    "input": {
+                        "format": { "type": "audio/pcm", "rate": super::REALTIME_SAMPLE_RATE }
+                    },
+                    "output": { "voice": config.voice.as_str() }
+                }
+            }
+        });
+        super::send_json(&mut socket, &update).await?;
+    }
+    Ok(WebRtcConnection {
+        socket,
+        media: WebRtcMedia {
+            peer: offer.peer,
+            input: offer.input,
+            audio: offer.audio,
+        },
+    })
+}
+
+async fn connect_sideband(
+    config: &ConnectConfig<'_>,
+    auth: &OpenAiAuthSnapshot,
+    call_id: &str,
+) -> Result<
+    (
+        Socket,
+        tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
+    ),
+    RealtimeError,
+> {
+    let endpoint = sideband_endpoint(config.websocket_url, call_id)?;
     debug!(url = %endpoint, "connecting GPT Realtime WebRTC sideband");
+    let mut last_error = None;
+    for attempt in 0..=3_u32 {
+        let connect_started = tokio::time::Instant::now();
+        let request = sideband_request(config, auth, &endpoint)?;
+        match timeout(CONNECT_TIMEOUT, connect_async(request)).await {
+            Ok(Ok((socket, response))) => {
+                debug!(
+                    attempt,
+                    elapsed_ms = connect_started.elapsed().as_millis(),
+                    "joined GPT Realtime WebRTC sideband"
+                );
+                return Ok((socket, response));
+            }
+            Ok(Err(error)) => last_error = Some(map_websocket_error(error)),
+            Err(_) => last_error = Some(RealtimeError::ConnectTimeout),
+        }
+        if attempt < 3 {
+            let delay = Duration::from_millis(100_u64.saturating_mul(1_u64 << attempt));
+            warn!(
+                attempt,
+                delay_ms = delay.as_millis(),
+                "retrying GPT Realtime sideband join"
+            );
+            sleep(delay).await;
+        }
+    }
+    Err(last_error.unwrap_or(RealtimeError::ConnectTimeout))
+}
+
+fn sideband_request(
+    config: &ConnectConfig<'_>,
+    auth: &OpenAiAuthSnapshot,
+    endpoint: &Url,
+) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, RealtimeError> {
     let mut request = endpoint
         .as_str()
         .into_client_request()
         .map_err(|error| RealtimeError::InvalidUrl(error.to_string()))?;
-    add_auth_headers(request.headers_mut(), &auth)?;
+    add_auth_headers(request.headers_mut(), auth)?;
     request.headers_mut().insert(
         "x-oai-attestation",
         HeaderValue::from_str(config.attestation_header.unwrap_or(ATTESTATION_UNAVAILABLE))
             .map_err(|error| RealtimeError::InvalidAuthorization(error.to_string()))?,
     );
-    request
-        .headers_mut()
-        .insert("openai-alpha", HeaderValue::from_static("quicksilver=v2"));
+    request.headers_mut().insert(
+        "openai-alpha",
+        HeaderValue::from_static(alpha_header(config.version)),
+    );
     request.headers_mut().insert(
         header::USER_AGENT,
         HeaderValue::from_static(concat!("nanocodex/", env!("CARGO_PKG_VERSION"))),
@@ -141,24 +223,7 @@ pub(super) async fn connect(config: ConnectConfig<'_>) -> Result<WebRtcConnectio
         request.headers_mut().insert("thread-id", value);
     }
 
-    let connect_started = tokio::time::Instant::now();
-    let (socket, response) = timeout(CONNECT_TIMEOUT, connect_async(request))
-        .await
-        .map_err(|_| RealtimeError::ConnectTimeout)?
-        .map_err(map_websocket_error)?;
-    debug!(
-        status = response.status().as_u16(),
-        elapsed_ms = connect_started.elapsed().as_millis(),
-        "connected GPT Realtime WebRTC sideband"
-    );
-    Ok(WebRtcConnection {
-        socket,
-        media: WebRtcMedia {
-            peer: offer.peer,
-            input: offer.input,
-            audio: offer.audio,
-        },
-    })
+    Ok(request)
 }
 
 fn ensure_rustls_crypto_provider() {
@@ -465,53 +530,63 @@ fn spawn_microphone_encoder(
 #[derive(Serialize)]
 struct CallRequest<'a> {
     sdp: &'a str,
-    session: CallSession<'a>,
-}
-
-#[derive(Serialize)]
-struct CallSession<'a> {
-    model: &'a str,
-    instructions: &'a str,
-    audio: CallAudio<'a>,
-    delegation: CallDelegation,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    initial_items: Vec<CallInitialItem<'a>>,
-}
-
-#[derive(Serialize)]
-struct CallInitialItem<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    role: &'static str,
-    content: [CallInitialText<'a>; 1],
-}
-
-#[derive(Serialize)]
-struct CallInitialText<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    text: &'a str,
-}
-
-#[derive(Serialize)]
-struct CallAudio<'a> {
-    output: CallAudioOutput<'a>,
-}
-
-#[derive(Serialize)]
-struct CallAudioOutput<'a> {
-    voice: &'a str,
-}
-
-#[derive(Serialize)]
-struct CallDelegation {
-    #[serde(rename = "type")]
-    kind: &'static str,
+    session: Value,
 }
 
 struct CallResponse {
     sdp: String,
     id: String,
+}
+
+fn call_session(config: &ConnectConfig<'_>) -> Value {
+    match config.version {
+        RealtimeVersion::V1 => json!({
+            "type": "quicksilver",
+            "model": config.model,
+            "instructions": config.instructions,
+            "audio": {
+                "input": {
+                    "format": { "type": "audio/pcm", "rate": super::REALTIME_SAMPLE_RATE }
+                },
+                "output": { "voice": config.voice.as_str() }
+            }
+        }),
+        RealtimeVersion::V2 => unreachable!("realtime v2 does not support AVAS WebRTC"),
+        RealtimeVersion::V3 => {
+            let initial_items = config
+                .initial_items
+                .iter()
+                .map(|item| {
+                    json!({
+                        "type": "message",
+                        "role": item.role.as_str(),
+                        "content": [{
+                            "type": item.role.content_type(),
+                            "text": item.text,
+                        }],
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut session = json!({
+                "model": config.model,
+                "instructions": config.instructions,
+                "audio": { "output": { "voice": config.voice.as_str() } },
+                "delegation": { "type": "client" },
+            });
+            if !initial_items.is_empty() {
+                session["initial_items"] = Value::Array(initial_items);
+            }
+            session
+        }
+    }
+}
+
+const fn alpha_header(version: RealtimeVersion) -> &'static str {
+    match version {
+        RealtimeVersion::V1 => "quicksilver=v1",
+        RealtimeVersion::V2 => "",
+        RealtimeVersion::V3 => "quicksilver=v2",
+    }
 }
 
 async fn create_call_with_auth_recovery(
@@ -557,33 +632,12 @@ async fn create_call(
     let endpoint = call_endpoint(config.api_base_url).map_err(CallAttemptError::Other)?;
     let request = CallRequest {
         sdp: offer,
-        session: CallSession {
-            model: config.model,
-            instructions: config.instructions,
-            audio: CallAudio {
-                output: CallAudioOutput {
-                    voice: config.voice.as_str(),
-                },
-            },
-            delegation: CallDelegation { kind: "client" },
-            initial_items: config
-                .initial_items
-                .iter()
-                .map(|item| CallInitialItem {
-                    kind: "message",
-                    role: item.role.as_str(),
-                    content: [CallInitialText {
-                        kind: item.role.content_type(),
-                        text: &item.text,
-                    }],
-                })
-                .collect(),
-        },
+        session: call_session(config),
     };
     let mut builder = realtime_http_client()
         .post(endpoint)
         .bearer_auth(auth.bearer())
-        .header("openai-alpha", "quicksilver=v2")
+        .header("openai-alpha", alpha_header(config.version))
         .header("originator", "nanocodex")
         .header(
             "x-oai-attestation",
@@ -765,7 +819,7 @@ mod tests {
     };
     use crate::{
         OpenAiAuth, OpenAiAuthMode, OpenAiAuthSnapshot,
-        realtime::{RealtimeInitialItem, RealtimeTextRole, RealtimeVoice},
+        realtime::{RealtimeInitialItem, RealtimeTextRole, RealtimeVersion, RealtimeVoice},
     };
 
     #[test]
@@ -938,6 +992,7 @@ mod tests {
             voice: RealtimeVoice::Cove,
             session_id: Some("session-1"),
             initial_items: &initial_items,
+            version: RealtimeVersion::V3,
         };
         let snapshot = OpenAiAuthSnapshot::new(
             OpenAiAuthMode::ChatGpt,
