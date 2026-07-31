@@ -31,11 +31,16 @@ type NanocodexClient = ReturnType<typeof makeClient>;
 type Session = ReturnType<NanocodexClient["nanocodex"]["getOrCreate"]>;
 type Connection = ReturnType<Session["connect"]>;
 
+const requestedEndpoint = new URLSearchParams(location.search).get("endpoint")?.trim();
+const defaultEndpoint = requestedEndpoint || (location.hostname === "127.0.0.1" || location.hostname === "localhost"
+  ? "http://127.0.0.1:6420"
+  : `${location.origin}/api/rivet`);
 let state = loadState() ?? {
-  endpoint: "http://127.0.0.1:6420",
+  endpoint: defaultEndpoint,
   actorKey: crypto.randomUUID(),
   messages: [],
 };
+if (requestedEndpoint) state.endpoint = requestedEndpoint;
 let client: NanocodexClient | undefined;
 let connection: Connection | undefined;
 let generation = 0;
@@ -51,7 +56,7 @@ ui.connect.addEventListener("click", () => void connect());
 ui.newActor.addEventListener("click", () => {
   void detach();
   state = {
-    endpoint: ui.endpoint.value.trim() || "http://127.0.0.1:6420",
+    endpoint: ui.endpoint.value.trim() || defaultEndpoint,
     actorKey: crypto.randomUUID(),
     messages: [],
   };

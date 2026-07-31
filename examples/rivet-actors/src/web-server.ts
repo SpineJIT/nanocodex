@@ -27,7 +27,7 @@ export async function startWebClient(options: { host?: string; port?: number } =
         "cache-control": "no-store",
         "content-security-policy": "default-src 'none'; connect-src http: https: ws: wss:; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
       }, request.method === "HEAD");
-    } else if (pathname === "/app.js") {
+    } else if (pathname === "/app.js" || pathname === "/dist/app.js") {
       send(response, 200, "text/javascript; charset=utf-8", script, {
         "cache-control": "public, max-age=3600",
       }, request.method === "HEAD");
