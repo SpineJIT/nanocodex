@@ -9,6 +9,8 @@ being exercised and revised:
   plus retained guest-backed workspace tools.
 - [`nanocodex-browser`](nanocodex-browser/README.md): deterministic browser
   control, diagnostics, artifacts, and headed-browser VM composition.
+- [`nanocodex-egress`](nanocodex-egress/README.md): authenticated loopback
+  HTTP(S) forwarding and application-owned outbound middleware composition.
 
 Experimental means API stability, not reduced engineering standards. These
 packages remain workspace members and must pass the normal formatting, Clippy,

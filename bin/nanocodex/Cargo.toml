@@ -20,9 +20,8 @@ default = []
 # Keep paid-provider composition out of the direct-agent development graph.
 tempo = [
     "dep:alloy-primitives",
-    "dep:http-body-util",
-    "dep:hudsucker",
     "dep:mpp",
+    "dep:nanocodex-egress",
     "dep:nanousd",
     "dep:nix",
     "dep:rand",
@@ -41,8 +40,6 @@ eyre.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
 hex.workspace = true
-http-body-util = { workspace = true, optional = true }
-hudsucker = { workspace = true, optional = true }
 image.workspace = true
 nanocodex.workspace = true
 nanocodex-browser.workspace = true
@@ -51,7 +48,8 @@ nanocodex-voice.workspace = true
 nix = { workspace = true, optional = true }
 nanousd = { workspace = true, optional = true }
 pulldown-cmark.workspace = true
-mpp = { workspace = true, optional = true, features = ["client", "tempo", "reqwest-rustls-tls-no-provider"] }
+mpp = { workspace = true, optional = true, features = ["middleware", "tempo", "reqwest-rustls-tls-no-provider"] }
+nanocodex-egress = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 ratatui.workspace = true
 ratatex.workspace = true

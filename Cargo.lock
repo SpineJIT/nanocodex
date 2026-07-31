@@ -4916,13 +4916,16 @@ version = "0.11.0"
 source = "git+https://github.com/gakonst/mpp-rs?rev=b1a7088bc05da933923220e29028ff75dbcb1ea4#b1a7088bc05da933923220e29028ff75dbcb1ea4"
 dependencies = [
  "alloy",
+ "anyhow",
  "async-trait",
  "base64",
  "hex",
  "hmac 0.13.0",
+ "http",
  "p256",
  "rand 0.10.2",
  "reqwest",
+ "reqwest-middleware",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
@@ -5013,12 +5016,11 @@ dependencies = [
  "fs2",
  "futures-util",
  "hex",
- "http-body-util",
- "hudsucker",
  "image",
  "mpp",
  "nanocodex",
  "nanocodex-browser",
+ "nanocodex-egress",
  "nanocodex-observability",
  "nanocodex-tools",
  "nanocodex-vm",
@@ -5081,6 +5083,27 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "v8-heap-parser",
+]
+
+[[package]]
+name = "nanocodex-egress"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "criterion",
+ "futures-util",
+ "http",
+ "http-body-util",
+ "hudsucker",
+ "rand 0.9.5",
+ "reqwest",
+ "reqwest-middleware",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -7087,6 +7110,20 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+]
+
+[[package]]
+name = "reqwest-middleware"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07bc3f1384cffa4f274dad2d4ddd73aed32fed8f786d96c6be8aa4e5fd3c3b58"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "http",
+ "reqwest",
+ "thiserror 2.0.18",
+ "tower-service",
 ]
 
 [[package]]

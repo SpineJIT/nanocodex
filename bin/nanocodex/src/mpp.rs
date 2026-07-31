@@ -3,7 +3,7 @@ use std::path::PathBuf;
 mod egress;
 mod resource;
 
-use self::egress::{EgressPolicy, MppEgress};
+use self::egress::TempoEgress;
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Context, Result, eyre};
 use mpp::{
@@ -15,6 +15,7 @@ use mpp::{
         methods::tempo::{INTENT_CHARGE, METHOD_NAME},
     },
 };
+use nanocodex_egress::EgressProxy;
 use nanousd::{NANOUSD_ADDRESS, TEMPO_MAINNET_CHAIN_ID};
 
 const DEFAULT_MPP_API_BASE_URL: &str = "https://openai.mpp.tempo.xyz/v1";
@@ -115,7 +116,9 @@ impl MppArgs {
             provider,
             max_charge: self.egress_max_charge,
         };
-        let egress = MppEgress::start(provider, EgressPolicy::default())
+        let egress = EgressProxy::builder()
+            .layer(TempoEgress::new(provider))
+            .spawn()
             .await
             .wrap_err("failed to start the embedded MPP egress proxy")?;
 
@@ -206,7 +209,7 @@ fn normalize_api_base_url(value: &str) -> Result<String> {
 pub(crate) struct MppAdapter {
     api_base_url: String,
     mpp_api_key: Option<String>,
-    egress: Option<MppEgress>,
+    egress: Option<EgressProxy>,
 }
 
 impl MppAdapter {
@@ -215,9 +218,9 @@ impl MppAdapter {
     }
 
     pub(crate) fn tool_environment(&self) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-        self.egress
-            .as_ref()
-            .map_or_else(Vec::new, MppEgress::environment)
+        self.egress.as_ref().map_or_else(Vec::new, |egress| {
+            egress.environment().into_iter().collect()
+        })
     }
 
     fn http_client_builder(&self) -> Result<reqwest::ClientBuilder> {
@@ -225,7 +228,7 @@ impl MppAdapter {
             .egress
             .as_ref()
             .ok_or_else(|| eyre!("MPP egress proxy is not running"))?;
-        let certificate = std::fs::read(egress.certificate_path())
+        let certificate = std::fs::read(egress.ca_certificate_path())
             .wrap_err("failed to read the MPP egress CA certificate")?;
         let certificate = reqwest::Certificate::from_pem(&certificate)
             .wrap_err("failed to parse the MPP egress CA certificate")?;
