@@ -796,7 +796,7 @@ impl<'a> MarkdownWriter<'a> {
                     .add_modifier(Modifier::BOLD),
             )],
             current: Vec::new(),
-            styles: vec![Style::default().fg(Color::White)],
+            styles: vec![Style::default()],
             lists: Vec::new(),
             pending_item_prefix: None,
             quote_depth: 0,
