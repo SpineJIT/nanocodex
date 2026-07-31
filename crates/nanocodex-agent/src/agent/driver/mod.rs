@@ -406,6 +406,7 @@ where
                             model.replace_client(ResponsesClient::new((self
                                 .spawner
                                 .service_factory)(
+                                Arc::clone(&self.spawner.config),
                             )));
                             Err(NanocodexError::TurnCancelled)
                         }
@@ -717,7 +718,9 @@ where
                         .instrument(turn_span.clone())
                         .await;
                     latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
-                    model.replace_client(ResponsesClient::new((self.spawner.service_factory)()));
+                    model.replace_client(ResponsesClient::new((self.spawner.service_factory)(
+                        Arc::clone(&self.spawner.config),
+                    )));
                     (Err(NanocodexError::TurnCancelled), true)
                 }
                 Ok(ModelTurnOutcome::Failed { error, checkpoint }) => {

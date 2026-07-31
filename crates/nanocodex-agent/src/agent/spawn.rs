@@ -102,7 +102,7 @@ where
             context_source.resolve_workspace(configured_workspace.as_deref())?,
         ))
     };
-    let service = service_factory();
+    let service = service_factory(Arc::clone(&config));
     spawn_agent_driver(
         BranchSpawner {
             config,

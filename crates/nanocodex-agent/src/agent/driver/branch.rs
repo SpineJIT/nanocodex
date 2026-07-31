@@ -61,11 +61,12 @@ where
         config.fast_mode = fast_mode;
         spawner.config = Arc::new(config);
         spawner.depth = self.depth.saturating_add(1);
+        let service = (spawner.service_factory)(Arc::clone(&spawner.config));
         spawn_agent_driver(
             spawner,
             session_id,
             workspace,
-            (self.service_factory)(),
+            service,
             Some(InitialResume::Exact(Box::new(checkpoint.model().clone()))),
             AgentOrigin {
                 kind: "fork",
@@ -106,7 +107,7 @@ where
             durability: self.durability.for_new_thread(),
             service_factory: Arc::clone(&self.service_factory),
         };
-        let service = (self.service_factory)();
+        let service = (spawner.service_factory)(Arc::clone(&spawner.config));
         spawn_agent_driver(
             spawner,
             session_id,
