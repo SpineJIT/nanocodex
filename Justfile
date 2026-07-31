@@ -84,6 +84,11 @@ smoke-wasm-node: build-wasm
 build-react-example: build-wasm
     npm run build --prefix examples/react-vite
 
+# Type-check and test the Rivet Actors WASM consumer.
+build-rivet-example: build-wasm
+    npm ci --prefix examples/rivet-actors
+    npm run check --prefix examples/rivet-actors
+
 # Run the React frontend and API Worker together in Cloudflare's Vite environment.
 dev-react-example:
     CLOUDFLARE_INCLUDE_PROCESS_ENV=true npm run dev --prefix examples/react-vite -- --host 127.0.0.1
