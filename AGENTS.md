@@ -65,7 +65,10 @@
 - `nanocodex-tools/macros` contains the `nanocodex-tools-macros` package that
   implements `#[tool]`. Keep the executable under `bin/nanocodex`; do not move
   CLI behavior into the library.
-- Tempo payment, egress, and `NanoUSD` support stay under `bin/`; public
+- The unpublished experimental `nanocodex-egress` crate owns the authenticated
+  loopback HTTP(S) proxy, ephemeral CA, bounded forwarding, and ordered outbound
+  layer seam. Provider and payment behavior stays in the consuming application.
+- Tempo payment policy and `NanoUSD` support stay under `bin/`; public
   `nanocodex-*` library crates must not depend on them.
 - The unpublished experimental `nanocodex-vm` crate owns the complete VM
   boundary: the audited libkrun interface, VM/process configuration, gvproxy

@@ -6,6 +6,7 @@ members = [
     "crates/nanocodex",
     "crates/nanocodex-agent",
     "crates/experimental/nanocodex-browser",
+    "crates/experimental/nanocodex-egress",
     "crates/experimental/nanocodex-voice",
     "crates/experimental/nanocodex-vm",
     "crates/nanocodex-oai-api",
@@ -67,6 +68,7 @@ mpp = { version = "=0.11.0", git = "https://github.com/gakonst/mpp-rs", rev = "b
 nanocodex = { version = "0.3.0", path = "crates/nanocodex" }
 nanocodex-agent = { version = "0.3.0", path = "crates/nanocodex-agent" }
 nanocodex-browser = { version = "0.3.0", path = "crates/experimental/nanocodex-browser" }
+nanocodex-egress = { version = "0.3.0", path = "crates/experimental/nanocodex-egress" }
 nanocodex-voice = { version = "0.3.0", path = "crates/experimental/nanocodex-voice" }
 nanocodex-vm = { version = "0.3.0", path = "crates/experimental/nanocodex-vm" }
 nanocodex-oai-api = { version = "0.3.0", path = "crates/nanocodex-oai-api" }
@@ -98,6 +100,7 @@ quote = "1.0.46"
 ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
 ratatex = "0.1.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-ring"] }
+reqwest-middleware = "0.5.2"
 rustls = { version = "0.23.42", default-features = false, features = ["ring"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 rquickjs = "0.12.1"
