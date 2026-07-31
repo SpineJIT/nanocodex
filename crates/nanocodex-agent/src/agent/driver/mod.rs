@@ -79,6 +79,7 @@ where
         let mut latest_fork_checkpoint = inherited_checkpoint;
         let mut queued_turns = VecDeque::new();
         let mut pending_compact = None;
+        let mut pending_developer_messages = Vec::new();
         let mut commands_open = true;
         loop {
             let command = loop {
@@ -223,6 +224,20 @@ where
                     drop(result.send(Ok(())));
                     continue;
                 }
+                if let Command::AppendDeveloperMessage { text, result } = command {
+                    if let Some(checkpoint) = model.append_developer_message(text) {
+                        latest_fork_checkpoint = Some(Arc::new(CommittedSession::new(
+                            Arc::clone(&self.spawner.lineage_id),
+                            checkpoint,
+                        )));
+                    }
+                    drop(result.send(agent_session_context(
+                        latest_fork_checkpoint.as_deref(),
+                        self.workspace.as_deref(),
+                        &self.spawner.context_source,
+                    )));
+                    continue;
+                }
                 if let Command::Compact { parent, result } = command {
                     logical_turn_index = logical_turn_index.saturating_add(1);
                     let span = agent_compact_span(
@@ -333,6 +348,14 @@ where
                                         default_fast_mode = enabled;
                                         drop(result.send(Ok(())));
                                     }
+                                    Some(Command::AppendDeveloperMessage { text, result }) => {
+                                        pending_developer_messages.push(text);
+                                        drop(result.send(agent_session_context(
+                                            latest_fork_checkpoint.as_deref(),
+                                            self.workspace.as_deref(),
+                                            &self.spawner.context_source,
+                                        )));
+                                    }
                                     Some(Command::Shutdown) => {
                                         if let Some(cancel) = cancel_compaction.take() {
                                             let _ = cancel.send(());
@@ -432,6 +455,14 @@ where
                         "duration_ns",
                         u64::try_from(compact_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
                     );
+                    for text in pending_developer_messages.drain(..) {
+                        if let Some(checkpoint) = model.append_developer_message(text) {
+                            latest_fork_checkpoint = Some(Arc::new(CommittedSession::new(
+                                Arc::clone(&self.spawner.lineage_id),
+                                checkpoint,
+                            )));
+                        }
+                    }
                     drop(result.send(outcome));
                     continue;
                 }
@@ -626,6 +657,24 @@ where
                                 default_fast_mode = enabled;
                                 drop(result.send(Ok(())));
                             }
+                            Some(Command::AppendDeveloperMessage { text, result }) => {
+                                pending_developer_messages.push(text);
+                                let checkpoint = fork_snapshot_rx
+                                    .borrow_and_update()
+                                    .clone()
+                                    .map(|checkpoint| {
+                                        Arc::new(CommittedSession::new(
+                                            Arc::clone(&self.spawner.lineage_id),
+                                            checkpoint,
+                                        ))
+                                    })
+                                    .or_else(|| latest_fork_checkpoint.clone());
+                                drop(result.send(agent_session_context(
+                                    checkpoint.as_deref(),
+                                    self.workspace.as_deref(),
+                                    &self.spawner.context_source,
+                                )));
+                            }
                             Some(Command::Compact { parent, result }) => {
                                 pending_compact = Some((parent, result));
                                 if let Some(cancel) = cancel.take() {
@@ -729,6 +778,14 @@ where
                 if outcome.is_ok() { "OK" } else { "ERROR" },
             );
             drop(result.send(outcome));
+            for text in pending_developer_messages.drain(..) {
+                if let Some(checkpoint) = model.append_developer_message(text) {
+                    latest_fork_checkpoint = Some(Arc::new(CommittedSession::new(
+                        Arc::clone(&self.spawner.lineage_id),
+                        checkpoint,
+                    )));
+                }
+            }
             if let Some(cancel_result) = cancel_result {
                 let outcome = if was_cancelled {
                     Ok(())
@@ -739,4 +796,16 @@ where
             }
         }
     }
+}
+
+fn agent_session_context(
+    checkpoint: Option<&CommittedSession>,
+    configured_workspace: Option<&str>,
+    context_source: &ContextSource,
+) -> Result<AgentSessionContext> {
+    let workspace = checkpoint
+        .map(|checkpoint| checkpoint.model().workspace().to_owned())
+        .or_else(|| configured_workspace.map(str::to_owned))
+        .map_or_else(|| context_source.resolve_workspace(None), Ok)?;
+    Ok(AgentSessionContext::new(checkpoint, workspace))
 }

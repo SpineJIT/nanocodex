@@ -1104,6 +1104,7 @@ fn spawn_agent_worker(
                 }
             }
         }
+        worker.stop_voice().await;
     })
 }
 
@@ -1196,11 +1197,11 @@ impl AgentWorker {
                     let _ = voice.observe_agent_event(event);
                 }
             }
-            WorkerCommand::Voice(control) => self.control_voice(control),
+            WorkerCommand::Voice(control) => self.control_voice(control).await,
         }
     }
 
-    fn control_voice(&mut self, control: VoiceControl) {
+    async fn control_voice(&mut self, control: VoiceControl) {
         let running = self.voice_running();
         match control {
             VoiceControl::List => {
@@ -1214,15 +1215,11 @@ impl AgentWorker {
                 return;
             }
             VoiceControl::Stop => {
-                if let Some(active) = self.voice.as_mut() {
-                    active.stop();
-                }
+                self.stop_voice().await;
                 return;
             }
             VoiceControl::Toggle if running => {
-                if let Some(active) = self.voice.as_mut() {
-                    active.stop();
-                }
+                self.stop_voice().await;
                 return;
             }
             VoiceControl::Start(_) if running => {
@@ -1269,6 +1266,17 @@ impl AgentWorker {
 
     fn voice_running(&self) -> bool {
         self.voice.as_ref().is_some_and(VoiceSession::is_running)
+    }
+
+    async fn stop_voice(&mut self) {
+        let Some(mut voice) = self.voice.take() else {
+            return;
+        };
+        if let Err(error) = voice.shutdown().await {
+            drop(self.updates.send(WorkerEvent::VoiceFailed {
+                error: format!("failed to stop voice cleanly: {error}"),
+            }));
+        }
     }
 
     fn mcp_login(&self, name: String) {

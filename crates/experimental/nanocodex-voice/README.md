@@ -13,10 +13,10 @@ acknowledges the steering tool call immediately; Frameless retargets the open
 delegation to the newest request. Neither path waits behind the active turn as
 a second queued request.
 
-If another UI can start work through the same agent before voice does, mirror
-its session-wide `AgentEvent`s through `VoiceSession::observe_agent_event`.
-That lets the voice handoff attach to the already-running turn, stream its
-remaining output, and announce completion. The Nanocodex TUI wires this path
+While voice is active, mirror work started by typed input through
+`VoiceSession::observe_agent_event`. The result joins an open handoff when one
+exists and otherwise reaches Realtime as a standalone update, so the voice
+model stays synchronized with typed work. The Nanocodex TUI wires this path
 automatically.
 
 Voice-started coding work remains independently controllable when the audio
@@ -26,12 +26,17 @@ embedding's normal interrupt gesture through `VoiceAgentControl::cancel`.
 Stopping voice disconnects Realtime; cancelling the controller interrupts the
 coding turn.
 
-The default conversational prompt, local first-name rendering, delegation
-markers, tool descriptions, and protocol-specific steering acknowledgement are
-ported from Codex's Realtime implementation. Callers can still replace the
-conversation prompt with `VoiceSessionBuilder::instructions`, or reuse the
-rendered default and delegation envelope independently through
-`codex_voice_instructions()` and `codex_realtime_delegation()`.
+The crate owns Codex's Realtime policy: lifecycle developer markers, bounded
+startup context, transcript-tail flushing, typed-turn mirroring, delegation
+markers, tool descriptions, handoff routing, and protocol-specific steering.
+`nanocodex-agent` only supplies protocol-neutral live-input, developer-context,
+and read-only session-context capabilities.
+
+The builder exposes V1/V2/V3, WebSocket/WebRTC, conversation/transcription,
+audio/text output, initial items, client-managed handoffs, responses-as-items,
+item prefixes, thinking/commentary/BEM routing, configurable BEM prefixes,
+startup-context policy, and tail-flush policy. Defaults follow Codex for the
+selected authentication mode.
 
 ```rust,no_run
 use nanocodex::{Nanocodex, OpenAi};
@@ -50,7 +55,7 @@ while let Some(event) = events.recv().await {
         VoiceEvent::Connecting | VoiceEvent::Started { .. } => {}
     }
 }
-voice.stop();
+voice.shutdown().await?;
 let _cancelled = agent_control.cancel().await?;
 # Ok(())
 # }

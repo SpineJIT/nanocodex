@@ -88,6 +88,7 @@ pub(crate) struct ModelRun<S> {
     context_source: ContextSource,
     global_instructions: Option<Arc<str>>,
     force_compaction: bool,
+    pending_developer_messages: Vec<ResponseItem>,
 }
 
 pub(crate) enum ModelTurnOutcome {
@@ -229,6 +230,7 @@ impl<S> ModelRun<S> {
             context_source,
             global_instructions,
             force_compaction: false,
+            pending_developer_messages: Vec::new(),
         }
     }
 
@@ -292,6 +294,7 @@ impl<S> ModelRun<S> {
             context_source,
             global_instructions,
             force_compaction: false,
+            pending_developer_messages: Vec::new(),
         }
     }
 
@@ -310,6 +313,30 @@ impl<S> ModelRun<S> {
         if let Some(tools) = &self.active_tools {
             tools.cancel().await;
         }
+    }
+
+    pub(crate) fn append_developer_message(&mut self, text: String) -> Option<ModelCheckpoint> {
+        let item = ResponseItem::message(
+            MessageRole::Developer,
+            [ContentItem::InputText {
+                text: text.into_boxed_str(),
+            }],
+        );
+        let Some(session) = &mut self.session else {
+            self.pending_developer_messages.push(item);
+            return None;
+        };
+        session.conversation.append([item]);
+        session.conversation.commit_tail();
+        Some(ModelCheckpoint {
+            workspace: session.workspace.clone(),
+            conversation: session.conversation.clone(),
+            request_prefix: session.factory.profile().shared_prefix(),
+            prompt_cache_key: Arc::from(session.factory.profile().prompt_cache_key()),
+            preserve_inherited_delta: false,
+            global_instructions: self.global_instructions.clone(),
+            context_baseline: session.context.baseline(),
+        })
     }
 
     fn empty_session(&mut self, requested_workspace: Option<&str>) -> Result<ModelSessionState> {

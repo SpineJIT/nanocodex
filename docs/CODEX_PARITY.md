@@ -361,16 +361,21 @@ items without introducing app-server protocol types.
 
 ### Realtime voice delegation
 
-The experimental Realtime boundary matches Codex's V2 and Frameless behavior:
-current model/voice catalogs, byte-identical backend instructions, exact tool
-descriptions and acknowledgements, transcript-aware handoffs, atomic steering,
-queued `response.create`, 200 ms bounded agent updates, 500-byte Frameless
-context appends, and server-side V2 audio truncation when user speech interrupts
-playback. ChatGPT sessions create a genuine WebRTC/Opus media call and use a
-sideband WebSocket; the host owns device-attestation generation and passes the
-opaque value into the reusable session builder. Nanocodex deliberately uses a
-native Rust media/device stack instead of importing Chromium or Codex's
-app-server protocol.
+The experimental Realtime boundary matches Codex's V1, V2, and Frameless/V3
+behavior: lifecycle developer context, bounded 5,300-token startup context,
+typed-turn mirroring, transcript-tail flushing, current model/voice catalogs,
+byte-identical backend instructions, exact tools and acknowledgements, atomic
+steering, queued `response.create`, 200 ms bounded agent updates, 500-byte
+Frameless appends, BEM commentary/speakable routing, responses-as-items, and V2
+audio truncation on interruption. Protocol/transport, transcription/text
+output, client-managed handoffs, initial items, channel prefixes, startup
+context, and tail flushing are explicit builder policies. Shutdown awaits the
+transport/media lifecycle before the agent is stopped.
+
+All Realtime orchestration remains in `nanocodex-voice`; the agent crate exposes
+only protocol-neutral live-input, developer-message, and read-only session
+context hooks. ChatGPT WebRTC uses native Rust WebRTC/Opus with a sideband
+WebSocket, while the host owns device-attestation generation.
 
 ### Responses Lite parallel-tool scheduling
 

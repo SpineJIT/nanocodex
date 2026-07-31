@@ -418,7 +418,14 @@ where
             let mut context = ContextState::new(selected_agents_md, ContextBaseline::Missing);
             let context_snapshot =
                 context.capture(tools.working_directory(), tools.default_shell_name());
-            let history = task_input(user_content, &context_snapshot);
+            let mut history = task_input(user_content, &context_snapshot);
+            if !self.pending_developer_messages.is_empty() {
+                let user = history
+                    .pop()
+                    .expect("task input always ends with user input");
+                history.append(&mut self.pending_developer_messages);
+                history.push(user);
+            }
             context.establish(context_snapshot);
             let conversation = ConversationState::new(history)?;
             let mut session = ModelSessionState {

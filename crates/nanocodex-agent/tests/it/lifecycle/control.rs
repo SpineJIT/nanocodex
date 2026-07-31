@@ -103,6 +103,69 @@ async fn turn_result_does_not_wait_for_attempt_event_producers_to_close() {
 }
 
 #[tokio::test]
+async fn adapter_developer_context_is_visible_at_safe_model_boundaries() {
+    let (retained, mut retained_attempts) = mpsc::unbounded_channel();
+    let openai = OpenAi::builder("test")
+        .service(move || RetainingCompletedService {
+            retained: retained.clone(),
+        })
+        .build()
+        .unwrap();
+    let tools = Tools::builder().without_defaults().build().unwrap();
+    let (agent, events) = Nanocodex::builder(openai).tools(tools).build().unwrap();
+
+    let initial = agent
+        .append_developer_message("adapter session started")
+        .await
+        .unwrap();
+    assert!(initial.history().is_empty());
+    assert!(!initial.workspace().is_empty());
+
+    agent
+        .prompt("first request")
+        .await
+        .unwrap()
+        .result()
+        .await
+        .unwrap();
+    let first = retained_attempts.recv().await.unwrap();
+    let first_items = first.input_items().collect::<Vec<_>>();
+    assert!(matches!(
+        first_items.as_slice(),
+        [
+            ..,
+            ResponseItem::Message {
+                role: MessageRole::Developer,
+                ..
+            },
+            ResponseItem::Message {
+                role: MessageRole::User,
+                ..
+            }
+        ]
+    ));
+
+    let completed = agent
+        .append_developer_message("adapter session ended")
+        .await
+        .unwrap();
+    assert!(completed.history().iter().any(|item| matches!(
+        item,
+        ResponseItem::Message {
+            role: MessageRole::Developer,
+            content,
+            ..
+        } if content.iter().any(|part| matches!(
+            part,
+            ContentItem::InputText { text } if text.as_ref() == "adapter session ended"
+        ))
+    )));
+
+    agent.shutdown().await.unwrap();
+    drop((agent, events));
+}
+
+#[tokio::test]
 async fn dropping_every_command_handle_cancels_an_in_flight_attempt() {
     let started = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicBool::new(false));

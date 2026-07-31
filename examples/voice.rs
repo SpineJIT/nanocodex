@@ -50,10 +50,11 @@ async fn main() -> Result<()> {
         }
     };
 
-    voice.stop();
+    let voice_shutdown = voice.shutdown().await;
     let shutdown_result = agent.shutdown().await;
     agent_log.await.wrap_err("agent event logger failed")?;
     voice_result?;
+    voice_shutdown?;
     shutdown_result?;
     Ok(())
 }
