@@ -7,7 +7,7 @@ use std::{
 
 use clap::{Args, ValueHint};
 use eyre::{Context, Result, bail, eyre};
-use reqwest::{Client, header};
+use reqwest::{Client, Url, header};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -71,8 +71,19 @@ struct Release {
 
 #[derive(Debug, Deserialize)]
 struct ReleaseAsset {
+    id: u64,
     name: String,
     browser_download_url: String,
+}
+
+impl ReleaseAsset {
+    fn download_url(&self) -> Result<Url> {
+        let mut url = Url::parse(&self.browser_download_url)
+            .wrap_err_with(|| format!("GitHub returned an invalid URL for {}", self.name))?;
+        url.query_pairs_mut()
+            .append_pair("asset_id", &self.id.to_string());
+        Ok(url)
+    }
 }
 
 impl Update {
@@ -267,7 +278,7 @@ fn report_activation(previous: &str, selected: &str, downloaded: bool) {
 
 async fn download(client: &Client, asset: &ReleaseAsset) -> Result<Vec<u8>> {
     client
-        .get(&asset.browser_download_url)
+        .get(asset.download_url()?)
         .send()
         .await
         .wrap_err_with(|| format!("failed to download {}", asset.name))?
@@ -418,5 +429,21 @@ mod tests {
     fn rejects_missing_and_malformed_checksums() {
         assert!(checksum_for(b"abcd  nanocodex-test\n", "nanocodex-test").is_err());
         assert!(checksum_for(b"", "nanocodex-test").is_err());
+    }
+
+    #[test]
+    fn cache_busts_mutable_release_assets_with_their_identity() {
+        let asset = ReleaseAsset {
+            id: 496_045_871,
+            name: CHECKSUMS_ASSET.to_owned(),
+            browser_download_url:
+                "https://github.com/gakonst/nanocodex/releases/download/nightly/SHA256SUMS"
+                    .to_owned(),
+        };
+
+        assert_eq!(
+            asset.download_url().unwrap().as_str(),
+            "https://github.com/gakonst/nanocodex/releases/download/nightly/SHA256SUMS?asset_id=496045871"
+        );
     }
 }
