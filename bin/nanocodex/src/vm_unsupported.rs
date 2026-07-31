@@ -66,6 +66,9 @@ pub(crate) struct ConfiguredVm {
     _private: (),
 }
 
+/// Placeholder for a provider-neutral VM route on unsupported hosts.
+pub(crate) enum EgressLease {}
+
 /// Private VMM entrypoint retained for command-line compatibility.
 #[derive(Args)]
 pub(crate) struct VmRunConfig {
@@ -81,12 +84,11 @@ impl VmRunConfig {
 }
 
 impl VmArgs {
-    #[cfg(test)]
     pub(crate) const fn is_enabled(&self) -> bool {
         self.rootfs.is_some()
     }
 
-    pub(crate) async fn start(self) -> Result<Option<ConfiguredVm>> {
+    pub(crate) async fn start(self, _egress: Option<EgressLease>) -> Result<Option<ConfiguredVm>> {
         match self.rootfs {
             Some(rootfs) => Err(unsupported_error(Some(&rootfs))),
             None => Ok(None),

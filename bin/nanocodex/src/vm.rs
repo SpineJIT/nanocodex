@@ -16,6 +16,8 @@ use nanocodex_vm::{
 use tokio::time::sleep;
 use tracing::info;
 
+pub(crate) use nanocodex_vm::host::EgressLease;
+
 const DEFAULT_CPUS: u8 = 2;
 const DEFAULT_MEMORY_MIB: u32 = 1_024;
 const DEFAULT_EXT4_WORKSPACE: &str = "/app";
@@ -107,15 +109,19 @@ impl VmRunConfig {
 }
 
 impl VmArgs {
-    #[cfg(test)]
     pub(crate) const fn is_enabled(&self) -> bool {
         self.rootfs.is_some()
     }
 
-    pub(crate) async fn start(self) -> Result<Option<ConfiguredVm>> {
+    pub(crate) async fn start(self, egress: Option<EgressLease>) -> Result<Option<ConfiguredVm>> {
         let Some(rootfs) = self.rootfs else {
             return Ok(None);
         };
+        if self.vm_no_network && egress.is_some() {
+            return Err(eyre!(
+                "--vm-no-network cannot be combined with provider-backed VM egress"
+            ));
+        }
         let rootfs = rootfs
             .canonicalize()
             .wrap_err_with(|| format!("failed to resolve VM rootfs {}", rootfs.display()))?;
@@ -168,9 +174,15 @@ impl VmArgs {
                  contain /usr/local/bin/nanocodex-vm-guest"
             ));
         }
-        if self.vm_no_network {
+        let network = if self.vm_no_network {
             vm = vm.offline();
-        }
+            "disabled"
+        } else if let Some(egress) = egress {
+            vm = vm.egress(egress);
+            "provider_proxy"
+        } else {
+            "internet"
+        };
         let firmware = Path::new(DEFAULT_KRUNFW_DIRECTORY);
         let platform_firmware = if cfg!(target_os = "macos") {
             firmware.join("libkrunfw.5.dylib")
@@ -190,7 +202,7 @@ impl VmArgs {
             vm_workspace = workspace,
             vm_cpu_count = self.vm_cpus.unwrap_or(DEFAULT_CPUS),
             vm_memory_mib = self.vm_memory_mib.unwrap_or(DEFAULT_MEMORY_MIB),
-            vm_network = if self.vm_no_network { "disabled" } else { "internet" },
+            vm_network = network,
             "normal agent workspace tools are running in a VM"
         );
         Ok(Some(ConfiguredVm {

@@ -17,6 +17,7 @@ futures-util.workspace = true
 http.workspace = true
 nanocodex = { workspace = true, features = ["realtime"] }
 nanocodex-browser.workspace = true
+nanocodex-egress.workspace = true
 nanocodex-voice.workspace = true
 nanocodex-vm.workspace = true
 reqwest.workspace = true
@@ -79,6 +80,10 @@ path = "rollout_resume_bench.rs"
 [[bin]]
 name = "vm-tools"
 path = "vm_tools.rs"
+
+[[bin]]
+name = "secret-egress"
+path = "secret_egress.rs"
 
 [[bin]]
 name = "browser-agent"

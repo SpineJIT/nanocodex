@@ -4,7 +4,7 @@ All language consumers live at this repository boundary:
 
 - Rust: `minimal.rs`, `voice.rs`, `realtime_pipe.rs`, `follow_on.rs`, `lifecycle.rs`,
   `custom_tool.rs`, `subagents.rs`, `resume.rs`, `fork_conversations.rs`,
-  `fork_checkpoint_bench.rs`, and `mcp.rs` are binaries in the
+  `fork_checkpoint_bench.rs`, `secret_egress.rs`, and `mcp.rs` are binaries in the
   `nanocodex-examples` package.
 - Python: `python/` uses the native PyO3 binding (`follow_on.py`, `events.py`,
   `lifecycle.py`).
@@ -29,6 +29,7 @@ cargo run -p nanocodex-examples --bin subagents -- \
   "Review the retry policy using whatever clean or context-bearing workers you need"
 NANOCODEX_SUBAGENT_JSONL=1 cargo run -p nanocodex-examples --bin subagents
 cargo run -p nanocodex-examples --bin mcp
+cargo run -p nanocodex-examples --bin secret-egress -- host
 just build-vm-example
 target/debug/vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4]
 just smoke-python
@@ -83,3 +84,20 @@ custom merged-event protocol.
 The MCP example defaults to the public OpenAI documentation MCP. Override
 `NANOCODEX_MCP_URL` for another Streamable HTTP server and set
 `NANOCODEX_MCP_BEARER_TOKEN` when it requires bearer authentication.
+
+`secret-egress` runs a real Nanocodex turn whose Code Mode cell fans out curl
+commands through an authenticated host-owned proxy. Set `OPENAI_API_KEY`,
+`NANOCODEX_SECRET_UPSTREAM`, and `NANOCODEX_SECRET_VALUE`; the model and its
+commands receive only `DEMO_SERVICE_BASE_URL` and the public
+`DEMO_SERVICE_TOKEN` placeholder. Use `NANOCODEX_SECRET_STRESS_REQUESTS` to
+change the default eight-way `Promise.all` fanout. The same example runs tools
+inside the retained VM while model traffic remains on the host:
+
+```sh
+cargo run -p nanocodex-examples --bin secret-egress -- \
+  vm ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4]
+```
+
+VM mode provisions the proxy's public CA and child environment through a
+provider-neutral `EgressLease`. It uses the default libkrun TSI network, under
+which the host loopback proxy is reachable from guest workspace commands.
