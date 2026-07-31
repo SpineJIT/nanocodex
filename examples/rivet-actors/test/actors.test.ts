@@ -201,6 +201,27 @@ describe.sequential("Nanocodex Rivet Actors", () => {
     expect((await session.status()).auth_mode).toBe("chatgpt");
   });
 
+  test("runs a disposable subscription deployment without copying the refresh token", async (context) => {
+    resetMock();
+    configureAccessTokenOnlySubscription();
+    const { client } = await setupTest(context, registry);
+    const auth = client.nanocodexAuth.getOrCreate([authActorKey]);
+
+    expect(await auth.snapshot(createCapabilityProof("snapshot"))).toMatchObject({
+      accountId: ACCOUNT_ID,
+      revision: 0,
+    });
+    const session = client.nanocodex.getOrCreate([`access-only-${crypto.randomUUID()}`]);
+    const result = await session.prompt({
+      id: "access-only-turn",
+      input: "Reply with exactly ACCESS_ONLY_OK",
+    });
+    expect(result.final_message).toBe("ACCESS_ONLY_OK");
+    await expect(auth.recover(createCapabilityProof("recover:0"), 0))
+      .rejects.toThrow(/internal error/i);
+    expect(refreshCount).toBe(0);
+  });
+
   test("bounds prompt size and active turn fan-in", async (context) => {
     resetMock();
     configureApiKey();
@@ -258,6 +279,12 @@ function configureSubscription(): void {
   process.env.NANOCODEX_AUTH_ACTOR_KEY = authActorKey;
   process.env.NANOCODEX_AUTH_CAPABILITY = AUTH_CAPABILITY;
   delete process.env.OPENAI_API_KEY;
+}
+
+function configureAccessTokenOnlySubscription(): void {
+  configureSubscription();
+  process.env.CHATGPT_ACCESS_TOKEN = VALID_ACCESS_TOKEN;
+  delete process.env.CHATGPT_REFRESH_TOKEN;
 }
 
 function resetMock(): void {

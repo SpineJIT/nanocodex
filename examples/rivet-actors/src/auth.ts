@@ -136,6 +136,11 @@ async function refresh(database: RawAccess, vars: AuthVars, rejectedRevision: nu
 }
 
 async function performRefresh(database: RawAccess, current: CredentialRow): Promise<CredentialRow> {
+  if (!current.refresh_token) {
+    throw new Error(
+      "ChatGPT access token needs rotation; run `codex login` and redeploy the subscription demo",
+    );
+  }
   const response = await fetch(process.env.CHATGPT_TOKEN_ENDPOINT ?? DEFAULT_TOKEN_ENDPOINT, {
     method: "POST",
     signal: AbortSignal.timeout(25_000),
@@ -200,7 +205,7 @@ async function performRefresh(database: RawAccess, current: CredentialRow): Prom
 
 async function seed(database: RawAccess): Promise<CredentialRow> {
   const accessToken = requiredSecret("CHATGPT_ACCESS_TOKEN");
-  const refreshToken = requiredSecret("CHATGPT_REFRESH_TOKEN");
+  const refreshToken = optionalString(process.env.CHATGPT_REFRESH_TOKEN) ?? "";
   const accountId = requiredSecret("CHATGPT_ACCOUNT_ID");
   const row: CredentialRow = {
     access_token: accessToken,

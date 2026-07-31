@@ -17,6 +17,7 @@
     "dev": "node scripts/run-local-server.mjs --env-file src/server.ts",
     "predev:subscription": "npm run build:web",
     "dev:subscription": "node scripts/run-local-server.mjs scripts/dev-subscription.ts",
+    "deploy:subscription": "node --import tsx scripts/deploy-subscription.ts",
     "repl": "node --import tsx scripts/repl.ts",
     "smoke": "node --import tsx scripts/live-smoke.ts",
     "stress": "node --import tsx scripts/stress.ts",
