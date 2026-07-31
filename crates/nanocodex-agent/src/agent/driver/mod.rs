@@ -232,6 +232,7 @@ where
                     if let Some(checkpoint) = model.append_developer_message(text) {
                         latest_fork_checkpoint = Some(Arc::new(CommittedSession::new(
                             Arc::clone(&self.spawner.lineage_id),
+                            thread_model,
                             checkpoint,
                         )));
                     }
@@ -470,6 +471,7 @@ where
                         if let Some(checkpoint) = model.append_developer_message(text) {
                             latest_fork_checkpoint = Some(Arc::new(CommittedSession::new(
                                 Arc::clone(&self.spawner.lineage_id),
+                                thread_model,
                                 checkpoint,
                             )));
                         }
@@ -685,6 +687,7 @@ where
                                     .map(|checkpoint| {
                                         Arc::new(CommittedSession::new(
                                             Arc::clone(&self.spawner.lineage_id),
+                                            thread_model,
                                             checkpoint,
                                         ))
                                     })
@@ -807,6 +810,7 @@ where
                 if let Some(checkpoint) = model.append_developer_message(text) {
                     latest_fork_checkpoint = Some(Arc::new(CommittedSession::new(
                         Arc::clone(&self.spawner.lineage_id),
+                        thread_model,
                         checkpoint,
                     )));
                 }
