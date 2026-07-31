@@ -113,6 +113,33 @@ the Nanocodex process.
 MPP tracing records full request, response, challenge, and credential content.
 Operators must protect those traces like wallet and conversation data.
 
+### Agent-driven host and VM smoke
+
+This exercises the complete path through Nanocodex and Code Mode rather than
+calling the proxy on its own. The model fetches the live public catalog at
+`https://mpp.dev/api/services`, chooses endpoints within the configured charge
+cap, and fans curl subprocesses out from one `Promise.all` cell:
+
+```sh
+nanocodex run --provider.tempo \
+  "Use one Code Mode cell. Fetch https://mpp.dev/api/services, select eight safe HTTP service smoke requests whose advertised charges fit the configured cap, then use Promise.all over exec_command calls that each run curl -fsS. Verify every exit code and report the endpoint/status matrix."
+```
+
+Run the same model turn with every workspace command inside the retained VM:
+
+```sh
+nanocodex run --provider.tempo \
+  --vm .nanocodex/vm/session-rootfs.ext4 \
+  --vm-guest-runtime target/aarch64-unknown-linux-musl/debug/nanocodex-vm-guest \
+  "Use one Code Mode cell. Fetch https://mpp.dev/api/services, select eight safe HTTP service smoke requests whose advertised charges fit the configured cap, then use Promise.all over exec_command calls that each run curl -fsS. Verify every exit code and report the endpoint/status matrix."
+```
+
+Host mode applies the proxy route only to tool subprocesses. VM mode projects
+the same authenticated URL and public ephemeral CA through an `EgressLease`
+before tools become available; it does not put host filesystem paths or wallet
+material in the guest. Both modes keep model Responses traffic in the host
+process while routing its HTTPS client through the same Tempo payment layer.
+
 ## Credits onramp
 
 `nanocodex credits` and `nanousd-api` are separate from MPP settlement:

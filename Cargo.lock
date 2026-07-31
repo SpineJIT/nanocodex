@@ -3761,7 +3761,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 [[package]]
 name = "hudsucker"
 version = "0.25.0"
-source = "git+https://github.com/gakonst/hudsucker?rev=d718d2d5af9ce8cc328ea9560611f8b7708d2522#d718d2d5af9ce8cc328ea9560611f8b7708d2522"
+source = "git+https://github.com/gakonst/hudsucker?rev=9a13609adc4b37b3e7fba28a320546bf672f0f4d#9a13609adc4b37b3e7fba28a320546bf672f0f4d"
 dependencies = [
  "bstr",
  "futures",
@@ -3862,7 +3862,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -5100,6 +5100,7 @@ dependencies = [
  "rand 0.9.5",
  "reqwest",
  "reqwest-middleware",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -5116,6 +5117,7 @@ dependencies = [
  "http",
  "nanocodex",
  "nanocodex-browser",
+ "nanocodex-egress",
  "nanocodex-vm",
  "nanocodex-voice",
  "reflink-copy",
@@ -6559,7 +6561,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6597,7 +6599,7 @@ dependencies = [
  "cfg_aliases 0.2.1",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]

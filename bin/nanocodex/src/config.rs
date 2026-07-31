@@ -231,7 +231,15 @@ impl AgentArgs {
         }
         let openai = openai.build()?;
         let realtime = (!mpp_enabled).then(|| openai.clone());
-        let configured_vm = vm.start().await?;
+        let vm_egress = if vm.is_enabled() {
+            mpp_adapter
+                .as_ref()
+                .map(MppAdapter::vm_egress_lease)
+                .transpose()?
+        } else {
+            None
+        };
+        let configured_vm = vm.start(vm_egress).await?;
         let mut tools = configured_vm
             .as_ref()
             .map_or_else(Tools::builder, ConfiguredVm::tools_builder)
@@ -243,9 +251,10 @@ impl AgentArgs {
             tools = tools.provider(provider);
         }
         if let Some(mpp_adapter) = &mpp_adapter {
-            tools = tools
-                .process_environment(mpp_adapter.tool_environment())
-                .remote_http_client(mpp_adapter.tool_http_client()?);
+            if configured_vm.is_none() {
+                tools = tools.process_environment(mpp_adapter.tool_environment());
+            }
+            tools = tools.remote_http_client(mpp_adapter.tool_http_client()?);
         }
         if let Some(browser) = &configured_browser {
             tools = tools.provider(browser.tool());

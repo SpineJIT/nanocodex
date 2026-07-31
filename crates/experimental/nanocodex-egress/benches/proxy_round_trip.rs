@@ -57,7 +57,7 @@ fn benchmark_proxy_round_trip(criterion: &mut Criterion) {
 
     for (name, layers) in [("direct", 0_usize), ("two_layers", 2_usize)] {
         let proxy = runtime.block_on(async {
-            let mut builder = EgressProxy::builder();
+            let mut builder = EgressProxy::builder().allow_loopback_upstreams(true);
             if layers > 0 {
                 builder = builder.layer(MarkerLayer("one"));
             }

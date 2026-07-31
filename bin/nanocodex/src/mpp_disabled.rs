@@ -43,6 +43,10 @@ impl MppAdapter {
         match *self {}
     }
 
+    pub(crate) const fn vm_egress_lease(&self) -> Result<crate::vm::EgressLease> {
+        match *self {}
+    }
+
     pub(crate) async fn shutdown(self) -> Result<()> {
         match self {}
     }

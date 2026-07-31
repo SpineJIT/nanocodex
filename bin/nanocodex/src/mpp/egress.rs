@@ -10,16 +10,18 @@ use nanocodex_egress::{
     EgressLayer,
     middleware::{
         Error, Extensions, Middleware, Next, Request, Response, Result as MiddlewareResult,
-        async_trait,
+        StatusCode, async_trait, buffer_response_body,
     },
 };
 
+const DEFAULT_MAX_PAYMENT_REQUIRED_BYTES: usize = 1024 * 1024;
 const MPP_REQUEST_ID: &str = "mpp-request-id";
 
 /// MPP payment and replay as one Tempo-owned outbound egress layer.
 pub(super) struct TempoEgress<P> {
     middleware: PaymentMiddleware<P>,
     _events: ClientEventSubscription,
+    max_payment_required_bytes: usize,
     request_id_prefix: String,
     request_ids: AtomicU64,
 }
@@ -40,9 +42,16 @@ where
         Self {
             middleware,
             _events: subscription,
+            max_payment_required_bytes: DEFAULT_MAX_PAYMENT_REQUIRED_BYTES,
             request_id_prefix: random_identifier(),
             request_ids: AtomicU64::new(1),
         }
+    }
+
+    #[cfg(test)]
+    const fn max_payment_required_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_payment_required_bytes = max_bytes;
+        self
     }
 }
 
@@ -57,12 +66,21 @@ where
         extensions: &mut Extensions,
         next: Next<'_>,
     ) -> MiddlewareResult<Response> {
+        buffer_response_body(
+            extensions,
+            StatusCode::PAYMENT_REQUIRED,
+            self.max_payment_required_bytes,
+        );
         let request_id = self.request_ids.fetch_add(1, Ordering::Relaxed);
         let logical_request_id = format!("{}-{request_id}", self.request_id_prefix);
         tracing::Span::current().record("mpp.request.id", logical_request_id.as_str());
         let value = logical_request_id.parse().map_err(Error::middleware)?;
         request.headers_mut().insert(MPP_REQUEST_ID, value);
         self.middleware.handle(request, extensions, next).await
+    }
+
+    fn uses_response_buffering(&self) -> bool {
+        true
     }
 }
 
@@ -273,7 +291,7 @@ mod tests {
         provider: MockProvider,
         configure: impl FnOnce(EgressProxyBuilder) -> EgressProxyBuilder,
     ) -> EgressProxy {
-        configure(EgressProxy::builder())
+        configure(EgressProxy::builder().allow_loopback_upstreams(true))
             .layer(TempoEgress::new(provider))
             .spawn()
             .await
@@ -394,6 +412,43 @@ mod tests {
             rollbacks.load(Ordering::SeqCst),
             DEFAULT_MAX_PAYMENT_RETRIES
         );
+        egress.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_challenge_body_fails_before_payment() {
+        let challenge = challenge_header("oversized-challenge");
+        let origin = spawn_origin(Router::new().route(
+            "/paid",
+            post(move || {
+                let challenge = challenge.clone();
+                async move {
+                    (
+                        AxumStatus::PAYMENT_REQUIRED,
+                        [(WWW_AUTHENTICATE, challenge)],
+                        "larger than four bytes",
+                    )
+                }
+            }),
+        ))
+        .await;
+        let provider = MockProvider::default();
+        let payments = Arc::clone(&provider.payments);
+        let egress = EgressProxy::builder()
+            .allow_loopback_upstreams(true)
+            .layer(TempoEgress::new(provider).max_payment_required_bytes(4))
+            .spawn()
+            .await
+            .unwrap();
+
+        let response = proxied_client(&egress)
+            .post(format!("{origin}/paid"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), AxumStatus::BAD_GATEWAY);
+        assert_eq!(payments.load(Ordering::SeqCst), 0);
         egress.shutdown().await.unwrap();
     }
 

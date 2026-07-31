@@ -1,5 +1,11 @@
 use std::path::PathBuf;
 
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+use std::path::Path;
+
 mod egress;
 mod resource;
 
@@ -18,9 +24,27 @@ use mpp::{
 use nanocodex_egress::EgressProxy;
 use nanousd::{NANOUSD_ADDRESS, TEMPO_MAINNET_CHAIN_ID};
 
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+use nanocodex_vm::host::{EgressFile, GUEST_EGRESS_ROOT};
+
+use crate::vm::EgressLease;
+
 const DEFAULT_MPP_API_BASE_URL: &str = "https://openai.mpp.tempo.xyz/v1";
 const DEFAULT_TEMPO_SWAP_SLIPPAGE_BPS: u16 = 100;
 const DEFAULT_MAX_EGRESS_CHARGE: u128 = 100_000;
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+const GUEST_EGRESS_DIRECTORY: &str = "tempo";
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+const GUEST_EGRESS_CA_FILENAME: &str = "egress-ca.pem";
 
 #[derive(Args, Clone)]
 pub(crate) struct MppArgs {
@@ -105,6 +129,16 @@ impl MppArgs {
         }
 
         resource::ensure_mpp_file_descriptor_capacity()?;
+        let api_base_url = normalize_api_base_url(&self.api_base_url)?;
+        let allow_loopback = reqwest::Url::parse(&api_base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .is_some_and(|host| {
+                host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+            });
         let provider = self.wallet_store.map_or_else(
             TempoAccountsProvider::from_default_store,
             TempoAccountsProvider::from_store,
@@ -117,13 +151,14 @@ impl MppArgs {
             max_charge: self.egress_max_charge,
         };
         let egress = EgressProxy::builder()
+            .allow_loopback_upstreams(allow_loopback)
             .layer(TempoEgress::new(provider))
             .spawn()
             .await
             .wrap_err("failed to start the embedded MPP egress proxy")?;
 
         Ok(Some(MppAdapter {
-            api_base_url: normalize_api_base_url(&self.api_base_url)?,
+            api_base_url,
             mpp_api_key: self.mpp_api_key,
             egress: Some(egress),
         }))
@@ -221,6 +256,52 @@ impl MppAdapter {
         self.egress.as_ref().map_or_else(Vec::new, |egress| {
             egress.environment().into_iter().collect()
         })
+    }
+
+    #[cfg(any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    pub(crate) fn vm_egress_lease(&self) -> Result<EgressLease> {
+        let egress = self
+            .egress
+            .as_ref()
+            .ok_or_else(|| eyre!("MPP egress proxy is not running"))?;
+        let route = egress.route();
+        let guest_certificate = Path::new(GUEST_EGRESS_ROOT)
+            .join(GUEST_EGRESS_DIRECTORY)
+            .join(GUEST_EGRESS_CA_FILENAME);
+        let mut lease = EgressLease::internet();
+        lease
+            .insert_file(EgressFile::new(
+                &guest_certificate,
+                route.ca_certificate_pem(),
+                0o444,
+            ))
+            .wrap_err("failed to provision the MPP egress CA in the VM")?;
+        for (name, value) in route.environment(&guest_certificate) {
+            let name = name
+                .into_string()
+                .map_err(|_| eyre!("MPP egress environment name is not valid UTF-8"))?;
+            let value = value
+                .into_string()
+                .map_err(|_| eyre!("MPP egress environment value for {name} is not valid UTF-8"))?;
+            lease
+                .insert_environment(name, value)
+                .wrap_err("failed to configure MPP egress environment in the VM")?;
+        }
+        Ok(lease)
+    }
+
+    #[cfg(not(any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )))]
+    pub(crate) fn vm_egress_lease(&self) -> Result<EgressLease> {
+        Err(eyre!(
+            "provider-backed VM egress is unsupported on {}",
+            std::env::consts::ARCH
+        ))
     }
 
     fn http_client_builder(&self) -> Result<reqwest::ClientBuilder> {
@@ -356,6 +437,42 @@ mod tests {
     #[tokio::test]
     async fn mpp_is_opt_in() {
         assert!(test_args().start().await.unwrap().is_none());
+    }
+
+    #[cfg(any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    #[tokio::test]
+    async fn vm_lease_contains_only_the_proxy_route_and_public_ca() {
+        let egress = EgressProxy::builder().spawn().await.unwrap();
+        let proxy_url = egress.route().proxy_url().to_owned();
+        let adapter = MppAdapter {
+            api_base_url: DEFAULT_MPP_API_BASE_URL.to_owned(),
+            mpp_api_key: None,
+            egress: Some(egress),
+        };
+
+        let lease = adapter.vm_egress_lease().unwrap();
+        let guest_certificate = Path::new(GUEST_EGRESS_ROOT)
+            .join(GUEST_EGRESS_DIRECTORY)
+            .join(GUEST_EGRESS_CA_FILENAME);
+
+        assert_eq!(
+            lease.guest_environment().get("HTTPS_PROXY"),
+            Some(&proxy_url)
+        );
+        assert_eq!(
+            lease.guest_environment().get("SSL_CERT_FILE"),
+            Some(&guest_certificate.to_string_lossy().into_owned())
+        );
+        let file = lease.guest_files().next().unwrap();
+        assert_eq!(file.guest_path(), guest_certificate);
+        assert!(file.contents().starts_with(b"-----BEGIN CERTIFICATE-----"));
+        assert!(lease.guest_environment().keys().all(|name| {
+            !name.contains("WALLET") && !name.contains("PRIVATE") && !name.contains("SECRET")
+        }));
+        adapter.shutdown().await.unwrap();
     }
 
     #[tokio::test]
