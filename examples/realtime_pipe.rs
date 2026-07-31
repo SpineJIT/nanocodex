@@ -145,8 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     | RealtimeEvent::InputTranscriptDelta(_)
                     | RealtimeEvent::OutputTranscriptDelta(_)
                     | RealtimeEvent::ResponseStarted
-                    | RealtimeEvent::ResponseDone
-                    | RealtimeEvent::TranscriptTail(_) => {}
+                    | RealtimeEvent::ResponseDone => {}
                 }
             }
             completed = completed_rx.recv() => {
