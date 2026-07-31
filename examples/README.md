@@ -13,8 +13,8 @@ All language consumers live at this repository boundary:
   ordered events in React.
 - Browser CDN: `browser-cdn/` is one static HTML file that imports the published
   package directly, with no install or build step.
-- Rivet Actors + AgentOS: `rivet-actors/` runs the same harness as a
-  SQLite-backed Rivet Actor and composes it with an AgentOS workspace actor.
+- Rivet Actors: `rivet-actors/` runs the same harness as a durable,
+  SQLite-backed Rivet Actor.
 
 From the repository root:
 
