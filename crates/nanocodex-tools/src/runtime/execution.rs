@@ -68,6 +68,7 @@ impl ToolRuntime {
         process_environment: Arc<Vec<(OsString, OsString)>>,
         remote_http_client: Option<reqwest::Client>,
     ) -> Self {
+        nanocodex_oai_api::transport::install_default_rustls_crypto_provider();
         let workspace = workspace.into();
         let current_turn = Arc::new(AtomicU64::new(0));
         let sessions = Arc::new(ShellSessions::with_environment_and_turn(

@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Once, OnceLock},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -99,7 +99,6 @@ pub(super) struct ConnectConfig<'a> {
 }
 
 pub(super) async fn connect(config: ConnectConfig<'_>) -> Result<WebRtcConnection, RealtimeError> {
-    ensure_rustls_crypto_provider();
     let offer = create_offer().await?;
     let (call, auth) = create_call_with_auth_recovery(&config, &offer.sdp).await?;
     trace!(target: "nanocodex_oai_api::realtime::wire", sdp = %call.sdp, call_id = %call.id, "GPT Realtime WebRTC answer");
@@ -224,16 +223,6 @@ fn sideband_request(
     }
 
     Ok(request)
-}
-
-fn ensure_rustls_crypto_provider() {
-    static RUSTLS_PROVIDER_INIT: Once = Once::new();
-    RUSTLS_PROVIDER_INIT.call_once(|| {
-        // Embeddings may have installed their own process-wide provider. When
-        // they have not, select the provider used by Codex before WebRTC or
-        // Reqwest asks rustls to auto-select from an ambiguous feature graph.
-        drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
-    });
 }
 
 async fn create_offer() -> Result<Offer, RealtimeError> {

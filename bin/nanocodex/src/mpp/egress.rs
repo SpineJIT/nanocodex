@@ -35,7 +35,7 @@ use hudsucker::{
     },
     rustls::{
         ServerConfig,
-        crypto::aws_lc_rs,
+        crypto::ring,
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     },
 };
@@ -145,6 +145,7 @@ impl MppEgress {
         std::fs::write(temp_dir.path().join(CA_FILENAME), certificate_pem)
             .map_err(EgressError::WriteCertificate)?;
 
+        let rustls_provider = ring::default_provider();
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -172,7 +173,7 @@ impl MppEgress {
         let proxy = Proxy::builder()
             .with_listener(listener)
             .with_ca(authority)
-            .with_rustls_connector(aws_lc_rs::default_provider())
+            .with_rustls_connector(rustls_provider)
             .with_max_concurrent_connections(max_concurrent_connections)
             .with_http_handler(handler)
             .with_graceful_shutdown(async move {

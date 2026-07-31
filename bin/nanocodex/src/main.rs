@@ -113,6 +113,7 @@ struct ResumeCommand {
 }
 
 fn main() -> Result<()> {
+    nanocodex::oai::transport::install_default_rustls_crypto_provider();
     // Keep direct `cargo run` behavior consistent with the Justfile without
     // requiring shell-specific syntax to load the repository's `.env` file.
     let _ = dotenvy::dotenv();

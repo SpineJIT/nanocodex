@@ -51,7 +51,7 @@ nanocodex-voice.workspace = true
 nix = { workspace = true, optional = true }
 nanousd = { workspace = true, optional = true }
 pulldown-cmark.workspace = true
-mpp = { workspace = true, optional = true, features = ["client", "tempo", "reqwest-rustls-tls"] }
+mpp = { workspace = true, optional = true, features = ["client", "tempo", "reqwest-rustls-tls-no-provider"] }
 rand = { workspace = true, optional = true }
 ratatui.workspace = true
 ratatex.workspace = true

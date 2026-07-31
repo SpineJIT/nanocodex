@@ -124,6 +124,7 @@ impl AlloyIssuer {
         fee_token: Address,
         wallet_store: Option<&Path>,
     ) -> Result<Self, IssuerError> {
+        nanousd::install_default_rustls_crypto_provider();
         let wallet = wallet_store.map_or_else(
             TempoAccountsWallet::from_default_store,
             TempoAccountsWallet::from_store,

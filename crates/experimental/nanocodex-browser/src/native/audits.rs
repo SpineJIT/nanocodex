@@ -629,6 +629,7 @@ mod tests {
 
     #[tokio::test]
     async fn crux_request_errors_do_not_retain_the_api_key_url() {
+        nanocodex_oai_api::transport::install_default_rustls_crypto_provider();
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind a local test socket");

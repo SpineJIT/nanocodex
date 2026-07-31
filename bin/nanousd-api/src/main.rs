@@ -14,6 +14,7 @@ use crate::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    nanousd::install_default_rustls_crypto_provider();
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(
