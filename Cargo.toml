@@ -205,8 +205,8 @@ strip = "symbols"
 panic = "unwind"
 codegen-units = 16
 
-# Release artifacts favor runtime performance over build time, matching Reth's
-# maxperf profile without raising the minimum CPU level of portable binaries.
+# Opt-in builds can favor maximum runtime performance over build time, matching
+# Reth's maxperf profile without raising the minimum CPU level of binaries.
 [profile.maxperf]
 inherits = "release"
 lto = "fat"

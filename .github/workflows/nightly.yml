@@ -68,7 +68,7 @@ jobs:
           TAG_NAME: ${{ inputs.pr && format('pr-{0}', inputs.pr) || 'nightly' }}
         run: |
           VERGEN_GIT_SHA="$BUILD_SHA" \
-            cargo build --locked --profile maxperf \
+            cargo build --locked --release \
               --package nanocodex-bin --bin nanocodex --features tempo \
               --target ${{ matrix.target }}
       - name: Stage Unix artifact
@@ -76,13 +76,13 @@ jobs:
         shell: bash
         run: |
           mkdir dist
-          cp "target/${{ matrix.target }}/maxperf/nanocodex" "dist/${{ matrix.artifact }}"
+          cp "target/${{ matrix.target }}/release/nanocodex" "dist/${{ matrix.artifact }}"
       - name: Stage Windows artifact
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist
-          Copy-Item "target/${{ matrix.target }}/maxperf/nanocodex.exe" "dist/${{ matrix.artifact }}"
+          Copy-Item "target/${{ matrix.target }}/release/nanocodex.exe" "dist/${{ matrix.artifact }}"
       - name: Stage PR provenance and checksum
         if: github.event_name == 'workflow_dispatch' && inputs.pr != ''
         shell: bash
@@ -129,7 +129,7 @@ jobs:
           mkdir dist
           docker build \
             --platform linux/amd64 \
-            --build-arg CARGO_PROFILE=maxperf \
+            --build-arg CARGO_PROFILE=release \
             --build-arg TAG_NAME="$TAG_NAME" \
             --build-arg VERGEN_GIT_SHA="$BUILD_SHA" \
             --file harbor_adapter/nanocodex.Dockerfile \
