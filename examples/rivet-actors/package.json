@@ -7,6 +7,8 @@
     "node": ">=22.13.0"
   },
   "scripts": {
+    "build": "npm run build:web && npm run build:server",
+    "build:server": "tsc -p tsconfig.server.json",
     "build:web": "esbuild web/app.ts --bundle --format=esm --minify --outfile=web/dist/app.js",
     "check": "npm run check:dependencies && npm run typecheck && npm test",
     "check:dependencies": "node scripts/check-no-pi.mjs",

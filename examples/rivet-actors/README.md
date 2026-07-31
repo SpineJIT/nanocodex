@@ -173,13 +173,47 @@ Rivet automatically sleeps idle actors after 30 seconds.
 
 ## Deployment
 
-Rivet Actors can run on Rivet Compute or a self-hosted Rivet platform. Build
-Nanocodex WASM as part of the image, start `src/server.ts`, and provide the
-selected authentication secrets to the runner. Rivet's current CLI deploy path
-is:
+Rivet Actors can run on Rivet Compute or a self-hosted Rivet platform. The
+included production image builds Nanocodex WASM, compiles the actor server, and
+starts it without a TypeScript runtime dependency. From the repository root,
+get a cloud token from the Rivet dashboard's **Connect > Rivet Cloud** page and
+deploy with API-key model authentication:
 
 ```sh
-npx @rivetkit/cli deploy --token cloud_api_xxxxx
+export RIVET_CLOUD_TOKEN=cloud_api_xxxxx
+export OPENAI_API_KEY=sk-...
+npx @rivetkit/cli@2.3.10 deploy \
+  --dockerfile examples/rivet-actors/Dockerfile \
+  --build-context . \
+  --namespace production \
+  --env NANOCODEX_AUTH_MODE=api_key \
+  --env OPENAI_API_KEY="$OPENAI_API_KEY"
 ```
 
-See the official [Rivet deployment guide](https://rivet.dev/docs/deploy/).
+For deployment-managed ChatGPT authentication, replace the last two flags with
+the `NANOCODEX_AUTH_MODE`, capability, actor key, and dedicated ChatGPT
+credential variables documented above. Do not share that rotating refresh
+token with another deployment or local Codex installation.
+
+Once the pool is ready, mint a client-safe public token and use the resulting
+endpoint with the REPL, smoke driver, or browser client:
+
+```sh
+RIVET_PUBLIC_TOKEN="$(npx @rivetkit/cli@2.3.10 token create \
+  --kind public --namespace production)"
+export RIVET_PUBLIC_ENDPOINT="https://production:${RIVET_PUBLIC_TOKEN}@api.rivet.dev"
+npm run smoke --prefix examples/rivet-actors
+npm run repl --prefix examples/rivet-actors
+```
+
+The browser bundle is static and can be published on any static host after
+`npm run build:web --prefix examples/rivet-actors`; paste the same public
+endpoint into its endpoint field. Anyone with that endpoint can invoke this
+example's actors and spend model tokens because the demo intentionally does not
+add application authentication. Use a dedicated namespace/token and remove or
+protect it after the demo.
+
+Monitor the hosted runner with
+`npx @rivetkit/cli@2.3.10 logs --follow --namespace production`. See the official
+[Rivet Compute deployment guide](https://rivet.dev/docs/deploy/rivet-compute/)
+and [endpoint guide](https://rivet.dev/docs/general/endpoints/).
