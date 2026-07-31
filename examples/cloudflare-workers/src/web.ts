@@ -45,7 +45,7 @@ const HTML = `<!doctype html>
       <span id="status" class="pill">no session</span>
     </header>
     <section class="setup">
-      <label>Session creation token <input id="admin" type="password" autocomplete="off" placeholder="local-admin-token"></label>
+      <label>Session creation token <input id="admin" type="password" autocomplete="off" placeholder="Paste the deployment admin token"></label>
       <button id="new-session" type="button">New session</button>
       <button id="reconnect" type="button" class="secondary">Reconnect</button>
       <button id="detach" type="button" class="secondary">Detach</button>
@@ -90,6 +90,7 @@ ui.newSession.addEventListener("click", async () => {
       method: "POST",
       headers: { authorization: "Bearer " + token },
     });
+    if (response.status === 401) throw new Error("session creation token rejected; enter this deployment's NANOCODEX_ADMIN_TOKEN");
     if (!response.ok) throw new Error("session creation failed with HTTP " + response.status);
     const created = await response.json();
     if (socket) socket.close(1000, "new session");
@@ -97,11 +98,11 @@ ui.newSession.addEventListener("click", async () => {
     saveState();
     renderState();
     connect();
+    ui.admin.value = "";
   } catch (error) {
     setActivity(errorMessage(error), true);
   } finally {
     setBusy(false);
-    ui.admin.value = "";
   }
 });
 

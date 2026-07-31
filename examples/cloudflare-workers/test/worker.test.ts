@@ -12,13 +12,16 @@ describe("Nanocodex Durable Object Worker", () => {
     const page = await SELF.fetch("https://example.test/");
     expect(page.status).toBe(200);
     expect(page.headers.get("content-security-policy")).toContain("connect-src 'self' ws: wss:");
-    expect(await page.text()).toContain("Durable agent, disposable client.");
+    const html = await page.text();
+    expect(html).toContain("Durable agent, disposable client.");
+    expect(html).toContain("Paste the deployment admin token");
 
     const script = await SELF.fetch("https://example.test/app.js");
     const source = await script.text();
     expect(script.headers.get("content-type")).toContain("text/javascript");
     expect(source).toContain("localStorage");
     expect(source).toContain("crypto.randomUUID()");
+    expect(source).toContain("session creation token rejected");
     expect(source).not.toContain("OPENAI_API_KEY");
     expect(source).not.toContain("CHATGPT_ACCESS_TOKEN");
   });
