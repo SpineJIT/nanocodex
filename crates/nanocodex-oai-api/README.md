@@ -36,10 +36,17 @@ if let Some(cost) = completed.estimated_cost() {
 # }
 ```
 
-USD estimates require no pricing configuration. This crate supports only
-`gpt-5.6-sol` and applies OpenAI's published standard rates, or its priority
-rates when [`OpenAiBuilder::fast_mode`] is enabled. If the provider omits
-usage, [`CompletedResponse::estimated_cost`] returns `None`.
+This crate supports `gpt-5.6-sol` (the default) and `gpt-5.6-luna`. Select a
+client default with `OpenAi::builder(auth).model(Model::Luna)`. A session keeps
+that model for its lifetime, and each replayable attempt retains it across
+retries. Changing models would invalidate the provider checkpoint and require
+an inefficient replay of the complete retained context.
+
+USD estimates require no pricing configuration. Each model applies its
+published standard rates, or its priority rates when
+[`OpenAiBuilder::fast_mode`] is enabled. Luna usage receives the same complete
+estimate and status treatment as Sol. Provider-omitted usage remains
+distinguishable as `usage_not_reported`.
 
 ## ChatGPT subscription login
 
@@ -200,7 +207,7 @@ prominent:
   batteries-included runtime and implementations.
 - [`auth`] owns API-key credentials plus native managed ChatGPT login,
   persistence, refresh, and logout.
-- [`pricing`] and [`events`] expose automatic `gpt-5.6-sol` cost estimates and
+- [`pricing`] and [`events`] expose automatic model-specific cost estimates and
   lifecycle-event components.
 - [`realtime`] exposes native GPT Realtime PCM streams and typed voice events.
 - [`tower`] contains the generic attempt, response, and retry contracts.

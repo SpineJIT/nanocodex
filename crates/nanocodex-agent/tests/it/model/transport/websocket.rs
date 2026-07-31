@@ -117,7 +117,7 @@ async fn websocket_full_replay_never_sends_a_previous_response_id() -> Result<()
 }
 
 #[tokio::test]
-async fn policy_precedence_is_client_then_agent_then_runtime_setter() -> Result<()> {
+async fn model_is_fixed_at_creation_while_runtime_reasoning_policy_can_change() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
     let server = tokio::spawn(async move {
@@ -125,11 +125,13 @@ async fn policy_precedence_is_client_then_agent_then_runtime_setter() -> Result<
         let mut socket = accept_async(stream).await?;
         let warmup = next_json(&mut socket).await?;
         assert_warmup(&warmup);
+        assert_eq!(warmup["model"], "gpt-5.6-luna");
         assert_eq!(warmup["reasoning"]["effort"], "low");
         assert_eq!(warmup["input"][1]["content"][0]["text"], "custom prompt");
         send_warmup(&mut socket, "resp-warmup").await?;
 
         let first = next_json(&mut socket).await?;
+        assert_eq!(first["model"], "gpt-5.6-luna");
         assert_eq!(first["previous_response_id"], "resp-warmup");
         assert_eq!(first["reasoning"]["effort"], "low");
         assert!(first.get("service_tier").is_none());
@@ -137,6 +139,7 @@ async fn policy_precedence_is_client_then_agent_then_runtime_setter() -> Result<
         send_final(&mut socket, "resp-first").await?;
 
         let follow_on = next_json(&mut socket).await?;
+        assert_eq!(follow_on["model"], "gpt-5.6-luna");
         assert!(follow_on.get("previous_response_id").is_none());
         assert_eq!(follow_on["reasoning"]["effort"], "high");
         assert_eq!(follow_on["service_tier"], "priority");
@@ -147,6 +150,7 @@ async fn policy_precedence_is_client_then_agent_then_runtime_setter() -> Result<
         send_final(&mut socket, "resp-second").await?;
 
         let standard = next_json(&mut socket).await?;
+        assert_eq!(standard["model"], "gpt-5.6-luna");
         assert!(standard.get("previous_response_id").is_none());
         assert_eq!(standard["reasoning"]["effort"], "high");
         assert!(standard.get("service_tier").is_none());
@@ -160,12 +164,14 @@ async fn policy_precedence_is_client_then_agent_then_runtime_setter() -> Result<
     let workspace = temporary_workspace("follow-on")?;
     let openai = OpenAi::builder("test-key")
         .websocket_url(endpoint)
+        .model(Model::Sol)
         .thinking(Thinking::Medium)
         .fast_mode(true)
         .reasoning_mode(ReasoningMode::Pro)
         .build()?;
     let (agent, mut events) = Nanocodex::builder(openai)
         .instructions("custom prompt")
+        .model(Model::Luna)
         .thinking(Thinking::Low)
         .fast_mode(false)
         .reasoning_mode(ReasoningMode::Standard)
@@ -194,12 +200,15 @@ async fn policy_precedence_is_client_then_agent_then_runtime_setter() -> Result<
     assert_eq!(completed[0]["connection_attempts"], 1);
     assert_eq!(completed[0]["response_attempts"], 2);
     assert_eq!(completed[0]["effort"], "low");
+    assert_eq!(completed[0]["model"], "gpt-5.6-luna");
     assert_eq!(completed[1]["connection_attempts"], 0);
     assert_eq!(completed[1]["response_attempts"], 1);
     assert_eq!(completed[1]["effort"], "high");
+    assert_eq!(completed[1]["model"], "gpt-5.6-luna");
     assert_eq!(completed[2]["connection_attempts"], 0);
     assert_eq!(completed[2]["response_attempts"], 1);
     assert_eq!(completed[2]["effort"], "high");
+    assert_eq!(completed[2]["model"], "gpt-5.6-luna");
 
     timeout(std::time::Duration::from_secs(5), server)
         .await
@@ -209,7 +218,7 @@ async fn policy_precedence_is_client_then_agent_then_runtime_setter() -> Result<
 }
 
 #[tokio::test]
-async fn queued_prompts_retain_the_thinking_captured_when_accepted() -> Result<()> {
+async fn queued_prompts_retain_effort_captured_when_accepted() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
     let (first_started, first_started_rx) = tokio::sync::oneshot::channel();
@@ -218,10 +227,12 @@ async fn queued_prompts_retain_the_thinking_captured_when_accepted() -> Result<(
         let (stream, _) = listener.accept().await?;
         let mut socket = accept_async(stream).await?;
         let warmup = next_json(&mut socket).await?;
+        assert_eq!(warmup["model"], "gpt-5.6-luna");
         assert_eq!(warmup["reasoning"]["effort"], "low");
         send_warmup(&mut socket, "resp-warmup").await?;
 
         let first = next_json(&mut socket).await?;
+        assert_eq!(first["model"], "gpt-5.6-luna");
         assert_eq!(first["reasoning"]["effort"], "low");
         first_started
             .send(())
@@ -244,17 +255,20 @@ async fn queued_prompts_retain_the_thinking_captured_when_accepted() -> Result<(
         .await?;
 
         let continuation = next_json(&mut socket).await?;
+        assert_eq!(continuation["model"], "gpt-5.6-luna");
         assert_eq!(continuation["previous_response_id"], "resp-first-tool");
         assert_eq!(continuation["reasoning"]["effort"], "low");
         send_final(&mut socket, "resp-first").await?;
 
         let queued = next_json(&mut socket).await?;
+        assert_eq!(queued["model"], "gpt-5.6-luna");
         assert_eq!(queued["previous_response_id"], "resp-first");
         assert_eq!(queued["reasoning"]["effort"], "low");
         assert!(queued.get("service_tier").is_none());
         send_final(&mut socket, "resp-queued").await?;
 
         let updated = next_json(&mut socket).await?;
+        assert_eq!(updated["model"], "gpt-5.6-luna");
         assert!(updated.get("previous_response_id").is_none());
         assert_eq!(updated["reasoning"]["effort"], "high");
         assert_eq!(updated["service_tier"], "priority");
@@ -265,11 +279,12 @@ async fn queued_prompts_retain_the_thinking_captured_when_accepted() -> Result<(
         send_final(&mut socket, "resp-updated").await
     });
 
-    let workspace = temporary_workspace("queued-thinking")?;
+    let workspace = temporary_workspace("queued-turn-policy")?;
     let openai = OpenAi::builder("test-key")
         .websocket_url(endpoint)
         .build()?;
     let (agent, events) = Nanocodex::builder(openai)
+        .model(Model::Luna)
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .session_id(test_session_id())
@@ -286,8 +301,16 @@ async fn queued_prompts_retain_the_thinking_captured_when_accepted() -> Result<(
         .send(())
         .map_err(|()| eyre!("first request release receiver dropped"))?;
     first.result().await?;
-    queued.result().await?;
-    agent.prompt("updated prompt").await?.result().await?;
+    let queued = queued.result().await?;
+    assert_eq!(
+        serde_json::to_value(queued.snapshot())?["model"],
+        "gpt-5.6-luna"
+    );
+    let updated = agent.prompt("updated prompt").await?.result().await?;
+    assert_eq!(
+        serde_json::to_value(updated.snapshot())?["model"],
+        "gpt-5.6-luna"
+    );
 
     drop((agent, events));
     timeout(std::time::Duration::from_secs(5), server)

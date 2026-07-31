@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{OpenAiAuth, ReasoningMode, ResponsesHistory, ResponsesTransport, Thinking};
+use crate::{Model, OpenAiAuth, ReasoningMode, ResponsesHistory, ResponsesTransport, Thinking};
 
 const SYSTEM_PROMPT: &str = include_str!("../../prompts/system.md");
 
@@ -13,6 +13,8 @@ const SYSTEM_PROMPT: &str = include_str!("../../prompts/system.md");
 /// [`ResponsesServiceFactory`]: super::ResponsesServiceFactory
 #[derive(Clone)]
 pub struct ModelConfig {
+    /// Selected GPT-5.6 coding model.
+    pub model: Model,
     /// Authentication source resolved for each transport connection.
     pub auth: OpenAiAuth,
     /// Reasoning execution mode.
@@ -61,6 +63,7 @@ impl ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
+            model: Model::default(),
             auth: OpenAiAuth::api_key(String::new()),
             reasoning_mode: ReasoningMode::default(),
             thinking: Thinking::default(),

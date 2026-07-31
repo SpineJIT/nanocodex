@@ -29,6 +29,16 @@ pub(super) struct CodexCompatibility {
 }
 
 impl<F> NanocodexBuilder<F> {
+    /// Overrides the `OpenAi` recipe's model for this agent.
+    ///
+    /// Without this call the agent inherits the client default. The selected
+    /// model is fixed for the lifetime of the agent thread.
+    #[must_use]
+    pub const fn model(mut self, model: Model) -> Self {
+        self.config.model = model;
+        self
+    }
+
     /// Replaces the stable system/developer instructions.
     #[must_use]
     pub fn instructions(mut self, instructions: impl Into<Arc<str>>) -> Self {
@@ -226,10 +236,7 @@ where
     validate(&builder.config, builder.prompt_cache.key.as_deref())?;
     let config = Arc::new(builder.config);
     let factory = builder.factory;
-    let service_factory: ServiceFactory<F::Service> = Arc::new({
-        let service_config = Arc::clone(&config);
-        move || factory.make(Arc::clone(&service_config))
-    });
+    let service_factory: ServiceFactory<F::Service> = Arc::new(move |config| factory.make(config));
     build_agent(
         config,
         builder.tools,
@@ -240,4 +247,104 @@ where
         builder.resume,
         service_factory,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::{Pending, pending},
+        sync::Mutex,
+        task::{Context, Poll},
+    };
+
+    use nanocodex_oai_api::{
+        auth::OpenAiAuth,
+        responses::{ContentItem, MessageRole, ResponseItem},
+    };
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct ObservingFactory {
+        model: Arc<Mutex<Option<Model>>>,
+    }
+
+    impl ResponsesServiceFactory for ObservingFactory {
+        type Service = PendingService;
+
+        fn make(&self, config: Arc<ModelConfig>) -> Self::Service {
+            *self.model.lock().expect("model observation lock") = Some(config.model);
+            PendingService
+        }
+    }
+
+    struct PendingService;
+
+    impl Service<ResponsesAttempt> for PendingService {
+        type Response = ResponsesServiceResponse;
+        type Error = ResponseError;
+        type Future = Pending<std::result::Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: ResponsesAttempt) -> Self::Future {
+            pending()
+        }
+    }
+
+    #[tokio::test]
+    async fn resumed_model_reaches_the_service_factory() {
+        let workspace = std::env::current_dir().expect("current workspace");
+        let canonical_context = ResponseItem::message(
+            MessageRole::User,
+            [ContentItem::input_text("resume with the retained model")],
+        );
+        let snapshot = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "model": "gpt-5.6-luna",
+            "lineage_id": "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+            "prompt_cache_key": "retained-model",
+            "workspace": workspace,
+            "canonical_context": canonical_context,
+            "history": [canonical_context],
+        }))
+        .expect("valid session snapshot");
+        let observed_model = Arc::new(Mutex::new(None));
+        let mut config = ModelConfig {
+            auth: OpenAiAuth::api_key("test-key"),
+            ..ModelConfig::default()
+        };
+        config.model = Model::Sol;
+        let builder = NanocodexBuilder {
+            config,
+            tools: ToolsConfiguration::Shared(
+                Tools::builder()
+                    .without_defaults()
+                    .build()
+                    .expect("empty tools"),
+            ),
+            workspace: None,
+            session_id: None,
+            prompt_cache: PromptCacheConfig::default(),
+            codex: CodexCompatibility::default(),
+            resume: Some(snapshot),
+            factory: ObservingFactory {
+                model: Arc::clone(&observed_model),
+            },
+        };
+
+        let (agent, events) = builder.build().expect("resumed agent");
+
+        assert_eq!(
+            *observed_model.lock().expect("model observation lock"),
+            Some(Model::Luna)
+        );
+        agent.shutdown().await.expect("agent shutdown");
+        drop(events);
+    }
 }

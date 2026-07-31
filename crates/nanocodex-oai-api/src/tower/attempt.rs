@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    AgentEventKind, EventError, EventSink, ResponseEvent, ResponseItem, ResponsesTransport,
+    AgentEventKind, EventError, EventSink, Model, ResponseEvent, ResponseItem, ResponsesTransport,
     Thinking,
     responses::{RequestProfile, ResponseHistory, ResponsesInput, WarmupResponse},
     tower::transport_policy::SessionTransport,
@@ -155,6 +155,7 @@ pub struct ResponsesAttempt {
     incremental_start: usize,
     tail: Option<ResponseItem>,
     previous_response_id: Option<String>,
+    model: Model,
     thinking: Thinking,
     fast_mode: bool,
     pub(crate) profile: Arc<RequestProfile>,
@@ -168,6 +169,7 @@ pub struct ResponsesAttempt {
 
 impl ResponsesAttempt {
     fn warmup(
+        model: Model,
         thinking: Thinking,
         fast_mode: bool,
         profile: Arc<RequestProfile>,
@@ -182,6 +184,7 @@ impl ResponsesAttempt {
             incremental_start: 0,
             tail: None,
             previous_response_id: None,
+            model,
             thinking,
             fast_mode,
             profile,
@@ -201,6 +204,7 @@ impl ResponsesAttempt {
         incremental_history: ResponseHistory,
         incremental_start: usize,
         previous_response_id: Option<&str>,
+        model: Model,
         thinking: Thinking,
         fast_mode: bool,
         profile: Arc<RequestProfile>,
@@ -215,6 +219,7 @@ impl ResponsesAttempt {
             incremental_start,
             tail: None,
             previous_response_id: previous_response_id.map(str::to_owned),
+            model,
             thinking,
             fast_mode,
             profile,
@@ -235,6 +240,7 @@ impl ResponsesAttempt {
         incremental_start: usize,
         previous_response_id: Option<&str>,
         trigger: ResponseItem,
+        model: Model,
         thinking: Thinking,
         fast_mode: bool,
         profile: Arc<RequestProfile>,
@@ -249,6 +255,7 @@ impl ResponsesAttempt {
             incremental_start,
             tail: Some(trigger),
             previous_response_id: previous_response_id.map(str::to_owned),
+            model,
             thinking,
             fast_mode,
             profile,
@@ -297,6 +304,12 @@ impl ResponsesAttempt {
     #[must_use]
     pub const fn thinking(&self) -> Thinking {
         self.thinking
+    }
+
+    /// Returns the model fixed for this replayable attempt.
+    #[must_use]
+    pub const fn model(&self) -> Model {
+        self.model
     }
 
     /// Returns whether this replayable attempt uses priority service.
@@ -518,8 +531,9 @@ impl ResponsesAttemptFactory {
 
     /// Builds a WebSocket warmup attempt.
     #[must_use]
-    pub fn warmup(&self, thinking: Thinking, fast_mode: bool) -> ResponsesAttempt {
+    pub fn warmup(&self, model: Model, thinking: Thinking, fast_mode: bool) -> ResponsesAttempt {
         let mut attempt = ResponsesAttempt::warmup(
+            model,
             thinking,
             fast_mode,
             Arc::clone(&self.profile),
@@ -540,6 +554,7 @@ impl ResponsesAttemptFactory {
         incremental_history: ResponseHistory,
         incremental_start: usize,
         previous_response_id: Option<&str>,
+        model: Model,
         thinking: Thinking,
         fast_mode: bool,
     ) -> ResponsesAttempt {
@@ -549,6 +564,7 @@ impl ResponsesAttemptFactory {
             incremental_history,
             incremental_start,
             previous_response_id,
+            model,
             thinking,
             fast_mode,
             Arc::clone(&self.profile),
@@ -570,6 +586,7 @@ impl ResponsesAttemptFactory {
         incremental_start: usize,
         previous_response_id: Option<&str>,
         trigger: ResponseItem,
+        model: Model,
         thinking: Thinking,
         fast_mode: bool,
     ) -> ResponsesAttempt {
@@ -580,6 +597,7 @@ impl ResponsesAttemptFactory {
             incremental_start,
             previous_response_id,
             trigger,
+            model,
             thinking,
             fast_mode,
             Arc::clone(&self.profile),
@@ -595,7 +613,7 @@ impl ResponsesAttemptFactory {
 mod tests {
     use super::{ResponseHistory, ResponsesAttemptFactory, TransportStats};
     use crate::{
-        ContentItem, EventSink, MessageRole, ResponseItem, ResponsesTransport, Thinking,
+        ContentItem, EventSink, MessageRole, Model, ResponseItem, ResponsesTransport, Thinking,
         responses::RequestProfile,
     };
     use serde_json::json;
@@ -615,13 +633,16 @@ mod tests {
             ResponseHistory::default(),
             0,
             Some("resp-previous"),
+            Model::Luna,
             Thinking::High,
             true,
         );
 
+        assert_eq!(attempt.model(), Model::Luna);
         assert_eq!(attempt.thinking(), Thinking::High);
         assert!(attempt.fast_mode());
         assert!(attempt.prepare_retry());
+        assert_eq!(attempt.model(), Model::Luna);
         assert_eq!(attempt.thinking(), Thinking::High);
         assert!(attempt.fast_mode());
     }
@@ -647,6 +668,7 @@ mod tests {
             1,
             None,
             ResponseItem::compaction_trigger(),
+            Model::Sol,
             Thinking::Medium,
             false,
         );
@@ -681,6 +703,7 @@ mod tests {
             ResponseHistory::default(),
             0,
             None,
+            Model::Sol,
             Thinking::High,
             false,
         );
@@ -692,6 +715,7 @@ mod tests {
             ResponseHistory::default(),
             0,
             None,
+            Model::Sol,
             Thinking::High,
             false,
         );
@@ -712,6 +736,7 @@ mod tests {
             ResponseHistory::default(),
             0,
             None,
+            Model::Sol,
             Thinking::High,
             false,
         );

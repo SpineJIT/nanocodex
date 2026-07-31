@@ -46,7 +46,7 @@ pub(super) fn agent_turn_span(
         agent.origin = origin.kind,
         agent.depth = origin.depth,
         trace.parented = parented,
-        model = nanocodex_oai_api::MODEL,
+        model = reasoning.model.as_str(),
         reasoning.mode = reasoning.mode.as_str(),
         reasoning.effort = reasoning.effort.as_str(),
         thinking = reasoning.effort.as_str(),
@@ -71,6 +71,7 @@ pub(super) fn agent_turn_span(
 
 #[derive(Clone, Copy)]
 pub(super) struct ReasoningSettings {
+    pub(super) model: Model,
     pub(super) mode: ReasoningMode,
     pub(super) effort: Thinking,
 }

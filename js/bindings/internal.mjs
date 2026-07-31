@@ -141,6 +141,7 @@ export function toWasmConfig(options = {}) {
     throw new TypeError("apiKey must be a non-empty string");
   }
   const config = { api_key: apiKey };
+  copy(config, "model", options.model);
   copy(config, "thinking", options.thinking);
   copy(config, "reasoning_mode", options.reasoningMode);
   copy(config, "fast_mode", options.fastMode);

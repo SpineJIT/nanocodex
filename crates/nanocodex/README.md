@@ -40,11 +40,17 @@ not wait for the turn's optional event stream to be consumed. Follow-on prompts
 reuse the same retained context and transport without asking the caller to
 manage response IDs or history.
 
+`gpt-5.6-sol` is the default; `.model(Model::Luna)` selects
+`gpt-5.6-luna` when creating the agent. The selected model remains fixed for
+the thread so follow-on turns can continue from the provider checkpoint without
+replaying the complete retained context.
+
 ## Usage and USD estimates
 
 Every completed turn reports aggregate provider usage. Cost remains explicit:
-Nanocodex applies OpenAI's published `gpt-5.6-sol` standard or priority rates
-automatically, while omitted provider usage remains distinguishable from zero.
+Nanocodex automatically applies the selected model's published standard or
+priority rates. Luna uses its documented Luna rates rather than Sol's higher
+rates.
 
 ```rust,no_run
 use nanocodex::{Nanocodex, OpenAi};

@@ -113,6 +113,7 @@ async fn execute_code_call(
     call: &CodeCall,
     owned_context: Option<OwnedToolContext>,
     session_id: &str,
+    model: Model,
     observer: &mut dyn CodeModeObserver,
     tool_span: &tracing::Span,
 ) -> CodeModeExecution {
@@ -123,7 +124,7 @@ async fn execute_code_call(
             .await
     } else {
         let context = ToolContext::new(
-            MODEL,
+            model.as_str(),
             session_id,
             &call.call_id,
             &[],
@@ -162,6 +163,7 @@ where
         let events = self.events.clone();
         let tool_call_indices = self.tool_call_indices.clone();
         let session_id = events.request_id().to_owned();
+        let model = self.model;
         let mut executions = prepared
             .into_iter()
             .map(|(call, supports_parallel, active)| {
@@ -188,6 +190,7 @@ where
                                 call,
                                 history,
                                 &session_id,
+                                model,
                                 started_at,
                                 &active.progress,
                                 &active.span,
@@ -208,6 +211,7 @@ where
                                 call,
                                 history,
                                 &session_id,
+                                model,
                                 started_at,
                                 &active.progress,
                                 &active.span,
@@ -406,6 +410,7 @@ where
         call: CodeCall,
         history: Option<Arc<Vec<ResponseItem>>>,
         session_id: &str,
+        model: Model,
         started_at: Instant,
         progress: &Mutex<ActiveToolProgress>,
         tool_span: &tracing::Span,
@@ -434,7 +439,7 @@ where
         }
         if matches!(call.kind, CodeCallKind::Function) && call.namespace.is_some() {
             let context = ToolContext::new(
-                MODEL,
+                model.as_str(),
                 session_id,
                 &call.call_id,
                 &[],
@@ -472,7 +477,7 @@ where
         if matches!(call.kind, CodeCallKind::ToolSearch) {
             let search_history = history.as_deref().map_or(&[][..], Vec::as_slice);
             let context = ToolContext::new(
-                MODEL,
+                model.as_str(),
                 session_id,
                 &call.call_id,
                 search_history,
@@ -515,7 +520,7 @@ where
                 metadata: execution.metadata,
             });
         }
-        let owned_context = owned_code_context(&call, history, session_id)?;
+        let owned_context = owned_code_context(&call, history, session_id, model)?;
         let mut observer = NestedToolEventObserver {
             events,
             tool_call_indices,
@@ -529,6 +534,7 @@ where
             &call,
             owned_context,
             session_id,
+            model,
             &mut observer,
             tool_span,
         )

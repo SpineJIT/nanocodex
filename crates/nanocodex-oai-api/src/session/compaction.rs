@@ -65,7 +65,7 @@ static ORIGINAL_IMAGE_ESTIMATE_CACHE: LazyLock<Mutex<OriginalImageEstimateCache>
 
 #[must_use]
 pub fn auto_compact_token_limit(model: &str) -> Option<u64> {
-    (model == "gpt-5.6-sol").then_some((CONTEXT_WINDOW_TOKENS * 9) / 10)
+    matches!(model, "gpt-5.6-sol" | "gpt-5.6-luna").then_some((CONTEXT_WINDOW_TOKENS * 9) / 10)
 }
 
 #[must_use]
@@ -472,8 +472,9 @@ mod tests {
     }
 
     #[test]
-    fn sol_compacts_at_ninety_percent_of_its_context_window() {
+    fn supported_models_compact_at_ninety_percent_of_their_context_window() {
         assert_eq!(auto_compact_token_limit("gpt-5.6-sol"), Some(244_800));
+        assert_eq!(auto_compact_token_limit("gpt-5.6-luna"), Some(244_800));
         assert_eq!(auto_compact_token_limit("unknown-model"), None);
     }
 

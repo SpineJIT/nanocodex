@@ -64,6 +64,7 @@ class Nanocodex:
         api_key: str | None = ...,
         *,
         auth_file: str | None = ...,
+        model: str = ...,
         thinking: str = ...,
         reasoning_mode: str = ...,
         fast_mode: bool = ...,

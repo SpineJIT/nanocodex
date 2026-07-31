@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use nanocodex::{
-    Nanocodex as RustNanocodex, OpenAi, ReasoningMode, Thinking,
+    Model, Nanocodex as RustNanocodex, OpenAi, ReasoningMode, Thinking,
     agent::session::SessionId,
     oai::auth::{OpenAiAuth, load_chatgpt_auth},
 };
@@ -15,7 +15,7 @@ use tokio::runtime::Runtime;
 use crate::{
     error::{lock_error, runtime_error},
     events::AgentEvents,
-    runtime::runtime,
+    runtime::{runtime, shared_http_client},
     snapshot::SessionSnapshot,
     turn::{Turn, TurnResult},
 };
@@ -35,6 +35,7 @@ impl Nanocodex {
         api_key = None,
         *,
         auth_file = None,
+        model = "gpt-5.6-sol",
         thinking = "high",
         reasoning_mode = "standard",
         fast_mode = false,
@@ -54,6 +55,7 @@ impl Nanocodex {
         py: Python<'_>,
         api_key: Option<String>,
         auth_file: Option<String>,
+        model: &str,
         thinking: &str,
         reasoning_mode: &str,
         fast_mode: bool,
@@ -66,6 +68,7 @@ impl Nanocodex {
         api_base_url: Option<String>,
     ) -> PyResult<(Self, AgentEvents)> {
         let auth = parse_auth(api_key, auth_file)?;
+        let model = parse_model(model)?;
         let thinking = parse_thinking(thinking)?;
         let reasoning_mode = parse_reasoning_mode(reasoning_mode)?;
         let session_id = session_id
@@ -74,9 +77,11 @@ impl Nanocodex {
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let resume = resume.map(|snapshot| snapshot.borrow(py).inner().clone());
         let mut openai = OpenAi::builder(auth)
+            .model(model)
             .thinking(thinking)
             .reasoning_mode(reasoning_mode)
-            .fast_mode(fast_mode);
+            .fast_mode(fast_mode)
+            .http_client(shared_http_client());
         if let Some(websocket_url) = websocket_url {
             openai = openai.websocket_url(websocket_url);
         }
@@ -241,6 +246,10 @@ fn parse_auth(api_key: Option<String>, auth_file: Option<String>) -> PyResult<Op
 }
 
 fn parse_thinking(value: &str) -> PyResult<Thinking> {
+    value.parse().map_err(PyValueError::new_err)
+}
+
+fn parse_model(value: &str) -> PyResult<Model> {
     value.parse().map_err(PyValueError::new_err)
 }
 

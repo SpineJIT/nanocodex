@@ -7,6 +7,7 @@ pub(in crate::rollout) struct RolloutWriter {
     written_revision: Option<u64>,
     written_len: usize,
     written_context_baseline: Option<ContextBaseline>,
+    workspace: PathBuf,
     window_number: u64,
     first_window_id: String,
     current_window_id: String,
@@ -15,13 +16,18 @@ pub(in crate::rollout) struct RolloutWriter {
 }
 
 impl RolloutWriter {
-    pub(in crate::rollout) fn new(file: tokio::fs::File, initial_window_id: String) -> Self {
+    pub(in crate::rollout) fn new(
+        file: tokio::fs::File,
+        initial_window_id: String,
+        workspace: PathBuf,
+    ) -> Self {
         Self {
             file,
             pending: None,
             written_revision: None,
             written_len: 0,
             written_context_baseline: None,
+            workspace,
             window_number: 0,
             first_window_id: initial_window_id.clone(),
             current_window_id: initial_window_id,
@@ -37,6 +43,7 @@ impl RolloutWriter {
             written_revision: Some(0),
             written_len: state.written_len,
             written_context_baseline: state.context_baseline,
+            workspace: state.workspace,
             window_number: state.window_number,
             first_window_id: state.first_window_id,
             current_window_id: state.current_window_id,
@@ -141,8 +148,9 @@ impl RolloutWriter {
                         id: window_id,
                     }),
                     turn: commit.turn.clone(),
+                    model: commit.model,
                     context_baseline: commit.context_baseline.clone(),
-                    write_context: true,
+                    write_state: true,
                 })
             }
             None => Ok(PreparedAppend {
@@ -154,8 +162,9 @@ impl RolloutWriter {
                 len,
                 window: None,
                 turn: commit.turn.clone(),
+                model: commit.model,
                 context_baseline: commit.context_baseline.clone(),
-                write_context: self.written_context_baseline.as_ref()
+                write_state: self.written_context_baseline.as_ref()
                     != Some(&commit.context_baseline),
             }),
             Some(revision) if revision == commit.revision => {
@@ -174,8 +183,9 @@ impl RolloutWriter {
                     len,
                     window: None,
                     turn: commit.turn.clone(),
+                    model: commit.model,
                     context_baseline: commit.context_baseline.clone(),
-                    write_context: self.written_context_baseline.as_ref()
+                    write_state: self.written_context_baseline.as_ref()
                         != Some(&commit.context_baseline),
                 })
             }
@@ -198,10 +208,11 @@ impl RolloutWriter {
                         id: window_id,
                     }),
                     turn: commit.turn.clone(),
+                    model: commit.model,
                     context_baseline: commit.context_baseline.clone(),
                     // A compaction starts a new history window, whose context
                     // baseline must be independently reconstructable.
-                    write_context: true,
+                    write_state: true,
                 })
             }
         }
@@ -225,9 +236,9 @@ impl RolloutWriter {
             self.write_event(CodexEvent::UserMessage(user_message))
                 .await?;
         }
-
         match &prepared.records {
             PreparedRecords::Items { history, start } => {
+                self.write_turn_context(turn, prepared.model).await?;
                 for item in history.iter_from(*start) {
                     write_async_line(
                         &mut self.file,
@@ -248,9 +259,10 @@ impl RolloutWriter {
                     },
                 )
                 .await?;
+                self.write_turn_context(turn, prepared.model).await?;
             }
         }
-        if prepared.write_context {
+        if prepared.write_state {
             write_async_line(
                 &mut self.file,
                 &RolloutLine {
@@ -338,10 +350,30 @@ impl RolloutWriter {
         .await
     }
 
+    async fn write_turn_context(&mut self, turn: &RolloutTurn, model: Model) -> io::Result<()> {
+        write_async_line(
+            &mut self.file,
+            &RolloutLine {
+                timestamp: timestamp(),
+                item: RolloutItem::TurnContext(&TurnContext {
+                    cwd: &self.workspace,
+                    approval_policy: "never",
+                    sandbox_policy: SandboxPolicy {
+                        kind: "danger-full-access",
+                    },
+                    model: model.as_str(),
+                    effort: turn.effort.as_str(),
+                    summary: "auto",
+                }),
+            },
+        )
+        .await
+    }
+
     fn apply_prepared(&mut self, prepared: PreparedAppend) {
         self.written_revision = Some(prepared.revision);
         self.written_len = prepared.len;
-        if prepared.write_context {
+        if prepared.write_state {
             self.written_context_baseline = Some(prepared.context_baseline);
         }
         if let Some(window) = prepared.window {
@@ -368,8 +400,9 @@ struct PreparedAppend {
     len: usize,
     window: Option<WindowAdvance>,
     turn: RolloutTurn,
+    model: Model,
     context_baseline: ContextBaseline,
-    write_context: bool,
+    write_state: bool,
 }
 
 enum PreparedRecords {
@@ -387,6 +420,7 @@ struct WindowAdvance {
 
 pub(super) struct ResumeWriterState {
     pub(super) written_len: usize,
+    workspace: PathBuf,
     context_baseline: Option<ContextBaseline>,
     window_number: u64,
     first_window_id: String,
@@ -401,6 +435,7 @@ pub(super) fn read_resume_writer_state(
     let mut current_window_id = None;
     let mut window_number = 0;
     let mut written_len = 0;
+    let mut workspace = None;
     let mut context_baseline = None;
     for line in BufReader::new(File::open(path)?).lines() {
         let line = line?;
@@ -426,6 +461,12 @@ pub(super) fn read_resume_writer_state(
                     .to_owned();
                 first_window_id = Some(window.clone());
                 current_window_id = Some(window);
+                workspace = Some(PathBuf::from(payload["cwd"].as_str().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Codex rollout is missing its workspace",
+                    )
+                })?));
             }
             Some("compacted") => {
                 let payload = &value["payload"];
@@ -473,8 +514,15 @@ pub(super) fn read_resume_writer_state(
             "Codex rollout is missing session metadata",
         )
     })?;
+    let workspace = workspace.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex rollout is missing session metadata",
+        )
+    })?;
     Ok(ResumeWriterState {
         written_len,
+        workspace,
         context_baseline,
         window_number,
         current_window_id: current_window_id.unwrap_or_else(|| first_window_id.clone()),

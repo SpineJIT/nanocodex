@@ -49,7 +49,11 @@ import threading
 
 from nanocodex import Nanocodex
 
-agent, events = Nanocodex(os.environ["OPENAI_API_KEY"], thinking="low")
+agent, events = Nanocodex(
+    os.environ["OPENAI_API_KEY"],
+    model="gpt-5.6-luna",
+    thinking="low",
+)
 
 
 def print_events() -> None:

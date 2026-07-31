@@ -4,8 +4,8 @@ use ::tower::Service;
 use tokio::sync::mpsc;
 
 use crate::{
-    ContentItem, EventSink, MessageRole, OpenAi, ResponseItem, ResponsesAttempt, ResponsesClient,
-    ResponsesServiceResponse, Thinking, ToolDefinition, TransportStats,
+    ContentItem, EventSink, MessageRole, Model, OpenAi, ResponseItem, ResponsesAttempt,
+    ResponsesClient, ResponsesServiceResponse, Thinking, ToolDefinition, TransportStats,
     openai::{ResponsesServiceFactory, StandardServiceFactory},
     responses::RequestProfile,
 };
@@ -143,6 +143,7 @@ where
             canonical_context_reinjection_pending: false,
             next_call_index: 1,
             next_logical_turn: 1,
+            model: config.model,
             thinking: config.thinking,
             fast_mode: config.fast_mode,
             transport_stats: Arc::new(TransportStats::default()),
@@ -174,6 +175,7 @@ pub struct Session<S> {
     pub(super) canonical_context_reinjection_pending: bool,
     pub(super) next_call_index: u32,
     next_logical_turn: u64,
+    pub(super) model: Model,
     pub(super) thinking: Thinking,
     pub(super) fast_mode: bool,
     pub(super) transport_stats: Arc<TransportStats>,

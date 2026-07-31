@@ -1,5 +1,6 @@
 export type Thinking = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 export type ReasoningMode = "standard" | "pro";
+export type Model = "gpt-5.6-sol" | "gpt-5.6-luna";
 
 export type PromptItem =
   | { type: "text"; text: string }
@@ -18,6 +19,7 @@ export type AgentEvent = {
 
 export type AgentOptions = {
   instructions?: string | undefined;
+  model?: Model | undefined;
   reasoningMode?: ReasoningMode | undefined;
   fastMode?: boolean | undefined;
   sessionId?: string | undefined;

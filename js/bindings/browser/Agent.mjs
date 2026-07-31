@@ -21,6 +21,7 @@ export function create(options = {}) {
     websocketUrl,
     apiBaseUrl,
     module,
+    model,
     thinking,
     reasoningMode,
     fastMode,
@@ -68,6 +69,7 @@ export function create(options = {}) {
     decorate: (agent) => agent.extend(agentActions()),
   });
   return createAgentClient(runtime, {
+    model,
     thinking,
     reasoningMode,
     fastMode,

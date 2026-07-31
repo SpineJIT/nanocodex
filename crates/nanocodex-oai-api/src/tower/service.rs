@@ -460,6 +460,7 @@ impl ResponsesService {
         let encoded = match request.kind {
             ResponsesAttemptKind::Warmup => EncodedRequest::new(&ResponseCreate::warmup(
                 &self.config,
+                request.model(),
                 request.thinking(),
                 request.fast_mode(),
                 &request.profile,
@@ -468,7 +469,12 @@ impl ResponsesService {
             ResponsesAttemptKind::Generation | ResponsesAttemptKind::Compaction => {
                 EncodedRequest::new(&ResponseCreate::generation_with_policy(
                     &self.config,
-                    CreatePolicy::new(transport, request.thinking(), request.fast_mode()),
+                    CreatePolicy::new(
+                        transport,
+                        request.model(),
+                        request.thinking(),
+                        request.fast_mode(),
+                    ),
                     request.input(),
                     request.previous_response_id(),
                     &request.profile,
@@ -896,7 +902,7 @@ mod tests {
             events,
             Arc::new(crate::TransportStats::default()),
         );
-        let request = factory.warmup(crate::Thinking::High, false);
+        let request = factory.warmup(crate::Model::Sol, crate::Thinking::High, false);
 
         drop(WebSocketAttemptGuard::new(
             &mut connection,

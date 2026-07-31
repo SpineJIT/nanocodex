@@ -562,6 +562,9 @@ pub(crate) async fn run(
     initial_prompt: Option<String>,
     resume: Option<DurableSession>,
 ) -> Result<()> {
+    let initial_model = resume
+        .as_ref()
+        .map_or_else(|| config.model(), DurableSession::model);
     let initial_thinking = config.thinking();
     let restored_transcript = resume
         .as_ref()
@@ -614,7 +617,9 @@ pub(crate) async fn run(
     );
     let mut input_events = EventStream::new();
     let mut ticker = ui_ticker();
-    let mut app = App::new(cwd).with_thinking(initial_thinking);
+    let mut app = App::new(cwd)
+        .with_model(initial_model)
+        .with_thinking(initial_thinking);
     app.set_math_renderer(math_renderer.clone());
     app.restore_transcript(restored_transcript);
     let mut ui = UiModel::new(app, Arc::clone(&root_session_id));

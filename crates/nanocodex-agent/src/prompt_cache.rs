@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use nanocodex_oai_api::{MODEL, responses::RequestProfile};
+use nanocodex_oai_api::{Model, responses::RequestProfile};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OnceCell};
 
@@ -36,8 +36,12 @@ impl ModelPromptCache {
 }
 
 impl SharedPromptCache {
-    pub(crate) async fn entry(&self, profile: &RequestProfile) -> Result<WarmupEntry> {
-        let fingerprint = prefix_fingerprint(profile)?;
+    pub(crate) async fn entry(
+        &self,
+        model: Model,
+        profile: &RequestProfile,
+    ) -> Result<WarmupEntry> {
+        let fingerprint = prefix_fingerprint(model, profile)?;
         let mut entries = self.entries.lock().await;
         Ok(Arc::clone(
             entries.entry(fingerprint).or_insert_with(Arc::default),
@@ -45,8 +49,8 @@ impl SharedPromptCache {
     }
 }
 
-fn prefix_fingerprint(profile: &RequestProfile) -> Result<PrefixFingerprint> {
-    let encoded = serde_json::to_vec(&(MODEL, profile.prompt_cache_key(), profile.prefix()))
+fn prefix_fingerprint(model: Model, profile: &RequestProfile) -> Result<PrefixFingerprint> {
+    let encoded = serde_json::to_vec(&(model, profile.prompt_cache_key(), profile.prefix()))
         .map_err(NanocodexError::SerializePromptPrefix)?;
     Ok(Sha256::digest(encoded).into())
 }

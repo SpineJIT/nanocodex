@@ -180,12 +180,18 @@ pub(super) async fn begin_shutdown(
     mark_all_queued_turns_cancelled(queued_turns);
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct TurnDefaults {
+    pub(super) model: Model,
+    pub(super) thinking: Thinking,
+    pub(super) fast_mode: bool,
+}
+
 pub(super) fn handle_idle_command<S>(
     command: Command,
     latest: Option<&Arc<CommittedSession>>,
     spawner: &BranchSpawner<S>,
-    thinking: Thinking,
-    fast_mode: bool,
+    defaults: TurnDefaults,
     session_id: &str,
     workspace: Option<Arc<str>>,
 ) where
@@ -199,12 +205,24 @@ pub(super) fn handle_idle_command<S>(
             let outcome = checkpoint
                 .ok_or(NanocodexError::ForkBeforeCompletedTurn)
                 .and_then(|checkpoint| {
-                    spawner.spawn_fork(&checkpoint, session_id, thinking, fast_mode)
+                    spawner.spawn_fork(
+                        &checkpoint,
+                        session_id,
+                        defaults.model,
+                        defaults.thinking,
+                        defaults.fast_mode,
+                    )
                 });
             drop(result.send(outcome));
         }
         Command::Spawn { result } => {
-            drop(result.send(spawner.spawn_clean(workspace, session_id, thinking, fast_mode)));
+            drop(result.send(spawner.spawn_clean(
+                workspace,
+                session_id,
+                defaults.model,
+                defaults.thinking,
+                defaults.fast_mode,
+            )));
         }
         Command::Steer { result, .. } => {
             drop(result.send(Err(NanocodexError::TurnNotSteerable)));

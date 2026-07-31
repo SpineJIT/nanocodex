@@ -1,17 +1,21 @@
-//! Built-in USD estimates for the supported `OpenAI` model.
+//! Built-in USD estimates for supported GPT-5.6 models.
 //!
-//! Nanocodex supports only [`crate::MODEL`], so callers do not configure a
-//! pricing catalog. Completed responses are priced automatically from the
-//! provider-reported token usage and the standard or priority service tier
-//! selected by the request.
+//! Sol and Luna responses are priced automatically from provider-reported
+//! token usage and the selected standard or priority service tier.
 //!
-//! Rates are sourced from the
-//! [OpenAI API pricing page](https://developers.openai.com/api/docs/pricing):
+//! Standard rates and the cache-write multiplier are sourced from the OpenAI
+//! model pages for [Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)
+//! and [Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna).
+//! Fast mode rates are sourced from the
+//! [Fast mode page](https://openai.com/api-fast-mode/). OpenAI continues to
+//! return `priority` as the service-tier name for these models.
 //!
-//! | Service tier | Input | Cached input | Cache write | Output |
-//! | --- | ---: | ---: | ---: | ---: |
-//! | Standard | $5.00 | $0.50 | $6.25 | $30.00 |
-//! | Priority | $10.00 | $1.00 | $12.50 | $60.00 |
+//! | Model | Service tier | Input | Cached input | Cache write | Output |
+//! | --- | --- | ---: | ---: | ---: | ---: |
+//! | Sol | Standard | $5.00 | $0.50 | $6.25 | $30.00 |
+//! | Sol | Fast (`priority`) | $10.00 | $1.00 | $12.50 | $60.00 |
+//! | Luna | Standard | $0.20 | $0.02 | $0.25 | $1.20 |
+//! | Luna | Fast (`priority`) | $0.40 | $0.04 | $0.50 | $2.40 |
 //!
 //! Prices are per one million tokens. Reasoning tokens are already included
 //! in output tokens and are not charged a second time.
@@ -22,7 +26,7 @@ mod estimate;
 use serde::{Deserialize, Serialize};
 
 pub use amount::UsdAmount;
-pub use estimate::{EstimatedUsdCost, ServiceTier, estimate};
+pub use estimate::{EstimatedUsdCost, ServiceTier, estimate, estimate_for_model};
 
 /// Availability of the automatic local USD estimate.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

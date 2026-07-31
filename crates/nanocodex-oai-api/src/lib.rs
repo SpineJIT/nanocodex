@@ -16,7 +16,7 @@ pub mod auth;
 pub mod events;
 #[cfg(feature = "client")]
 mod openai;
-/// Automatic `gpt-5.6-sol` USD estimates from provider token usage.
+/// Automatic model-specific USD estimates from provider token usage.
 #[cfg(feature = "client")]
 pub mod pricing;
 /// Bidirectional GPT Realtime audio sessions and typed conversation events.
@@ -142,10 +142,53 @@ pub mod __private {
     }
 }
 
-/// The single Responses model contract supported by this SDK.
-pub const MODEL: &str = "gpt-5.6-sol";
+/// The default Responses model used by this SDK.
+pub const MODEL: &str = Model::Sol.as_str();
 
-/// Context-window size of the supported Responses model contract.
+/// Supported models in the GPT-5.6 coding-model family.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum Model {
+    /// GPT-5.6 Sol.
+    #[default]
+    Sol,
+    /// GPT-5.6 Luna.
+    Luna,
+}
+
+impl Model {
+    /// Returns the Responses API model identifier.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sol => "gpt-5.6-sol",
+            Self::Luna => "gpt-5.6-luna",
+        }
+    }
+}
+
+impl fmt::Display for Model {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Model {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "gpt-5.6-sol" | "sol" => Ok(Self::Sol),
+            "gpt-5.6-luna" | "luna" => Ok(Self::Luna),
+            _ => Err(format!(
+                "invalid model {value:?}; expected gpt-5.6-sol or gpt-5.6-luna"
+            )),
+        }
+    }
+}
+
+/// Context-window size used by both supported Responses Lite model contracts.
 pub const CONTEXT_WINDOW_TOKENS: u64 = 272_000;
 
 /// User input for one agent turn.
@@ -461,7 +504,16 @@ impl FromStr for Thinking {
 mod tests {
     use serde_json::json;
 
-    use super::{Prompt, ReasoningMode, Thinking};
+    use super::{Model, Prompt, ReasoningMode, Thinking};
+
+    #[test]
+    fn model_parses_short_and_api_names() {
+        assert_eq!("sol".parse(), Ok(Model::Sol));
+        assert_eq!("gpt-5.6-sol".parse(), Ok(Model::Sol));
+        assert_eq!("luna".parse(), Ok(Model::Luna));
+        assert_eq!("gpt-5.6-luna".parse(), Ok(Model::Luna));
+        assert_eq!(Model::default().as_str(), "gpt-5.6-sol");
+    }
 
     #[test]
     fn reasoning_configuration_parses_every_public_value() {

@@ -371,12 +371,14 @@ async fn serialized_session_resumes_over_ephemeral_https() -> Result<()> {
     let endpoint = format!("http://{}", listener.local_addr()?);
     let server = tokio::spawn(async move {
         let first = next_http_json(&listener).await?;
+        assert_eq!(first.body["model"], "gpt-5.6-luna");
         assert_eq!(first.body["store"], false);
         assert!(first.body.get("previous_response_id").is_none());
         assert!(first.body.to_string().contains("first prompt"));
         send_http_final(first.stream, "resp-first").await?;
 
         let resumed = next_http_json(&listener).await?;
+        assert_eq!(resumed.body["model"], "gpt-5.6-luna");
         assert_eq!(resumed.body["store"], false);
         assert!(resumed.body.get("previous_response_id").is_none());
         let replay = resumed.body.to_string();
@@ -394,12 +396,15 @@ async fn serialized_session_resumes_over_ephemeral_https() -> Result<()> {
         .build()?;
     let (agent, events) = Nanocodex::builder(openai)
         .instructions("durable instructions")
+        .model(Model::Luna)
         .thinking(Thinking::Low)
         .workspace(&workspace)
         .prompt_cache_key("durable-cache")
         .build()?;
     let first = agent.prompt("first prompt").await?.result().await?;
-    let snapshot = serde_json::from_slice(&serde_json::to_vec(&first.snapshot())?)?;
+    let snapshot_json = serde_json::to_value(first.snapshot())?;
+    assert_eq!(snapshot_json["model"], "gpt-5.6-luna");
+    let snapshot = serde_json::from_value(snapshot_json)?;
     drop((agent, events, first));
 
     let openai = OpenAi::builder("test-key")

@@ -2,7 +2,7 @@ use super::*;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_agent<S>(
-    config: Arc<ModelConfig>,
+    mut config: Arc<ModelConfig>,
     tools: ToolsConfiguration,
     workspace: Option<PathBuf>,
     session_id: Option<SessionId>,
@@ -23,6 +23,7 @@ where
     let is_resume = resume.is_some();
     let (lineage_id, prompt_cache_key, initial_resume) = if let Some(snapshot) = resume {
         let SessionResume {
+            model,
             lineage_id,
             prompt_cache_key: restored_cache_key,
             workspace,
@@ -32,6 +33,7 @@ where
             context_baseline,
             checkpoint,
         } = snapshot.into_resume()?;
+        Arc::make_mut(&mut config).model = model;
         if base_instructions
             .as_deref()
             .is_some_and(|stored| stored != config.system_prompt())
@@ -100,7 +102,7 @@ where
             context_source.resolve_workspace(configured_workspace.as_deref())?,
         ))
     };
-    let service = service_factory();
+    let service = service_factory(Arc::clone(&config));
     spawn_agent_driver(
         BranchSpawner {
             config,

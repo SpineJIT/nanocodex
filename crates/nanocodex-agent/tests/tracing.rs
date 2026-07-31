@@ -15,11 +15,11 @@ use std::{
 };
 
 use nanocodex_agent::{
-    Nanocodex, NanocodexError, OpenAi, ResponseError, Tools,
+    Model, Nanocodex, NanocodexError, OpenAi, ResponseError, Tools,
     transport::{ResponsesAttempt, ResponsesAttemptKind, ResponsesServiceResponse},
 };
 use nanocodex_oai_api::{
-    responses::WarmupResponse,
+    responses::{Usage, WarmupResponse},
     tower::{CodeCall, CodeCallKind, GenerationOutput, ResponsePipelineStats, ResponsesOutput},
 };
 use nanocodex_tools::{
@@ -116,6 +116,11 @@ struct SteeringTraceService {
     calls: Arc<AtomicU32>,
 }
 
+#[derive(Clone)]
+struct PricingTraceService {
+    calls: Arc<AtomicU32>,
+}
+
 impl Service<ResponsesAttempt> for PendingToolService {
     type Response = ResponsesServiceResponse;
     type Error = ResponseError;
@@ -157,6 +162,48 @@ impl Service<ResponsesAttempt> for SteeringTraceService {
             }),
             (1, ResponsesAttemptKind::Generation) => pending_tool_generation(),
             (2, ResponsesAttemptKind::Generation) => final_generation(),
+            _ => panic!("unexpected attempt {call}: {:?}", request.kind()),
+        };
+        ready(Ok(ResponsesServiceResponse::new(output)))
+    }
+}
+
+impl Service<ResponsesAttempt> for PricingTraceService {
+    type Response = ResponsesServiceResponse;
+    type Error = ResponseError;
+    type Future = Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
+        assert_eq!(request.model(), Model::Luna);
+        let call = self.calls.fetch_add(1, Ordering::Relaxed);
+        let output = match (call, request.kind()) {
+            (0, ResponsesAttemptKind::Warmup) => ResponsesOutput::Warmup(WarmupResponse {
+                id: "resp-warmup".to_owned(),
+                usage: None,
+            }),
+            (1, ResponsesAttemptKind::Generation) => {
+                ResponsesOutput::Generation(GenerationOutput {
+                    id: "resp-final".to_owned(),
+                    status: "completed".to_owned(),
+                    end_turn: Some(true),
+                    final_message: Some("priced".to_owned()),
+                    output_items: Vec::new(),
+                    code_calls: Vec::new(),
+                    usage: Some(Usage {
+                        input_tokens: 1_000_000,
+                        output_tokens: 1_000_000,
+                        total_tokens: 2_000_000,
+                        ..Usage::default()
+                    }),
+                    time_to_first_event_ns: 0,
+                    time_to_first_output_ns: Some(0),
+                    pipeline_stats: ResponsePipelineStats::default(),
+                })
+            }
             _ => panic!("unexpected attempt {call}: {:?}", request.kind()),
         };
         ready(Ok(ResponsesServiceResponse::new(output)))
@@ -329,6 +376,57 @@ where
             .unwrap()
             .push(CapturedTraceEvent { scope, fields });
     }
+}
+
+#[test]
+fn luna_model_call_span_uses_luna_rates() {
+    let capture = TraceCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async {
+            let calls = Arc::new(AtomicU32::new(0));
+            let service_calls = Arc::clone(&calls);
+            let openai = OpenAi::builder("test")
+                .service(move || PricingTraceService {
+                    calls: Arc::clone(&service_calls),
+                })
+                .build()
+                .unwrap();
+            let (agent, events) = Nanocodex::builder(openai)
+                .model(Model::Luna)
+                .tools(Tools::builder().without_defaults().build().unwrap())
+                .build()
+                .unwrap();
+
+            agent
+                .prompt("price this turn")
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+            agent.shutdown().await.unwrap();
+            drop((agent, events));
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+        });
+    });
+
+    let capture = capture.0.lock().unwrap();
+    let call = capture
+        .spans
+        .iter()
+        .find(|span| span.name == "model.call")
+        .expect("model call span was captured");
+    assert_eq!(
+        call.fields.get("model").map(String::as_str),
+        Some("gpt-5.6-luna")
+    );
+    assert_eq!(call.fields.get("cost.usd").map(String::as_str), Some("1.4"));
 }
 
 #[test]

@@ -122,9 +122,23 @@ async fn response_stream_and_future_share_one_completed_operation() {
 
 #[test]
 fn missing_usage_never_becomes_a_zero_cost_estimate() {
-    let (estimate, status) = estimate_cost(None, false);
+    let (estimate, status) = estimate_cost(None, crate::Model::Sol, false);
     assert!(estimate.is_none());
     assert_eq!(status, crate::CostStatus::UsageNotReported);
+}
+
+#[test]
+fn luna_usage_receives_a_model_specific_estimate() {
+    let usage = crate::Usage {
+        input_tokens: 1_000_000,
+        output_tokens: 1_000_000,
+        total_tokens: 2_000_000,
+        ..crate::Usage::default()
+    };
+    let (estimate, status) = estimate_cost(Some(&usage), crate::Model::Luna, false);
+
+    assert_eq!(estimate.unwrap().amount().decimal(), "1.4");
+    assert_eq!(status, crate::CostStatus::EstimatedFromUsage);
 }
 
 #[derive(Debug)]

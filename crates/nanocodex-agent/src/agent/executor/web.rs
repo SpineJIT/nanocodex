@@ -1,8 +1,10 @@
 use std::{future::Future, sync::Arc};
 
+use nanocodex_oai_api::__private::ModelConfig;
+
 use crate::Result;
 
-pub(crate) type ServiceFactory<S> = Arc<dyn Fn() -> S>;
+pub(crate) type ServiceFactory<S> = Arc<dyn Fn(Arc<ModelConfig>) -> S>;
 
 pub(crate) trait AgentSend {}
 

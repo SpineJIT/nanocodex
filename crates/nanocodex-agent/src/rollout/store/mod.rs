@@ -54,6 +54,7 @@ pub(super) struct RolloutCommit {
     history: ResponseHistory,
     revision: u64,
     turn: RolloutTurn,
+    model: Model,
     context_baseline: ContextBaseline,
 }
 
@@ -63,6 +64,7 @@ impl RolloutCommit {
             history: session.rollout_history(),
             revision: session.history_revision(),
             turn,
+            model: session.selected_model(),
             context_baseline: session.context_baseline().clone(),
         }
     }
@@ -72,6 +74,7 @@ impl RolloutCommit {
             history: session.rollout_history(),
             revision: session.history_revision(),
             turn,
+            model: session.selected_model(),
             context_baseline: session.context_baseline().clone(),
         }
     }
@@ -86,6 +89,7 @@ impl RolloutCommit {
             history,
             revision,
             turn,
+            model: Model::Sol,
             context_baseline: ContextBaseline::Missing,
         }
     }
@@ -100,6 +104,7 @@ pub(crate) struct RolloutTurn {
     completed_at: Option<i64>,
     duration_ms: Option<i64>,
     status: RolloutTurnStatus,
+    effort: Thinking,
     timer: Option<Instant>,
 }
 
@@ -113,7 +118,7 @@ enum RolloutTurnStatus {
 }
 
 impl RolloutTurn {
-    pub(crate) fn started(prompt: &Prompt) -> Self {
+    pub(crate) fn started(prompt: &Prompt, effort: Thinking) -> Self {
         Self {
             turn_id: uuid::Uuid::now_v7().to_string(),
             user_message: Some(UserMessage::from_prompt(prompt)),
@@ -122,11 +127,12 @@ impl RolloutTurn {
             completed_at: None,
             duration_ms: None,
             status: RolloutTurnStatus::InProgress,
+            effort,
             timer: Some(Instant::now()),
         }
     }
 
-    pub(crate) fn compaction_started() -> Self {
+    pub(crate) fn compaction_started(effort: Thinking) -> Self {
         Self {
             turn_id: uuid::Uuid::now_v7().to_string(),
             user_message: None,
@@ -135,6 +141,7 @@ impl RolloutTurn {
             completed_at: None,
             duration_ms: None,
             status: RolloutTurnStatus::InProgress,
+            effort,
             timer: Some(Instant::now()),
         }
     }
@@ -240,7 +247,11 @@ impl RolloutRecorder {
         file.flush()?;
         file.sync_all()?;
 
-        let writer = RolloutWriter::new(tokio::fs::File::from_std(file), initial_window_id);
+        let writer = RolloutWriter::new(
+            tokio::fs::File::from_std(file),
+            initial_window_id,
+            cwd.to_path_buf(),
+        );
         Ok(Self::spawn(runtime, thread_id, path, writer))
     }
 

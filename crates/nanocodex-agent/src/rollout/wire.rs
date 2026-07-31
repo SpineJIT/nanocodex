@@ -13,6 +13,7 @@ pub(super) enum RolloutItem<'a> {
     SessionMeta(&'a SessionMeta),
     #[serde(rename = "event_msg")]
     Event(&'a CodexEvent<'a>),
+    TurnContext(&'a TurnContext<'a>),
     ResponseItem(&'a ResponseItem),
     WorldState(&'a WorldStateItem<'a>),
     Compacted(&'a CompactedItem),
@@ -136,6 +137,22 @@ pub(super) struct SessionMeta {
     pub(super) base_instructions: BaseInstructions,
     pub(super) history_mode: &'static str,
     pub(super) context_window: SessionContextWindow,
+}
+
+#[derive(Serialize)]
+pub(super) struct TurnContext<'a> {
+    pub(super) cwd: &'a Path,
+    pub(super) approval_policy: &'static str,
+    pub(super) sandbox_policy: SandboxPolicy,
+    pub(super) model: &'static str,
+    pub(super) effort: &'static str,
+    pub(super) summary: &'static str,
+}
+
+#[derive(Serialize)]
+pub(super) struct SandboxPolicy {
+    #[serde(rename = "type")]
+    pub(super) kind: &'static str,
 }
 
 #[derive(Serialize)]

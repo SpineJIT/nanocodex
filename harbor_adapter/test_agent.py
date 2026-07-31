@@ -17,6 +17,8 @@ import yaml
 from harbor.models.agent.context import AgentContext
 
 from harbor_adapter.agent import (
+    DEFAULT_MODEL,
+    SUPPORTED_MODELS,
     NanocodexAgent,
     _cli_tools_install_command,
     _remote_binary_install_command,
@@ -121,10 +123,45 @@ class CliToolInstallContractTests(unittest.TestCase):
         self.assertIn(agent._binary_sha256, download_command)
 
 
+class ModelContractTests(unittest.TestCase):
+    def test_supported_models_are_exactly_sol_and_luna(self) -> None:
+        self.assertEqual(
+            SUPPORTED_MODELS,
+            {"gpt-5.6-sol", "gpt-5.6-luna"},
+        )
+        self.assertEqual(DEFAULT_MODEL, "gpt-5.6-sol")
+        self.assertEqual(NanocodexAgent._api_model_name(None), DEFAULT_MODEL)
+        self.assertEqual(
+            NanocodexAgent._api_model_name("openai/gpt-5.6-luna"),
+            "gpt-5.6-luna",
+        )
+
+    def test_run_arguments_forward_the_selected_model(self) -> None:
+        agent = object.__new__(NanocodexAgent)
+        agent._model = "gpt-5.6-luna"
+        agent._effort = "low"
+        agent._web_search = False
+        agent._subagents = False
+
+        self.assertEqual(
+            agent._run_arguments("test prompt")[2:4],
+            ["--model", "gpt-5.6-luna"],
+        )
+
+    def test_constructor_rejects_models_outside_the_supported_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "supports only gpt-5.6-luna, gpt-5.6-sol"):
+                NanocodexAgent(
+                    logs_dir=Path(directory),
+                    model_name="openai/gpt-5.6-terra",
+                    extra_env={"OPENAI_API_KEY": "test-key"},
+                )
+
+
 class WebSearchContractTests(unittest.TestCase):
     def test_run_arguments_always_pass_web_search_explicitly(self) -> None:
         agent = object.__new__(NanocodexAgent)
-        agent._model = "test-model"
+        agent._model = DEFAULT_MODEL
         agent._effort = "low"
 
         agent._web_search = True
@@ -143,7 +180,7 @@ class WebSearchContractTests(unittest.TestCase):
 
     def test_run_arguments_protect_a_prompt_that_starts_with_a_hyphen(self) -> None:
         agent = object.__new__(NanocodexAgent)
-        agent._model = "test-model"
+        agent._model = DEFAULT_MODEL
         agent._effort = "low"
         agent._web_search = False
         agent._subagents = False

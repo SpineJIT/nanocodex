@@ -7,7 +7,7 @@ use std::{
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr, eyre};
 use nanocodex::{
-    AgentEvents, Nanocodex, OpenAi, ReasoningMode, Thinking, Tools,
+    AgentEvents, Model, Nanocodex, OpenAi, ReasoningMode, Thinking, Tools,
     agent::{
         rollout::{DurableSession, RolloutConfig},
         session::{SessionId, SessionSnapshot},
@@ -64,6 +64,10 @@ pub(crate) struct AgentArgs {
     /// Reasoning effort: none, low, medium, high, xhigh, or max.
     #[arg(long, env = "OPENAI_REASONING_EFFORT", default_value_t)]
     thinking: Thinking,
+
+    /// GPT-5.6 coding model: gpt-5.6-sol or gpt-5.6-luna.
+    #[arg(long, env = "OPENAI_MODEL", default_value_t)]
+    model: Model,
 
     /// Reasoning execution mode: standard or pro.
     #[arg(long, env = "OPENAI_REASONING_MODE", default_value_t)]
@@ -157,6 +161,10 @@ impl AgentArgs {
         self.thinking
     }
 
+    pub(crate) const fn model(&self) -> Model {
+        self.model
+    }
+
     pub(crate) fn responses_transport(&self) -> ResponsesTransport {
         self.responses_transport
             .unwrap_or(if self.mpp.is_enabled() {
@@ -245,6 +253,7 @@ impl AgentArgs {
         let tools = tools.build()?;
         let child_agents = self.subagents.then(|| Arc::new(ChildAgents::default()));
         let mut builder = Nanocodex::builder(openai)
+            .model(self.model)
             .reasoning_mode(self.reasoning_mode)
             .thinking(self.thinking)
             .workspace(session.workspace)

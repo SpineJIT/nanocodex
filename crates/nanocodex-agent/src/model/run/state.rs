@@ -26,6 +26,7 @@ impl ModelSessionState {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) struct ContinuationPolicy {
+    pub(super) model: Model,
     pub(super) thinking: Thinking,
     pub(super) fast_mode: bool,
 }

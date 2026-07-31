@@ -191,7 +191,7 @@ impl RunStats {
         self.retry_backoff_duration_ns = delta.retry_backoff_duration_ns;
     }
 
-    pub(super) fn turn_usage(&self, fast_mode: bool) -> TurnUsage {
+    pub(super) fn turn_usage(&self, model: nanocodex_oai_api::Model, fast_mode: bool) -> TurnUsage {
         TurnUsage::from_counts(
             crate::usage::TurnUsageCounts {
                 input_tokens: self.usage.input_tokens + self.warmup_usage.input_tokens,
@@ -205,6 +205,7 @@ impl RunStats {
                 total_tokens: self.usage.total_tokens + self.warmup_usage.total_tokens,
                 reported: self.usage.reported || self.warmup_usage.reported,
             },
+            model,
             fast_mode,
         )
     }
@@ -214,13 +215,14 @@ pub(super) fn terminal_payload<'a>(
     terminal_status: &'static str,
     elapsed: Duration,
     config: &'a ModelConfig,
+    model: nanocodex_oai_api::Model,
     thinking: Thinking,
     stats: &'a RunStats,
     usage: &'a TurnUsage,
 ) -> TerminalPayload<'a> {
     TerminalPayload {
         status: terminal_status,
-        model: nanocodex_oai_api::MODEL,
+        model: model.as_str(),
         reasoning_mode: config.reasoning_mode.as_str(),
         effort: thinking.as_str(),
         transport: config.responses_transport.as_str(),

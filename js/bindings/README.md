@@ -9,6 +9,7 @@ import { Actions, Agent } from "nanocodex/node";
 
 const agent = await Agent.create({
   apiKey: process.env.OPENAI_API_KEY,
+  model: "gpt-5.6-luna",
   instructions: "You are a Rust coding agent. Preserve unrelated work and run relevant tests.",
   reasoningMode: "pro",
   thinking: "high",

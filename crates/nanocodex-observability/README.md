@@ -14,7 +14,7 @@ model requests and responses, API-visible reasoning and summaries, opaque
 encrypted reasoning payloads, tool arguments and results, steering, and
 cancellation. Structural fields retain lineage and parentage, ordering,
 latency, token and prompt-cache measurements, routing state, and automatic
-`gpt-5.6-sol` USD estimates.
+model-specific USD estimates.
 
 Tracing does not redact or truncate values based on their content. Treat local
 logs and OTLP backends as sensitive conversation and tool-execution stores,

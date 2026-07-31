@@ -85,6 +85,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from nanocodex import Nanocodex
 
 def threads():
@@ -132,7 +133,12 @@ if errors:
 during = threads()
 for agent in agents:
     agent.shutdown()
-after = threads()
+deadline = time.monotonic() + 2
+while True:
+    after = threads()
+    if during - after >= len(agents) or time.monotonic() >= deadline:
+        break
+    time.sleep(0.01)
 print(json.dumps({{"before": before, "during": during, "after": after}}))
 """
             completed = subprocess.run(

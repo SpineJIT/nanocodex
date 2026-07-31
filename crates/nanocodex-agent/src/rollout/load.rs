@@ -10,6 +10,7 @@ pub struct DurableSession {
     codex_home: PathBuf,
     thread_id: String,
     rollout_path: PathBuf,
+    model: Model,
     snapshot: SessionSnapshot,
     transcript: Vec<RolloutTranscriptItem>,
 }
@@ -30,6 +31,7 @@ impl DurableSession {
         })?;
         let materialized = materialize_rollout(&rollout_path, thread_id)?;
         let snapshot = SessionSnapshot::from_rollout(
+            materialized.model,
             thread_id.to_owned(),
             materialized.workspace,
             materialized.base_instructions,
@@ -41,6 +43,7 @@ impl DurableSession {
             codex_home: codex_home.to_path_buf(),
             thread_id: thread_id.to_owned(),
             rollout_path,
+            model: materialized.model,
             snapshot,
             transcript: materialized.transcript,
         })
@@ -56,6 +59,12 @@ impl DurableSession {
     #[must_use]
     pub fn workspace(&self) -> &str {
         self.snapshot.workspace()
+    }
+
+    /// Returns the model selected at the latest committed rollout boundary.
+    #[must_use]
+    pub const fn model(&self) -> Model {
+        self.model
     }
 
     /// Returns the restored model boundary.
@@ -159,6 +168,7 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
     let mut history = Vec::new();
     let mut transcript = Vec::new();
     let mut context_baseline = None;
+    let mut model = Model::Sol;
     for (index, line) in BufReader::new(File::open(path)?).lines().enumerate() {
         let line = line?;
         let value: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
@@ -227,6 +237,14 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
                 })?;
                 context_baseline = None;
             }
+            Some("turn_context") => {
+                if let Some(selected) = value["payload"]["model"]
+                    .as_str()
+                    .and_then(|model| model.parse().ok())
+                {
+                    model = selected;
+                }
+            }
             Some("world_state") => {
                 if let Some(state) = value["payload"]["state"].get("nanocodex_context") {
                     context_baseline =
@@ -267,6 +285,7 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
         )
     })?;
     Ok(MaterializedRollout {
+        model,
         workspace,
         base_instructions,
         history,
@@ -276,6 +295,7 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
 }
 
 struct MaterializedRollout {
+    model: Model,
     workspace: String,
     base_instructions: Option<String>,
     history: Vec<ResponseItem>,

@@ -6,7 +6,7 @@ mod config;
 mod platform;
 
 use crate::{
-    DefaultResponsesService, OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, ReasoningMode,
+    DefaultResponsesService, Model, OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, ReasoningMode,
     ResponsesHistory, ResponsesRetryPolicy, ResponsesTransport, Thinking, session::SessionBuilder,
 };
 
@@ -118,6 +118,16 @@ pub struct OpenAiBuilder<F = StandardServiceFactory> {
 }
 
 impl<F> OpenAiBuilder<F> {
+    /// Selects the default GPT-5.6 coding model for new sessions and agents.
+    ///
+    /// A higher-level session or agent builder may override this reusable
+    /// client default without mutating the `OpenAi` recipe.
+    #[must_use]
+    pub const fn model(mut self, model: Model) -> Self {
+        self.config.model = model;
+        self
+    }
+
     /// Selects the initial Responses transport policy for new sessions.
     ///
     /// [`ResponsesTransport::WebSocket`] prefers a persistent socket. The

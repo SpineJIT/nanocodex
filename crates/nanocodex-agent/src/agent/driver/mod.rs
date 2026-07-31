@@ -6,7 +6,8 @@ use super::*;
 pub(super) use branch::{AgentOrigin, BranchSpawner};
 pub(super) use control::DriverShutdown;
 use control::{
-    begin_shutdown, cancel_queued_turn, handle_idle_command, mark_all_queued_turns_cancelled,
+    TurnDefaults, begin_shutdown, cancel_queued_turn, handle_idle_command,
+    mark_all_queued_turns_cancelled,
 };
 use telemetry::{ReasoningSettings, agent_compact_span, agent_turn_span};
 
@@ -38,11 +39,13 @@ where
     #[allow(clippy::too_many_lines)]
     pub(super) async fn run(mut self) -> Result<()> {
         let session_id = self.events.request_id().to_owned();
+        let thread_model = self.spawner.config.model;
         let mut default_thinking = self.spawner.config.thinking;
         let mut default_fast_mode = self.spawner.config.fast_mode;
         let inherited_checkpoint = self.initial_model.as_ref().map(|initial| {
             Arc::new(CommittedSession::new(
                 Arc::clone(&self.spawner.lineage_id),
+                thread_model,
                 initial.checkpoint.clone(),
             ))
         });
@@ -127,6 +130,7 @@ where
                                 self.spawner.lineage_id.as_ref(),
                                 &self.origin,
                                 ReasoningSettings {
+                                    model: thread_model,
                                     mode: self.spawner.config.reasoning_mode,
                                     effort: thinking,
                                 },
@@ -233,7 +237,7 @@ where
                     );
                     drop(parent);
                     let compact_started = web_time::Instant::now();
-                    let durability_turn = self.durability.start_compaction();
+                    let durability_turn = self.durability.start_compaction(default_thinking);
                     let mut compact_replaced = false;
                     let (cancel_compaction, mut cancel_compaction_rx) = oneshot::channel();
                     let mut cancel_compaction = Some(cancel_compaction);
@@ -319,8 +323,11 @@ where
                                             command,
                                             latest_fork_checkpoint.as_ref(),
                                             &self.spawner,
-                                            default_thinking,
-                                            default_fast_mode,
+                                            TurnDefaults {
+                                                model: thread_model,
+                                                thinking: default_thinking,
+                                                fast_mode: default_fast_mode,
+                                            },
                                             session_id.as_str(),
                                             self.workspace.clone(),
                                         );
@@ -364,6 +371,7 @@ where
                         Ok(ModelCompactOutcome::Completed(checkpoint)) => {
                             let checkpoint = Arc::new(CommittedSession::new(
                                 Arc::clone(&self.spawner.lineage_id),
+                                thread_model,
                                 checkpoint,
                             ));
                             // The installed in-memory boundary is authoritative.
@@ -382,6 +390,7 @@ where
                         Ok(ModelCompactOutcome::Cancelled(checkpoint)) => {
                             let checkpoint = Arc::new(CommittedSession::new(
                                 Arc::clone(&self.spawner.lineage_id),
+                                thread_model,
                                 checkpoint,
                             ));
                             latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
@@ -397,12 +406,14 @@ where
                             model.replace_client(ResponsesClient::new((self
                                 .spawner
                                 .service_factory)(
+                                Arc::clone(&self.spawner.config),
                             )));
                             Err(NanocodexError::TurnCancelled)
                         }
                         Ok(ModelCompactOutcome::Failed { error, checkpoint }) => {
                             let checkpoint = Arc::new(CommittedSession::new(
                                 Arc::clone(&self.spawner.lineage_id),
+                                thread_model,
                                 checkpoint,
                             ));
                             latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
@@ -439,8 +450,11 @@ where
                     command,
                     latest_fork_checkpoint.as_ref(),
                     &self.spawner,
-                    default_thinking,
-                    default_fast_mode,
+                    TurnDefaults {
+                        model: thread_model,
+                        thinking: default_thinking,
+                        fast_mode: default_fast_mode,
+                    },
                     session_id.as_str(),
                     self.workspace.clone(),
                 );
@@ -462,6 +476,7 @@ where
                 self.spawner.lineage_id.as_ref(),
                 &self.origin,
                 ReasoningSettings {
+                    model: thread_model,
                     mode: self.spawner.config.reasoning_mode,
                     effort: thinking,
                 },
@@ -479,7 +494,7 @@ where
                     );
                 });
             }
-            let durability_turn = self.durability.start_turn(&prompt);
+            let durability_turn = self.durability.start_turn(&prompt, thinking);
             let (steers, steer_rx) = mpsc::channel(STEER_CAPACITY);
             let (cancel, cancel_rx) = oneshot::channel();
             let (fork_snapshots, mut fork_snapshot_rx) = watch::channel(None);
@@ -516,6 +531,7 @@ where
                         if let Some(snapshot) = snapshot {
                             latest_fork_checkpoint = Some(Arc::new(CommittedSession::new(
                                 Arc::clone(&self.spawner.lineage_id),
+                                thread_model,
                                 snapshot,
                             )));
                         }
@@ -605,6 +621,7 @@ where
                                     latest_fork_checkpoint =
                                         Some(Arc::new(CommittedSession::new(
                                             Arc::clone(&self.spawner.lineage_id),
+                                            thread_model,
                                             snapshot,
                                         )));
                                 }
@@ -612,8 +629,11 @@ where
                                     command,
                                     latest_fork_checkpoint.as_ref(),
                                     &self.spawner,
-                                    default_thinking,
-                                    default_fast_mode,
+                                    TurnDefaults {
+                                        model: thread_model,
+                                        thinking: default_thinking,
+                                        fast_mode: default_fast_mode,
+                                    },
                                     session_id.as_str(),
                                     self.workspace.clone(),
                                 );
@@ -668,6 +688,7 @@ where
                     } = completed;
                     let checkpoint = Arc::new(CommittedSession::new(
                         Arc::clone(&self.spawner.lineage_id),
+                        thread_model,
                         checkpoint,
                     ));
                     let durability_turn = durability_turn.completed(final_message.clone());
@@ -688,6 +709,7 @@ where
                 Ok(ModelTurnOutcome::Cancelled(checkpoint)) => {
                     let checkpoint = Arc::new(CommittedSession::new(
                         Arc::clone(&self.spawner.lineage_id),
+                        thread_model,
                         checkpoint,
                     ));
                     let durability_turn = durability_turn.interrupted();
@@ -696,12 +718,15 @@ where
                         .instrument(turn_span.clone())
                         .await;
                     latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
-                    model.replace_client(ResponsesClient::new((self.spawner.service_factory)()));
+                    model.replace_client(ResponsesClient::new((self.spawner.service_factory)(
+                        Arc::clone(&self.spawner.config),
+                    )));
                     (Err(NanocodexError::TurnCancelled), true)
                 }
                 Ok(ModelTurnOutcome::Failed { error, checkpoint }) => {
                     let checkpoint = Arc::new(CommittedSession::new(
                         Arc::clone(&self.spawner.lineage_id),
+                        thread_model,
                         checkpoint,
                     ));
                     let durability_turn = durability_turn.failed();

@@ -28,7 +28,8 @@ from harbor.utils.trajectory_utils import format_trajectory_json
 
 
 PROTOCOL_VERSION = 1
-MODEL = "gpt-5.6-sol"
+DEFAULT_MODEL = "gpt-5.6-sol"
+SUPPORTED_MODELS = {DEFAULT_MODEL, "gpt-5.6-luna"}
 TERMINAL_EVENTS = {"run.completed", "run.failed"}
 RUN_METRIC_FIELDS = (
     "connection_attempts",
@@ -160,8 +161,9 @@ class NanocodexAgent(BaseInstalledAgent):
             binary_sha256.lower() if binary_sha256 is not None else None
         )
         self._model = self._api_model_name(model_name)
-        if self._model != MODEL:
-            raise ValueError(f"nanocodex supports only {MODEL}, got {self._model}")
+        if self._model not in SUPPORTED_MODELS:
+            supported = ", ".join(sorted(SUPPORTED_MODELS))
+            raise ValueError(f"nanocodex supports only {supported}, got {self._model}")
         self._effort = effort
         self._web_search = web_search
         self._subagents = subagents
@@ -304,6 +306,8 @@ class NanocodexAgent(BaseInstalledAgent):
         return [
             self._BINARY,
             "run",
+            "--model",
+            self._model,
             "--thinking",
             self._effort,
             "--web-search",
@@ -553,7 +557,7 @@ class NanocodexAgent(BaseInstalledAgent):
     @staticmethod
     def _api_model_name(model_name: str | None) -> str:
         if model_name is None:
-            return MODEL
+            return DEFAULT_MODEL
         _, separator, api_model = model_name.partition("/")
         return api_model if separator else model_name
 
