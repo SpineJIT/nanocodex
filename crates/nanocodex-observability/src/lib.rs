@@ -374,13 +374,30 @@ mod tests {
                             .unwrap();
                         let mut request = Vec::with_capacity(4 * 1024);
                         let mut chunk = [0_u8; 1024];
-                        while request.len() < 16 * 1024 {
+                        let mut request_len = None;
+                        while request.len() < 1024 * 1024 {
                             let read = stream.read(&mut chunk).unwrap_or_default();
                             if read == 0 {
                                 break;
                             }
                             request.extend_from_slice(&chunk[..read]);
-                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            if request_len.is_none()
+                                && let Some(header_end) =
+                                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                            {
+                                let headers = String::from_utf8_lossy(&request[..header_end]);
+                                let content_len = headers
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (name, value) = line.split_once(':')?;
+                                        name.eq_ignore_ascii_case("content-length")
+                                            .then(|| value.trim().parse::<usize>().ok())
+                                            .flatten()
+                                    })
+                                    .unwrap_or_default();
+                                request_len = Some(header_end + 4 + content_len);
+                            }
+                            if request_len.is_some_and(|request_len| request.len() >= request_len) {
                                 break;
                             }
                         }
