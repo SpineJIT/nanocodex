@@ -806,7 +806,7 @@ fn inline_edit_text(input: &str, width: u16) -> Text<'static> {
     lines.extend(
         (0..layout.row_count())
             .filter_map(|row| layout.row(row))
-            .map(|range| Line::styled(input[range.clone()].to_owned(), Color::White)),
+            .map(|range| Line::styled(input[range.clone()].to_owned(), Style::default())),
     );
     Text::from(lines)
 }
@@ -2207,10 +2207,7 @@ impl RenderedText {
         let mut first_line = !show_header && self.text.lines.is_empty();
         for line in tail.split_terminator('\n') {
             let line = if first_line {
-                Line::from(Span::styled(
-                    line.to_owned(),
-                    Style::default().fg(Color::White),
-                ))
+                Line::from(Span::styled(line.to_owned(), Style::default()))
             } else {
                 let line = if show_header {
                     line
@@ -2219,7 +2216,7 @@ impl RenderedText {
                 };
                 Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(line.to_owned(), Style::default().fg(Color::White)),
+                    Span::styled(line.to_owned(), Style::default()),
                 ])
             };
             self.push_line(line);
@@ -2235,7 +2232,7 @@ impl RenderedText {
         for line in paragraph.split_terminator('\n') {
             self.push_line(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(line.to_owned(), Style::default().fg(Color::White)),
+                Span::styled(line.to_owned(), Style::default()),
             ]));
         }
         self.text.style = base_style;
@@ -2358,7 +2355,7 @@ impl RenderedText {
             if math_fallback || selected {
                 widget
                     .compact_source_fallback(formula.full_source.as_ref())
-                    .source_fallback_style(Style::default().fg(Color::White))
+                    .source_fallback_style(Style::default())
                     .render(area, buffer);
             } else {
                 widget.render(area, buffer);
@@ -2772,10 +2769,7 @@ fn message_text(title: &'static str, title_style: Style, message: &str) -> Text<
     let mut lines = Vec::with_capacity(message.lines().count().saturating_add(2));
     lines.push(Line::styled(title, title_style));
     for line in message.split('\n') {
-        lines.push(Line::styled(
-            format!("  {line}"),
-            Style::default().fg(Color::White),
-        ));
+        lines.push(Line::styled(format!("  {line}"), Style::default()));
     }
     lines.push(Line::raw(""));
     Text::from(lines)
