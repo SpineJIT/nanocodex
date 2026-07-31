@@ -3303,6 +3303,7 @@ impl BrowserBuilder {
     ///
     /// Returns an error when the private runtime directory cannot be created.
     pub fn build(self) -> Result<Browser, BrowserBuildError> {
+        nanocodex_oai_api::transport::install_default_rustls_crypto_provider();
         if self.executable.is_some() && self.brave_session.is_some() {
             return Err(BrowserBuildError::Configuration {
                 message: "`executable` and `brave_session` cannot both be configured".to_owned(),

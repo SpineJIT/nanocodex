@@ -23,11 +23,12 @@ client = [
     "dep:base64",
     "dep:getrandom",
     "dep:reqwest",
+    "dep:rustls",
     "dep:sha2",
     "dep:tokio-tungstenite",
     "dep:url",
 ]
-realtime = ["client", "dep:opusic-c", "dep:rustls", "dep:webrtc"]
+realtime = ["client", "dep:opusic-c", "dep:webrtc"]
 
 [dependencies]
 async-trait.workspace = true
@@ -81,6 +82,16 @@ required-features = ["client"]
 [[test]]
 name = "it"
 path = "tests/it/main.rs"
+required-features = ["client"]
+
+[[test]]
+name = "rustls_provider"
+path = "tests/rustls_provider.rs"
+required-features = ["client"]
+
+[[test]]
+name = "rustls_preinstalled_provider"
+path = "tests/rustls_preinstalled_provider.rs"
 required-features = ["client"]
 
 [lints]

@@ -153,6 +153,9 @@ impl ObservabilityBuilder {
     /// Returns an error for an invalid filter, unusable output file, invalid
     /// exporter configuration, or an already-installed global subscriber.
     pub fn install(self) -> Result<ObservabilityGuard, ObservabilityError> {
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            drop(rustls::crypto::ring::default_provider().install_default());
+        }
         let (writer, writer_guard) = tracing_appender::non_blocking(self.writer()?);
         let filter = EnvFilter::try_new(self.filter.as_str())?;
         let otel_filter = EnvFilter::try_new(self.otel_filter.as_str())?;

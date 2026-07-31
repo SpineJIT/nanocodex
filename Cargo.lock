@@ -1385,30 +1385,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
-name = "aws-lc-rs"
-version = "1.17.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00bdb5da18dac48ca2cc7cd4a98e533e8635a58e2361d13a1a4ee3888e0d72f1"
-dependencies = [
- "aws-lc-sys",
- "untrusted 0.7.1",
- "zeroize",
-]
-
-[[package]]
-name = "aws-lc-sys"
-version = "0.43.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43103168cc76fe62678a375e722fc9cb3a0146159ac5828bc4f0dfd755c2224c"
-dependencies = [
- "cc",
- "cmake",
- "dunce",
- "fs_extra",
- "pkg-config",
-]
-
-[[package]]
 name = "axum"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3336,12 +3312,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fs_extra"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
-
-[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3791,7 +3761,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 [[package]]
 name = "hudsucker"
 version = "0.25.0"
-source = "git+https://github.com/gakonst/hudsucker?rev=0c7da328e446518036b9420db3e75451fca522e9#0c7da328e446518036b9420db3e75451fca522e9"
+source = "git+https://github.com/gakonst/hudsucker?rev=d718d2d5af9ce8cc328ea9560611f8b7708d2522#d718d2d5af9ce8cc328ea9560611f8b7708d2522"
 dependencies = [
  "bstr",
  "futures",
@@ -3910,7 +3880,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4384,22 +4354,6 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "jsonwebtoken"
-version = "10.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
-dependencies = [
- "aws-lc-rs",
- "base64",
- "getrandom 0.2.17",
- "js-sys",
- "serde",
- "serde_json",
- "signature",
- "zeroize",
 ]
 
 [[package]]
@@ -4959,7 +4913,7 @@ dependencies = [
 [[package]]
 name = "mpp"
 version = "0.11.0"
-source = "git+https://github.com/tempoxyz/mpp-rs?rev=5caad442edeab796821b7f3bb009ab6945106e35#5caad442edeab796821b7f3bb009ab6945106e35"
+source = "git+https://github.com/gakonst/mpp-rs?rev=b1a7088bc05da933923220e29028ff75dbcb1ea4#b1a7088bc05da933923220e29028ff75dbcb1ea4"
 dependencies = [
  "alloy",
  "async-trait",
@@ -5192,6 +5146,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "reqwest",
+ "rustls",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5320,6 +5275,7 @@ version = "0.3.0"
 dependencies = [
  "alloy-primitives",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -5741,17 +5697,15 @@ dependencies = [
 [[package]]
 name = "oci-client"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5261a7fb43d9c53b8e63e6d5e86860719dad253d015d022066c72d585125aed8"
+source = "git+https://github.com/gakonst/rust-oci-client?rev=17c22ce8842e9275ef6bc11fa4eb58101a4abd7f#17c22ce8842e9275ef6bc11fa4eb58101a4abd7f"
 dependencies = [
+ "base64",
  "bytes",
  "chrono",
  "futures-util",
  "hex",
  "http",
  "http-auth",
- "jsonwebtoken",
- "lazy_static",
  "oci-spec",
  "olpc-cjson",
  "regex",
@@ -5767,9 +5721,9 @@ dependencies = [
 
 [[package]]
 name = "oci-spec"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8445a2631507cec628a15fdd6154b54a3ab3f20ed4fe9d73a3b8b7a4e1ba03a"
+checksum = "3df6f876ad774d6a676f7e968f5c3edacc32f90e65fe680a8b686235396556fb"
 dependencies = [
  "const_format",
  "derive_builder",
@@ -6595,7 +6549,6 @@ version = "0.11.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
 dependencies = [
- "aws-lc-rs",
  "bytes",
  "getrandom 0.4.3",
  "lru-slab",
@@ -7098,8 +7051,7 @@ dependencies = [
 [[package]]
 name = "reqwest"
 version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
+source = "git+https://github.com/gakonst/reqwest?rev=d45d0c3d2b2a74b723f82791f464d6241f2c6e90#d45d0c3d2b2a74b723f82791f464d6241f2c6e90"
 dependencies = [
  "base64",
  "bytes",
@@ -7425,7 +7377,7 @@ dependencies = [
  "cfg-if",
  "getrandom 0.2.17",
  "libc",
- "untrusted 0.9.0",
+ "untrusted",
  "windows-sys 0.52.0",
 ]
 
@@ -7732,7 +7684,6 @@ version = "0.23.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
 dependencies = [
- "aws-lc-rs",
  "log",
  "once_cell",
  "ring",
@@ -7797,10 +7748,9 @@ version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
- "aws-lc-rs",
  "ring",
  "rustls-pki-types",
- "untrusted 0.9.0",
+ "untrusted",
 ]
 
 [[package]]
@@ -8757,7 +8707,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -8766,7 +8716,7 @@ dependencies = [
 [[package]]
 name = "tempo-alloy"
 version = "1.10.1"
-source = "git+https://github.com/tempoxyz/tempo?rev=9081cc65940c419ab60ebd1fd8170483ee49cfe1#9081cc65940c419ab60ebd1fd8170483ee49cfe1"
+source = "git+https://github.com/gakonst/tempo?rev=c2cf774b95ea920b671d311aa07c96051913c314#c2cf774b95ea920b671d311aa07c96051913c314"
 dependencies = [
  "alloy-consensus",
  "alloy-contract",
@@ -8806,7 +8756,7 @@ dependencies = [
 [[package]]
 name = "tempo-chainspec"
 version = "1.10.1"
-source = "git+https://github.com/tempoxyz/tempo?rev=9081cc65940c419ab60ebd1fd8170483ee49cfe1#9081cc65940c419ab60ebd1fd8170483ee49cfe1"
+source = "git+https://github.com/gakonst/tempo?rev=c2cf774b95ea920b671d311aa07c96051913c314#c2cf774b95ea920b671d311aa07c96051913c314"
 dependencies = [
  "alloy-eips",
  "alloy-genesis",
@@ -8822,7 +8772,7 @@ dependencies = [
 [[package]]
 name = "tempo-contracts"
 version = "1.10.1"
-source = "git+https://github.com/tempoxyz/tempo?rev=9081cc65940c419ab60ebd1fd8170483ee49cfe1#9081cc65940c419ab60ebd1fd8170483ee49cfe1"
+source = "git+https://github.com/gakonst/tempo?rev=c2cf774b95ea920b671d311aa07c96051913c314#c2cf774b95ea920b671d311aa07c96051913c314"
 dependencies = [
  "alloy-contract",
  "alloy-primitives",
@@ -8834,7 +8784,7 @@ dependencies = [
 [[package]]
 name = "tempo-hardfork"
 version = "1.10.1"
-source = "git+https://github.com/tempoxyz/tempo?rev=9081cc65940c419ab60ebd1fd8170483ee49cfe1#9081cc65940c419ab60ebd1fd8170483ee49cfe1"
+source = "git+https://github.com/gakonst/tempo?rev=c2cf774b95ea920b671d311aa07c96051913c314#c2cf774b95ea920b671d311aa07c96051913c314"
 dependencies = [
  "alloy-eips",
  "alloy-hardforks",
@@ -8845,7 +8795,7 @@ dependencies = [
 [[package]]
 name = "tempo-primitives"
 version = "1.10.1"
-source = "git+https://github.com/tempoxyz/tempo?rev=9081cc65940c419ab60ebd1fd8170483ee49cfe1#9081cc65940c419ab60ebd1fd8170483ee49cfe1"
+source = "git+https://github.com/gakonst/tempo?rev=c2cf774b95ea920b671d311aa07c96051913c314#c2cf774b95ea920b671d311aa07c96051913c314"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9508,12 +9458,6 @@ dependencies = [
  "crypto-common 0.1.7",
  "subtle",
 ]
-
-[[package]]
-name = "untrusted"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
 
 [[package]]
 name = "untrusted"

@@ -16,6 +16,15 @@ pub const NANOUSD_DECIMALS: u32 = 6;
 /// Default local credits API used by the CLI and development server.
 pub const DEFAULT_API_URL: &str = "http://127.0.0.1:8789";
 
+/// Installs the workspace's ring-backed Rustls provider if the host has not
+/// already selected a process-level provider.
+#[doc(hidden)]
+pub fn install_default_rustls_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        drop(rustls::crypto::ring::default_provider().install_default());
+    }
+}
+
 /// A server-controlled credit package. One cent buys 10,000 atomic `NanoUSD` units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreditPackage {
@@ -115,6 +124,7 @@ impl CreditsClient {
     /// Returns an error when the endpoint is not a valid URL or the HTTP client
     /// cannot be constructed.
     pub fn new(base_url: &str) -> Result<Self, ClientError> {
+        install_default_rustls_crypto_provider();
         let mut base_url = Url::parse(base_url).map_err(ClientError::Url)?;
         if !base_url.path().ends_with('/') {
             base_url.set_path(&format!("{}/", base_url.path()));

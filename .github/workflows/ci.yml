@@ -119,6 +119,7 @@ jobs:
       - run: ./scripts/check-experimental-boundary.sh
       - run: cargo deny check
       - run: ./scripts/check-crate-boundaries.sh
+      - run: ./scripts/check-rustls-provider.sh
       - uses: crate-ci/typos@96d9af6217dc2855210655af7e1ff19d23d4e593 # v1
 
   bindings:

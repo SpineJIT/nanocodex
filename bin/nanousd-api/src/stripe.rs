@@ -52,6 +52,7 @@ impl StripeClient {
         secret_key: String,
         api_version: Option<String>,
     ) -> Result<Self, StripeError> {
+        nanousd::install_default_rustls_crypto_provider();
         let api_url = Url::parse(api_url)?;
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))

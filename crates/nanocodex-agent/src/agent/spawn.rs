@@ -16,6 +16,8 @@ where
     S::Error: Into<ResponseError> + AgentSend + 'static,
     S::Future: AgentSend,
 {
+    #[cfg(not(target_family = "wasm"))]
+    nanocodex_oai_api::transport::install_default_rustls_crypto_provider();
     let session_id = session_id.unwrap_or_default();
     let session_id_text = session_id.to_string();
     let context_source = codex.context.build();

@@ -363,6 +363,8 @@ where
     /// Returns an error for unavailable credentials or an incompatible
     /// transport, storage, and replay configuration.
     pub fn build(self) -> Result<OpenAi<F>, OpenAiError> {
+        #[cfg(not(target_family = "wasm"))]
+        crate::transport::install_default_rustls_crypto_provider();
         validate(&self.config)?;
         self.factory.validate_config(&self.config)?;
         Ok(OpenAi {
@@ -382,6 +384,8 @@ pub struct StandardServiceFactory {
 
 impl Default for StandardServiceFactory {
     fn default() -> Self {
+        #[cfg(not(target_family = "wasm"))]
+        crate::transport::install_default_rustls_crypto_provider();
         Self {
             max_attempts: ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS,
             platform: platform::FactoryPlatform::new(),
