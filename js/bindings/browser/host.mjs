@@ -14,6 +14,10 @@ export function createBrowserHost(options = {}) {
   }
   const connections = new Map();
   const code = createCodeRuntime(options.tools);
+  const toolMode = options.toolMode ?? "code";
+  if (toolMode !== "code" && toolMode !== "direct") {
+    throw new TypeError("toolMode must be code or direct");
+  }
   const onEvent = options.onEvent || (() => {});
   const maxQueuedMessages = options.maxQueuedMessages ?? DEFAULT_MAX_QUEUED_MESSAGES;
   const maxQueuedBytes = options.maxQueuedBytes ?? DEFAULT_MAX_QUEUED_BYTES;
@@ -21,12 +25,19 @@ export function createBrowserHost(options = {}) {
   const encoder = new TextEncoder();
   let nextHandle = 1;
 
-  function connect(endpoint, _apiKey, sessionId, metadata = {}) {
+  async function connect(endpoint, apiKey, sessionId, metadata = {}) {
     if (options.mpp) return connectMpp(endpoint);
+    const authorization = options.hostAuth
+      ? { authorization: "host_managed" }
+      : { authorization: "bearer", bearerToken: apiKey };
+    const request = { ...metadata };
+    delete request.authorization;
+    delete request.bearerToken;
+    Object.assign(request, authorization);
+    const opened = await createWebSocket(endpoint, sessionId, request);
+    const { socket, ...handshake } = normalizeWebSocketConnection(opened);
     return new Promise((resolve, reject) => {
       let settled = false;
-      const handle = nextHandle++;
-      const socket = createWebSocket(endpoint, sessionId, metadata);
       const connection = {
         socket,
         queue: [],
@@ -35,11 +46,21 @@ export function createBrowserHost(options = {}) {
         intentionallyClosed: false,
         overflowed: false,
       };
-      socket.addEventListener("open", () => {
+      const resolveOpen = () => {
+        if (settled) return;
         settled = true;
+        const handle = nextHandle++;
         connections.set(handle, connection);
-        resolve(JSON.stringify({ handle, status: 101, reasoning_included: false }));
-      }, { once: true });
+        resolve(JSON.stringify({
+          handle,
+          status: handshake.status ?? 101,
+          request_id: handshake.requestId,
+          server_model: handshake.serverModel,
+          reasoning_included: handshake.reasoningIncluded ?? false,
+          turn_state: handshake.turnState,
+        }));
+      };
+      socket.addEventListener("open", resolveOpen, { once: true });
       socket.addEventListener("message", (event) => {
         enqueue(connection, typeof event.data === "string"
           ? { kind: "text", text: event.data }
@@ -61,6 +82,11 @@ export function createBrowserHost(options = {}) {
           enqueue(connection, { kind: "error", detail: "WebSocket connection failed" });
         }
       });
+      if (socket.readyState === WEBSOCKET_OPEN) resolveOpen();
+      else if (socket.readyState > WEBSOCKET_OPEN) {
+        settled = true;
+        reject(new Error("WebSocket closed during connection"));
+      }
     });
   }
 
@@ -198,8 +224,20 @@ export function createBrowserHost(options = {}) {
     close,
     sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
     executeCode: code.executeCode,
+    executeTool: code.executeTool,
+    toolMode: () => toolMode,
     toolDefinitions: code.toolDefinitions,
     emitEvent: onEvent,
     reset: code.reset,
   });
+}
+
+function normalizeWebSocketConnection(opened) {
+  if (opened?.socket && typeof opened.socket.addEventListener === "function") {
+    return opened;
+  }
+  if (!opened || typeof opened.addEventListener !== "function") {
+    throw new TypeError("createWebSocket must return a WebSocket or a connection descriptor");
+  }
+  return { socket: opened };
 }

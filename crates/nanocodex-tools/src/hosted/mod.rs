@@ -50,7 +50,7 @@ mod types;
 
 use std::{error::Error, fmt, future::Future, pin::Pin};
 
-use crate::{ToolContext, ToolDefinition};
+use crate::{ToolContext, ToolDefinition, ToolInput, ToolOutput};
 
 pub use input::{prepare_output_images, prepare_user_input};
 pub use runtime::{HostedToolRuntime, HostedToolRuntimeControl, HostedTools};
@@ -103,6 +103,16 @@ impl fmt::Display for CodeModeHostError {
 
 impl Error for CodeModeHostError {}
 
+/// Model-visible dispatch policy selected by an embedding host.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HostedToolMode {
+    /// Expose one Code Mode `exec` tool and nest application tools below it.
+    #[default]
+    Code,
+    /// Expose application tools directly without dynamic code evaluation.
+    Direct,
+}
+
 /// Application-owned Code Mode and nested-tool execution boundary.
 ///
 /// The host receives a read-only [`ToolContext`] for every cell and returns the
@@ -111,6 +121,11 @@ impl Error for CodeModeHostError {}
 /// [`CodeModeExecution`] for model-visible script failures. Reserve
 /// [`CodeModeHostError`] for failures in the host bridge itself.
 pub trait CodeModeHost: Send + Sync + 'static {
+    /// Selects Code Mode or CSP-safe direct function dispatch.
+    fn tool_mode(&self) -> HostedToolMode {
+        HostedToolMode::Code
+    }
+
     /// Returns the tools available to Code Mode for this session.
     ///
     /// The runtime calls this synchronously while building the model-visible
@@ -123,4 +138,18 @@ pub trait CodeModeHost: Send + Sync + 'static {
         source: &'a str,
         context: ToolContext<'a>,
     ) -> HostFuture<'a, Result<CodeModeExecution, CodeModeHostError>>;
+
+    /// Executes one directly exposed application tool.
+    fn execute_tool<'a>(
+        &'a self,
+        name: &'a str,
+        _input: ToolInput,
+        _context: ToolContext<'a>,
+    ) -> HostFuture<'a, Result<ToolOutput, CodeModeHostError>> {
+        Box::pin(async move {
+            Err(CodeModeHostError::new(format!(
+                "direct hosted tool `{name}` is unavailable"
+            )))
+        })
+    }
 }

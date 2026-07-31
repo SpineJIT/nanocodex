@@ -18,6 +18,10 @@ export function createNodeHost(options = {}) {
     require: createRequire(resolve(options.workspace ?? process.cwd(), ".nanocodex-code-mode.cjs")),
     console: new Console({ stdout: process.stderr, stderr: process.stderr }),
   });
+  const toolMode = options.toolMode ?? "code";
+  if (toolMode !== "code" && toolMode !== "direct") {
+    throw new TypeError("toolMode must be code or direct");
+  }
   const onEvent = options.onEvent || (() => {});
   const connectTimeoutMs = options.connectTimeoutMs ?? 30_000;
   const sendTimeoutMs = options.sendTimeoutMs ?? 30_000;
@@ -237,6 +241,8 @@ export function createNodeHost(options = {}) {
     close,
     sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
     executeCode: code.executeCode,
+    executeTool: code.executeTool,
+    toolMode: () => toolMode,
     toolDefinitions: code.toolDefinitions,
     emitEvent: onEvent,
     reset: code.reset,

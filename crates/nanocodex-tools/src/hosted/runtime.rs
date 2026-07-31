@@ -1,4 +1,8 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 
 use nanocodex_oai_api::{
     responses::CustomToolFormat,
@@ -7,7 +11,7 @@ use nanocodex_oai_api::{
 
 use super::{
     CodeModeExecution, CodeModeHost, CodeModeNotification, CodeModeObserver, CodeModeUpdate,
-    NestedToolCall, OwnedToolContext,
+    HostedToolMode, NestedToolCall, OwnedToolContext,
 };
 use crate::runtime_config::{ImageGenerationConfig, WebSearchConfig};
 
@@ -66,6 +70,7 @@ impl HostedTools {
 pub struct HostedToolRuntime {
     working_directory: Arc<str>,
     host: Option<Arc<dyn CodeModeHost>>,
+    direct_tool_names: RwLock<HashSet<String>>,
 }
 
 /// Cancellation handle for a hosted runtime.
@@ -91,6 +96,7 @@ impl HostedToolRuntime {
         Self {
             working_directory: Arc::from(workspace.to_string_lossy().into_owned()),
             host: None,
+            direct_tool_names: RwLock::new(HashSet::new()),
         }
     }
 
@@ -140,6 +146,10 @@ impl HostedToolRuntime {
         &self,
         session_id: &str,
     ) -> (Vec<ToolDefinition>, Vec<(String, String)>) {
+        let mode = self
+            .host
+            .as_ref()
+            .map_or(HostedToolMode::Code, |host| host.tool_mode());
         let mut definitions = self.host.as_ref().map_or_else(Vec::new, |host| {
             match host.tool_definitions(session_id) {
                 Ok(definitions) => definitions,
@@ -154,6 +164,22 @@ impl HostedToolRuntime {
             }
         });
         definitions.sort_by(|left, right| left.name().cmp(right.name()));
+        if mode == HostedToolMode::Direct {
+            if let Ok(mut names) = self.direct_tool_names.write() {
+                names.clear();
+                names.extend(
+                    definitions
+                        .iter()
+                        .map(|definition| definition.name().to_owned()),
+                );
+            } else {
+                tracing::warn!(
+                    target: "nanocodex_tools",
+                    "hosted direct-tool registry lock was poisoned"
+                );
+            }
+            return (definitions, Vec::new());
+        }
         let code_mode_tool_names = definitions
             .iter()
             .map(|definition| {
@@ -190,8 +216,14 @@ impl HostedToolRuntime {
 
     /// Returns `false`; hosted tools are callable only inside Code Mode.
     #[must_use]
-    pub const fn contains(&self, _name: &str) -> bool {
-        false
+    pub fn contains(&self, name: &str) -> bool {
+        self.host.as_ref().is_some_and(|host| {
+            host.tool_mode() == HostedToolMode::Direct
+                && self
+                    .direct_tool_names
+                    .read()
+                    .is_ok_and(|names| names.contains(name))
+        })
     }
 
     /// Returns a model-visible failure for unsupported direct hosted dispatch.
@@ -205,12 +237,21 @@ impl HostedToolRuntime {
     pub async fn execute_tool(
         &self,
         name: &str,
-        _input: ToolInput,
-        _context: ToolContext<'_>,
+        input: ToolInput,
+        context: ToolContext<'_>,
     ) -> ToolOutput {
-        ToolOutput::error(format!(
-            "direct tool `{name}` is unavailable in a hosted runtime"
-        ))
+        let Some(host) = &self.host else {
+            return ToolOutput::error("no hosted tool adapter is configured");
+        };
+        if host.tool_mode() != HostedToolMode::Direct {
+            return ToolOutput::error(format!(
+                "direct tool `{name}` is unavailable in a Code Mode hosted runtime"
+            ));
+        }
+        match host.execute_tool(name, input, context).await {
+            Ok(output) => output,
+            Err(error) => ToolOutput::error(error.to_string()),
+        }
     }
 
     /// Executes one Code Mode cell through the embedding host.

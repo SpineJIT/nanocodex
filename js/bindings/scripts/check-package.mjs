@@ -24,6 +24,7 @@ const requiredFiles = [
   "browser/index.d.mts",
   "node/index.mjs",
   "node/index.d.mts",
+  "wasm.d.mts",
   "pkg-web/nanocodex.js",
   "pkg-web/nanocodex.d.ts",
   "pkg-web/nanocodex_bg.wasm",
@@ -44,6 +45,7 @@ export async function checkPackage(packageRoot = root) {
   assert.equal(packageJson.publishConfig?.access, "public");
   assert.equal(packageJson.exports?.["./browser"]?.import, "./browser/index.mjs");
   assert.equal(packageJson.exports?.["./node"]?.import, "./node/index.mjs");
+  assert.equal(packageJson.exports?.["./wasm"]?.import, "./pkg-web/nanocodex_bg.wasm");
   checkDocumentedBrowserVersion(readme, packageJson.version);
 
   for (const file of requiredFiles) {

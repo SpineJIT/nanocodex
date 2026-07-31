@@ -32,6 +32,7 @@ export function create(options = {}) {
     apiBaseUrl,
     module,
     tools,
+    toolMode,
   } = options;
   const events = createEventChannel();
   if (mpp !== undefined && apiKey !== undefined) {
@@ -41,6 +42,7 @@ export function create(options = {}) {
     mpp,
     onEvent: events.emit,
     tools,
+    toolMode,
     workspace: workspace ?? resume?.workspace,
   });
   activateHost(host);

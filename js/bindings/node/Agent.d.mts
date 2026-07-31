@@ -14,6 +14,7 @@ export declare namespace create {
     apiBaseUrl?: string | undefined;
     module?: unknown;
     tools?: ToolMap | undefined;
+    toolMode?: "code" | "direct" | undefined;
     websocketUrl?: string | undefined;
   };
   type ReturnType = Agent;

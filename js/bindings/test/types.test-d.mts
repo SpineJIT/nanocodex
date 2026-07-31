@@ -59,10 +59,15 @@ async function check() {
   await Actions.session.shutdown(agent);
 
   await BrowserAgent.create({ websocketUrl: "wss://example.com" });
+  await BrowserAgent.create({ hostAuth: true, websocketUrl: "wss://example.com" });
   await BrowserAgent.create({ apiKey });
   await BrowserAgent.create({ mpp: { async ws() { return {} as WebSocket; } } });
   // @ts-expect-error API-key and MPP authentication are mutually exclusive.
   await BrowserAgent.create({ apiKey, mpp: { async ws() { return {} as WebSocket; } } });
+  // @ts-expect-error API-key and host-managed authentication are mutually exclusive.
+  await BrowserAgent.create({ apiKey, hostAuth: true });
+  // @ts-expect-error MPP and host-managed authentication are mutually exclusive.
+  await BrowserAgent.create({ hostAuth: true, mpp: { async ws() { return {} as WebSocket; } } });
   await Agent.create({
     mpp: {
       async ws() {

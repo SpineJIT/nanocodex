@@ -243,6 +243,44 @@ const agent = await Agent.create({
 });
 ```
 
+Server-side Worker runtimes can await a `fetch()`-based WebSocket upgrade. The
+third callback argument is a discriminated authorization request plus connection
+metadata. With `apiKey`, `authorization` is `"bearer"` and `bearerToken` is
+present. With `hostAuth: true`, it is `"host_managed"`; the host must resolve
+credentials without exposing them to WASM. Do not retain or log bearer tokens.
+Return the socket alone or a descriptor containing response metadata:
+
+```js
+import { Agent } from "nanocodex/browser";
+import module from "nanocodex/wasm";
+
+const agent = await Agent.create({
+  apiKey,
+  module,
+  async createWebSocket(endpoint, sessionId, request) {
+    if (request.authorization !== "bearer") {
+      throw new Error("this host requires Nanocodex bearer authorization");
+    }
+    const response = await fetch(endpoint.replace("wss:", "https:"), {
+      headers: {
+        Authorization: `Bearer ${request.bearerToken}`,
+        Upgrade: "websocket",
+        "session-id": sessionId,
+      },
+    });
+    if (!response.webSocket) throw new Error(`upgrade failed: ${response.status}`);
+    response.webSocket.accept();
+    return { socket: response.webSocket, status: response.status };
+  },
+});
+```
+
+`hostAuth` is useful when the embedding runtime owns rotating credentials. The
+callback can acquire a fresh token, attempt the upgrade, and refresh-and-retry
+on 401. Bound and reject upgrade work in the callback: until it returns a
+socket, there is no connection handle for Nanocodex to close. `apiKey`,
+`hostAuth`, and `mpp` are mutually exclusive.
+
 After publication, a browser can load the same entrypoint without a package
 manager or build step:
 

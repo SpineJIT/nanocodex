@@ -437,7 +437,7 @@ where
                 response_items: vec![response_item],
             });
         }
-        if matches!(call.kind, CodeCallKind::Function) && call.namespace.is_some() {
+        if matches!(call.kind, CodeCallKind::Function) && tools.contains(&qualified_name) {
             let context = ToolContext::new(
                 model.as_str(),
                 session_id,
