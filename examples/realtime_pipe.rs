@@ -134,6 +134,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     RealtimeEvent::OutputTranscriptDone(text) => {
                         eprintln!("assistant: {text}");
                     }
+                    RealtimeEvent::TranscriptTail(tail) => {
+                        for entry in tail {
+                            eprintln!("{}: {}", entry.role, entry.text);
+                        }
+                    }
                     RealtimeEvent::Error(error) => return Err(error.into()),
                     RealtimeEvent::SessionReady { .. }
                     | RealtimeEvent::SpeechStarted
