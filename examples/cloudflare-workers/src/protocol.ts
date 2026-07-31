@@ -14,13 +14,18 @@ export type TurnCompleted = {
   usage: TurnUsage;
 };
 
+export type ActiveTurn = {
+  id: string;
+  input: PromptInput;
+};
+
 export type ServerMessage =
-  | { type: "ready"; session_id: string; restored: boolean; active_turns: string[] }
-  | { type: "turn_accepted"; id: string; replayed: boolean }
+  | { type: "ready"; session_id: string; restored: boolean; active_turns: string[]; active_turn_details: ActiveTurn[] }
+  | { type: "turn_accepted"; id: string; input: PromptInput; replayed: boolean }
   | TurnCompleted
   | { type: "turn_failed"; id: string; error: string }
   | { type: "event"; event: AgentEvent }
-  | { type: "status"; active_turns: string[]; agent_loaded: boolean; connected_clients: number }
+  | { type: "status"; active_turns: string[]; active_turn_details: ActiveTurn[]; agent_loaded: boolean; connected_clients: number }
   | { type: "pong"; nonce?: string }
   | { type: "error"; code: string; message: string };
 

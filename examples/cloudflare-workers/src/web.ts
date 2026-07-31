@@ -76,8 +76,12 @@ let state = loadState();
 let socket;
 let ready = false;
 let eventCount = 0;
+let streamedText = "";
 
 if (["127.0.0.1", "localhost"].includes(location.hostname)) ui.admin.placeholder = "local-admin-token";
+window.addEventListener("storage", (event) => {
+  if (event.key === STORAGE_KEY) syncStoredState(event.newValue);
+});
 renderState();
 if (state) connect();
 
@@ -120,7 +124,7 @@ ui.form.addEventListener("submit", (event) => {
   if (!input || !state) return setActivity(state ? "prompt is empty" : "create a session first", true);
   if (state.pending) return setActivity("one durable turn is already pending", true);
   state.pending = { id: crypto.randomUUID(), input };
-  state.messages.push({ role: "you", text: input });
+  state.messages.push({ role: "you", text: input, turn_id: state.pending.id });
   ui.input.value = "";
   saveState();
   renderMessages();
@@ -149,30 +153,46 @@ function onMessage(encoded) {
   if (message.type === "ready") {
     ready = true;
     setStatus(message.restored ? "restored" : "ready", "ok");
+    for (const turn of message.active_turn_details || []) observeTurn(turn.id, turn.input);
     socket.send(JSON.stringify({ type: "status" }));
     sendPending();
   } else if (message.type === "turn_accepted") {
+    observeTurn(message.id, message.input);
     setStatus(message.replayed ? "resuming" : "running", "ok");
     setActivity((message.replayed ? "rejoined " : "started ") + shortId(message.id));
   } else if (message.type === "event") {
     eventCount += 1;
     const kind = message.event && message.event.type ? message.event.type : "agent event";
+    const delta = kind === "assistant.delta" && message.event.payload && message.event.payload.text;
+    if (typeof delta === "string") {
+      streamedText = (streamedText + delta).slice(-1048576);
+      renderMessages();
+    }
     setActivity(kind + " · " + eventCount + " events");
   } else if (message.type === "turn_completed") {
-    if (!state || !state.pending || state.pending.id !== message.id) return;
-    state.messages.push({ role: "agent", text: message.final_message });
-    delete state.pending;
+    if (!state) return;
+    finishTurn(message.id);
+    if (!hasMessage("agent", message.id)) {
+      state.messages.push({ role: "agent", text: message.final_message, turn_id: message.id });
+    }
+    streamedText = "";
     saveState();
     renderMessages();
     setStatus("ready", "ok");
     setActivity("committed durably · " + eventCount + " events");
   } else if (message.type === "turn_failed") {
-    if (state && state.pending && state.pending.id === message.id) delete state.pending;
-    if (state) state.messages.push({ role: "error", text: message.error });
+    if (!state) return;
+    finishTurn(message.id);
+    if (!hasMessage("error", message.id)) {
+      state.messages.push({ role: "error", text: message.error, turn_id: message.id });
+    }
+    streamedText = "";
     saveState();
     renderMessages();
     setStatus("failed", "bad");
     setActivity(message.error, true);
+  } else if (message.type === "status") {
+    for (const turn of message.active_turn_details || []) observeTurn(turn.id, turn.input);
   } else if (message.type === "error") {
     setActivity(message.code + ": " + message.message, true);
   }
@@ -197,7 +217,7 @@ function renderState() {
 function renderMessages() {
   ui.transcript.replaceChildren();
   const messages = state && state.messages ? state.messages : [];
-  if (!messages.length) {
+  if (!messages.length && !streamedText) {
     const empty = document.createElement("article");
     empty.className = "system";
     empty.textContent = "Send a prompt, detach during inference, then reload to prove the client is disposable.";
@@ -213,21 +233,98 @@ function renderMessages() {
     article.append(label, text);
     ui.transcript.append(article);
   }
+  if (streamedText) {
+    const article = document.createElement("article");
+    article.className = "agent live";
+    const label = document.createElement("strong");
+    label.textContent = "agent · live";
+    const text = document.createElement("div");
+    text.textContent = streamedText;
+    article.append(label, text);
+    ui.transcript.append(article);
+  }
   ui.transcript.scrollTop = ui.transcript.scrollHeight;
 }
 
 function loadState() {
+  return parseStoredState(localStorage.getItem(STORAGE_KEY));
+}
+
+function parseStoredState(encoded) {
   try {
-    const value = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    const value = JSON.parse(encoded);
     if (!value || typeof value.session_id !== "string" || typeof value.websocket_url !== "string") return undefined;
     value.messages = Array.isArray(value.messages) ? value.messages.slice(-50) : [];
+    value.active_turns = Array.isArray(value.active_turns) ? value.active_turns.slice(-16) : [];
     return value;
   } catch { return undefined; }
+}
+
+function syncStoredState(encoded) {
+  const incoming = parseStoredState(encoded);
+  const previousPendingId = state && state.pending && state.pending.id;
+  const changedSession = Boolean((!state && incoming)
+    || (state && !incoming)
+    || (state && incoming && (state.session_id !== incoming.session_id || state.websocket_url !== incoming.websocket_url)));
+  if (changedSession && socket) {
+    socket.close(1000, "session changed in another tab");
+    socket = undefined;
+    ready = false;
+  }
+  state = incoming;
+  renderState();
+  if (!state) return;
+  if (changedSession || !socket || socket.readyState === WebSocket.CLOSED) connect();
+  else if (previousPendingId !== (state.pending && state.pending.id)) sendPending();
+}
+
+function observeTurn(id, input) {
+  if (!state || typeof id !== "string") return;
+  let changed = false;
+  if (!Array.isArray(state.active_turns)) {
+    state.active_turns = [];
+    changed = true;
+  }
+  const current = state.active_turns.find((turn) => turn && turn.id === id);
+  if (current && JSON.stringify(current.input) !== JSON.stringify(input)) {
+    current.input = input;
+    changed = true;
+  } else if (!current) {
+    state.active_turns.push({ id, input });
+    changed = true;
+  }
+  const text = displayInput(input);
+  if (text && !hasMessage("you", id)) {
+    state.messages.push({ role: "you", text, turn_id: id });
+    changed = true;
+  }
+  if (changed) saveState();
+  renderMessages();
+}
+
+function finishTurn(id) {
+  if (!state) return;
+  if (state.pending && state.pending.id === id) delete state.pending;
+  state.active_turns = (state.active_turns || []).filter((turn) => turn && turn.id !== id);
+}
+
+function hasMessage(role, id) {
+  return Boolean(state && state.messages.some((message) => message.role === role && message.turn_id === id));
+}
+
+function displayInput(input) {
+  if (typeof input === "string") return input;
+  if (!Array.isArray(input)) return "";
+  return input.map((item) => {
+    if (item && item.type === "text" && typeof item.text === "string") return item.text;
+    return item && typeof item.type === "string" ? "[" + item.type + "]" : "[content]";
+  }).join("\\n");
 }
 
 function saveState() {
   if (!state) return localStorage.removeItem(STORAGE_KEY);
   state.messages = state.messages.slice(-50);
+  state.active_turns = (state.active_turns || []).slice(-16);
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
   catch {
     state.messages = state.messages.slice(-10).map((message) => ({ ...message, text: message.text.slice(-20000) }));

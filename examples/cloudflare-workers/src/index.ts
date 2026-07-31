@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import type {
   DefaultAgent,
   EventWatcher,
+  PromptInput,
   SessionSnapshot,
   Turn,
   TurnResult,
@@ -17,6 +18,7 @@ import {
 export { NanocodexSubscriptionAuth } from "./subscription-auth";
 
 import {
+  type ActiveTurn,
   type ClientCommand,
   ProtocolError,
   type ServerMessage,
@@ -144,6 +146,7 @@ export class NanocodexSession extends DurableObject<Env> {
   #events?: EventWatcher;
   readonly #turns = new Map<string, Turn>();
   readonly #pendingTurnIds = new Set<string>();
+  readonly #turnInputs = new Map<string, PromptInput>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -189,6 +192,7 @@ export class NanocodexSession extends DurableObject<Env> {
         completed_turns: session.completed_turns,
         last_active: session.last_active,
         active_turns: this.#activeTurnIds(),
+        active_turn_details: this.#activeTurnDetails(),
         agent_loaded: this.#agent !== undefined,
         connected_clients: this.ctx.getWebSockets().length,
         auth_mode: modelAuthMode(this.env),
@@ -259,6 +263,7 @@ export class NanocodexSession extends DurableObject<Env> {
       session_id: session.session_id,
       restored: session.has_snapshot !== 0,
       active_turns: this.#activeTurnIds(),
+      active_turn_details: this.#activeTurnDetails(),
     });
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -273,6 +278,7 @@ export class NanocodexSession extends DurableObject<Env> {
       this.#send(socket, {
         type: "status",
         active_turns: this.#activeTurnIds(),
+        active_turn_details: this.#activeTurnDetails(),
         agent_loaded: this.#agent !== undefined,
         connected_clients: this.ctx.getWebSockets().length,
       });
@@ -299,7 +305,16 @@ export class NanocodexSession extends DurableObject<Env> {
       return;
     }
     if (this.#turns.has(command.id) || this.#pendingTurnIds.has(command.id)) {
-      this.#send(socket, { type: "turn_accepted", id: command.id, replayed: true });
+      const input = this.#turnInputs.get(command.id);
+      if (input !== undefined && JSON.stringify(input) !== JSON.stringify(command.input)) {
+        this.#send(socket, {
+          type: "error",
+          code: "turn_id_conflict",
+          message: `turn ${command.id} is already active with different input`,
+        });
+        return;
+      }
+      this.#send(socket, { type: "turn_accepted", id: command.id, input: input ?? command.input, replayed: true });
       return;
     }
     if (this.#turns.size + this.#pendingTurnIds.size >= MAX_ACTIVE_TURNS) {
@@ -307,7 +322,8 @@ export class NanocodexSession extends DurableObject<Env> {
       return;
     }
     this.#pendingTurnIds.add(command.id);
-    this.#broadcast({ type: "turn_accepted", id: command.id, replayed: false });
+    this.#turnInputs.set(command.id, command.input);
+    this.#broadcast({ type: "turn_accepted", id: command.id, input: command.input, replayed: false });
     try {
       const agent = await this.#ensureAgent();
       if (this.#agent !== agent) throw new Error("agent became unavailable while accepting the turn");
@@ -317,6 +333,7 @@ export class NanocodexSession extends DurableObject<Env> {
       this.ctx.waitUntil(this.#complete(command.id, turn));
     } catch (error) {
       this.#pendingTurnIds.delete(command.id);
+      this.#turnInputs.delete(command.id);
       this.#broadcast({ type: "turn_failed", id: command.id, error: errorMessage(error) });
       if (this.#turns.size === 0 && this.#agent) {
         await this.ctx.storage.setAlarm(Date.now() + this.#idleTimeoutMs());
@@ -427,6 +444,7 @@ export class NanocodexSession extends DurableObject<Env> {
       this.#broadcastEncoded(payload);
     } finally {
       this.#turns.delete(id);
+      this.#turnInputs.delete(id);
       turn.dispose();
       if (this.#turns.size === 0) {
         await this.ctx.storage.setAlarm(Date.now() + this.#idleTimeoutMs());
@@ -442,6 +460,7 @@ export class NanocodexSession extends DurableObject<Env> {
     await this.#shutdownAgent();
     this.#turns.clear();
     this.#pendingTurnIds.clear();
+    this.#turnInputs.clear();
   }
 
   async #shutdownAgent(): Promise<void> {
@@ -489,6 +508,13 @@ export class NanocodexSession extends DurableObject<Env> {
 
   #activeTurnIds(): string[] {
     return [...this.#pendingTurnIds, ...this.#turns.keys()];
+  }
+
+  #activeTurnDetails(): ActiveTurn[] {
+    return this.#activeTurnIds().flatMap((id) => {
+      const input = this.#turnInputs.get(id);
+      return input === undefined ? [] : [{ id, input }];
+    });
   }
 
   #idleTimeoutMs(): number {

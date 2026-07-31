@@ -21,6 +21,9 @@ describe("Nanocodex Durable Object Worker", () => {
     expect(script.headers.get("content-type")).toContain("text/javascript");
     expect(source).toContain("localStorage");
     expect(source).toContain("crypto.randomUUID()");
+    expect(source).toContain('window.addEventListener("storage"');
+    expect(source).toContain('kind === "assistant.delta"');
+    expect(source).toContain("message.active_turn_details");
     expect(source).toContain("session creation token rejected");
     expect(source).not.toContain("OPENAI_API_KEY");
     expect(source).not.toContain("CHATGPT_ACCESS_TOKEN");

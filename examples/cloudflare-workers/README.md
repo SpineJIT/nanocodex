@@ -81,6 +81,7 @@ Start workerd in one terminal and run the live probes in another:
 ```sh
 npm run repl --prefix examples/cloudflare-workers
 npm run smoke --prefix examples/cloudflare-workers
+npm run multiclient --prefix examples/cloudflare-workers
 npm run stress --prefix examples/cloudflare-workers
 npm run soak --prefix examples/cloudflare-workers
 npm run fanout --prefix examples/cloudflare-workers
@@ -105,6 +106,9 @@ The smoke performs real model turns, verifies duplicate suppression, detaches
 its client, waits for idle teardown, reconnects to the durable snapshot, proves
 that a follow-on remembers history, and requires a completed `runtimeInfo` tool
 call/result pair.
+`multiclient` attaches at least two clients before prompting and requires every
+client to receive the same accepted turn, assistant-delta stream, event count,
+and terminal result without reconnecting.
 `stress` drives ping round trips through one object, `soak`
 checks parallel sessions for cross-session leakage and duplicate model calls,
 and `fanout` broadcasts a bursty model stream to 64 attached clients. Override
