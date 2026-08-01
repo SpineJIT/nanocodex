@@ -523,14 +523,6 @@ impl DynamicToolProvider for Mcp {
         ]
     }
 
-    fn direct_tools_for_exposure(&self, exposure: crate::ToolExposure) -> Vec<Arc<dyn Tool>> {
-        let mut tools = self.direct_tools();
-        if exposure == crate::ToolExposure::CodeModeOnly {
-            tools.retain(|tool| !matches!(tool.definition(), ToolDefinition::ToolSearch { .. }));
-        }
-        tools
-    }
-
     fn available_definitions(&self) -> Vec<ToolDefinition> {
         self.state.available_definitions()
     }
@@ -861,8 +853,8 @@ mod tests {
         let specs = runtime.model_specs("test-session");
         assert_eq!(
             specs.iter().map(ToolDefinition::name).collect::<Vec<_>>(),
-            ["exec", "wait"],
-            "Code Mode-only must keep native tool_search off the top-level surface"
+            ["exec", "wait", "tool_search"],
+            "Code Mode-only must retain the discovery primitive while deferring MCP tools"
         );
 
         let description = specs[0].description();

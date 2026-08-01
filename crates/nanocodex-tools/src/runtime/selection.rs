@@ -25,9 +25,9 @@ pub trait DynamicToolProvider: Send + Sync {
 
     /// Returns the provider's direct tools for one model exposure policy.
     ///
-    /// Providers normally expose the same tools under either policy. A provider may
-    /// hide discovery entrypoints in Code Mode-only when its deferred tools
-    /// are already callable through `ALL_TOOLS`, matching Codex's MCP policy.
+    /// Providers normally expose the same tools under either policy. In
+    /// particular, discovery entrypoints such as `tool_search` remain visible
+    /// while the tools they discover stay deferred.
     fn direct_tools_for_exposure(&self, _exposure: ToolExposure) -> Vec<Arc<dyn Tool>> {
         self.direct_tools()
     }

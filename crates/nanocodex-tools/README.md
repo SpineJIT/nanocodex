@@ -138,12 +138,12 @@ let tools = Tools::builder().provider(mcp).build()?;
 # }
 ```
 
-Handshakes and discovery start with the owning runtime. Under
-`DirectAndCodeMode`, `mcp::Mcp` initially exposes the provider-native
-`tool_search`; Code Mode-only discovers the same deferred tools through
-`ALL_TOOLS`. Search results contain loadable MCP namespaces for direct model
-calls and also activate matching Code Mode definitions, keeping large catalogs
-out of the initial tool list.
+Handshakes and discovery start with the owning runtime. Both exposure policies
+keep the provider-native `tool_search` visible while omitting deferred MCP
+schemas from the initial request. Code Mode lists those deferred tools as
+compact name/description entries in `ALL_TOOLS`. Search results contain
+loadable MCP namespaces for direct model calls and also activate matching Code
+Mode definitions, keeping large catalogs out of the initial tool list.
 
 ## Companion workspace runtimes
 
