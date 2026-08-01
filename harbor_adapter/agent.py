@@ -335,6 +335,8 @@ class NanocodexAgent(BaseInstalledAgent):
             self._model,
             "--thinking",
             self._effort,
+            "--rollouts",
+            "false",
             "--fast-mode",
             str(getattr(self, "_fast_mode", False)).lower(),
             "--web-search",
