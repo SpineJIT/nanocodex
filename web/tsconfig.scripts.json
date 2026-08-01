@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "moduleResolution": "NodeNext",
+    "module": "NodeNext"
+  },
+  "include": ["scripts/harbor-comparison.ts", "test/harbor-comparison.test.ts"]
+}
