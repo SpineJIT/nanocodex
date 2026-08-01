@@ -107,20 +107,27 @@ or an explicitly managed CDP endpoint.
 - Harness-owned cookies/storage, virtual passkeys, allowlisted source-browser handoff,
   upload roots, browser egress policy, remote CDP, and libkrun VM composition.
 
-The Nanocodex CLI can copy a standard Chromium-family profile's complete
-cookie database into either supported session-private browser. A bare cookie
-flag auto-detects a source; `brave`, `chrome`, `chromium`, and `edge` select it
-explicitly:
+The Nanocodex CLI can copy a standard desktop browser profile's complete cookie
+database into either supported session-private browser. A bare cookie flag
+auto-detects a source; `brave`, `chrome`, `chromium`, `edge`, `firefox`, and
+`safari` select it explicitly:
 
 ```console
 nanocodex --browser --cookies
 nanocodex --browser --cookies=chrome
 nanocodex --browser=brave --cookies=edge
+nanocodex --browser --cookies=firefox
+nanocodex --browser --cookies=safari
 ```
 
-The source profile remains open, is never mutated, and cookie values remain
-outside the model-callable browser schema. This mode deliberately gives the
-agent authenticated access to every site represented in the selected profile.
+Chromium-family sources use their own executable as a short-lived decryption
+broker. Firefox is copied with SQLite's online backup API. Safari's bounded
+binary-cookie decoder may require granting the Nanocodex process macOS access
+to Safari's sandboxed profile. Source profiles are never mutated.
+
+The source profile is never mutated, and cookie values remain outside the
+model-callable browser schema. This mode deliberately gives the agent
+authenticated access to every site represented in the selected profile.
 
 ## Current boundaries
 

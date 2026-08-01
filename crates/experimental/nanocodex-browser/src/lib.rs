@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![deny(unsafe_code, rustdoc::broken_intra_doc_links)]
 
+mod cookie_source;
 mod features;
 mod native;
 mod session;
@@ -56,6 +57,7 @@ where
     }
 }
 
+pub use cookie_source::{BrowserCookieSourceError, FirefoxCookieSource, SafariCookieSource};
 pub use features::{
     BrowserAccessibilityAudit, BrowserAccessibilityImpact, BrowserAccessibilityViolation,
     BrowserAfterAction, BrowserAxeAudit, BrowserAxeFinding, BrowserAxeNode, BrowserBreakpoint,

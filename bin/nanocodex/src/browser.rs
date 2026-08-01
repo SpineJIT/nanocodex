@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
 use eyre::{Result, WrapErr, eyre};
-use nanocodex_browser::{BraveSession, Browser, BrowserProfileKind, BrowserTool};
+use nanocodex_browser::{
+    BraveSession, Browser, BrowserProfileKind, BrowserStorageState, BrowserTool,
+    FirefoxCookieSource, SafariCookieSource,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum BrowserKind {
@@ -19,6 +22,13 @@ enum CookieSourceKind {
     Chrome,
     Chromium,
     Edge,
+    Firefox,
+    Safari,
+}
+
+enum CookieSource {
+    Chromium(BraveSession),
+    State(BrowserStorageState),
 }
 
 /// Opt-in local browser configuration for normal agent sessions.
@@ -38,7 +48,7 @@ pub(crate) struct BrowserArgs {
     )]
     browser: Option<BrowserKind>,
 
-    /// Copy cookies from a standard Chromium-family profile.
+    /// Copy cookies from a standard desktop browser profile.
     ///
     /// Pass a browser name to select the source profile. A bare flag or `true`
     /// automatically selects an installed profile.
@@ -96,8 +106,10 @@ impl BrowserArgs {
             }
         }
         if let Some(source) = self.cookies {
-            let source = cookie_source(source, kind)?;
-            builder = builder.cookie_source(source.copy_all_cookies());
+            builder = match cookie_source(source, kind)? {
+                CookieSource::Chromium(source) => builder.cookie_source(source.copy_all_cookies()),
+                CookieSource::State(state) => builder.storage_state(state),
+            };
         }
         let browser = builder
             .build()
@@ -106,16 +118,33 @@ impl BrowserArgs {
     }
 }
 
-fn cookie_source(source: CookieSourceKind, target: BrowserKind) -> Result<BraveSession> {
+fn cookie_source(source: CookieSourceKind, target: BrowserKind) -> Result<CookieSource> {
+    match source {
+        CookieSourceKind::Firefox => {
+            return FirefoxCookieSource::standard()
+                .and_then(|source| source.load())
+                .map(CookieSource::State)
+                .wrap_err("failed to load the standard Firefox cookie profile");
+        }
+        CookieSourceKind::Safari => {
+            return SafariCookieSource::standard()
+                .and_then(|source| source.load())
+                .map(CookieSource::State)
+                .wrap_err("failed to load the standard Safari cookie profile");
+        }
+        _ => {}
+    }
     let explicit = match source {
         CookieSourceKind::Auto => None,
         CookieSourceKind::Brave => Some(BrowserProfileKind::Brave),
         CookieSourceKind::Chrome => Some(BrowserProfileKind::Chrome),
         CookieSourceKind::Chromium => Some(BrowserProfileKind::Chromium),
         CookieSourceKind::Edge => Some(BrowserProfileKind::Edge),
+        CookieSourceKind::Firefox | CookieSourceKind::Safari => None,
     };
     if let Some(source) = explicit {
         return BraveSession::standard_for(source)
+            .map(CookieSource::Chromium)
             .wrap_err_with(|| format!("failed to locate the standard {} profile", source.name()));
     }
 
@@ -136,7 +165,20 @@ fn cookie_source(source: CookieSourceKind, target: BrowserKind) -> Result<BraveS
     preferences
         .into_iter()
         .find_map(|source| BraveSession::standard_for(source).ok())
-        .ok_or_else(|| eyre!("failed to locate an installed Chromium-family cookie profile"))
+        .map(CookieSource::Chromium)
+        .or_else(|| {
+            FirefoxCookieSource::standard()
+                .and_then(|source| source.load())
+                .ok()
+                .map(CookieSource::State)
+        })
+        .or_else(|| {
+            SafariCookieSource::standard()
+                .and_then(|source| source.load())
+                .ok()
+                .map(CookieSource::State)
+        })
+        .ok_or_else(|| eyre!("failed to locate an installed browser cookie profile"))
 }
 
 impl ConfiguredBrowser {
