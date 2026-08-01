@@ -54,6 +54,7 @@ class CliToolInstallContractTests(unittest.TestCase):
             "/opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt",
             command,
         )
+        self.assertIn("/etc/pki/tls/certs/ca-bundle.crt", command)
         self.assertIn(
             '"/opt/nanocodex-toolbox/usr/share/nodejs"',
             command,
@@ -182,6 +183,15 @@ class CliToolInstallContractTests(unittest.TestCase):
 
             self.assertFalse(marker.exists())
             self.assertFalse(task_certificate.exists())
+
+    def test_yum_ca_bundle_is_an_accepted_native_certificate_location(self) -> None:
+        command = _cli_tools_install_command(install_node=False)
+
+        self.assertIn(
+            "test -s /etc/ssl/certs/ca-certificates.crt || "
+            "test -s /etc/pki/tls/certs/ca-bundle.crt",
+            command,
+        )
 
     def test_missing_tool_uses_package_manager_then_rechecks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -901,6 +911,7 @@ class EnvironmentToolboxContractTests(unittest.TestCase):
 
         self.assertIn("as bash curl", dockerfile)
         self.assertIn("node npm readelf rg", dockerfile)
+        self.assertIn("nodejs \\\n        npm", dockerfile)
         self.assertIn('npm)', toolbox_exec)
         self.assertIn('npm/bin/npm-cli.js', toolbox_exec)
 
@@ -919,8 +930,10 @@ class EnvironmentToolboxContractTests(unittest.TestCase):
                     task_root = root / f"task-{has_task_modules}"
                     verifier = task_root / "opt" / "nanocodex-verifier"
                     task_modules = task_root / "usr" / "share" / "nodejs"
+                    bash = task_root / "bin" / "bash"
                     verifier.parent.mkdir(parents=True)
                     task_modules.parent.mkdir(parents=True)
+                    bash.parent.mkdir(parents=True)
                     if has_task_modules:
                         task_modules.mkdir()
                         owned_module = task_modules / "font-awesome"
@@ -937,6 +950,7 @@ class EnvironmentToolboxContractTests(unittest.TestCase):
                                 toolbox_root=str(toolbox),
                                 verifier_root=str(verifier),
                                 node_modules_root=str(task_modules),
+                                bash_path=str(bash),
                             ),
                         ],
                         check=True,
@@ -957,6 +971,7 @@ class EnvironmentToolboxContractTests(unittest.TestCase):
                         )
                     else:
                         self.assertEqual(task_modules.readlink(), toolbox_modules)
+                    self.assertEqual(bash.readlink(), verifier / "bin" / "bash")
 
 
 class InterruptedRunContractTests(unittest.TestCase):
@@ -1106,6 +1121,11 @@ class RunCancellationContractTests(unittest.IsolatedAsyncioTestCase):
 
             command = agent.exec_as_agent.await_args.args[1]
             self.assertIn("set -o pipefail", command)
+            self.assertIn('SSL_CERT_FILE="$ca_bundle"', command)
+            self.assertIn(
+                "/opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt",
+                command,
+            )
             self.assertIn('tee "$events_tmp"', command)
             self.assertNotIn("tee /logs/agent/events.jsonl", command)
             self.assertNotIn('mv "$events_tmp"', command)

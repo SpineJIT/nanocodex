@@ -23,6 +23,7 @@ def _toolbox_mount_setup_command(
     toolbox_root: str = _TOOLBOX_ROOT,
     verifier_root: str = _VERIFIER_ROOT,
     node_modules_root: str = "/usr/share/nodejs",
+    bash_path: str = "/bin/bash",
 ) -> str:
     toolbox_verifier_root = f"{toolbox_root}{_VERIFIER_ROOT}"
     toolbox_node_modules = f"{toolbox_root}/usr/share/nodejs"
@@ -30,6 +31,8 @@ def _toolbox_mount_setup_command(
     toolbox_verifier = shlex.quote(toolbox_verifier_root)
     node_modules = shlex.quote(node_modules_root)
     toolbox_modules = shlex.quote(toolbox_node_modules)
+    bash = shlex.quote(bash_path)
+    verifier_bash = shlex.quote(f"{verifier_root}/bin/bash")
     return (
         f"if [ -e {verifier} ] || [ -L {verifier} ]; then "
         f'test "$(readlink {verifier})" = {toolbox_verifier}; '
@@ -42,7 +45,9 @@ def _toolbox_mount_setup_command(
         f'task_node_entry={node_modules}/${{toolbox_node_entry##*/}}; '
         'if [ ! -e "$task_node_entry" ] && [ ! -L "$task_node_entry" ]; then '
         'ln -s "$toolbox_node_entry" "$task_node_entry"; fi; '
-        "done; fi"
+        "done; fi; "
+        f"if [ -e {bash} ] || [ -L {bash} ]; then test -x {bash}; "
+        f"else ln -s {verifier_bash} {bash}; fi"
     )
 
 

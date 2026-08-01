@@ -26,6 +26,7 @@ RUN find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
         git \
         mtools \
         nodejs \
+        npm \
         openssh-client \
         primer3 \
         ripgrep \

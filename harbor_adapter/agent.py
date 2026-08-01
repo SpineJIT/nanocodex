@@ -84,7 +84,8 @@ def _cli_tools_install_command(*, install_node: bool) -> str:
         'case "$curl_path" in '
         "/opt/nanocodex-verifier/bin/curl) "
         "test -s /opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt ;; "
-        "*) test -s /etc/ssl/certs/ca-certificates.crt ;; esac"
+        "*) { test -s /etc/ssl/certs/ca-certificates.crt || "
+        "test -s /etc/pki/tls/certs/ca-bundle.crt; } ;; esac"
     )
     return (
         "PATH=$PATH:/opt/nanocodex-verifier/bin; export PATH; "
@@ -293,8 +294,16 @@ class NanocodexAgent(BaseInstalledAgent):
         await self._stage_agents_md(environment)
         arguments = self._run_arguments(instruction)
         agent_command = (
+            "if [ -s /etc/ssl/certs/ca-certificates.crt ]; then "
+            "ca_bundle=/etc/ssl/certs/ca-certificates.crt; "
+            "elif [ -s /etc/pki/tls/certs/ca-bundle.crt ]; then "
+            "ca_bundle=/etc/pki/tls/certs/ca-bundle.crt; "
+            "elif [ -s /opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt ]; then "
+            "ca_bundle=/opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt; "
+            "else echo 'No CA certificate bundle found' >&2; exit 1; fi; "
             f'api_key=$(<{self._API_KEY_FILE}) && test -n "$api_key" && '
             f'rm -f {self._API_KEY_FILE} && OPENAI_API_KEY="$api_key" '
+            'SSL_CERT_FILE="$ca_bundle" '
             + (
                 "NANOCODEX_SUBAGENT_JSONL=1 "
                 if getattr(self, "_subagents", False)
