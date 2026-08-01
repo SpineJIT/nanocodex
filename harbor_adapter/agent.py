@@ -70,12 +70,21 @@ def _cli_tools_install_command(*, install_node: bool) -> str:
 
     package_list = " ".join(packages)
     command_checks = " && ".join(
-        f"command -v {command} >/dev/null 2>&1" for command in checks
+        [
+            "curl_path=$(command -v curl)",
+            *(
+                f"command -v {command} >/dev/null 2>&1"
+                for command in checks
+                if command != "curl"
+            ),
+        ]
     )
     fast_path_checks = (
-        "(test -s /etc/ssl/certs/ca-certificates.crt || "
-        "test -s /opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt) && "
-        f"{command_checks}"
+        f"{command_checks} && "
+        'case "$curl_path" in '
+        "/opt/nanocodex-verifier/bin/curl) "
+        "test -s /opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt ;; "
+        "*) test -s /etc/ssl/certs/ca-certificates.crt ;; esac"
     )
     return (
         "PATH=$PATH:/opt/nanocodex-verifier/bin; export PATH; "

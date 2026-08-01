@@ -100,6 +100,89 @@ class CliToolInstallContractTests(unittest.TestCase):
 
             self.assertFalse(marker.exists())
 
+    def test_native_curl_without_native_ca_uses_package_manager(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            task_certificate = root / "task-ca-certificates.crt"
+            toolbox_certificate = root / "toolbox-ca-certificates.crt"
+            toolbox_certificate.write_text("test certificate", encoding="utf-8")
+            marker = root / "package-manager-ran"
+            for command in ("curl", "bash", "rg"):
+                executable = bin_dir / command
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o755)
+            apt_get = bin_dir / "apt-get"
+            apt_get.write_text(
+                "#!/bin/sh\n"
+                f"touch {marker}\n"
+                f"printf 'test certificate' > {task_certificate}\n",
+                encoding="utf-8",
+            )
+            apt_get.chmod(0o755)
+
+            command = _cli_tools_install_command(install_node=False).replace(
+                "/opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt",
+                str(toolbox_certificate),
+            ).replace(
+                "/etc/ssl/certs/ca-certificates.crt",
+                str(task_certificate),
+            )
+            subprocess.run(
+                ["sh", "-c", command],
+                check=True,
+                env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+            )
+
+            self.assertTrue(marker.exists())
+            self.assertTrue(task_certificate.exists())
+
+    def test_toolbox_curl_with_toolbox_ca_skips_package_managers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            toolbox_bin = root / "toolbox-bin"
+            bin_dir.mkdir()
+            toolbox_bin.mkdir()
+            task_certificate = root / "missing-task-ca-certificates.crt"
+            toolbox_certificate = root / "toolbox-ca-certificates.crt"
+            toolbox_certificate.write_text("test certificate", encoding="utf-8")
+            marker = root / "package-manager-ran"
+            for command in ("bash", "rg"):
+                executable = bin_dir / command
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o755)
+            curl = toolbox_bin / "curl"
+            curl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            curl.chmod(0o755)
+            apt_get = bin_dir / "apt-get"
+            apt_get.write_text(
+                f"#!/bin/sh\ntouch {marker}\nexit 99\n", encoding="utf-8"
+            )
+            apt_get.chmod(0o755)
+
+            command = (
+                _cli_tools_install_command(install_node=False)
+                .replace("/opt/nanocodex-verifier/bin", str(toolbox_bin))
+                .replace(
+                    "/opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt",
+                    str(toolbox_certificate),
+                )
+                .replace(
+                    "/etc/ssl/certs/ca-certificates.crt",
+                    str(task_certificate),
+                )
+            )
+            subprocess.run(
+                ["/bin/sh", "-c", command],
+                check=True,
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertFalse(marker.exists())
+            self.assertFalse(task_certificate.exists())
+
     def test_missing_tool_uses_package_manager_then_rechecks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
