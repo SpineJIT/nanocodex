@@ -32,7 +32,13 @@ const wasmBytes = readFile(new URL(import.meta.resolve("nanocodex/wasm")));
 
 type ModelAuthMode = "api_key" | "chatgpt";
 
+type PromptAdmission =
+  | { kind: "fresh" }
+  | { kind: "terminal"; completed: TurnCompleted };
+
 type InFlightTurn = {
+  admission: Promise<PromptAdmission>;
+  input: string;
   inputHash: string;
   operation: Promise<TurnCompleted>;
 };
@@ -60,7 +66,13 @@ export type TurnCompleted = {
 export type TurnAccepted = {
   type: "turn_accepted";
   id: string;
+  input: string;
   replayed: boolean;
+};
+
+export type ActiveTurn = {
+  id: string;
+  input: string;
 };
 
 export type TurnFailed = {
@@ -75,6 +87,7 @@ export type SessionStatus = {
   completed_turns: number;
   last_active: number;
   active_turns: string[];
+  active_turn_details: ActiveTurn[];
   agent_loaded: boolean;
   auth_mode: ModelAuthMode;
 };
@@ -146,6 +159,7 @@ export const nanocodex = actor({
   }),
   events: {
     agentEvent: event<AgentEvent>(),
+    turnAccepted: event<TurnAccepted>(),
     turnCompleted: event<TurnCompleted>(),
     turnFailed: event<TurnFailed>(),
   },
@@ -153,10 +167,12 @@ export const nanocodex = actor({
     start: async (c, request: PromptRequest): Promise<TurnAccepted> => {
       const started = startPrompt(c, request, true);
       void started.operation.catch(() => {});
+      const admission = await started.admission;
       return {
         type: "turn_accepted",
         id: request.id,
-        replayed: started.replayed,
+        input: request.input,
+        replayed: started.replayed || admission.kind === "terminal",
       };
     },
     prompt: async (c, request: PromptRequest): Promise<TurnCompleted> => {
@@ -183,6 +199,10 @@ export const nanocodex = actor({
         completed_turns: row.completed_turns,
         last_active: row.last_active,
         active_turns: [...c.vars.inFlight.keys()],
+        active_turn_details: [...c.vars.inFlight].map(([id, turn]) => ({
+          id,
+          input: turn.input,
+        })),
         agent_loaded: c.vars.agent !== undefined,
         auth_mode: modelAuthMode(),
       };
@@ -227,17 +247,39 @@ function startPrompt(
     throw userError(`at most ${MAX_ACTIVE_TURNS} turns may be active`);
   }
 
-  const running = runPrompt(context, request, inputHash, !detached);
+  const admission = classifyPrompt(context, request, inputHash);
+  const running = admission.then((result) => result.kind === "terminal"
+    ? result.completed
+    : runPrompt(context, request, inputHash, !detached));
   let inFlight: InFlightTurn;
   const operation = running.finally(() => {
     if (context.vars.inFlight.get(request.id) === inFlight) {
       context.vars.inFlight.delete(request.id);
     }
   });
-  inFlight = { inputHash, operation };
+  inFlight = { admission, input: request.input, inputHash, operation };
   context.vars.inFlight.set(request.id, inFlight);
   context.keepAwake(operation);
   return { ...inFlight, replayed: false };
+}
+
+async function classifyPrompt(
+  context: SessionContext,
+  request: PromptRequest,
+  inputHash: string,
+): Promise<PromptAdmission> {
+  const stored = await terminal(context.db, request.id);
+  if (stored) {
+    if (stored.input_hash !== inputHash) throw userError(`turn ${request.id} already has different input`);
+    return { kind: "terminal", completed: parseTerminal(stored.payload) };
+  }
+  context.broadcast("turnAccepted", {
+    type: "turn_accepted",
+    id: request.id,
+    input: request.input,
+    replayed: false,
+  } satisfies TurnAccepted);
+  return { kind: "fresh" };
 }
 
 async function runPrompt(
@@ -246,12 +288,6 @@ async function runPrompt(
   inputHash: string,
   cancelOnContextAbort: boolean,
 ): Promise<TurnCompleted> {
-  const stored = await terminal(context.db, request.id);
-  if (stored) {
-    if (stored.input_hash !== inputHash) throw userError(`turn ${request.id} already has different input`);
-    return parseTerminal(stored.payload);
-  }
-
   let turn: Turn | undefined;
   const onAbort = () => {
     void turn?.cancel().catch(() => {});

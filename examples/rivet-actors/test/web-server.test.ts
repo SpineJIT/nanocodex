@@ -22,6 +22,9 @@ describe("browser client", () => {
     expect(script.headers.get("content-type")).toContain("text/javascript");
     expect(source).toContain("localStorage");
     expect(source).toContain("URLSearchParams");
+    expect(source).toContain("turnAccepted");
+    expect(source).toContain("assistant.delta");
+    expect(source).toContain("storage");
     expect(source).not.toContain("OPENAI_API_KEY");
     expect(source).not.toContain("CHATGPT_ACCESS_TOKEN");
   });
