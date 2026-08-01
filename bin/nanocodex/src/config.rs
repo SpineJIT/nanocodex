@@ -6,6 +6,11 @@ use std::{
 
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr, eyre};
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+use nanocodex::NanocodexBuilder;
 use nanocodex::{
     AgentEvents, Model, Nanocodex, OpenAi, ReasoningMode, Thinking, Tools,
     agent::{
@@ -43,12 +48,9 @@ struct SessionBuild {
     rollout: Option<RolloutConfig>,
 }
 
+/// Authentication flags shared by every direct-OpenAI CLI consumer.
 #[derive(Args)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "independent CLI feature toggles are not one state machine"
-)]
-pub(crate) struct AgentArgs {
+pub(crate) struct AuthArgs {
     /// Explicit `OpenAI` API key override.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     api_key: Option<String>,
@@ -56,14 +58,58 @@ pub(crate) struct AgentArgs {
     /// Explicitly use `ChatGPT` authorization from this credential file.
     #[arg(long, env = "NANOCODEX_AUTH_FILE")]
     auth_file: Option<PathBuf>,
+}
+
+/// Model-facing flags shared by normal agents and evaluator agents.
+#[derive(Args)]
+pub(crate) struct ModelArgs {
+    /// Reasoning effort: none, low, medium, high, xhigh, or max.
+    #[arg(long, env = "OPENAI_REASONING_EFFORT")]
+    thinking: Option<Thinking>,
+
+    /// Whether standalone web search is exposed to the model.
+    #[arg(long, env = "NANOCODEX_WEB_SEARCH", action = ArgAction::Set)]
+    web_search: Option<bool>,
+}
+
+/// The credential source selected once by the CLI and reusable by paired eval
+/// implementations.
+#[derive(Clone)]
+pub(crate) enum SharedAuth {
+    ApiKey(Arc<str>),
+    AuthFile(PathBuf),
+}
+
+/// The deliberately small standard-agent configuration accepted by eval
+/// commands.
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+#[derive(Args)]
+pub(crate) struct EvalAgentArgs {
+    #[command(flatten)]
+    auth: AuthArgs,
+
+    #[command(flatten)]
+    model_policy: ModelArgs,
+}
+
+#[derive(Args)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent CLI feature toggles are not one state machine"
+)]
+pub(crate) struct AgentArgs {
+    #[command(flatten)]
+    auth: AuthArgs,
 
     /// Working directory exposed to the coding tools.
     #[arg(long)]
     cwd: Option<PathBuf>,
 
-    /// Reasoning effort: none, low, medium, high, xhigh, or max.
-    #[arg(long, env = "OPENAI_REASONING_EFFORT", default_value_t)]
-    thinking: Thinking,
+    #[command(flatten)]
+    model_policy: ModelArgs,
 
     /// GPT-5.6 coding model: gpt-5.6-sol or gpt-5.6-luna.
     #[arg(long, env = "OPENAI_MODEL", default_value_t)]
@@ -85,15 +131,6 @@ pub(crate) struct AgentArgs {
     /// Replace the standard system/developer instructions.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     instructions: Option<String>,
-
-    /// Whether standalone web search is exposed to the model.
-    #[arg(
-        long,
-        env = "NANOCODEX_WEB_SEARCH",
-        default_value_t = true,
-        action = ArgAction::Set
-    )]
-    web_search: bool,
 
     /// Whether image generation is exposed to the model.
     #[arg(
@@ -166,8 +203,12 @@ impl AgentArgs {
         self.browser.is_enabled()
     }
 
-    pub(crate) const fn thinking(&self) -> Thinking {
-        self.thinking
+    pub(crate) fn thinking(&self) -> Thinking {
+        self.model_policy.thinking.unwrap_or_default()
+    }
+
+    pub(crate) fn web_search(&self) -> bool {
+        self.model_policy.web_search.unwrap_or(true)
     }
 
     pub(crate) const fn fast_mode(&self) -> bool {
@@ -204,6 +245,8 @@ impl AgentArgs {
         durable: Option<DurableSession>,
         vm: VmArgs,
     ) -> Result<ConfiguredAgent> {
+        let thinking = self.thinking();
+        let web_search = self.web_search();
         let codex_home = default_codex_home()?;
         let responses_transport = self.responses_transport();
         let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
@@ -217,7 +260,7 @@ impl AgentArgs {
         let auth = if mpp_enabled {
             OpenAiAuth::api_key("tempo-proxy")
         } else {
-            select_auth(self.api_key, self.auth_file, environment_api_key()?)?
+            self.auth.resolve()?.nanocodex()?
         };
         let direct_websocket_url = direct_websocket_url(self.websocket_url, auth.mode());
         let mpp_adapter = self.mpp.start().await?;
@@ -256,7 +299,7 @@ impl AgentArgs {
         let mut tools = configured_vm
             .as_ref()
             .map_or_else(Tools::builder, ConfiguredVm::tools_builder)
-            .web_search(self.web_search)
+            .web_search(web_search)
             .image_generation(self.image_generation);
         let mcp = self.mcp.build(&codex_home)?;
         let mcp_handle = mcp.as_ref().map(|mcp| mcp.handle.clone());
@@ -277,7 +320,7 @@ impl AgentArgs {
         let mut builder = Nanocodex::builder(openai)
             .model(self.model)
             .reasoning_mode(self.reasoning_mode)
-            .thinking(self.thinking)
+            .thinking(thinking)
             .fast_mode(self.fast_mode)
             .workspace(session.workspace)
             .codex_home(codex_home);
@@ -316,6 +359,64 @@ impl AgentArgs {
             vm: configured_vm,
         })
     }
+}
+
+impl AuthArgs {
+    fn resolve(self) -> Result<SharedAuth> {
+        select_shared_auth(self.api_key, self.auth_file, environment_api_key()?)
+    }
+}
+
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+impl EvalAgentArgs {
+    pub(crate) fn builder(self, thinking: Thinking, web_search: bool) -> Result<NanocodexBuilder> {
+        let auth = self.auth.resolve()?;
+        eval_builder_with_auth(auth.nanocodex()?, thinking, web_search)
+    }
+
+    pub(crate) fn shared_builder(
+        self,
+        thinking: Thinking,
+        web_search: bool,
+    ) -> Result<(NanocodexBuilder, SharedAuth)> {
+        let auth = self.auth.resolve()?;
+        let builder = eval_builder_with_auth(auth.nanocodex()?, thinking, web_search)?;
+        Ok((builder, auth))
+    }
+
+    pub(crate) const fn thinking(&self) -> Option<Thinking> {
+        self.model_policy.thinking
+    }
+
+    pub(crate) const fn web_search(&self) -> Option<bool> {
+        self.model_policy.web_search
+    }
+}
+
+impl SharedAuth {
+    fn nanocodex(&self) -> Result<OpenAiAuth> {
+        match self {
+            Self::ApiKey(api_key) => Ok(OpenAiAuth::api_key(Arc::clone(api_key))),
+            Self::AuthFile(path) => load_subscription_auth(path),
+        }
+    }
+}
+
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+fn eval_builder_with_auth(
+    auth: OpenAiAuth,
+    thinking: Thinking,
+    web_search: bool,
+) -> Result<NanocodexBuilder> {
+    let tools = Tools::builder().web_search(web_search).build()?;
+    let openai = OpenAi::new(auth)?;
+    Ok(Nanocodex::builder(openai).thinking(thinking).tools(tools))
 }
 
 fn prepare_session_build(
@@ -368,19 +469,22 @@ fn selected_api_base_url(generic: Option<String>, tempo: Option<&str>) -> Option
     tempo.map(str::to_owned).or(generic)
 }
 
+#[cfg(test)]
 fn select_auth(
     explicit_api_key: Option<String>,
     auth_file: Option<PathBuf>,
     environment_api_key: Option<String>,
 ) -> Result<OpenAiAuth> {
-    select_auth_with_default(
+    select_shared_auth_with_default(
         explicit_api_key,
         auth_file,
         environment_api_key,
         default_auth_file,
     )
+    .and_then(|auth| auth.nanocodex())
 }
 
+#[cfg(test)]
 fn select_auth_with_default<F>(
     explicit_api_key: Option<String>,
     auth_file: Option<PathBuf>,
@@ -390,23 +494,54 @@ fn select_auth_with_default<F>(
 where
     F: FnOnce() -> Result<PathBuf>,
 {
+    select_shared_auth_with_default(
+        explicit_api_key,
+        auth_file,
+        environment_api_key,
+        resolve_default_auth_file,
+    )
+    .and_then(|auth| auth.nanocodex())
+}
+
+fn select_shared_auth(
+    explicit_api_key: Option<String>,
+    auth_file: Option<PathBuf>,
+    environment_api_key: Option<String>,
+) -> Result<SharedAuth> {
+    select_shared_auth_with_default(
+        explicit_api_key,
+        auth_file,
+        environment_api_key,
+        default_auth_file,
+    )
+}
+
+fn select_shared_auth_with_default<F>(
+    explicit_api_key: Option<String>,
+    auth_file: Option<PathBuf>,
+    environment_api_key: Option<String>,
+    resolve_default_auth_file: F,
+) -> Result<SharedAuth>
+where
+    F: FnOnce() -> Result<PathBuf>,
+{
     if let Some(api_key) = explicit_api_key {
-        return Ok(OpenAiAuth::api_key(api_key));
+        return Ok(SharedAuth::ApiKey(api_key.into()));
     }
     if let Some(auth_file) = auth_file {
-        return load_subscription_auth(&auth_file);
+        return Ok(SharedAuth::AuthFile(auth_file));
     }
     let auth_file = resolve_default_auth_file()?;
     if auth_file
         .try_exists()
         .wrap_err_with(|| format!("failed to inspect {}", auth_file.display()))?
     {
-        return load_subscription_auth(&auth_file);
+        return Ok(SharedAuth::AuthFile(auth_file));
     }
     if let Some(api_key) = environment_api_key {
-        return Ok(OpenAiAuth::api_key(api_key));
+        return Ok(SharedAuth::ApiKey(api_key.into()));
     }
-    load_subscription_auth(&auth_file)
+    Ok(SharedAuth::AuthFile(auth_file))
 }
 
 fn environment_api_key() -> Result<Option<String>> {
