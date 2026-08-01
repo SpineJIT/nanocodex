@@ -4457,7 +4457,7 @@ dependencies = [
  "libc",
  "libloading",
  "log",
- "lru 0.16.4",
+ "lru 0.12.5",
  "nix 0.30.1",
  "rand 0.9.5",
  "virtio-bindings",
@@ -4913,7 +4913,7 @@ dependencies = [
 [[package]]
 name = "mpp"
 version = "0.11.0"
-source = "git+https://github.com/gakonst/mpp-rs?rev=b1a7088bc05da933923220e29028ff75dbcb1ea4#b1a7088bc05da933923220e29028ff75dbcb1ea4"
+source = "git+https://github.com/tempoxyz/mpp-rs?rev=3e37469bb19434982b433ae44ea8c713f7ea923a#3e37469bb19434982b433ae44ea8c713f7ea923a"
 dependencies = [
  "alloy",
  "anyhow",
@@ -7160,7 +7160,7 @@ dependencies = [
 [[package]]
 name = "reth-ethereum-primitives"
 version = "2.4.1"
-source = "git+https://github.com/paradigmxyz/reth?rev=01d3400#01d3400ffa06ff8912ade8c693cdafce54d0c936"
+source = "git+https://github.com/paradigmxyz/reth?rev=fc3f7da#fc3f7da91b345cd011767a3e71cde541ebfa02e0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8746,7 +8746,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -8755,7 +8755,7 @@ dependencies = [
 [[package]]
 name = "tempo-alloy"
 version = "1.10.1"
-source = "git+https://github.com/gakonst/tempo?rev=c2cf774b95ea920b671d311aa07c96051913c314#c2cf774b95ea920b671d311aa07c96051913c314"
+source = "git+https://github.com/tempoxyz/tempo?rev=bdc5c78c155d746d4e7f16d64b41ce791ba24580#bdc5c78c155d746d4e7f16d64b41ce791ba24580"
 dependencies = [
  "alloy-consensus",
  "alloy-contract",
@@ -8795,7 +8795,7 @@ dependencies = [
 [[package]]
 name = "tempo-chainspec"
 version = "1.10.1"
-source = "git+https://github.com/gakonst/tempo?rev=c2cf774b95ea920b671d311aa07c96051913c314#c2cf774b95ea920b671d311aa07c96051913c314"
+source = "git+https://github.com/tempoxyz/tempo?rev=bdc5c78c155d746d4e7f16d64b41ce791ba24580#bdc5c78c155d746d4e7f16d64b41ce791ba24580"
 dependencies = [
  "alloy-eips",
  "alloy-genesis",
@@ -8811,7 +8811,7 @@ dependencies = [
 [[package]]
 name = "tempo-contracts"
 version = "1.10.1"
-source = "git+https://github.com/gakonst/tempo?rev=c2cf774b95ea920b671d311aa07c96051913c314#c2cf774b95ea920b671d311aa07c96051913c314"
+source = "git+https://github.com/tempoxyz/tempo?rev=bdc5c78c155d746d4e7f16d64b41ce791ba24580#bdc5c78c155d746d4e7f16d64b41ce791ba24580"
 dependencies = [
  "alloy-contract",
  "alloy-primitives",
@@ -8823,7 +8823,7 @@ dependencies = [
 [[package]]
 name = "tempo-hardfork"
 version = "1.10.1"
-source = "git+https://github.com/gakonst/tempo?rev=c2cf774b95ea920b671d311aa07c96051913c314#c2cf774b95ea920b671d311aa07c96051913c314"
+source = "git+https://github.com/tempoxyz/tempo?rev=bdc5c78c155d746d4e7f16d64b41ce791ba24580#bdc5c78c155d746d4e7f16d64b41ce791ba24580"
 dependencies = [
  "alloy-eips",
  "alloy-hardforks",
@@ -8834,7 +8834,7 @@ dependencies = [
 [[package]]
 name = "tempo-primitives"
 version = "1.10.1"
-source = "git+https://github.com/gakonst/tempo?rev=c2cf774b95ea920b671d311aa07c96051913c314#c2cf774b95ea920b671d311aa07c96051913c314"
+source = "git+https://github.com/tempoxyz/tempo?rev=bdc5c78c155d746d4e7f16d64b41ce791ba24580#bdc5c78c155d746d4e7f16d64b41ce791ba24580"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
