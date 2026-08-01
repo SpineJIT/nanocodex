@@ -566,6 +566,7 @@ pub(crate) async fn run(
         .as_ref()
         .map_or_else(|| config.model(), DurableSession::model);
     let initial_thinking = config.thinking();
+    let initial_fast_mode = config.fast_mode();
     let restored_transcript = resume
         .as_ref()
         .map(|session| session.transcript().to_vec())
@@ -619,7 +620,8 @@ pub(crate) async fn run(
     let mut ticker = ui_ticker();
     let mut app = App::new(cwd)
         .with_model(initial_model)
-        .with_thinking(initial_thinking);
+        .with_thinking(initial_thinking)
+        .with_fast_mode(initial_fast_mode);
     app.set_math_renderer(math_renderer.clone());
     app.restore_transcript(restored_transcript);
     let mut ui = UiModel::new(app, Arc::clone(&root_session_id));

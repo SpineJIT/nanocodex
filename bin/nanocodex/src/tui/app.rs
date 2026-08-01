@@ -1256,6 +1256,11 @@ impl App {
         self
     }
 
+    pub(super) const fn with_fast_mode(mut self, enabled: bool) -> Self {
+        self.fast_mode = enabled;
+        self
+    }
+
     pub(super) fn set_math_renderer(&mut self, renderer: Ratatex) {
         self.main.transcript.set_math_renderer(renderer.clone());
         for branch in &mut self.main_branches {
@@ -3316,6 +3321,13 @@ mod tests {
             app.main.transcript.latest_user_message(),
             Some("visible prompt")
         );
+    }
+
+    #[test]
+    fn configured_fast_mode_seeds_the_tui_state() {
+        let app = App::new(std::path::PathBuf::from("/worktree")).with_fast_mode(true);
+
+        assert!(app.fast_mode());
     }
 
     #[test]

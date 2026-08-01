@@ -170,6 +170,10 @@ impl AgentArgs {
         self.thinking
     }
 
+    pub(crate) const fn fast_mode(&self) -> bool {
+        self.fast_mode
+    }
+
     pub(crate) const fn model(&self) -> Model {
         self.model
     }
