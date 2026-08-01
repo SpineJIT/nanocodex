@@ -32,7 +32,12 @@ const wasmBytes = readFile(new URL(import.meta.resolve("nanocodex/wasm")));
 
 type ModelAuthMode = "api_key" | "chatgpt";
 
+type PromptAdmission =
+  | { kind: "fresh" }
+  | { kind: "terminal"; completed: TurnCompleted };
+
 type InFlightTurn = {
+  admission: Promise<PromptAdmission>;
   input: string;
   inputHash: string;
   operation: Promise<TurnCompleted>;
@@ -160,27 +165,17 @@ export const nanocodex = actor({
   },
   actions: {
     start: async (c, request: PromptRequest): Promise<TurnAccepted> => {
-      const completed = await completedReplay(c.db, request);
-      if (completed) {
-        return {
-          type: "turn_accepted",
-          id: request.id,
-          input: request.input,
-          replayed: true,
-        };
-      }
       const started = startPrompt(c, request, true);
       void started.operation.catch(() => {});
+      const admission = await started.admission;
       return {
         type: "turn_accepted",
         id: request.id,
         input: request.input,
-        replayed: started.replayed,
+        replayed: started.replayed || admission.kind === "terminal",
       };
     },
     prompt: async (c, request: PromptRequest): Promise<TurnCompleted> => {
-      const completed = await completedReplay(c.db, request);
-      if (completed) return completed;
       return startPrompt(c, request, false).operation;
     },
     steer: async (c, id: string, input: string): Promise<void> => {
@@ -252,23 +247,39 @@ function startPrompt(
     throw userError(`at most ${MAX_ACTIVE_TURNS} turns may be active`);
   }
 
-  const running = runPrompt(context, request, inputHash, !detached);
+  const admission = classifyPrompt(context, request, inputHash);
+  const running = admission.then((result) => result.kind === "terminal"
+    ? result.completed
+    : runPrompt(context, request, inputHash, !detached));
   let inFlight: InFlightTurn;
   const operation = running.finally(() => {
     if (context.vars.inFlight.get(request.id) === inFlight) {
       context.vars.inFlight.delete(request.id);
     }
   });
-  inFlight = { input: request.input, inputHash, operation };
+  inFlight = { admission, input: request.input, inputHash, operation };
   context.vars.inFlight.set(request.id, inFlight);
   context.keepAwake(operation);
+  return { ...inFlight, replayed: false };
+}
+
+async function classifyPrompt(
+  context: SessionContext,
+  request: PromptRequest,
+  inputHash: string,
+): Promise<PromptAdmission> {
+  const stored = await terminal(context.db, request.id);
+  if (stored) {
+    if (stored.input_hash !== inputHash) throw userError(`turn ${request.id} already has different input`);
+    return { kind: "terminal", completed: parseTerminal(stored.payload) };
+  }
   context.broadcast("turnAccepted", {
     type: "turn_accepted",
     id: request.id,
     input: request.input,
     replayed: false,
   } satisfies TurnAccepted);
-  return { ...inFlight, replayed: false };
+  return { kind: "fresh" };
 }
 
 async function runPrompt(
@@ -277,14 +288,6 @@ async function runPrompt(
   inputHash: string,
   cancelOnContextAbort: boolean,
 ): Promise<TurnCompleted> {
-  const stored = await terminal(context.db, request.id);
-  if (stored) {
-    if (stored.input_hash !== inputHash) throw userError(`turn ${request.id} already has different input`);
-    const completed = parseTerminal(stored.payload);
-    context.broadcast("turnCompleted", completed);
-    return completed;
-  }
-
   let turn: Turn | undefined;
   const onAbort = () => {
     void turn?.cancel().catch(() => {});
@@ -479,19 +482,6 @@ async function terminal(database: RawAccess, id: string): Promise<TerminalRow | 
     "SELECT input_hash, payload FROM terminal_turns WHERE id = ?",
     id,
   ))[0];
-}
-
-async function completedReplay(
-  database: RawAccess,
-  request: PromptRequest,
-): Promise<TurnCompleted | undefined> {
-  validatePrompt(request);
-  const stored = await terminal(database, request.id);
-  if (!stored) return undefined;
-  if (stored.input_hash !== hashInput(request.input)) {
-    throw userError(`turn ${request.id} already has different input`);
-  }
-  return parseTerminal(stored.payload);
 }
 
 function parseTerminal(payload: string): TurnCompleted {
