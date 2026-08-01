@@ -107,10 +107,11 @@ or an explicitly managed CDP endpoint.
 - Harness-owned cookies/storage, virtual passkeys, allowlisted Brave handoff,
   upload roots, browser egress policy, remote CDP, and libkrun VM composition.
 
-The Nanocodex CLI can launch the standard Brave installation and copy its
-complete cookie database into the session-private profile:
+The Nanocodex CLI can copy the standard Brave profile's complete cookie
+database into either supported session-private browser:
 
 ```console
+nanocodex --browser --cookies=true
 nanocodex --browser=brave --cookies=true
 ```
 

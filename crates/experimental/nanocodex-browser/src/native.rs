@@ -142,6 +142,7 @@ pub(crate) struct NativeBrowser {
     executable: Option<PathBuf>,
     cdp_endpoint: Option<Url>,
     brave_session: Option<BraveSession>,
+    launch_brave_executable: bool,
     virtual_authenticator: Option<VirtualAuthenticator>,
     react_diagnostics: Option<ReactDiagnostics>,
     egress_policy: Option<BrowserEgressPolicy>,
@@ -644,6 +645,7 @@ fn trace_browser_configuration(owner: &NativeBrowser) {
         "executable": owner.executable,
         "cdpEndpoint": owner.cdp_endpoint,
         "braveSession": owner.brave_session.as_ref().map(BraveSession::trace_value),
+        "launchBraveExecutable": owner.launch_brave_executable,
         "virtualAuthenticator": owner.virtual_authenticator.is_some(),
         "reactDiagnostics": owner.react_diagnostics.map(|diagnostics| {
             serde_json::json!({
@@ -673,6 +675,7 @@ impl Session {
         let executable = owner.executable.as_deref();
         let cdp_endpoint = owner.cdp_endpoint.as_ref();
         let brave_session = owner.brave_session.as_ref();
+        let launch_brave_executable = owner.launch_brave_executable;
         let virtual_authenticator = owner.virtual_authenticator;
         let react_diagnostics = owner.react_diagnostics;
         let egress_policy = owner.egress_policy.clone();
@@ -684,8 +687,11 @@ impl Session {
         tokio::fs::create_dir_all(&output_dir).await?;
         tokio::fs::create_dir_all(&download_dir).await?;
 
-        let imported_cookies = if let (Some(_), Some(brave_session)) = (cdp_endpoint, brave_session)
-        {
+        let opens_brave_profile = cdp_endpoint.is_none()
+            && executable.is_none()
+            && launch_brave_executable
+            && brave_session.is_some();
+        let imported_cookies = if !opens_brave_profile && let Some(brave_session) = brave_session {
             Some(export_brave_cookies(runtime_dir, brave_session).await?)
         } else {
             None
@@ -693,9 +699,7 @@ impl Session {
         if let Some(cookies) = &imported_cookies {
             trace_serialized("session.imported_brave_cookies", cookies);
         }
-        if cdp_endpoint.is_none()
-            && let Some(brave_session) = brave_session
-        {
+        if opens_brave_profile && let Some(brave_session) = brave_session {
             brave_session.prepare(&profile).await?;
         }
 
@@ -706,12 +710,13 @@ impl Session {
                 .user_data_dir(&profile)
                 .window_size(1280, 720)
                 .new_headless_mode();
-            if let Some(brave_session) = brave_session {
-                config = brave_launch_config(config)
-                    .chrome_executable(brave_session.executable())
-                    .arg("restore-last-session");
-            } else if let Some(executable) = executable {
+            if opens_brave_profile {
+                config = brave_launch_config(config).arg("restore-last-session");
+            }
+            if let Some(executable) = executable {
                 config = config.chrome_executable(executable);
+            } else if launch_brave_executable && let Some(brave_session) = brave_session {
+                config = config.chrome_executable(brave_session.executable());
             }
             if egress_policy.is_some() {
                 config = config
@@ -2053,6 +2058,7 @@ impl NativeBrowser {
         executable: Option<PathBuf>,
         cdp_endpoint: Option<Url>,
         brave_session: Option<BraveSession>,
+        launch_brave_executable: bool,
         virtual_authenticator: Option<VirtualAuthenticator>,
         react_diagnostics: Option<ReactDiagnostics>,
         egress_policy: Option<BrowserEgressPolicy>,
@@ -2071,6 +2077,7 @@ impl NativeBrowser {
             executable,
             cdp_endpoint,
             brave_session,
+            launch_brave_executable,
             virtual_authenticator,
             react_diagnostics,
             egress_policy,

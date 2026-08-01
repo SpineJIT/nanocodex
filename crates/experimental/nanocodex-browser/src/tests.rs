@@ -55,6 +55,24 @@ fn browser_accepts_an_explicit_all_cookie_brave_session() -> Result<()> {
 }
 
 #[test]
+fn browser_cookie_source_is_independent_from_the_browser_executable() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let brave_executable = directory.path().join("brave");
+    let chromium_executable = directory.path().join("chromium");
+    std::fs::write(&brave_executable, [])?;
+    std::fs::write(&chromium_executable, [])?;
+    let user_data = directory.path().join("user-data");
+    std::fs::create_dir(&user_data)?;
+    let cookies = BraveSession::new(brave_executable, user_data).copy_all_cookies();
+
+    Browser::builder()
+        .executable(chromium_executable)
+        .brave_cookie_source(cookies)
+        .build()?;
+    Ok(())
+}
+
+#[test]
 fn harness_owned_browser_secrets_are_redacted_from_debug_output() {
     let state = BrowserStorageState {
         cookies: vec![BrowserCookie {

@@ -3158,6 +3158,7 @@ pub struct BrowserBuilder {
     executable: Option<std::path::PathBuf>,
     cdp_endpoint: Option<url::Url>,
     brave_session: Option<BraveSession>,
+    launch_brave_executable: bool,
     virtual_authenticator: Option<VirtualAuthenticator>,
     react_diagnostics: Option<ReactDiagnostics>,
     egress_policy: Option<BrowserEgressPolicy>,
@@ -3198,6 +3199,20 @@ impl BrowserBuilder {
     #[must_use]
     pub fn brave_session(mut self, session: BraveSession) -> Self {
         self.brave_session = Some(session);
+        self.launch_brave_executable = true;
+        self
+    }
+
+    /// Seeds the selected browser with cookies from a Brave profile.
+    ///
+    /// Unlike [`Self::brave_session`], this does not select Brave as the
+    /// browser executable. An explicitly configured Chrome or Chromium binary,
+    /// or the normal auto-detected browser, launches with the private cookie
+    /// snapshot instead.
+    #[must_use]
+    pub fn brave_cookie_source(mut self, session: BraveSession) -> Self {
+        self.brave_session = Some(session);
+        self.launch_brave_executable = false;
         self
     }
 
@@ -3304,11 +3319,6 @@ impl BrowserBuilder {
     /// Returns an error when the private runtime directory cannot be created.
     pub fn build(self) -> Result<Browser, BrowserBuildError> {
         nanocodex_oai_api::transport::install_default_rustls_crypto_provider();
-        if self.executable.is_some() && self.brave_session.is_some() {
-            return Err(BrowserBuildError::Configuration {
-                message: "`executable` and `brave_session` cannot both be configured".to_owned(),
-            });
-        }
         if self.cdp_endpoint.is_some() && self.executable.is_some() {
             return Err(BrowserBuildError::Configuration {
                 message: "`cdp_endpoint` cannot be combined with `executable`".to_owned(),
@@ -3390,6 +3400,7 @@ impl BrowserBuilder {
                 self.executable,
                 self.cdp_endpoint,
                 self.brave_session,
+                self.launch_brave_executable,
                 self.virtual_authenticator,
                 self.react_diagnostics,
                 egress_policy,

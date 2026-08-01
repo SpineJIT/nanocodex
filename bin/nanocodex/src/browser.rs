@@ -28,7 +28,7 @@ pub(crate) struct BrowserArgs {
     )]
     browser: Option<BrowserKind>,
 
-    /// Copy every cookie from the standard Brave profile into the private session.
+    /// Copy every cookie from the standard Brave profile into the selected browser.
     #[arg(
         long,
         env = "NANOCODEX_BROWSER_COOKIES",
@@ -65,11 +65,13 @@ impl BrowserArgs {
         let mut builder = Browser::builder().file_root(workspace);
         match kind {
             BrowserKind::Chromium => {
-                if self.cookies {
-                    return Err(eyre!("--cookies=true requires --browser=brave"));
-                }
                 if let Some(executable) = &self.browser_executable {
                     builder = builder.executable(executable);
+                }
+                if self.cookies {
+                    let brave = BraveSession::standard()
+                        .wrap_err("failed to locate the standard Brave profile")?;
+                    builder = builder.brave_cookie_source(brave.copy_all_cookies());
                 }
             }
             BrowserKind::Brave => {
@@ -141,20 +143,5 @@ mod tests {
         assert!(!serialized.contains("browser"));
         assert!(runtime.contains("browser"));
         browser.shutdown().await.unwrap();
-    }
-
-    #[test]
-    fn cookies_require_brave_mode() {
-        let workspace = tempfile::tempdir().unwrap();
-        let error = BrowserArgs {
-            browser: Some(super::BrowserKind::Chromium),
-            cookies: true,
-            browser_executable: None,
-        }
-        .configure(workspace.path())
-        .err()
-        .unwrap();
-
-        assert!(error.to_string().contains("--browser=brave"));
     }
 }
