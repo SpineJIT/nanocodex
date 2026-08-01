@@ -12,11 +12,11 @@ use crate::{
     },
 };
 
-use super::super::{ConnectionState, ResponsesService, record_pipeline_stats, required_call_index};
+use super::super::{AttemptGuard, ResponsesService, record_pipeline_stats, required_call_index};
 
 pub(crate) async fn run(
     service: &ResponsesService,
-    connection: &mut ConnectionState,
+    connection: &mut AttemptGuard<'_>,
     request: &ResponsesAttempt,
     started_at: Instant,
 ) -> Result<ResponsesServiceResponse, ResponsesServiceError> {
@@ -55,14 +55,18 @@ pub(crate) async fn run(
         },
     )?;
     let send_started_at = Instant::now();
-    let (mut response, metadata) = send_with_auth_recovery(
-        service,
-        request.profile.session_id(),
-        connection.turn_state.as_deref(),
-        &encoded,
-    )
-    .await
-    .map_err(|error| ResponsesServiceError::responses(error, FailurePhase::Send, 0))?;
+    let (mut response, metadata) =
+        send_with_auth_recovery(service, request.profile.session_id(), &encoded, connection)
+            .await
+            .map_err(|error| {
+                let billing_uncertain = matches!(error, ResponsesError::HttpRequest { .. });
+                let error = ResponsesServiceError::responses(error, FailurePhase::Send, 0);
+                if billing_uncertain {
+                    error.with_billing_uncertain()
+                } else {
+                    error
+                }
+            })?;
     connection.observe_turn_state(metadata.turn_state.as_deref());
     let send_duration_ns = elapsed_ns(send_started_at);
     span.record("request.send.duration_ns", send_duration_ns);
@@ -75,7 +79,8 @@ pub(crate) async fn run(
                 required_call_index(request)?,
                 started_at,
             )
-            .await?,
+            .await
+            .map_err(ResponsesServiceError::with_billing_uncertain_unless_provider_terminal)?,
         ),
         ResponsesAttemptKind::Compaction => ResponsesOutput::Compaction(
             stream::receive_compaction(
@@ -85,7 +90,8 @@ pub(crate) async fn run(
                 required_call_index(request)?,
                 started_at,
             )
-            .await?,
+            .await
+            .map_err(ResponsesServiceError::with_billing_uncertain_unless_provider_terminal)?,
         ),
         ResponsesAttemptKind::Warmup => unreachable!("warmup rejected above"),
     };
@@ -120,10 +126,12 @@ impl ResponseEventSource for ResponsesHttpStream {
 async fn send_with_auth_recovery(
     service: &ResponsesService,
     session_id: &str,
-    turn_state: Option<&str>,
     request: &EncodedRequest,
+    guard: &mut AttemptGuard<'_>,
 ) -> Result<(ResponsesHttpStream, HttpMetadata), ResponsesError> {
     let auth = service.auth_snapshot().await?;
+    let turn_state = guard.turn_state.clone();
+    guard.mark_request_sent();
     match service
         .platform
         .http()
@@ -131,7 +139,7 @@ async fn send_with_auth_recovery(
             &service.config.api_base_url,
             &auth,
             session_id,
-            turn_state,
+            turn_state.as_deref(),
             request,
         )
         .await
@@ -139,6 +147,7 @@ async fn send_with_auth_recovery(
         Err(ResponsesError::HttpRejected { status: 401, .. })
             if auth.mode() == OpenAiAuthMode::ChatGpt =>
         {
+            guard.mark_provider_terminal();
             service
                 .config
                 .auth
@@ -148,6 +157,7 @@ async fn send_with_auth_recovery(
                     detail: error.to_string(),
                 })?;
             let refreshed = service.auth_snapshot().await?;
+            guard.mark_request_sent();
             service
                 .platform
                 .http()
@@ -155,7 +165,7 @@ async fn send_with_auth_recovery(
                     &service.config.api_base_url,
                     &refreshed,
                     session_id,
-                    turn_state,
+                    turn_state.as_deref(),
                     request,
                 )
                 .await
