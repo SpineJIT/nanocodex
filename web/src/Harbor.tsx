@@ -13,6 +13,7 @@ import {
   Zap,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { LiveEvals, useLiveEvalSnapshot } from "./LiveEvals";
 
 type TrialStatus = "passed" | "failed" | "error";
 type EvalView = "overview" | "verifier" | "trajectory";
@@ -224,6 +225,7 @@ function runnerLabel(runner: Runner) {
 }
 
 export function Harbor() {
+  const live = useLiveEvalSnapshot();
   const [index, setIndex] = useState<HarborIndex | null>(null);
   const [loadError, setLoadError] = useState(false);
   const [selectedJobKey, setSelectedJobKey] = useState<string | null>(null);
@@ -309,6 +311,10 @@ export function Harbor() {
     estimateSize: () => 82,
     overscan: 8,
   });
+
+  if (live.availability === "available" && live.snapshot) {
+    return <LiveEvals connection={live} />;
+  }
 
   if (loadError) {
     return (

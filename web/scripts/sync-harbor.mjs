@@ -9,6 +9,7 @@ import {
   parseRetainedLock,
   policyEvidence,
 } from "./harbor-evidence.ts";
+import { redactPublicText } from "./public-redaction.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryPath = resolve(
@@ -55,10 +56,9 @@ function safeSegment(value) {
 }
 
 function redact(value) {
-  return value
+  return redactPublicText(value)
     .replace(/(api[_-]?key|token|password|secret)\s*[=:]\s*[^\s]+/gi, "$1=[redacted]")
-    .replace(/bearer\s+[^\s]+/gi, "Bearer [redacted]")
-    .replace(/-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*/gi, "[private key redacted]");
+    .replace(/bearer\s+[^\s]+/gi, "Bearer [redacted]");
 }
 
 function commandSummary(tool, argumentsValue) {

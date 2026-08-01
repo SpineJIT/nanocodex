@@ -179,3 +179,14 @@ test("BYOK creation rejects cross-origin requests before storing a key", async (
   assert.equal(response.status, 403);
   assert.equal(credentials.size, 0);
 });
+
+test("the deployed Worker does not expose local eval evidence", async () => {
+  for (const path of ["/api/evals", "/api/evals/events", "/api/evals/case?id=abc"]) {
+    const response = await worker.fetch(
+      new Request(`https://demo.test${path}`),
+      { ENVIRONMENT: "test" },
+    );
+    assert.equal(response.status, 404, path);
+    assert.deepEqual(await response.json(), { error: "not_found" });
+  }
+});

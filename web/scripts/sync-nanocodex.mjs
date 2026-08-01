@@ -3,6 +3,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { prepareFileTreeInput } from "@pierre/trees";
+import { redactPublicText } from "./public-redaction.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryPath = resolve(
@@ -147,9 +148,9 @@ const commits = rawLog
       "--",
       ...sourcePathspec,
     ]);
-    commitPatches.push(
+    commitPatches.push(redactPublicText(
       `From ${hash} Mon Sep 17 00:00:00 2001\n${patch}\n`,
-    );
+    ));
 
     return {
       hash,
@@ -161,8 +162,8 @@ const commits = rawLog
         .split(",")
         .map((ref) => ref.trim())
         .filter(Boolean),
-      subject,
-      body: body.trim(),
+      subject: redactPublicText(subject),
+      body: redactPublicText(body.trim()),
       files,
       stats: { files: files.length, additions, deletions },
     };
@@ -191,7 +192,12 @@ const tree = git(["ls-tree", "-r", "-z", "-l", head])
   .map(({ mode, objectId, rawSize, path }) => {
     const contents = gitBuffer(["cat-file", "blob", objectId]);
     const viewable = isText(contents);
-    if (viewable) blobFiles.push({ objectId, contents });
+    if (viewable) {
+      blobFiles.push({
+        objectId,
+        contents: Buffer.from(redactPublicText(contents.toString("utf8")), "utf8"),
+      });
+    }
     return {
       path,
       mode,
