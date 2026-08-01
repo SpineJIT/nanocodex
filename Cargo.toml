@@ -8,6 +8,7 @@ members = [
     "crates/experimental/nanocodex-browser",
     "crates/experimental/nanocodex-egress",
     "crates/experimental/nanocodex-voice",
+    "crates/experimental/nanocodex-eval",
     "crates/experimental/nanocodex-vm",
     "crates/nanocodex-oai-api",
     "crates/nanocodex-observability",
@@ -63,6 +64,7 @@ http-body-util = "0.1.3"
 hmac = "0.13.0"
 hudsucker = { version = "0.25.0", git = "https://github.com/gakonst/hudsucker", rev = "9a13609adc4b37b3e7fba28a320546bf672f0f4d", default-features = false, features = ["rcgen-ca", "ring", "rustls-client"] }
 ignore = "0.4.31"
+jiff = { version = "0.2.35", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 krun = { package = "libkrun", version = "=2.0.0-dev", git = "https://github.com/containers/libkrun", rev = "df85b8b75f55e8ef1b06b5bc18f08dc6d7b5aeb0", features = ["blk", "net"] }
 mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "3e37469bb19434982b433ae44ea8c713f7ea923a", default-features = false }
 nanocodex = { version = "0.3.0", path = "crates/nanocodex" }
@@ -70,6 +72,7 @@ nanocodex-agent = { version = "0.3.0", path = "crates/nanocodex-agent" }
 nanocodex-browser = { version = "0.3.0", path = "crates/experimental/nanocodex-browser" }
 nanocodex-egress = { version = "0.3.0", path = "crates/experimental/nanocodex-egress" }
 nanocodex-voice = { version = "0.3.0", path = "crates/experimental/nanocodex-voice" }
+nanocodex-eval = { version = "0.3.0", path = "crates/experimental/nanocodex-eval" }
 nanocodex-vm = { version = "0.3.0", path = "crates/experimental/nanocodex-vm" }
 nanocodex-oai-api = { version = "0.3.0", path = "crates/nanocodex-oai-api" }
 nanocodex-observability = { version = "0.3.0", path = "crates/nanocodex-observability" }
@@ -102,6 +105,7 @@ ratatex = "0.1.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-ring"] }
 reqwest-middleware = "0.5.2"
 rustls = { version = "0.23.42", default-features = false, features = ["ring"] }
+regex = "1"
 rusqlite = { version = "0.38", features = ["bundled"] }
 rquickjs = "0.12.1"
 rmcp = { version = "1.8.0", default-features = false, features = ["auth", "client", "reqwest-tls-no-provider", "transport-async-rw", "transport-streamable-http-client-reqwest"] }
@@ -119,6 +123,7 @@ simd-json = "=0.15.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 sonic-rs = "0.5.8"
 sourcemap = "9.3.2"
+sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 syn = { version = "2.0.119", features = ["full"] }
 thiserror = "2.0.17"
 tempfile = "3.27.0"
@@ -136,7 +141,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "jso
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
 url = "2.5.7"
-uuid = { version = "1", features = ["js", "serde", "v5", "v7"] }
+uuid = { version = "1", features = ["js", "serde", "v4", "v5", "v7"] }
 v8-heap-parser = "1.1.0"
 vergen = { version = "8", default-features = false }
 wasm-bindgen = "0.2.105"
@@ -144,6 +149,7 @@ wasm-bindgen-futures = "0.4.55"
 web-time = "1.1.0"
 webrtc = "0.17.0"
 whoami = "1.6.1"
+yansi = { version = "1.0", features = ["detect-env", "detect-tty"] }
 zstd = "0.13"
 
 [patch.crates-io]

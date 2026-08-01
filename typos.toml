@@ -13,6 +13,8 @@ ratatui = "ratatui"
 serde = "serde"
 wasm = "wasm"
 ba = "ba"
+# `CMO` abbreviates the differential evaluator's code-mode-only profile.
+CMO = "CMO"
 # `caf` is the hexadecimal middle of the reviewed Codex commit
 # `312caf176a8f`, not prose.
 caf = "caf"
@@ -20,3 +22,6 @@ caf = "caf"
 # and `ded4eacdbd`.
 ede = "ede"
 ded = "ded"
+# `iz` appears inside the exact retained benchmark flag
+# `flag{gc0d3_iz_ch4LLenGiNg}`.
+iz = "iz"
