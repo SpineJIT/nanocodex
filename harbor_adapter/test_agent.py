@@ -140,6 +140,7 @@ class ModelContractTests(unittest.TestCase):
         agent = object.__new__(NanocodexAgent)
         agent._model = "gpt-5.6-luna"
         agent._effort = "low"
+        agent._fast_mode = False
         agent._web_search = False
         agent._subagents = False
 
@@ -147,6 +148,23 @@ class ModelContractTests(unittest.TestCase):
             agent._run_arguments("test prompt")[2:4],
             ["--model", "gpt-5.6-luna"],
         )
+
+    def test_run_arguments_forward_fast_mode_explicitly(self) -> None:
+        agent = object.__new__(NanocodexAgent)
+        agent._model = DEFAULT_MODEL
+        agent._effort = "low"
+        agent._web_search = False
+        agent._subagents = False
+
+        agent._fast_mode = True
+        arguments = agent._run_arguments("test prompt")
+        fast_mode = arguments.index("--fast-mode")
+        self.assertEqual(arguments[fast_mode : fast_mode + 2], ["--fast-mode", "true"])
+
+        agent._fast_mode = False
+        arguments = agent._run_arguments("test prompt")
+        fast_mode = arguments.index("--fast-mode")
+        self.assertEqual(arguments[fast_mode : fast_mode + 2], ["--fast-mode", "false"])
 
     def test_constructor_rejects_models_outside_the_supported_pair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -163,6 +181,7 @@ class WebSearchContractTests(unittest.TestCase):
         agent = object.__new__(NanocodexAgent)
         agent._model = DEFAULT_MODEL
         agent._effort = "low"
+        agent._fast_mode = False
 
         agent._web_search = True
         agent._subagents = False
@@ -182,6 +201,7 @@ class WebSearchContractTests(unittest.TestCase):
         agent = object.__new__(NanocodexAgent)
         agent._model = DEFAULT_MODEL
         agent._effort = "low"
+        agent._fast_mode = False
         agent._web_search = False
         agent._subagents = False
 
@@ -197,6 +217,18 @@ class WebSearchContractTests(unittest.TestCase):
         )
 
         self.assertIs(config["agents"][0]["kwargs"]["web_search"], False)
+
+    def test_fast_eval_enables_priority_processing(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        config = yaml.safe_load(
+            (repository / "evals" / "terminal-bench-2-1-fast.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        kwargs = config["agents"][0]["kwargs"]
+        self.assertIs(kwargs["fast_mode"], True)
+        self.assertIs(kwargs["web_search"], False)
 
     def test_terminal_bench_arms_do_not_enable_subagents(self) -> None:
         repository = Path(__file__).resolve().parents[1]

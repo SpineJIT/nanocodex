@@ -129,6 +129,7 @@ class NanocodexAgent(BaseInstalledAgent):
         binary_sha256: str | None = None,
         model_name: str | None = None,
         effort: str = "low",
+        fast_mode: bool = False,
         web_search: bool = True,
         subagents: bool = False,
         install_node: bool = False,
@@ -165,6 +166,7 @@ class NanocodexAgent(BaseInstalledAgent):
             supported = ", ".join(sorted(SUPPORTED_MODELS))
             raise ValueError(f"nanocodex supports only {supported}, got {self._model}")
         self._effort = effort
+        self._fast_mode = fast_mode
         self._web_search = web_search
         self._subagents = subagents
         self._install_node = install_node
@@ -310,6 +312,8 @@ class NanocodexAgent(BaseInstalledAgent):
             self._model,
             "--thinking",
             self._effort,
+            "--fast-mode",
+            str(getattr(self, "_fast_mode", False)).lower(),
             "--web-search",
             str(self._web_search).lower(),
             "--subagents",
