@@ -143,6 +143,20 @@ changes to their inode, size, modification/change time, or permissions force
 validation or rebuilding. The caller-selected cache directory remains trusted
 application state rather than a security boundary against the same OS user.
 
+By default, the complete VMM executable is part of build-cache identity. An
+application whose small VMM entry point is embedded in a frequently changing
+binary may set [`image::VmImageBuilder::vmm_build_cache_identity`] to a stable,
+non-secret semantic version. This is an explicit correctness promise: the
+caller must change it whenever the VMM's Dockerfile-build behavior changes.
+The remaining runtime, firmware, resource, network, resolver, and egress inputs
+are still hashed independently. Empty and excessively large identities are
+rejected.
+
+Prepared roots retain the configured UID-zero account's supported `bash` or
+`sh` shell when that executable exists, then fall back to probing conventional
+shell paths. A cache hit revalidates the shell from the immutable disk instead
+of trusting metadata written by an older release.
+
 Dockerfile build VMs temporarily install the current usable host resolver and
 restore the image's original `/etc/resolv.conf` before a stage disk can be
 published. Retained private ext4 workspaces install resolver configuration at
@@ -304,6 +318,11 @@ using the resulting lease for Dockerfile builds must assign a non-secret
 identity with [`host::EgressLease::set_build_cache_scope`] after composition;
 otherwise image preparation fails rather than reusing output built through a
 different route or credential policy.
+
+The default [`host::Gvproxy`] topology exposes host loopback to the guest at
+[`host::Gvproxy::HOST_IPV4`]. If an owned gvproxy exits before cleanup, its
+status is appended to the caller-selected gvproxy log and emitted through
+tracing; ordinary owner drop still terminates and reaps a live child.
 
 The last workspace/tool capability kills the VMM child. Workspace startup has
 a 30-second default deadline covering readiness and egress provisioning;
