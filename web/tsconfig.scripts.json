@@ -4,5 +4,9 @@
     "moduleResolution": "NodeNext",
     "module": "NodeNext"
   },
-  "include": ["scripts/harbor-comparison.ts", "test/harbor-comparison.test.ts"]
+  "include": [
+    "scripts/harbor-comparison.ts",
+    "scripts/harbor-evidence.ts",
+    "test/harbor-comparison.test.ts"
+  ]
 }

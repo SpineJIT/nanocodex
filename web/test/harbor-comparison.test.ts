@@ -9,6 +9,11 @@ import {
   type Runner,
   validateExperimentPlan,
 } from "../scripts/harbor-comparison.ts";
+import {
+  candidateProvenanceEvidence,
+  parseRetainedLock,
+  policyEvidence,
+} from "../scripts/harbor-evidence.ts";
 
 const digest = (character: string): Digest => `sha256:${character.repeat(64)}`;
 
@@ -170,4 +175,99 @@ test("rejects changed job identity, lock, policy, model, effort, or attempt coun
     mutate(jobs);
     assert.throws(() => buildComparisonFromPlan(plan, jobs, digest("6")));
   }
+});
+
+function evidenceLock(kwargs: Record<string, unknown> = {}) {
+  return {
+    trials: [
+      {
+        agent: {
+          name: "nanocodex",
+          kwargs: { system_prompt_path: "evals/system.md", ...kwargs },
+        },
+        environment: {},
+        verifier: {},
+      },
+    ],
+  };
+}
+
+const runtimeEvidence = [
+  {
+    runtimeInstructionEvidence: {
+      systemPromptDigest: digest("9"),
+      agentsMdDigest: null,
+    },
+  },
+];
+
+test("requires instruction content retained by the completed trial", () => {
+  const retained = policyEvidence(evidenceLock(), "harness", runtimeEvidence);
+  const missing = policyEvidence(evidenceLock(), "harness", [{}]);
+
+  assert.match(retained.systemInstructionsDigest ?? "", /^sha256:/);
+  assert.equal(missing.systemInstructionsDigest, undefined);
+});
+
+test("requires retained AGENTS.md content when the lock configures it", () => {
+  const lock = evidenceLock({ agents_md_path: "evals/AGENTS.md" });
+  const missing = policyEvidence(lock, "harness", runtimeEvidence);
+  const retained = policyEvidence(lock, "harness", [
+    {
+      runtimeInstructionEvidence: {
+        systemPromptDigest: digest("9"),
+        agentsMdDigest: digest("8"),
+      },
+    },
+  ]);
+
+  assert.equal(missing.systemInstructionsDigest, undefined);
+  assert.match(retained.systemInstructionsDigest ?? "", /^sha256:/);
+});
+
+test("normalizes Nanocodex tool defaults and fingerprints Node provisioning", () => {
+  const defaults = policyEvidence(evidenceLock(), "harness", runtimeEvidence);
+  const explicitDefaults = policyEvidence(
+    evidenceLock({ web_search: true, install_node: false }),
+    "harness",
+    runtimeEvidence,
+  );
+  const noWeb = policyEvidence(
+    evidenceLock({ web_search: false }),
+    "harness",
+    runtimeEvidence,
+  );
+  const withNode = policyEvidence(
+    evidenceLock({ install_node: true }),
+    "harness",
+    runtimeEvidence,
+  );
+
+  assert.equal(defaults.toolAvailabilityDigest, explicitDefaults.toolAvailabilityDigest);
+  assert.notEqual(defaults.toolAvailabilityDigest, noWeb.toolAvailabilityDigest);
+  assert.notEqual(defaults.toolAvailabilityDigest, withNode.toolAvailabilityDigest);
+});
+
+test("accepts only exact resolved Codex versions as provenance", () => {
+  const provenance = (version: string) =>
+    candidateProvenanceEvidence(
+      { trials: [{ agent: { name: "codex", kwargs: { version } } }] },
+      "codex",
+    );
+
+  assert.match(provenance("0.144.5") ?? "", /^sha256:/);
+  for (const version of ["latest", "^0.144.5", ">=0.144.5", "0.144.x"]) {
+    assert.equal(provenance(version), null);
+  }
+});
+
+test("treats a malformed retained lock as ineligible", () => {
+  const warnings: string[] = [];
+  const lock = parseRetainedLock("{", "/retained/job/lock.json", (warning) => {
+    warnings.push(warning);
+  });
+
+  assert.equal(lock, null);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /malformed Harbor lock/);
 });

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import shlex
@@ -41,6 +42,20 @@ RUN_METRIC_FIELDS = (
     "tool_wall_duration_ns",
 )
 USAGE_METRIC_FIELDS = ("cache_write_input_tokens", "reasoning_output_tokens")
+
+
+def _retained_instruction_evidence(
+    system_prompt_path: Path | None, agents_md_path: Path | None
+) -> dict[str, str | None]:
+    def digest(path: Path | None) -> str | None:
+        if path is None:
+            return None
+        return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+
+    return {
+        "system_prompt_sha256": digest(system_prompt_path),
+        "agents_md_sha256": digest(agents_md_path),
+    }
 
 
 def _cli_tools_install_command(*, install_node: bool) -> str:
@@ -503,6 +518,10 @@ class NanocodexAgent(BaseInstalledAgent):
             **runtime_metrics,
             "last_response_id": terminal_payload.get("last_response_id"),
             "cost_status": terminal_payload.get("cost_status"),
+            **_retained_instruction_evidence(
+                getattr(self, "_system_prompt_path", None),
+                getattr(self, "_agents_md_path", None),
+            ),
         }
 
     def _verify_model_context(self, events: list[dict[str, Any]]) -> None:

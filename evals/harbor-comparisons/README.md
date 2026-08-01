@@ -20,8 +20,14 @@ unassigned attempts. The two jobs may differ only in their declared candidate
 arm. Rows are paired by `(datasetDigest, taskDigest, attemptIndex)`.
 
 Candidate evidence must itself be immutable: Nanocodex jobs need a pinned
-`binary_sha256`, and Codex jobs need a pinned `version`. A mutable local binary
-path is deliberately ineligible for published comparison.
+`binary_sha256`, and Codex jobs need an exact resolved semantic `version` (not
+`latest`, a distribution tag, or a range). A mutable local binary path is
+deliberately ineligible for published comparison.
+
+Both adapters retain the SHA-256 digests of the system prompt and AGENTS.md
+content they verified during each completed trial. Jobs created before this
+evidence was retained are deliberately ineligible; the sync never substitutes
+content from a newer worktree checkout.
 
 Store a plan as canonical one-line JSON followed by a newline. Its filename is
 the lowercase SHA-256 of those exact bytes plus `.json`. The sync rejects

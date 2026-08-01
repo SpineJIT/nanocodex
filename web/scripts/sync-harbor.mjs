@@ -4,6 +4,11 @@ import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { selectComparison, sha256, validateExperimentPlan } from "./harbor-comparison.ts";
+import {
+  candidateProvenanceEvidence,
+  parseRetainedLock,
+  policyEvidence,
+} from "./harbor-evidence.ts";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryPath = resolve(
@@ -228,6 +233,10 @@ async function buildTrial(jobName, trialName, trialPath, context) {
         }
       : null,
     detailUrl,
+    runtimeInstructionEvidence: {
+      systemPromptDigest: metadata.system_prompt_sha256 ?? null,
+      agentsMdDigest: metadata.agents_md_sha256 ?? null,
+    },
   };
 
   const [existingDetail, detailStat, ...sourceStats] = await Promise.all([
@@ -357,98 +366,6 @@ function assignDatasetDigest(trials, datasetDigest) {
   for (const trial of trials) trial.datasetDigest = datasetDigest;
 }
 
-function canonicalValue(value) {
-  if (Array.isArray(value)) return value.map(canonicalValue);
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value)
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([key, item]) => [key, canonicalValue(item)]),
-    );
-  }
-  return value;
-}
-
-function fingerprint(value) {
-  return sha256(`${JSON.stringify(canonicalValue(value))}\n`);
-}
-
-function uniformFingerprint(values) {
-  const fingerprints = [...new Set(values.map(fingerprint))];
-  return fingerprints.length === 1 ? fingerprints[0] : null;
-}
-
-async function systemInstructionsEvidence(trials, worktreePath) {
-  const evidence = [];
-  for (const trial of trials) {
-    const systemPromptPath = trial.agent?.kwargs?.system_prompt_path;
-    if (!systemPromptPath) return null;
-    const agentsMdPath = trial.agent?.kwargs?.agents_md_path;
-    const systemPrompt = await readFile(resolve(worktreePath, systemPromptPath), "utf8").catch(() => null);
-    const agentsMd = agentsMdPath
-      ? await readFile(resolve(worktreePath, agentsMdPath), "utf8").catch(() => null)
-      : null;
-    if (systemPrompt === null || (agentsMdPath && agentsMd === null)) return null;
-    evidence.push({
-      systemPromptDigest: sha256(systemPrompt),
-      agentsMdDigest: agentsMd === null ? null : sha256(agentsMd),
-      extraInstructions: trial.extra_instructions ?? [],
-    });
-  }
-  return uniformFingerprint(evidence);
-}
-
-async function policyEvidence(lock, worktreePath) {
-  const trials = lock?.trials ?? [];
-  const timeoutPolicy = (trial) => ({
-    timeoutMultiplier: trial.timeout_multiplier ?? 1,
-    agentTimeoutMultiplier: trial.agent_timeout_multiplier ?? null,
-    verifierTimeoutMultiplier: trial.verifier_timeout_multiplier ?? null,
-    agentSetupTimeoutMultiplier: trial.agent_setup_timeout_multiplier ?? null,
-    environmentBuildTimeoutMultiplier: trial.environment_build_timeout_multiplier ?? null,
-  });
-  const resourcePolicy = (trial) => ({
-    cpuEnforcementPolicy: trial.environment?.cpu_enforcement_policy ?? "auto",
-    memoryEnforcementPolicy: trial.environment?.memory_enforcement_policy ?? "auto",
-    cpus: trial.environment?.override_cpus ?? null,
-    memoryMb: trial.environment?.override_memory_mb ?? null,
-    storageMb: trial.environment?.override_storage_mb ?? null,
-    gpus: trial.environment?.override_gpus ?? null,
-    tpu: trial.environment?.override_tpu ?? null,
-  });
-  const toolAvailability = (trial) => ({
-    skills: trial.skills ?? [],
-    mcpServers: trial.agent?.mcp_servers ?? [],
-    webSearch: [true, "enabled"].includes(trial.agent?.kwargs?.web_search),
-    subagents: trial.agent?.kwargs?.subagents ?? false,
-  });
-  return {
-    systemInstructionsDigest: await systemInstructionsEvidence(trials, worktreePath),
-    environmentDigest: uniformFingerprint(trials.map((trial) => trial.environment)),
-    verifierDigest: uniformFingerprint(trials.map((trial) => trial.verifier)),
-    timeoutPolicyDigest: uniformFingerprint(trials.map(timeoutPolicy)),
-    resourcePolicyDigest: uniformFingerprint(trials.map(resourcePolicy)),
-    toolAvailabilityDigest: uniformFingerprint(trials.map(toolAvailability)),
-  };
-}
-
-function candidateProvenanceEvidence(lock, runner) {
-  const candidates = (lock?.trials ?? []).map((trial) => {
-    const agent = trial.agent ?? {};
-    const kwargs = agent.kwargs ?? {};
-    const artifact = runner === "codex"
-      ? { version: kwargs.version ?? null }
-      : { binaryUrl: kwargs.binary_url ?? null, binarySha256: kwargs.binary_sha256 ?? null };
-    if (runner === "codex" ? !artifact.version : !artifact.binarySha256) return null;
-    return {
-      name: agent.name ?? null,
-      importPath: agent.import_path ?? null,
-      artifact,
-    };
-  });
-  return candidates.includes(null) ? null : uniformFingerprint(candidates);
-}
-
 async function readExperimentPlans() {
   const entries = await readdir(experimentPlanDirectory, { withFileTypes: true }).catch(() => []);
   const plans = [];
@@ -484,7 +401,7 @@ for (const store of await discoverJobStores()) {
       readJson(resolve(jobPath, "config.json"), {}),
       readFile(resolve(jobPath, "lock.json"), "utf8").catch(() => null),
     ]);
-    const lock = lockContents ? JSON.parse(lockContents) : null;
+    const lock = parseRetainedLock(lockContents, resolve(jobPath, "lock.json"));
     const experimentPlan = await readJson(resolve(jobPath, "experiment-plan.json"));
     const runner = runnerFromResult(result, store.fallbackRunner);
 
@@ -520,7 +437,7 @@ for (const store of await discoverJobStores()) {
       retries: result?.stats?.n_retries ?? 0,
       lockDigest: lockContents ? sha256(lockContents) : null,
       experimentPlanDigest: experimentPlan?.digest ?? null,
-      policy: await policyEvidence(lock, store.worktreePath),
+      policy: policyEvidence(lock, runner, trials),
       candidateProvenanceDigest: candidateProvenanceEvidence(lock, runner),
       mean: jobMean(result),
       tokens: {
