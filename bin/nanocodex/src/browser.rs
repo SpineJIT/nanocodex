@@ -1,22 +1,42 @@
 use std::path::{Path, PathBuf};
 
-use clap::{ArgAction, Args};
-use eyre::{Result, WrapErr};
-use nanocodex_browser::{Browser, BrowserTool};
+use clap::{ArgAction, Args, ValueEnum};
+use eyre::{Result, WrapErr, eyre};
+use nanocodex_browser::{BraveSession, Browser, BrowserTool};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum BrowserKind {
+    #[value(alias = "true")]
+    Chromium,
+    Brave,
+}
 
 /// Opt-in local browser configuration for normal agent sessions.
 #[derive(Args, Default)]
 pub(crate) struct BrowserArgs {
-    /// Expose one private Chromium session to Code Mode as `tools.browser`.
+    /// Expose one private browser session to Code Mode as `tools.browser`.
     ///
-    /// Chromium starts lazily on the first browser action and remains alive for
-    /// the complete agent session.
+    /// Pass `brave` to use the standard Brave installation. A bare `--browser`
+    /// preserves the private Chromium default.
     #[arg(
         long,
         env = "NANOCODEX_BROWSER",
-        action = ArgAction::SetTrue
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "chromium",
+        require_equals = true
     )]
-    browser: bool,
+    browser: Option<BrowserKind>,
+
+    /// Copy every cookie from the standard Brave profile into the private session.
+    #[arg(
+        long,
+        env = "NANOCODEX_BROWSER_COOKIES",
+        action = ArgAction::Set,
+        default_value_t = false,
+        requires = "browser"
+    )]
+    cookies: bool,
 
     /// Chrome or Chromium executable used by the browser tool.
     #[arg(
@@ -35,16 +55,37 @@ pub(crate) struct ConfiguredBrowser {
 impl BrowserArgs {
     #[cfg(test)]
     pub(crate) const fn is_enabled(&self) -> bool {
-        self.browser
+        self.browser.is_some()
     }
 
     pub(crate) fn configure(&self, workspace: &Path) -> Result<Option<ConfiguredBrowser>> {
-        if !self.browser {
+        let Some(kind) = self.browser else {
             return Ok(None);
-        }
+        };
         let mut builder = Browser::builder().file_root(workspace);
-        if let Some(executable) = &self.browser_executable {
-            builder = builder.executable(executable);
+        match kind {
+            BrowserKind::Chromium => {
+                if self.cookies {
+                    return Err(eyre!("--cookies=true requires --browser=brave"));
+                }
+                if let Some(executable) = &self.browser_executable {
+                    builder = builder.executable(executable);
+                }
+            }
+            BrowserKind::Brave => {
+                if self.browser_executable.is_some() {
+                    return Err(eyre!(
+                        "--browser-executable cannot be combined with --browser=brave"
+                    ));
+                }
+                let brave = BraveSession::standard()
+                    .wrap_err("failed to locate the standard Brave profile")?;
+                builder = if self.cookies {
+                    builder.brave_session(brave.copy_all_cookies())
+                } else {
+                    builder.executable(brave.executable().to_path_buf())
+                };
+            }
         }
         let browser = builder
             .build()
@@ -80,7 +121,8 @@ mod tests {
         let baseline = ToolRuntime::new_with_tools(workspace.path(), None, None, &baseline_tools)
             .model_specs("browser-tui-test");
         let browser = BrowserArgs {
-            browser: true,
+            browser: Some(super::BrowserKind::Chromium),
+            cookies: false,
             browser_executable: None,
         }
         .configure(workspace.path())
@@ -99,5 +141,20 @@ mod tests {
         assert!(!serialized.contains("browser"));
         assert!(runtime.contains("browser"));
         browser.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn cookies_require_brave_mode() {
+        let workspace = tempfile::tempdir().unwrap();
+        let error = BrowserArgs {
+            browser: Some(super::BrowserKind::Chromium),
+            cookies: true,
+            browser_executable: None,
+        }
+        .configure(workspace.path())
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("--browser=brave"));
     }
 }

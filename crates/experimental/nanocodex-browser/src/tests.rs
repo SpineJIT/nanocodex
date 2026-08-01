@@ -42,6 +42,19 @@ fn remote_browser_accepts_cookie_only_brave_sessions() -> Result<()> {
 }
 
 #[test]
+fn browser_accepts_an_explicit_all_cookie_brave_session() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let executable = directory.path().join("brave");
+    std::fs::write(&executable, [])?;
+    let user_data = directory.path().join("user-data");
+    std::fs::create_dir(&user_data)?;
+    let brave = BraveSession::new(executable, user_data).copy_all_cookies();
+
+    Browser::builder().brave_session(brave).build()?;
+    Ok(())
+}
+
+#[test]
 fn harness_owned_browser_secrets_are_redacted_from_debug_output() {
     let state = BrowserStorageState {
         cookies: vec![BrowserCookie {

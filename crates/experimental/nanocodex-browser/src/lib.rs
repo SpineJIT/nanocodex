@@ -3370,14 +3370,19 @@ impl BrowserBuilder {
             .transpose()
             .map_err(BrowserBuildError::Io)?;
         let egress_policy = self.egress_policy.or_else(|| {
-            self.brave_session.as_ref().map(|session| {
-                session
-                    .allowed_origins()
-                    .iter()
-                    .cloned()
-                    .fold(BrowserEgressPolicy::deny_by_default(), |policy, origin| {
-                        policy.allow_origin(origin)
-                    })
+            self.brave_session.as_ref().and_then(|session| {
+                if session.copies_all_cookies() {
+                    return None;
+                }
+                Some(
+                    session
+                        .allowed_origins()
+                        .iter()
+                        .cloned()
+                        .fold(BrowserEgressPolicy::deny_by_default(), |policy, origin| {
+                            policy.allow_origin(origin)
+                        }),
+                )
             })
         });
         Ok(Browser {

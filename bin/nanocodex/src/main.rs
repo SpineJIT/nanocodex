@@ -244,12 +244,28 @@ mod tests {
         let tui = Cli::try_parse_from(["nanocodex", "--browser"]).unwrap();
         assert!(tui.agent.browser_enabled());
 
+        let brave =
+            Cli::try_parse_from(["nanocodex", "--browser=brave", "--cookies=true"]).unwrap();
+        assert!(brave.agent.browser_enabled());
+
         let run =
             Cli::try_parse_from(["nanocodex", "run", "inspect example.com", "--browser"]).unwrap();
         let Some(Command::Run(run)) = run.command else {
             panic!("run command was not parsed");
         };
         assert!(run.agent.browser_enabled());
+    }
+
+    #[test]
+    fn browser_cookies_require_an_opted_in_browser() {
+        let error = Cli::try_parse_from(["nanocodex", "--cookies=true"])
+            .err()
+            .unwrap();
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]

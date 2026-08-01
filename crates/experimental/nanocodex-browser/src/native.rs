@@ -1591,27 +1591,34 @@ async fn export_brave_cookies(
     let cookies = exported?;
     shutdown?;
 
-    let cookies = allowed_cookie_params(cookies, brave_session.allowed_origins());
+    let cookies = allowed_cookie_params(
+        cookies,
+        (!brave_session.copies_all_cookies()).then(|| brave_session.allowed_origins()),
+    );
     info!(
         target: "nanocodex_browser",
         browser_cookie_count = cookies.len(),
         browser_cookie_origin_count = brave_session.allowed_origins().len(),
-        "prepared allowlisted Brave cookies for a dedicated remote browser"
+        browser_cookie_all_origins = brave_session.copies_all_cookies(),
+        "prepared Brave cookies for a dedicated remote browser"
     );
     Ok(cookies)
 }
 
-fn allowed_cookie_params(cookies: Vec<Cookie>, allowed_origins: &[Url]) -> Vec<CookieParam> {
-    let allowed_hosts = allowed_origins
-        .iter()
-        .filter_map(Url::host_str)
-        .collect::<Vec<_>>();
+fn allowed_cookie_params(
+    cookies: Vec<Cookie>,
+    allowed_origins: Option<&[Url]>,
+) -> Vec<CookieParam> {
+    let allowed_hosts =
+        allowed_origins.map(|origins| origins.iter().filter_map(Url::host_str).collect::<Vec<_>>());
     cookies
         .into_iter()
         .filter(|cookie| {
-            allowed_hosts
-                .iter()
-                .any(|allowed| cookie_applies_to(&cookie.domain, allowed))
+            allowed_hosts.as_ref().is_none_or(|hosts| {
+                hosts
+                    .iter()
+                    .any(|allowed| cookie_applies_to(&cookie.domain, allowed))
+            })
         })
         .filter_map(cookie_param)
         .collect()
@@ -6666,10 +6673,25 @@ mod tests {
         ];
         let allowed = [url::Url::parse("https://console.example.com").expect("valid test origin")];
 
-        let parameters = allowed_cookie_params(cookies, &allowed);
+        let parameters = allowed_cookie_params(cookies, Some(&allowed));
 
         assert_eq!(parameters.len(), 1);
         assert_eq!(parameters[0].domain.as_deref(), Some(".example.com"));
+    }
+
+    #[test]
+    fn remote_cookie_mapping_can_preserve_every_domain() {
+        let cookies = vec![
+            test_cookie(".example.com", false, None),
+            test_cookie("sibling.example.net", false, None),
+            test_cookie("console.example.com", false, Some(true)),
+        ];
+
+        let parameters = allowed_cookie_params(cookies, None);
+
+        assert_eq!(parameters.len(), 2);
+        assert_eq!(parameters[0].domain.as_deref(), Some(".example.com"));
+        assert_eq!(parameters[1].domain.as_deref(), Some("sibling.example.net"));
     }
 
     #[tokio::test]

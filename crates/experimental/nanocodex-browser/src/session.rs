@@ -10,18 +10,20 @@ use std::env;
 use rusqlite::{Connection, OpenFlags, backup::Backup};
 use url::Url;
 
-/// An allowlisted, cookie-backed snapshot of an existing Brave profile.
+/// A cookie-backed snapshot of an existing Brave profile.
 ///
 /// This is designed for authenticated headless automation while the ordinary
-/// Brave window remains open. Only cookies applicable to an explicitly allowed
-/// origin are copied. The source profile is never passed to the launched
-/// browser and is never mutated.
+/// Brave window remains open. Callers may copy cookies applicable to an
+/// explicit origin allowlist or deliberately opt into every cookie in the
+/// selected profile. The source profile is never passed to the launched browser
+/// and is never mutated.
 #[derive(Clone, Debug)]
 pub struct BraveSession {
     executable: PathBuf,
     user_data_dir: PathBuf,
     profile_directory: PathBuf,
     allowed_origins: Vec<Url>,
+    copy_all_cookies: bool,
     include_site_data: bool,
 }
 
@@ -70,6 +72,7 @@ impl BraveSession {
             user_data_dir: user_data_dir.into(),
             profile_directory: PathBuf::from("Default"),
             allowed_origins: Vec::new(),
+            copy_all_cookies: false,
             include_site_data: false,
         }
     }
@@ -89,6 +92,17 @@ impl BraveSession {
         self
     }
 
+    /// Copies every cookie from the selected Brave profile.
+    ///
+    /// This deliberately gives the dedicated browser the profile's complete
+    /// authenticated cookie state. Cookie values remain outside the
+    /// model-callable browser action schema.
+    #[must_use]
+    pub const fn copy_all_cookies(mut self) -> Self {
+        self.copy_all_cookies = true;
+        self
+    }
+
     /// Also copies `localStorage`, `IndexedDB`, and storage-bucket metadata.
     ///
     /// Brave must be closed when the lazy browser launch takes this snapshot
@@ -101,7 +115,9 @@ impl BraveSession {
         self
     }
 
-    pub(crate) fn executable(&self) -> &Path {
+    /// Returns the Brave executable selected by this session.
+    #[must_use]
+    pub fn executable(&self) -> &Path {
         &self.executable
     }
 
@@ -113,17 +129,28 @@ impl BraveSession {
         self.include_site_data
     }
 
+    pub(crate) const fn copies_all_cookies(&self) -> bool {
+        self.copy_all_cookies
+    }
+
     pub(crate) fn trace_value(&self) -> serde_json::Value {
         serde_json::json!({
             "executable": self.executable,
             "userDataDirectory": self.user_data_dir,
             "profileDirectory": self.profile_directory,
             "allowedOrigins": self.allowed_origins,
+            "copyAllCookies": self.copy_all_cookies,
             "includeSiteData": self.include_site_data,
         })
     }
 
     pub(crate) fn validate_handoff_url(&self, url: &Url) -> Result<(), BraveSessionError> {
+        if self.copy_all_cookies
+            && matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+        {
+            return Ok(());
+        }
         if self
             .allowed_origins
             .iter()
@@ -181,14 +208,15 @@ impl BraveSession {
         tokio::fs::create_dir_all(&target_profile).await?;
         tokio::fs::copy(source_local_state, target_user_data_dir.join("Local State")).await?;
 
-        let allowed_hosts = self
-            .allowed_origins
-            .iter()
-            .filter_map(Url::host_str)
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
+        let allowed_hosts = (!self.copy_all_cookies).then(|| {
+            self.allowed_origins
+                .iter()
+                .filter_map(Url::host_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        });
         tokio::task::spawn_blocking(move || {
-            snapshot_cookies(&source_cookies, &target_cookies, &allowed_hosts)
+            snapshot_cookies(&source_cookies, &target_cookies, allowed_hosts.as_deref())
         })
         .await
         .map_err(BraveSessionError::SnapshotTask)??;
@@ -211,7 +239,7 @@ impl BraveSession {
 
     pub(crate) fn validate(&self) -> Result<(), BraveSessionError> {
         self.validate_paths()?;
-        if self.allowed_origins.is_empty() {
+        if self.allowed_origins.is_empty() && !self.copy_all_cookies {
             return Err(BraveSessionError::MissingAllowedOrigin);
         }
         for origin in &self.allowed_origins {
@@ -255,7 +283,7 @@ impl BraveSession {
 fn snapshot_cookies(
     source: &Path,
     target: &Path,
-    allowed_hosts: &[String],
+    allowed_hosts: Option<&[String]>,
 ) -> Result<(), BraveSessionError> {
     let source = Connection::open_with_flags(
         source,
@@ -266,28 +294,32 @@ fn snapshot_cookies(
     backup.run_to_completion(64, Duration::from_millis(5), None)?;
     drop(backup);
 
-    let mut statement = target.prepare("SELECT rowid, host_key FROM cookies")?;
-    let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut rejected = Vec::new();
-    for row in rows {
-        let (row_id, cookie_host) = row?;
-        if !allowed_hosts
-            .iter()
-            .any(|allowed| cookie_applies_to(&cookie_host, allowed))
+    if let Some(allowed_hosts) = allowed_hosts {
+        let mut statement = target.prepare("SELECT rowid, host_key FROM cookies")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut rejected = Vec::new();
+        for row in rows {
+            let (row_id, cookie_host) = row?;
+            if !allowed_hosts
+                .iter()
+                .any(|allowed| cookie_applies_to(&cookie_host, allowed))
+            {
+                rejected.push(row_id);
+            }
+        }
+        drop(statement);
+        let transaction = target.transaction()?;
         {
-            rejected.push(row_id);
+            let mut delete = transaction.prepare("DELETE FROM cookies WHERE rowid = ?1")?;
+            for row_id in rejected {
+                delete.execute([row_id])?;
+            }
         }
+        transaction.commit()?;
     }
-    drop(statement);
     let transaction = target.transaction()?;
-    {
-        let mut delete = transaction.prepare("DELETE FROM cookies WHERE rowid = ?1")?;
-        for row_id in rejected {
-            delete.execute([row_id])?;
-        }
-    }
     transaction.execute(
         "UPDATE cookies
          SET is_persistent = 1, has_expires = 1, expires_utc = ?1
@@ -464,7 +496,7 @@ mod tests {
         super::snapshot_cookies(
             &source_path,
             &target_path,
-            &["console.example.com".to_owned()],
+            Some(&["console.example.com".to_owned()]),
         )?;
 
         let source = Connection::open(source_path)?;
@@ -488,6 +520,55 @@ mod tests {
             target.query_row("SELECT is_persistent FROM cookies", [], |row| row
                 .get::<_, i64>(0))?,
             1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn all_cookie_snapshot_keeps_every_domain() -> Result<(), Box<dyn Error>> {
+        let directory = tempdir()?;
+        let source_path = directory.path().join("source.sqlite");
+        let target_path = directory.path().join("target.sqlite");
+        let source = Connection::open(&source_path)?;
+        source.execute(
+            "CREATE TABLE cookies(
+                host_key TEXT NOT NULL,
+                encrypted_value BLOB NOT NULL,
+                is_persistent INTEGER NOT NULL,
+                has_expires INTEGER NOT NULL,
+                expires_utc INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        source.execute(
+            "INSERT INTO cookies(
+                host_key, encrypted_value, is_persistent, has_expires, expires_utc
+            ) VALUES (?1, ?2, 0, 0, 0)",
+            (".example.com", b"first".as_slice()),
+        )?;
+        source.execute(
+            "INSERT INTO cookies(
+                host_key, encrypted_value, is_persistent, has_expires, expires_utc
+            ) VALUES (?1, ?2, 1, 1, 1)",
+            ("dashboard.stripe.com", b"second".as_slice()),
+        )?;
+        drop(source);
+
+        super::snapshot_cookies(&source_path, &target_path, None)?;
+
+        let target = Connection::open(target_path)?;
+        assert_eq!(
+            target.query_row("SELECT COUNT(*) FROM cookies", [], |row| row
+                .get::<_, i64>(0))?,
+            2
+        );
+        assert_eq!(
+            target.query_row(
+                "SELECT COUNT(*) FROM cookies WHERE is_persistent = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            2
         );
         Ok(())
     }

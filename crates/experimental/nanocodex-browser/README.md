@@ -107,6 +107,17 @@ or an explicitly managed CDP endpoint.
 - Harness-owned cookies/storage, virtual passkeys, allowlisted Brave handoff,
   upload roots, browser egress policy, remote CDP, and libkrun VM composition.
 
+The Nanocodex CLI can launch the standard Brave installation and copy its
+complete cookie database into the session-private profile:
+
+```console
+nanocodex --browser=brave --cookies=true
+```
+
+The source profile remains open, is never mutated, and cookie values remain
+outside the model-callable browser schema. This mode deliberately gives the
+agent authenticated access to every site represented in the selected profile.
+
 ## Current boundaries
 
 - This package is unpublished and its API is not stable. It currently targets
@@ -120,8 +131,8 @@ or an explicitly managed CDP endpoint.
   is runtime-only with provider registration, so enabling browser adds no model
   warmup schema bytes. The contract is not capability-filtered after discovery.
 - Lighthouse, CrUX, and video require caller-supplied external tooling or
-  credentials. Brave profile transfer is harness-only and intentionally absent
-  from the model-callable schema.
+  credentials. Brave profile transfer remains harness-owned and intentionally
+  absent from the model-callable schema.
 - Cloned browser handles share one session and serialized action stream. Call
   `Browser::close` or `BrowserVm::shutdown` when deterministic cleanup matters.
 - The crate consumes `nanocodex-vm` unconditionally today, so local-only builds
