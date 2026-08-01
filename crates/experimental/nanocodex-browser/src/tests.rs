@@ -67,7 +67,7 @@ fn browser_cookie_source_is_independent_from_the_browser_executable() -> Result<
 
     Browser::builder()
         .executable(chromium_executable)
-        .brave_cookie_source(cookies)
+        .cookie_source(cookies)
         .build()?;
     Ok(())
 }

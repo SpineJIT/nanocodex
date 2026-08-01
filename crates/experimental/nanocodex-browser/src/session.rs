@@ -10,10 +10,32 @@ use std::env;
 use rusqlite::{Connection, OpenFlags, backup::Backup};
 use url::Url;
 
-/// A cookie-backed snapshot of an existing Brave profile.
+/// A standard Chromium-family browser profile that can supply cookies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowserProfileKind {
+    Brave,
+    Chrome,
+    Chromium,
+    Edge,
+}
+
+impl BrowserProfileKind {
+    /// Returns the browser's display name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Brave => "Brave",
+            Self::Chrome => "Google Chrome",
+            Self::Chromium => "Chromium",
+            Self::Edge => "Microsoft Edge",
+        }
+    }
+}
+
+/// A cookie-backed snapshot of an existing Chromium-family profile.
 ///
 /// This is designed for authenticated headless automation while the ordinary
-/// Brave window remains open. Callers may copy cookies applicable to an
+/// source browser remains open. Callers may copy cookies applicable to an
 /// explicit origin allowlist or deliberately opt into every cookie in the
 /// selected profile. The source profile is never passed to the launched browser
 /// and is never mutated.
@@ -35,27 +57,76 @@ impl BraveSession {
     /// Returns an error when the platform has no standard location, the home
     /// directory is unavailable, or Brave is not installed there.
     pub fn standard() -> Result<Self, BraveSessionError> {
+        Self::standard_for(BrowserProfileKind::Brave)
+    }
+
+    /// Locates a standard Chromium-family installation and user-data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform has no standard location, the home
+    /// directory is unavailable, or the selected browser is not installed.
+    pub fn standard_for(browser: BrowserProfileKind) -> Result<Self, BraveSessionError> {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            Err(BraveSessionError::StandardInstallationUnavailable)
+            Err(BraveSessionError::StandardInstallationUnavailable {
+                browser: browser.name(),
+            })
         }
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let home = env::var_os("HOME").ok_or(BraveSessionError::HomeDirectoryUnavailable)?;
             #[cfg(target_os = "macos")]
-            let (executable, user_data_dir) = (
-                PathBuf::from("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
-                PathBuf::from(home).join("Library/Application Support/BraveSoftware/Brave-Browser"),
-            );
+            let (executable, user_data_dir) = match browser {
+                BrowserProfileKind::Brave => (
+                    PathBuf::from("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+                    PathBuf::from(&home)
+                        .join("Library/Application Support/BraveSoftware/Brave-Browser"),
+                ),
+                BrowserProfileKind::Chrome => (
+                    PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                    PathBuf::from(&home).join("Library/Application Support/Google/Chrome"),
+                ),
+                BrowserProfileKind::Chromium => (
+                    PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+                    PathBuf::from(&home).join("Library/Application Support/Chromium"),
+                ),
+                BrowserProfileKind::Edge => (
+                    PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+                    PathBuf::from(&home).join("Library/Application Support/Microsoft Edge"),
+                ),
+            };
+            #[cfg(target_os = "linux")]
+            let (executables, user_data_directory): (&[&str], &str) = match browser {
+                BrowserProfileKind::Brave => (
+                    &["/usr/bin/brave-browser", "/usr/bin/brave-browser-stable"],
+                    ".config/BraveSoftware/Brave-Browser",
+                ),
+                BrowserProfileKind::Chrome => (
+                    &["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"],
+                    ".config/google-chrome",
+                ),
+                BrowserProfileKind::Chromium => (
+                    &["/usr/bin/chromium", "/usr/bin/chromium-browser"],
+                    ".config/chromium",
+                ),
+                BrowserProfileKind::Edge => (
+                    &["/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable"],
+                    ".config/microsoft-edge",
+                ),
+            };
             #[cfg(target_os = "linux")]
             let (executable, user_data_dir) = (
-                ["/usr/bin/brave-browser", "/usr/bin/brave-browser-stable"]
-                    .into_iter()
+                executables
+                    .iter()
+                    .copied()
                     .map(PathBuf::from)
                     .find(|path| path.is_file())
-                    .ok_or(BraveSessionError::StandardInstallationUnavailable)?,
-                PathBuf::from(home).join(".config/BraveSoftware/Brave-Browser"),
+                    .ok_or(BraveSessionError::StandardInstallationUnavailable {
+                        browser: browser.name(),
+                    })?,
+                PathBuf::from(home).join(user_data_directory),
             );
 
             let session = Self::new(executable, user_data_dir);
@@ -64,7 +135,7 @@ impl BraveSession {
         }
     }
 
-    /// Creates a Brave session from explicit executable and user-data paths.
+    /// Creates a profile session from explicit executable and user-data paths.
     #[must_use]
     pub fn new(executable: impl Into<PathBuf>, user_data_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -92,7 +163,7 @@ impl BraveSession {
         self
     }
 
-    /// Copies every cookie from the selected Brave profile.
+    /// Copies every cookie from the selected source profile.
     ///
     /// This deliberately gives the dedicated browser the profile's complete
     /// authenticated cookie state. Cookie values remain outside the
@@ -105,7 +176,7 @@ impl BraveSession {
 
     /// Also copies `localStorage`, `IndexedDB`, and storage-bucket metadata.
     ///
-    /// Brave must be closed when the lazy browser launch takes this snapshot
+    /// The source browser must be closed when the lazy launch takes this snapshot
     /// because those stores use `LevelDB` and do not provide `SQLite`'s online
     /// backup guarantee. On APFS, Rust uses copy-on-write clones for the files,
     /// so the private snapshot consumes space only as either side changes.
@@ -115,7 +186,7 @@ impl BraveSession {
         self
     }
 
-    /// Returns the Brave executable selected by this session.
+    /// Returns the source browser executable selected by this session.
     #[must_use]
     pub fn executable(&self) -> &Path {
         &self.executable
@@ -382,35 +453,35 @@ fn copy_directory(source: &Path, target: &Path) -> Result<(), std::io::Error> {
 pub enum BraveSessionError {
     #[error("the home directory is unavailable")]
     HomeDirectoryUnavailable,
-    #[error("the standard Brave installation is unavailable on this platform")]
-    StandardInstallationUnavailable,
-    #[error("Brave executable does not exist at {path}")]
+    #[error("the standard {browser} installation is unavailable on this platform")]
+    StandardInstallationUnavailable { browser: &'static str },
+    #[error("source browser executable does not exist at {path}")]
     ExecutableUnavailable { path: PathBuf },
-    #[error("Brave user-data directory does not exist at {path}")]
+    #[error("source browser user-data directory does not exist at {path}")]
     UserDataUnavailable { path: PathBuf },
-    #[error("Brave profile directory must be one relative path component, got {directory}")]
+    #[error("source profile directory must be one relative path component, got {directory}")]
     InvalidProfileDirectory { directory: PathBuf },
     #[error("at least one HTTP(S) origin must be explicitly allowed")]
     MissingAllowedOrigin,
-    #[error("Brave session origin must contain only a scheme, host, and optional port: {origin}")]
+    #[error("profile session origin must contain only a scheme, host, and optional port: {origin}")]
     InvalidOrigin { origin: Url },
-    #[error("authentication handoff URL is outside the Brave session allowlist: {url}")]
+    #[error("authentication handoff URL is outside the profile session allowlist: {url}")]
     HandoffOriginNotAllowed { url: Url },
-    #[error("Brave cookie database is unavailable under {profile}")]
+    #[error("source cookie database is unavailable under {profile}")]
     CookiesUnavailable { profile: PathBuf },
     #[error(
-        "Brave must be closed before copying site data from {user_data_dir}; cookie-only snapshots remain available while Brave is running"
+        "the source browser must be closed before copying site data from {user_data_dir}; cookie-only snapshots remain available while it is running"
     )]
     SourceBrowserRunning { user_data_dir: PathBuf },
-    #[error("Brave session filesystem operation failed")]
+    #[error("profile session filesystem operation failed")]
     Io(#[from] std::io::Error),
-    #[error("Brave cookie snapshot failed")]
+    #[error("cookie snapshot failed")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("Brave cookie snapshot task failed")]
+    #[error("cookie snapshot task failed")]
     SnapshotTask(#[source] tokio::task::JoinError),
     #[error("the system clock is before the Unix epoch")]
     SystemClock(#[source] std::time::SystemTimeError),
-    #[error("temporary Brave cookie expiration does not fit Chromium's timestamp range")]
+    #[error("temporary cookie expiration does not fit Chromium's timestamp range")]
     CookieExpiryOverflow,
 }
 

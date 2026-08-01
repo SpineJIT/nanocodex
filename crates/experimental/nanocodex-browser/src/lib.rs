@@ -80,7 +80,7 @@ pub use features::{
     BrowserWebVitals,
 };
 pub use native::{BrowserBuildError, BrowserError};
-pub use session::{BraveSession, BraveSessionError};
+pub use session::{BraveSession, BraveSessionError, BrowserProfileKind};
 
 const TOOL_DESCRIPTION: &str = r"Control one server-managed browser session.
 
@@ -3203,14 +3203,14 @@ impl BrowserBuilder {
         self
     }
 
-    /// Seeds the selected browser with cookies from a Brave profile.
+    /// Seeds the selected browser with cookies from a Chromium-family profile.
     ///
     /// Unlike [`Self::brave_session`], this does not select Brave as the
     /// browser executable. An explicitly configured Chrome or Chromium binary,
     /// or the normal auto-detected browser, launches with the private cookie
     /// snapshot instead.
     #[must_use]
-    pub fn brave_cookie_source(mut self, session: BraveSession) -> Self {
+    pub fn cookie_source(mut self, session: BraveSession) -> Self {
         self.brave_session = Some(session);
         self.launch_brave_executable = false;
         self

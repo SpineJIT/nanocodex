@@ -1,14 +1,24 @@
 use std::path::{Path, PathBuf};
 
-use clap::{ArgAction, Args, ValueEnum};
+use clap::{Args, ValueEnum};
 use eyre::{Result, WrapErr, eyre};
-use nanocodex_browser::{BraveSession, Browser, BrowserTool};
+use nanocodex_browser::{BraveSession, Browser, BrowserProfileKind, BrowserTool};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum BrowserKind {
     #[value(alias = "true")]
     Chromium,
     Brave,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CookieSourceKind {
+    #[value(alias = "true")]
+    Auto,
+    Brave,
+    Chrome,
+    Chromium,
+    Edge,
 }
 
 /// Opt-in local browser configuration for normal agent sessions.
@@ -28,15 +38,20 @@ pub(crate) struct BrowserArgs {
     )]
     browser: Option<BrowserKind>,
 
-    /// Copy every cookie from the standard Brave profile into the selected browser.
+    /// Copy cookies from a standard Chromium-family profile.
+    ///
+    /// Pass a browser name to select the source profile. A bare flag or `true`
+    /// automatically selects an installed profile.
     #[arg(
         long,
         env = "NANOCODEX_BROWSER_COOKIES",
-        action = ArgAction::Set,
-        default_value_t = false,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "auto",
+        require_equals = true,
         requires = "browser"
     )]
-    cookies: bool,
+    cookies: Option<CookieSourceKind>,
 
     /// Chrome or Chromium executable used by the browser tool.
     #[arg(
@@ -68,11 +83,6 @@ impl BrowserArgs {
                 if let Some(executable) = &self.browser_executable {
                     builder = builder.executable(executable);
                 }
-                if self.cookies {
-                    let brave = BraveSession::standard()
-                        .wrap_err("failed to locate the standard Brave profile")?;
-                    builder = builder.brave_cookie_source(brave.copy_all_cookies());
-                }
             }
             BrowserKind::Brave => {
                 if self.browser_executable.is_some() {
@@ -82,18 +92,51 @@ impl BrowserArgs {
                 }
                 let brave = BraveSession::standard()
                     .wrap_err("failed to locate the standard Brave profile")?;
-                builder = if self.cookies {
-                    builder.brave_session(brave.copy_all_cookies())
-                } else {
-                    builder.executable(brave.executable().to_path_buf())
-                };
+                builder = builder.executable(brave.executable().to_path_buf());
             }
+        }
+        if let Some(source) = self.cookies {
+            let source = cookie_source(source, kind)?;
+            builder = builder.cookie_source(source.copy_all_cookies());
         }
         let browser = builder
             .build()
             .wrap_err("failed to configure the browser tool")?;
         Ok(Some(ConfiguredBrowser { browser }))
     }
+}
+
+fn cookie_source(source: CookieSourceKind, target: BrowserKind) -> Result<BraveSession> {
+    let explicit = match source {
+        CookieSourceKind::Auto => None,
+        CookieSourceKind::Brave => Some(BrowserProfileKind::Brave),
+        CookieSourceKind::Chrome => Some(BrowserProfileKind::Chrome),
+        CookieSourceKind::Chromium => Some(BrowserProfileKind::Chromium),
+        CookieSourceKind::Edge => Some(BrowserProfileKind::Edge),
+    };
+    if let Some(source) = explicit {
+        return BraveSession::standard_for(source)
+            .wrap_err_with(|| format!("failed to locate the standard {} profile", source.name()));
+    }
+
+    let preferences = match target {
+        BrowserKind::Brave => [
+            BrowserProfileKind::Brave,
+            BrowserProfileKind::Chrome,
+            BrowserProfileKind::Chromium,
+            BrowserProfileKind::Edge,
+        ],
+        BrowserKind::Chromium => [
+            BrowserProfileKind::Chrome,
+            BrowserProfileKind::Chromium,
+            BrowserProfileKind::Brave,
+            BrowserProfileKind::Edge,
+        ],
+    };
+    preferences
+        .into_iter()
+        .find_map(|source| BraveSession::standard_for(source).ok())
+        .ok_or_else(|| eyre!("failed to locate an installed Chromium-family cookie profile"))
 }
 
 impl ConfiguredBrowser {
@@ -124,7 +167,7 @@ mod tests {
             .model_specs("browser-tui-test");
         let browser = BrowserArgs {
             browser: Some(super::BrowserKind::Chromium),
-            cookies: false,
+            cookies: None,
             browser_executable: None,
         }
         .configure(workspace.path())

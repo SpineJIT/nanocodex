@@ -104,15 +104,18 @@ or an explicitly managed CDP endpoint.
   errors, network bodies, WebSocket messages, HAR, and React diagnostics.
 - Screenshots, PDF, visual/session/performance traces, video, CPU profiles,
   coverage, heap inspection, accessibility/axe, Lighthouse, and CrUX actions.
-- Harness-owned cookies/storage, virtual passkeys, allowlisted Brave handoff,
+- Harness-owned cookies/storage, virtual passkeys, allowlisted source-browser handoff,
   upload roots, browser egress policy, remote CDP, and libkrun VM composition.
 
-The Nanocodex CLI can copy the standard Brave profile's complete cookie
-database into either supported session-private browser:
+The Nanocodex CLI can copy a standard Chromium-family profile's complete
+cookie database into either supported session-private browser. A bare cookie
+flag auto-detects a source; `brave`, `chrome`, `chromium`, and `edge` select it
+explicitly:
 
 ```console
-nanocodex --browser --cookies=true
-nanocodex --browser=brave --cookies=true
+nanocodex --browser --cookies
+nanocodex --browser --cookies=chrome
+nanocodex --browser=brave --cookies=edge
 ```
 
 The source profile remains open, is never mutated, and cookie values remain

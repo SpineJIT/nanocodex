@@ -251,6 +251,10 @@ mod tests {
         let chromium = Cli::try_parse_from(["nanocodex", "--browser", "--cookies=true"]).unwrap();
         assert!(chromium.agent.browser_enabled());
 
+        let chrome_source =
+            Cli::try_parse_from(["nanocodex", "--browser=brave", "--cookies=chrome"]).unwrap();
+        assert!(chrome_source.agent.browser_enabled());
+
         let run =
             Cli::try_parse_from(["nanocodex", "run", "inspect example.com", "--browser"]).unwrap();
         let Some(Command::Run(run)) = run.command else {

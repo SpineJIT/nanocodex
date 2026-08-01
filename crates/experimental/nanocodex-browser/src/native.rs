@@ -692,7 +692,7 @@ impl Session {
             && launch_brave_executable
             && brave_session.is_some();
         let imported_cookies = if !opens_brave_profile && let Some(brave_session) = brave_session {
-            Some(export_brave_cookies(runtime_dir, brave_session).await?)
+            Some(export_profile_cookies(runtime_dir, brave_session).await?)
         } else {
             None
         };
@@ -711,7 +711,7 @@ impl Session {
                 .window_size(1280, 720)
                 .new_headless_mode();
             if opens_brave_profile {
-                config = brave_launch_config(config).arg("restore-last-session");
+                config = profile_launch_config(config).arg("restore-last-session");
             }
             if let Some(executable) = executable {
                 config = config.chrome_executable(executable);
@@ -846,7 +846,7 @@ impl Session {
         runtime_dir: &Path,
         brave_session: &BraveSession,
     ) -> Result<(), BrowserError> {
-        let cookies = export_brave_cookies(runtime_dir, brave_session).await?;
+        let cookies = export_profile_cookies(runtime_dir, brave_session).await?;
         trace_serialized("session.refreshed_brave_cookies", &cookies);
         replace_browser_cookies(&self.browser, cookies).await?;
         Ok(())
@@ -1562,7 +1562,7 @@ fn validate_snapshot_wire(
     Ok(())
 }
 
-async fn export_brave_cookies(
+async fn export_profile_cookies(
     runtime_dir: &Path,
     brave_session: &BraveSession,
 ) -> Result<Vec<CookieParam>, BrowserError> {
@@ -1571,7 +1571,7 @@ async fn export_brave_cookies(
         .tempdir_in(runtime_dir)?;
     brave_session.prepare(broker_profile.path()).await?;
 
-    let config = brave_launch_config(
+    let config = profile_launch_config(
         BrowserConfig::builder()
             .user_data_dir(broker_profile.path())
             .new_headless_mode(),
@@ -1605,7 +1605,7 @@ async fn export_brave_cookies(
         browser_cookie_count = cookies.len(),
         browser_cookie_origin_count = brave_session.allowed_origins().len(),
         browser_cookie_all_origins = brave_session.copies_all_cookies(),
-        "prepared Brave cookies for a dedicated remote browser"
+        "prepared source-profile cookies for a dedicated browser"
     );
     Ok(cookies)
 }
@@ -5739,7 +5739,7 @@ fn build_config(builder: BrowserConfigBuilder) -> Result<BrowserConfig, BrowserE
         .map_err(|message| BrowserError::Configuration { message })
 }
 
-fn brave_launch_config(builder: BrowserConfigBuilder) -> BrowserConfigBuilder {
+fn profile_launch_config(builder: BrowserConfigBuilder) -> BrowserConfigBuilder {
     // Chromiumoxide's Puppeteer-derived defaults select `password-store=basic`
     // and `use-mock-keychain`. Those are appropriate for an empty automation
     // profile but make real Brave cookie ciphertext undecryptable. Keep the
@@ -6434,8 +6434,8 @@ mod tests {
     use super::{
         BrowserConfig, Chromium, Diagnostics, GateSignals, MAX_ACTION_INPUT_BYTES,
         MAX_CONSOLE_ENTRIES, MAX_DIAGNOSTIC_TEXT_BYTES, MAX_NETWORK_REQUESTS, NetworkSource,
-        allowed_cookie_params, brave_launch_config, build_config, classify_gate, close_chromium,
-        cookie_param, diagnostic_limit, trace_browser_configuration, validate_url,
+        allowed_cookie_params, build_config, classify_gate, close_chromium, cookie_param,
+        diagnostic_limit, profile_launch_config, trace_browser_configuration, validate_url,
     };
     use crate::{
         BraveSession, Browser, BrowserAction, BrowserActionResult, BrowserConsoleEntry,
@@ -6780,7 +6780,7 @@ mod tests {
         profile: &std::path::Path,
         value: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let config = brave_launch_config(
+        let config = profile_launch_config(
             BrowserConfig::builder()
                 .user_data_dir(profile)
                 .new_headless_mode(),
