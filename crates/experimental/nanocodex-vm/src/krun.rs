@@ -21,7 +21,10 @@ use crate::{
 const ROOT_TAG: &std::ffi::CStr = c"/dev/root";
 const ROOT_BLOCK_ID: &std::ffi::CStr = c"vda";
 const ROOT_BLOCK_DEVICE: &std::ffi::CStr = c"/dev/vda";
+const OVERLAY_LOWER_BLOCK_ID: &std::ffi::CStr = c"nanocodex-overlay-lower";
+const OVERLAY_UPPER_BLOCK_ID: &std::ffi::CStr = c"nanocodex-overlay-upper";
 const EXT4_FILESYSTEM: &std::ffi::CStr = c"ext4";
+const READ_ONLY_MOUNT_OPTIONS: &std::ffi::CStr = c"ro";
 const TSI_HIJACK_INET: u32 = 1;
 const NET_FLAG_VFKIT: u32 = 1 << 0;
 const NET_FLAG_DHCP_CLIENT: u32 = 1 << 1;
@@ -138,6 +141,16 @@ pub struct KrunVm {
     context: Option<u32>,
 }
 
+enum ResolvedRoot {
+    Directory(PathBuf),
+    Ext4(PathBuf),
+    OverlayExt4 {
+        runtime: PathBuf,
+        lower: PathBuf,
+        upper: PathBuf,
+    },
+}
+
 impl KrunVm {
     /// Creates a libkrun configuration context.
     ///
@@ -153,22 +166,7 @@ impl KrunVm {
             return Err(VmError::InvalidConfig("memory must be nonzero"));
         }
 
-        let root = config
-            .root()
-            .canonicalize()
-            .map_err(|source| VmError::ResolveRoot {
-                path: config.root().to_path_buf(),
-                source,
-            })?;
-        match config.root_filesystem() {
-            RootFilesystem::Directory(_) if !root.is_dir() => {
-                return Err(VmError::RootNotDirectory(root));
-            }
-            RootFilesystem::Ext4(_) if !root.is_file() => {
-                return Err(VmError::RootNotFile(root));
-            }
-            RootFilesystem::Directory(_) | RootFilesystem::Ext4(_) => {}
-        }
+        let root = resolve_root(config.root_filesystem())?;
 
         let context = positive_context(krun::krun_create_ctx(), "create context")?;
         let vm = Self {
@@ -180,9 +178,9 @@ impl KrunVm {
             "configure VM",
         )?;
 
-        let root = c_string(root.as_os_str(), "root filesystem path")?;
-        match config.root_filesystem() {
-            RootFilesystem::Directory(_) => {
+        match root {
+            ResolvedRoot::Directory(root) => {
+                let root = c_string(root.as_os_str(), "root filesystem path")?;
                 // SAFETY: both C strings live through the call and libkrun copies their
                 // contents into the context before returning.
                 check(
@@ -198,26 +196,28 @@ impl KrunVm {
                     "attach root filesystem",
                 )?;
             }
-            RootFilesystem::Ext4(_) => {
-                // SAFETY: the path and block ID remain alive through each call;
-                // libkrun copies them into its context before returning.
-                check(
-                    unsafe {
-                        krun::krun_add_disk(context, ROOT_BLOCK_ID.as_ptr(), root.as_ptr(), false)
-                    },
-                    "attach root disk",
+            ResolvedRoot::Ext4(root) => {
+                attach_root_disk(context, &root, false)?;
+            }
+            ResolvedRoot::OverlayExt4 {
+                runtime,
+                lower,
+                upper,
+            } => {
+                attach_root_disk(context, &runtime, true)?;
+                attach_resolved_disk(
+                    context,
+                    OVERLAY_LOWER_BLOCK_ID,
+                    &lower,
+                    true,
+                    "attach immutable overlay lower disk",
                 )?;
-                // SAFETY: all strings are static and NUL terminated.
-                check(
-                    unsafe {
-                        krun::krun_set_root_disk_remount(
-                            context,
-                            ROOT_BLOCK_DEVICE.as_ptr(),
-                            EXT4_FILESYSTEM.as_ptr(),
-                            ptr::null(),
-                        )
-                    },
-                    "select root disk",
+                attach_resolved_disk(
+                    context,
+                    OVERLAY_UPPER_BLOCK_ID,
+                    &upper,
+                    false,
+                    "attach writable overlay upper disk",
                 )?;
             }
         }
@@ -334,6 +334,100 @@ impl KrunVm {
         self.context = None;
         Err(VmError::UnexpectedReturn)
     }
+}
+
+fn resolve_root(root: &RootFilesystem) -> Result<ResolvedRoot, VmError> {
+    match root {
+        RootFilesystem::Directory(path) => {
+            let resolved = resolve_root_path(path)?;
+            if !resolved.is_dir() {
+                return Err(VmError::RootNotDirectory(resolved));
+            }
+            Ok(ResolvedRoot::Directory(resolved))
+        }
+        RootFilesystem::Ext4(path) => {
+            let resolved = resolve_root_path(path)?;
+            if !resolved.is_file() {
+                return Err(VmError::RootNotFile(resolved));
+            }
+            Ok(ResolvedRoot::Ext4(resolved))
+        }
+        RootFilesystem::OverlayExt4 {
+            runtime,
+            lower,
+            upper,
+        } => {
+            let runtime = resolve_root_path(runtime)?;
+            if !runtime.is_file() {
+                return Err(VmError::RootNotFile(runtime));
+            }
+            let lower = resolve_block_path(lower)?;
+            if !lower.is_file() {
+                return Err(VmError::BlockDeviceNotFile(lower));
+            }
+            let upper = resolve_block_path(upper)?;
+            if !upper.is_file() {
+                return Err(VmError::BlockDeviceNotFile(upper));
+            }
+            Ok(ResolvedRoot::OverlayExt4 {
+                runtime,
+                lower,
+                upper,
+            })
+        }
+    }
+}
+
+fn resolve_root_path(path: &std::path::Path) -> Result<PathBuf, VmError> {
+    path.canonicalize().map_err(|source| VmError::ResolveRoot {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn resolve_block_path(path: &std::path::Path) -> Result<PathBuf, VmError> {
+    path.canonicalize()
+        .map_err(|source| VmError::ResolveBlockDevice {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn attach_root_disk(context: u32, path: &std::path::Path, read_only: bool) -> Result<(), VmError> {
+    attach_resolved_disk(context, ROOT_BLOCK_ID, path, read_only, "attach root disk")?;
+    let options = if read_only {
+        READ_ONLY_MOUNT_OPTIONS.as_ptr()
+    } else {
+        ptr::null()
+    };
+    // SAFETY: all strings are static and NUL terminated.
+    check(
+        unsafe {
+            krun::krun_set_root_disk_remount(
+                context,
+                ROOT_BLOCK_DEVICE.as_ptr(),
+                EXT4_FILESYSTEM.as_ptr(),
+                options,
+            )
+        },
+        "select root disk",
+    )
+}
+
+fn attach_resolved_disk(
+    context: u32,
+    id: &std::ffi::CStr,
+    path: &std::path::Path,
+    read_only: bool,
+    operation: &'static str,
+) -> Result<(), VmError> {
+    let path = c_string(path.as_os_str(), "block device path")?;
+    // SAFETY: both strings remain valid through the call and libkrun copies
+    // their contents into its context before returning.
+    check(
+        unsafe { krun::krun_add_disk(context, id.as_ptr(), path.as_ptr(), read_only) },
+        operation,
+    )
 }
 
 fn attach_network(context: u32, network: &Network) -> Result<(), VmError> {

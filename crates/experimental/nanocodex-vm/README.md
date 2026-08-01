@@ -67,6 +67,54 @@ workspace.shutdown().await?;
 # }
 ```
 
+High-fanout ephemeral attempts use guest OverlayFS instead of copying that
+retained workspace shape. [`host::VmConfig::overlay_ext4`] boots the runtime
+disk read-only, mounts the prepared task disk read-only as the lower layer,
+and sends all mutations to a fresh sparse ext4 upper created by
+[`host::create_sparse_overlay_disk`]. Reset is deletion of that upper disk;
+the host filesystem needs ordinary sparse-file support, not reflinks, XFS, or
+a host OverlayFS mount. Attempts configured for rootfs retention continue to
+use standalone private ext4 copies so retained artifacts remain self-contained.
+
+```no_run
+use nanocodex_vm::{
+    host::{
+        EgressLease, Network, VmConfig, create_sparse_overlay_disk,
+        overlay_guest_command,
+    },
+    tools::VmToolSession,
+};
+use tokio::process::Command;
+
+# async fn launch() -> Result<(), Box<dyn std::error::Error>> {
+let upper = ".nanocodex/attempts/018f/upper.ext4";
+create_sparse_overlay_disk(upper, 10 * 1024 * 1024 * 1024)?;
+let config = VmConfig::overlay_ext4(
+    ".cache/nanocodex/vm/runtime.ext4",
+    ".cache/nanocodex/vm/prepared-task.ext4",
+    upper,
+)
+.cpus(2)
+.memory_mib(1024)
+.network(Network::Disabled);
+let session = VmToolSession::spawn_configured(
+    Command::new("dedicated-vmm-process"),
+    config,
+    overlay_guest_command("/workspace", ""),
+    EgressLease::disabled(),
+)
+.await?;
+session.shutdown().await?;
+# std::fs::remove_file(upper)?;
+# Ok(())
+# }
+```
+
+The caller owns upper-disk retention and deletion. Drop all session/tool
+capabilities and complete [`tools::VmToolSession::shutdown`] before removing
+the disk. Overlay startup creates only the requested workspace; harness- or
+application-specific directories remain the caller's responsibility.
+
 [`VmWorkspace::tools`] returns a clone-cheap capability suitable for
 `NanocodexBuilder::tools_factory`. Every clone routes to the same retained
 guest runtime, filesystem, and interactive shell sessions. The non-cloneable

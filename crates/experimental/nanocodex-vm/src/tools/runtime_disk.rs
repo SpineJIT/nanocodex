@@ -17,7 +17,19 @@ use tracing::{info, info_span};
 const BLOCK_SIZE: u32 = 4_096;
 const DISK_BYTES: u64 = 128 * 1024 * 1024;
 const GUEST_PATH: &str = "/nanocodex-vm-guest";
-const IDENTITY_VERSION: &[u8] = b"nanocodex-vm-guest-runtime-v1\0";
+const RUNTIME_ROOT_DIRECTORIES: [&str; 10] = [
+    "/dev",
+    "/dev/pts",
+    "/dev/shm",
+    "/proc",
+    "/sys",
+    "/sys/fs",
+    "/sys/fs/cgroup",
+    "/mnt",
+    "/run",
+    "/tmp",
+];
+const IDENTITY_VERSION: &[u8] = b"nanocodex-vm-guest-runtime-v2-overlay-root\0";
 const RECORD_VERSION: u32 = 1;
 
 /// Whether preparing a guest runtime disk reused or created its cache entry.
@@ -205,6 +217,18 @@ impl GuestRuntimeDisk {
             .into_temp_path();
         let mut contents = bytes.as_slice();
         let mut formatter = Formatter::new(&temporary, BLOCK_SIZE, DISK_BYTES)?;
+        for directory in RUNTIME_ROOT_DIRECTORIES {
+            formatter.create(
+                directory,
+                make_mode(file_mode::S_IFDIR, 0o755),
+                None,
+                None,
+                None,
+                Some(0),
+                Some(0),
+                None,
+            )?;
+        }
         formatter.create(
             GUEST_PATH,
             make_mode(file_mode::S_IFREG, 0o755),
@@ -563,6 +587,13 @@ fn valid_cached_disk(path: &Path, binary: &[u8]) -> Result<bool, GuestRuntimeDis
     let Ok(mut reader) = Reader::new(path) else {
         return Ok(false);
     };
+    if RUNTIME_ROOT_DIRECTORIES.iter().any(|directory| {
+        !reader
+            .stat(directory)
+            .is_ok_and(|(_, inode)| inode.is_dir())
+    }) {
+        return Ok(false);
+    }
     let Ok((_, inode)) = reader.stat(GUEST_PATH) else {
         return Ok(false);
     };
@@ -587,6 +618,16 @@ fn validate_prepared_disk(path: &Path, binary: &[u8]) -> Result<(), GuestRuntime
             path: path.to_path_buf(),
             source: Some(source),
         })?;
+    if RUNTIME_ROOT_DIRECTORIES.iter().any(|directory| {
+        !reader
+            .stat(directory)
+            .is_ok_and(|(_, inode)| inode.is_dir())
+    }) {
+        return Err(GuestRuntimeDiskError::InvalidPreparedDisk {
+            path: path.to_path_buf(),
+            source: None,
+        });
+    }
     let (_, inode) =
         reader
             .stat(GUEST_PATH)
@@ -625,7 +666,10 @@ mod tests {
 
     use arcbox_ext4::Reader;
 
-    use super::{GUEST_PATH, GuestRuntimeDisk, GuestRuntimeDiskStatus, runtime_digest};
+    use super::{
+        GUEST_PATH, GuestRuntimeDisk, GuestRuntimeDiskStatus, RUNTIME_ROOT_DIRECTORIES,
+        runtime_digest,
+    };
 
     #[test]
     fn prepares_valid_content_addressed_disk_and_reuses_it() {
@@ -647,6 +691,9 @@ mod tests {
         );
 
         let mut reader = Reader::new(created.path()).unwrap();
+        for directory in RUNTIME_ROOT_DIRECTORIES {
+            assert!(reader.stat(directory).unwrap().1.is_dir());
+        }
         let (_, inode) = reader.stat(GUEST_PATH).unwrap();
         assert!(inode.is_reg());
         assert_eq!(inode.file_size(), bytes.len() as u64);

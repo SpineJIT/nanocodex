@@ -34,6 +34,8 @@ use super::protocol::{
     MemoryResponse, ReadFileRequest, ReadFileResponse, SessionRequest, SessionResponse,
     ShutdownRequest, ToolResponse, WriteFileRequest,
 };
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+use crate::overlay::{GuestOverlayError, enter_guest_overlay_root};
 
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONTROL_FILE_BYTES: usize = 32 * 1024 * 1024;
@@ -141,6 +143,12 @@ fn parse_vmstat_oom_kills(contents: &str) -> Option<u64> {
 /// Failure while serving VM tool requests inside the guest.
 #[derive(Debug, Error)]
 pub enum VmGuestError {
+    /// The immutable lower and writable upper disks could not become the
+    /// guest's effective OverlayFS root.
+    #[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+    #[error(transparent)]
+    Overlay(#[from] GuestOverlayError),
+
     /// Guest console I/O failed.
     #[error("VM tool console I/O failed: {0}")]
     Io(#[from] std::io::Error),
@@ -169,6 +177,16 @@ pub enum VmGuestError {
 #[cfg(feature = "guest-runtime")]
 pub(crate) async fn serve(workspace: &Path) -> Result<(), VmGuestError> {
     serve_io(workspace, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+#[cfg(all(feature = "guest-runtime", target_os = "linux"))]
+pub(crate) async fn serve_overlay(
+    workspace: &Path,
+    resolver_configuration: Option<&str>,
+) -> Result<(), VmGuestError> {
+    enter_guest_overlay_root(resolver_configuration)?;
+    tokio::fs::create_dir_all(workspace).await?;
+    serve(workspace).await
 }
 
 #[cfg(feature = "guest-runtime")]

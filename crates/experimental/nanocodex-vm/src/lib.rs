@@ -58,6 +58,17 @@ pub mod image;
     )
 ))]
 mod krun;
+#[cfg(any(
+    all(feature = "guest-runtime", target_os = "linux"),
+    all(
+        feature = "host",
+        any(
+            all(target_os = "linux", not(target_env = "musl")),
+            all(target_os = "macos", target_arch = "aarch64")
+        )
+    )
+))]
+mod overlay;
 #[cfg(all(
     feature = "host",
     any(
@@ -109,6 +120,7 @@ pub mod host {
         },
         gvproxy::{Gvproxy, GvproxyError},
         krun::{KrunVm, KrunVmControl, VmError},
+        overlay::{OverlayDiskError, create_sparse_overlay_disk, overlay_guest_command},
         process::{PrivateVmProcessConfig, VmProcessConfig, VmProcessError},
     };
 }
