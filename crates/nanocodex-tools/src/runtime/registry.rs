@@ -201,6 +201,11 @@ impl ToolRegistry {
                     ));
                 }
             },
+            ToolDefinition::Namespace { .. } => {
+                return ToolOutput::error(
+                    "Responses namespace definitions cannot execute as nested Code Mode tools",
+                );
+            }
             ToolDefinition::ToolSearch { .. } => {
                 return ToolOutput::error(
                     "provider-native tool_search cannot execute as a nested Code Mode tool",
@@ -300,6 +305,7 @@ impl ToolRegistry {
 fn definition_metadata(name: &str, definition: &ToolDefinition) -> Value {
     let kind = match definition {
         ToolDefinition::Function { .. } => "function",
+        ToolDefinition::Namespace { .. } => "namespace",
         ToolDefinition::Custom { .. } => "freeform",
         ToolDefinition::ToolSearch { .. } => "tool_search",
     };

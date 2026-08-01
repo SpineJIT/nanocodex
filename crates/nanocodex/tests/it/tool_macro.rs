@@ -11,14 +11,19 @@ async fn add(left: i64, right: i64) -> Result<i64, &'static str> {
 
 #[tokio::test]
 async fn macro_generates_schema_and_executes_through_public_tool_trait() {
-    let definition = serde_json::to_value(add.definition()).unwrap();
-    assert_eq!(definition["name"], "add_numbers");
-    assert_eq!(definition["parameters"]["type"], "object");
+    let definition = add.definition();
+    let serialized = serde_json::to_value(&definition).unwrap();
+    assert_eq!(serialized["name"], "add_numbers");
+    assert_eq!(serialized["parameters"]["type"], "object");
     assert_eq!(
-        definition["parameters"]["required"],
+        serialized["parameters"]["required"],
         json!(["left", "right"])
     );
-    assert_eq!(definition["output_schema"]["type"], "integer");
+    assert_eq!(
+        definition.output_schema().unwrap().as_value()["type"],
+        "integer"
+    );
+    assert!(serialized.get("output_schema").is_none());
 
     let execution = add
         .execute(

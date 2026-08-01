@@ -437,7 +437,11 @@ where
                 response_items: vec![response_item],
             });
         }
-        if matches!(call.kind, CodeCallKind::Function) && tools.contains(&qualified_name) {
+        let code_mode_entrypoint =
+            call.namespace.is_none() && matches!(call.name.as_str(), "exec" | "wait");
+        if !code_mode_entrypoint
+            && matches!(call.kind, CodeCallKind::Function | CodeCallKind::Custom)
+        {
             let context = ToolContext::new(
                 model.as_str(),
                 session_id,
@@ -445,17 +449,33 @@ where
                 &[],
                 DEFAULT_TOOL_OUTPUT_TOKENS,
             );
-            let execution = match RawValue::from_string(call.input.clone()) {
-                Ok(input) => {
+            let mut execution = match call.kind {
+                CodeCallKind::Function => match RawValue::from_string(call.input.clone()) {
+                    Ok(input) => {
+                        tools
+                            .execute_tool(&qualified_name, ToolInput::Function(input), context)
+                            .instrument(tool_span.clone())
+                            .await
+                    }
+                    Err(error) => ToolOutput::error(format!(
+                        "failed to encode {qualified_name} arguments: {error}"
+                    )),
+                },
+                CodeCallKind::Custom => {
                     tools
-                        .execute_tool(&qualified_name, ToolInput::Function(input), context)
+                        .execute_tool(
+                            &qualified_name,
+                            ToolInput::Freeform(call.input.clone()),
+                            context,
+                        )
                         .instrument(tool_span.clone())
                         .await
                 }
-                Err(error) => ToolOutput::error(format!(
-                    "failed to encode {qualified_name} arguments: {error}"
-                )),
+                CodeCallKind::ToolSearch => {
+                    unreachable!("tool search is not an ordinary direct tool")
+                }
             };
+            prepare_output_images(&mut execution.output).await;
             if let Some(content) = serialize_trace_content(&execution.output) {
                 record_span_content(tool_span, "tool.output", &content);
             }
@@ -469,7 +489,17 @@ where
                 success: execution.success,
                 duration_ns,
                 work_duration_ns: 0,
-                response_items: vec![function_tool_output(call.call_id, execution.output.clone())],
+                response_items: vec![match call.kind {
+                    CodeCallKind::Function => {
+                        function_tool_output(call.call_id, execution.output.clone())
+                    }
+                    CodeCallKind::Custom => {
+                        custom_tool_output(call.call_id, execution.output.clone())
+                    }
+                    CodeCallKind::ToolSearch => {
+                        unreachable!("tool search is not an ordinary direct tool")
+                    }
+                }],
                 output: execution.output,
                 metadata: execution.metadata,
             });

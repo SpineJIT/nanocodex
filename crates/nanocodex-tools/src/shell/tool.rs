@@ -84,19 +84,59 @@ fn shell_execution(result: &super::ExecCommandResult) -> ToolOutput {
     if let Some(error) = &result.error {
         return ToolOutput::error(error);
     }
-    ToolOutput::json(&result).with_process_trace(
-        result.exit_code,
-        result.session_id,
-        result.original_token_count,
-        result.output.len(),
-        result.wall_time_seconds,
-    )
+    let code_mode_value = match serde_json::to_value(result) {
+        Ok(value) => value,
+        Err(error) => {
+            return ToolOutput::error(format!("failed to encode tool result: {error}"));
+        }
+    };
+    ToolOutput::text(shell_response_text(result))
+        .with_code_mode_value(code_mode_value)
+        .with_process_trace(
+            result.exit_code,
+            result.session_id,
+            result.original_token_count,
+            result.output.len(),
+            result.wall_time_seconds,
+        )
+}
+
+fn shell_response_text(result: &super::ExecCommandResult) -> String {
+    let mut sections = Vec::new();
+    if let Some(chunk_id) = result
+        .chunk_id
+        .as_deref()
+        .filter(|chunk_id| !chunk_id.is_empty())
+    {
+        sections.push(format!("Chunk ID: {chunk_id}"));
+    }
+    sections.push(format!(
+        "Wall time: {:.4} seconds",
+        result.wall_time_seconds
+    ));
+    if let Some(exit_code) = result.exit_code {
+        sections.push(format!("Process exited with code {exit_code}"));
+    }
+    if let Some(session_id) = result.session_id {
+        sections.push(format!("Process running with session ID {session_id}"));
+    }
+    if let Some(original_token_count) = result.original_token_count {
+        sections.push(format!("Original token count: {original_token_count}"));
+    }
+    sections.push("Output:".to_owned());
+    sections.push(result.output.clone());
+    sections.join("\n")
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExecCommandArguments {
     cmd: String,
+    // Codex exposes these approval metadata fields even under a fixed
+    // full-access/never-ask policy. Nanocodex accepts but does not act on
+    // them; this does not add a second approval or sandbox policy owner.
+    #[serde(default)]
+    _justification: Option<String>,
     #[serde(default)]
     workdir: Option<String>,
     #[serde(default)]
@@ -109,6 +149,10 @@ struct ExecCommandArguments {
     yield_time_ms: Option<u64>,
     #[serde(default)]
     max_output_tokens: Option<usize>,
+    #[serde(default)]
+    _prefix_rule: Option<Vec<String>>,
+    #[serde(default)]
+    _sandbox_permissions: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -127,8 +171,11 @@ struct WriteStdinArguments {
 mod tests {
     use std::{path::PathBuf, sync::Arc};
 
-    use super::{ExecCommandHandler, Tool};
-    use crate::shell::ShellSessions;
+    use super::{ExecCommandHandler, Tool, shell_execution};
+    use crate::{
+        ToolOutputBody,
+        shell::{ExecCommandResult, ShellSessions},
+    };
 
     #[test]
     fn exec_command_exposes_codex_description_and_shell_parameter() {
@@ -146,6 +193,67 @@ mod tests {
             spec.pointer("/parameters/properties/shell/type")
                 .and_then(serde_json::Value::as_str),
             Some("string")
+        );
+    }
+
+    #[test]
+    fn shell_results_use_codex_text_directly_and_json_in_code_mode() {
+        let result = ExecCommandResult {
+            error: None,
+            chunk_id: Some("a1b2c3".to_owned()),
+            wall_time_seconds: 0.68754,
+            exit_code: Some(0),
+            session_id: None,
+            original_token_count: Some(7),
+            output: "hello\n".to_owned(),
+        };
+
+        let output = shell_execution(&result);
+        let ToolOutputBody::Text(direct) = &output.output else {
+            panic!("shell output should be plain text");
+        };
+        assert_eq!(
+            direct,
+            "Chunk ID: a1b2c3\n\
+             Wall time: 0.6875 seconds\n\
+             Process exited with code 0\n\
+             Original token count: 7\n\
+             Output:\n\
+             hello\n"
+        );
+        assert_eq!(
+            output.code_mode_value(),
+            serde_json::json!({
+                "chunk_id": "a1b2c3",
+                "wall_time_seconds": 0.68754,
+                "exit_code": 0,
+                "original_token_count": 7,
+                "output": "hello\n",
+            })
+        );
+    }
+
+    #[test]
+    fn running_shell_result_names_the_session() {
+        let result = ExecCommandResult {
+            error: None,
+            chunk_id: None,
+            wall_time_seconds: 10.0,
+            exit_code: None,
+            session_id: Some(42),
+            original_token_count: None,
+            output: String::new(),
+        };
+
+        let output = shell_execution(&result);
+        let ToolOutputBody::Text(direct) = output.output else {
+            panic!("shell output should be plain text");
+        };
+        assert_eq!(
+            direct,
+            "Wall time: 10.0000 seconds\n\
+             Process running with session ID 42\n\
+             Output:\n"
         );
     }
 }

@@ -66,6 +66,10 @@ fn exec_command_definition(name: &'static str) -> ToolDefinition {
             "type": "object",
             "properties": {
                 "cmd": { "type": "string", "description": "Shell command to execute." },
+                "justification": {
+                    "type": "string",
+                    "description": "User-facing approval question for `require_escalated`; omit otherwise."
+                },
                 "workdir": {
                     "type": "string",
                     "description": "Working directory for the command. Defaults to the turn cwd."
@@ -89,6 +93,16 @@ fn exec_command_definition(name: &'static str) -> ToolDefinition {
                 "max_output_tokens": {
                     "type": "number",
                     "description": "Output token budget. Defaults to 10000 tokens; larger requests may be capped by policy."
+                },
+                "prefix_rule": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Reusable approval prefix for `cmd`, only with `sandbox_permissions: \"require_escalated\"`; for example [\"git\", \"pull\"]."
+                },
+                "sandbox_permissions": {
+                    "type": "string",
+                    "enum": ["use_default", "require_escalated"],
+                    "description": "Per-command sandbox override. Defaults to `use_default`; use `require_escalated` for unsandboxed execution."
                 }
             },
             "required": ["cmd"],
@@ -247,7 +261,8 @@ mod tests {
 
     #[test]
     fn shell_contract_matches_codex_unified_exec() {
-        let exec = definition(StandardTool::ExecCommand);
+        let exec_definition = StandardTool::ExecCommand.definition();
+        let exec = serde_json::to_value(&exec_definition).unwrap();
         assert_eq!(
             exec["description"],
             "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
@@ -269,7 +284,8 @@ mod tests {
             "number"
         );
 
-        let write = definition(StandardTool::WriteStdin);
+        let write_definition = StandardTool::WriteStdin.definition();
+        let write = serde_json::to_value(&write_definition).unwrap();
         assert_eq!(
             write["description"],
             "Writes characters to an existing unified exec session and returns recent output."
@@ -289,7 +305,16 @@ mod tests {
             write["parameters"]["properties"]["max_output_tokens"]["type"],
             "number"
         );
-        assert_eq!(exec["output_schema"], write["output_schema"]);
+        assert!(exec.get("output_schema").is_none());
+        assert!(write.get("output_schema").is_none());
+        assert_eq!(
+            exec_definition
+                .output_schema()
+                .map(nanocodex_oai_api::responses::JsonSchema::as_value),
+            write_definition
+                .output_schema()
+                .map(nanocodex_oai_api::responses::JsonSchema::as_value)
+        );
     }
 
     #[test]
@@ -301,9 +326,11 @@ mod tests {
         );
         assert_eq!(patch["format"]["definition"], APPLY_PATCH_GRAMMAR);
 
+        let image_definition = StandardTool::ViewImage.definition();
         let image = definition(StandardTool::ViewImage);
+        assert!(image.get("output_schema").is_none());
         assert_eq!(
-            image["output_schema"]["properties"]["detail"]["description"],
+            image_definition.output_schema().unwrap().as_value()["properties"]["detail"]["description"],
             "Image detail hint returned by view_image. Returns `high` for default resized behavior or `original` when original resolution is preserved."
         );
     }

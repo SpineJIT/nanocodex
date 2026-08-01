@@ -10,6 +10,14 @@ use nanocodex_tools::{
 use serde_json::{json, value::to_raw_value};
 use tokio::runtime::Runtime;
 
+fn search_tool(provider: &Mcp) -> Arc<dyn Tool> {
+    provider
+        .direct_tools()
+        .into_iter()
+        .find(|tool| tool.definition().name() == "tool_search")
+        .expect("MCP must expose tool_search under direct exposure")
+}
+
 fn warm_provider(
     runtime: &Runtime,
     tool_count: usize,
@@ -28,11 +36,7 @@ fn warm_provider(
         let _runtime = runtime.enter();
         provider.start();
     }
-    let search = provider
-        .direct_tools()
-        .into_iter()
-        .next()
-        .expect("MCP must expose tool_search");
+    let search = search_tool(&provider);
     let input = to_raw_value(&json!({ "query": "deterministic echo message", "limit": 8 }))
         .expect("benchmark input must serialize");
     let context = ToolContext::new(
@@ -69,11 +73,7 @@ fn benchmark_search(c: &mut Criterion) {
                 .build()
                 .expect("benchmark MCP configuration must be valid");
             provider.start();
-            let search = provider
-                .direct_tools()
-                .into_iter()
-                .next()
-                .expect("MCP must expose tool_search");
+            let search = search_tool(&provider);
             let input = to_raw_value(&json!({ "query": "deterministic echo message", "limit": 8 }))
                 .expect("benchmark input must serialize");
             let result = search

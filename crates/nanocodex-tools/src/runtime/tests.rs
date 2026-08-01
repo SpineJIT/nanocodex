@@ -13,8 +13,8 @@ use serde_json::{Value, json, value::to_raw_value};
 use crate::{ToolOutputBody, ToolResult, contract::DEFAULT_TOOL_OUTPUT_TOKENS};
 
 use super::{
-    DynamicToolProvider, ImageGenerationConfig, Tool, ToolContext, ToolInput, ToolOutput,
-    ToolRuntime, Tools, WebSearchConfig,
+    DynamicToolProvider, ImageGenerationConfig, Tool, ToolContext, ToolExposure, ToolInput,
+    ToolOutput, ToolRuntime, Tools, WebSearchConfig,
 };
 
 struct Double;
@@ -477,6 +477,64 @@ fn model_description_is_stable_across_registration_order() {
 }
 
 #[test]
+fn exposure_controls_direct_visibility_without_removing_code_mode_access() {
+    let code_mode_only = Tools::builder()
+        .without_defaults()
+        .tool(Double)
+        .build()
+        .unwrap();
+    assert_eq!(code_mode_only.exposure(), ToolExposure::CodeModeOnly);
+    let code_mode_only = ToolRuntime::new_with_tools(".", None, None, &code_mode_only);
+    let code_mode_only_contract = code_mode_only.model_contract("test-session").1;
+    assert_eq!(
+        code_mode_only
+            .model_specs("test-session")
+            .iter()
+            .map(ToolDefinition::name)
+            .collect::<Vec<_>>(),
+        ["exec", "wait"]
+    );
+
+    let code_mode = Tools::builder()
+        .without_defaults()
+        .exposure(ToolExposure::DirectAndCodeMode)
+        .tool(Double)
+        .build()
+        .unwrap();
+    assert_eq!(code_mode.exposure(), ToolExposure::DirectAndCodeMode);
+    let code_mode = ToolRuntime::new_with_tools(".", None, None, &code_mode);
+    let code_mode_contract = code_mode.model_contract("test-session").1;
+    let specs = code_mode.model_specs("test-session");
+    assert_eq!(
+        specs.iter().map(ToolDefinition::name).collect::<Vec<_>>(),
+        ["exec", "wait", "double"]
+    );
+    let exec = specs
+        .iter()
+        .find(|definition| definition.name() == "exec")
+        .unwrap();
+    assert!(
+        !serde_json::to_value(exec).unwrap()["description"]
+            .as_str()
+            .is_some_and(|description| description.contains(
+                "declare const tools: { double(args: { value: number; }): Promise<unknown>; };"
+            )),
+        "normal Code Mode keeps exec terse like Codex"
+    );
+    let direct_double = specs
+        .iter()
+        .find(|definition| definition.name() == "double")
+        .unwrap();
+    assert!(
+        direct_double.description().contains(
+            "declare const tools: { double(args: { value: number; }): Promise<unknown>; };"
+        ),
+        "normal Code Mode augments each direct spec with its exec declaration"
+    );
+    assert_eq!(code_mode_contract, code_mode_only_contract);
+}
+
+#[test]
 fn tool_recipe_overrides_model_visible_environment_context() {
     let tools = Tools::builder()
         .without_defaults()
@@ -718,8 +776,8 @@ async fn code_mode_can_search_and_call_a_deferred_tool_in_one_cell() {
     assert!(
         model_specs_value[0]["description"]
             .as_str()
-            .is_some_and(|description| description.contains("Shared MCP Types:")),
-        "deferred MCP results need their stable shared type preamble before discovery"
+            .is_some_and(|description| !description.contains("Shared MCP Types:")),
+        "ordinary deferred providers must not opt into MCP-specific guidance"
     );
     let execution = runtime
         .execute_code(

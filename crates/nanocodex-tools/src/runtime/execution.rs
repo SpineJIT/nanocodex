@@ -6,6 +6,8 @@ use super::*;
 /// normally owned privately by the higher-level agent driver.
 pub struct ToolRuntime {
     pub(super) registry: Arc<ToolRegistry>,
+    exposure: ToolExposure,
+    deferred_tools_guidance_enabled: bool,
     code_mode: code_mode::CodeModeRuntime,
     sessions: Arc<ShellSessions>,
     current_turn: Arc<AtomicU64>,
@@ -108,6 +110,8 @@ impl ToolRuntime {
         }
         Self {
             registry: Arc::new(ToolRegistry::from_ordered(handlers)),
+            exposure: ToolExposure::default(),
+            deferred_tools_guidance_enabled: false,
             code_mode: code_mode::CodeModeRuntime::new_with_turn(
                 code_mode_workspace,
                 Arc::clone(&current_turn),
@@ -127,8 +131,11 @@ impl ToolRuntime {
     #[must_use]
     pub fn with_tools(mut self, tools: &Tools) -> Self {
         tools.start_providers();
+        self.exposure = tools.exposure();
+        self.deferred_tools_guidance_enabled = tools.deferred_tools_guidance_enabled;
         let registry = Arc::make_mut(&mut self.registry);
         registry.extend(tools.registered.iter().cloned());
+        registry.extend(tools.provider_direct.iter().cloned());
         registry.providers.extend(tools.providers.iter().cloned());
         if let Some(working_directory) = &tools.working_directory {
             self.working_directory = Arc::clone(working_directory);
@@ -168,24 +175,44 @@ impl ToolRuntime {
     /// session.
     #[must_use]
     pub fn model_specs(&self, _session_id: &str) -> Vec<ToolDefinition> {
-        let has_deferred_search = !self.registry.providers.is_empty()
-            && self
-                .registry
-                .definitions()
-                .iter()
-                .any(|definition| definition.name() == "tool_search");
-        let (mut native, mut nested): (Vec<_>, Vec<_>) = self
+        let mut nested = self
             .registry
             .definitions()
             .iter()
+            .filter(|definition| !matches!(definition, ToolDefinition::ToolSearch { .. }))
             .cloned()
-            .partition(|definition| matches!(definition, ToolDefinition::ToolSearch { .. }));
-        nested.sort_by(|left, right| left.name().cmp(right.name()));
-        native.extend([
-            code_mode::exec_spec(&nested, has_deferred_search),
+            .collect::<Vec<_>>();
+        let mut direct = self
+            .registry
+            .definitions()
+            .iter()
+            .filter(|definition| {
+                self.exposure == ToolExposure::DirectAndCodeMode
+                    && !matches!(definition, ToolDefinition::ToolSearch { .. })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if self.exposure == ToolExposure::DirectAndCodeMode {
+            direct = group_direct_code_mode_definitions(direct);
+            crate::code_mode_order::sort_direct_definitions(&mut direct);
+        }
+        crate::code_mode_order::sort_definitions(&mut nested);
+        let mut native = vec![
+            code_mode::exec_spec(
+                &nested,
+                self.deferred_tools_guidance_enabled,
+                self.exposure == ToolExposure::CodeModeOnly,
+            ),
             code_mode::wait_spec(),
-        ]);
-        native.sort_by(|left, right| left.name().cmp(right.name()));
+        ];
+        native.append(&mut direct);
+        native.extend(
+            self.registry
+                .definitions()
+                .iter()
+                .filter(|definition| matches!(definition, ToolDefinition::ToolSearch { .. }))
+                .cloned(),
+        );
         native
     }
 
@@ -298,6 +325,42 @@ impl ToolRuntime {
     ) -> ToolOutput {
         self.registry.execute_direct(name, input, context).await
     }
+}
+
+fn group_direct_code_mode_definitions(definitions: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+    let mut grouped = Vec::<ToolDefinition>::new();
+    for definition in definitions {
+        let canonical_name = definition.name().to_owned();
+        let mut definition = code_mode::description::augment_definition_for_code_mode(definition);
+        let Some((namespace, name)) = canonical_name.rsplit_once("__") else {
+            grouped.push(definition);
+            continue;
+        };
+        if namespace.is_empty() || name.is_empty() {
+            grouped.push(definition);
+            continue;
+        }
+        let ToolDefinition::Function {
+            name: direct_name, ..
+        } = &mut definition
+        else {
+            grouped.push(definition);
+            continue;
+        };
+        *direct_name = name.into();
+        if let Some(ToolDefinition::Namespace { tools, .. }) = grouped.iter_mut().find(
+            |group| matches!(group, ToolDefinition::Namespace { name, .. } if &**name == namespace),
+        ) {
+            tools.push(definition);
+        } else {
+            grouped.push(ToolDefinition::namespace(
+                namespace,
+                format!("Tools in the {namespace} namespace."),
+                [definition],
+            ));
+        }
+    }
+    grouped
 }
 
 impl ToolRuntimeControl {

@@ -3,7 +3,10 @@ use std::{collections::HashMap, sync::Arc};
 use http::{HeaderName, HeaderValue, header::USER_AGENT};
 use rmcp::{
     ServiceExt,
-    model::{CallToolRequestParams, CallToolResult, Tool},
+    model::{
+        CallToolRequestParams, CallToolResult, ListResourceTemplatesResult, ListResourcesResult,
+        PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult, Tool,
+    },
     service::{RoleClient, RunningService},
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -41,6 +44,36 @@ impl ClientInner {
         result
     }
 
+    pub(crate) async fn list_resources(
+        &self,
+        params: Option<PaginatedRequestParams>,
+    ) -> Result<ListResourcesResult, rmcp::service::ServiceError> {
+        let parent = Span::current();
+        let result = self.service.list_resources(params).await;
+        self.persist_oauth(&parent).await;
+        result
+    }
+
+    pub(crate) async fn list_resource_templates(
+        &self,
+        params: Option<PaginatedRequestParams>,
+    ) -> Result<ListResourceTemplatesResult, rmcp::service::ServiceError> {
+        let parent = Span::current();
+        let result = self.service.list_resource_templates(params).await;
+        self.persist_oauth(&parent).await;
+        result
+    }
+
+    pub(crate) async fn read_resource(
+        &self,
+        params: ReadResourceRequestParams,
+    ) -> Result<ReadResourceResult, rmcp::service::ServiceError> {
+        let parent = Span::current();
+        let result = self.service.read_resource(params).await;
+        self.persist_oauth(&parent).await;
+        result
+    }
+
     async fn list_all_tools(
         &self,
         parent: &Span,
@@ -52,6 +85,14 @@ impl ClientInner {
             tracing::warn!(%error, "failed to persist refreshed MCP OAuth credentials");
         }
         tools
+    }
+
+    async fn persist_oauth(&self, parent: &Span) {
+        if let Some(oauth) = &self.oauth
+            && let Err(error) = oauth.persist_if_changed(parent).await
+        {
+            tracing::warn!(%error, "failed to persist refreshed MCP OAuth credentials");
+        }
     }
 }
 

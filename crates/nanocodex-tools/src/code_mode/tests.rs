@@ -15,7 +15,7 @@ use tokio::sync::Semaphore;
 use super::{
     CellError, CellLifecycle, CellObservationState, CellUpdate, CodeModeExecution,
     CodeModeObserver, CodeModeUpdate, LiveCell, NestedToolCall, ObservationBuffer, ObservationMode,
-    nested_tool_yield_after, observe_cell, observer_yield_timeout, parse_exec_source,
+    observe_cell, observer_yield_timeout, parse_exec_source,
 };
 use crate::{
     Tool, ToolContext, ToolInput, ToolOutput, ToolOutputBody, ToolOutputContent, ToolResult, Tools,
@@ -316,7 +316,7 @@ text({
 }
 
 #[tokio::test]
-async fn all_tools_exposes_runtime_only_tool_contracts() -> Result<()> {
+async fn all_tools_matches_codex_metadata_shape() -> Result<()> {
     let workspace = temporary_workspace("all-tools-metadata")?;
     let tools = test_tools(&workspace);
     let history = Vec::new();
@@ -327,6 +327,7 @@ text(ALL_TOOLS.map((tool) => ({
   keys: Object.keys(tool).sort(),
   frozen: Object.isFrozen(tool),
   hasInputSchema: typeof tool.input_schema === "object",
+  hasOutputSchema: typeof tool.output_schema === "object",
   serializedSchema: JSON.stringify(tool).includes("input_schema"),
 })));
 "#,
@@ -343,7 +344,8 @@ text(ALL_TOOLS.map((tool) => ({
     assert!(tools.iter().all(|tool| {
         tool["keys"] == serde_json::json!(["description", "name"])
             && tool["frozen"] == true
-            && tool["hasInputSchema"] == true
+            && tool["hasInputSchema"] == false
+            && tool["hasOutputSchema"] == false
             && tool["serializedSchema"] == false
     }));
     std::fs::remove_dir_all(workspace)?;
@@ -1762,57 +1764,6 @@ fn exec_pragma_rejects_unknown_fields() {
     assert!(error.contains("only supports"));
 }
 
-#[test]
-fn nested_shell_yields_follow_the_handlers_bounds() {
-    assert_eq!(
-        nested_tool_yield_after("exec_command", &serde_json::json!({ "cmd": "sleep 1" })),
-        Some(Duration::from_secs(10))
-    );
-    assert_eq!(
-        nested_tool_yield_after("write_stdin", &serde_json::json!({ "session_id": 1 }),),
-        Some(Duration::from_secs(5))
-    );
-    assert_eq!(
-        nested_tool_yield_after(
-            "write_stdin",
-            &serde_json::json!({ "session_id": 1, "chars": "x" }),
-        ),
-        Some(Duration::from_millis(250))
-    );
-    assert_eq!(
-        nested_tool_yield_after(
-            "exec_command",
-            &serde_json::json!({ "yield_time_ms": 45_000 }),
-        ),
-        Some(Duration::from_secs(30))
-    );
-    assert_eq!(
-        nested_tool_yield_after(
-            "write_stdin",
-            &serde_json::json!({ "session_id": 1, "yield_time_ms": 120_000 }),
-        ),
-        Some(Duration::from_mins(2))
-    );
-    assert_eq!(
-        nested_tool_yield_after(
-            "write_stdin",
-            &serde_json::json!({
-                "session_id": 1,
-                "chars": "x",
-                "yield_time_ms": 120_000,
-            }),
-        ),
-        Some(Duration::from_secs(30))
-    );
-    assert_eq!(
-        nested_tool_yield_after(
-            "apply_patch",
-            &serde_json::json!({ "yield_time_ms": 30_000 })
-        ),
-        None
-    );
-}
-
 #[tokio::test]
 async fn negative_shell_limits_fail_during_codex_compatible_argument_parsing() -> Result<()> {
     let workspace = temporary_workspace("negative-shell-limits")?;
@@ -1911,7 +1862,6 @@ async fn dropped_observer_preserves_consumed_output_for_the_next_observation() -
             std::time::Instant::now(),
             ObservationMode::YieldAfter(Duration::from_secs(60)),
             None,
-            false,
             &mut observer,
         )
         .await
@@ -1926,7 +1876,6 @@ async fn dropped_observer_preserves_consumed_output_for_the_next_observation() -
             call_id: "call/code-1".to_owned(),
             name: "test".to_owned(),
             input: Value::Null,
-            yield_after: None,
         })
         .expect("test cell should receive the observation barrier");
     tokio::time::timeout(Duration::from_secs(1), started_rx)
@@ -1952,7 +1901,6 @@ async fn dropped_observer_preserves_consumed_output_for_the_next_observation() -
         std::time::Instant::now(),
         ObservationMode::YieldAfter(Duration::from_secs(1)),
         None,
-        false,
         &mut super::IgnoreCodeModeUpdates,
     )
     .await;
@@ -1991,7 +1939,6 @@ async fn yield_deadline_preempts_already_buffered_runtime_output() {
         std::time::Instant::now(),
         ObservationMode::YieldAfter(Duration::ZERO),
         None,
-        false,
         &mut super::IgnoreCodeModeUpdates,
     )
     .await;
@@ -2011,7 +1958,6 @@ async fn yield_deadline_preempts_already_buffered_runtime_output() {
         std::time::Instant::now(),
         ObservationMode::YieldAfter(Duration::from_secs(1)),
         None,
-        false,
         &mut super::IgnoreCodeModeUpdates,
     )
     .await;
@@ -2023,7 +1969,7 @@ async fn yield_deadline_preempts_already_buffered_runtime_output() {
 }
 
 #[tokio::test]
-async fn default_cell_yield_extends_for_a_longer_nested_shell_wait() {
+async fn nested_tool_start_does_not_extend_the_outer_yield() {
     let (updates_tx, updates) = tokio::sync::mpsc::unbounded_channel();
     let (terminate, _terminate_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
@@ -2032,7 +1978,6 @@ async fn default_cell_yield_extends_for_a_longer_nested_shell_wait() {
                 call_id: "call/code-1".to_owned(),
                 name: "write_stdin".to_owned(),
                 input: serde_json::Value::Null,
-                yield_after: Some(Duration::from_millis(40)),
             })
             .expect("observer should receive the nested call");
         tokio::time::sleep(Duration::from_millis(15)).await;
@@ -2051,45 +1996,6 @@ async fn default_cell_yield_extends_for_a_longer_nested_shell_wait() {
         std::time::Instant::now(),
         ObservationMode::YieldAfter(Duration::from_millis(5)),
         None,
-        true,
-        &mut super::IgnoreCodeModeUpdates,
-    )
-    .await;
-
-    assert!(!running);
-    assert!(execution.success);
-    assert!(execution_output(&execution).contains("Script completed"));
-    cell.join().await;
-}
-
-#[tokio::test]
-async fn explicit_cell_yield_is_not_extended_by_a_nested_shell_wait() {
-    let (updates_tx, updates) = tokio::sync::mpsc::unbounded_channel();
-    let (terminate, _terminate_rx) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
-        updates_tx
-            .send(CellUpdate::NestedCallStarted {
-                call_id: "call/code-1".to_owned(),
-                name: "write_stdin".to_owned(),
-                input: serde_json::Value::Null,
-                yield_after: Some(Duration::from_millis(40)),
-            })
-            .expect("observer should receive the nested call");
-        tokio::time::sleep(Duration::from_millis(15)).await;
-        let _ = updates_tx.send(CellUpdate::Completed);
-    });
-    let cell = test_live_cell(1, updates, terminate, task);
-    let observation = cell
-        .begin_observation()
-        .expect("test cell should not already have an observer");
-
-    let (execution, running) = observe_cell(
-        &cell,
-        observation,
-        std::time::Instant::now(),
-        ObservationMode::YieldAfter(Duration::from_millis(5)),
-        None,
-        false,
         &mut super::IgnoreCodeModeUpdates,
     )
     .await;

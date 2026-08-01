@@ -34,6 +34,30 @@ let tools = Tools::builder()
 # }
 ```
 
+`Tools` defaults to `ToolExposure::CodeModeOnly`, where ordinary tools are
+available through `exec` and only Code Mode entrypoints are directly visible.
+Select `ToolExposure::DirectAndCodeMode` when a consumer needs the same
+ordinary tools directly as well as through `exec`:
+
+```rust
+use nanocodex_tools::{ToolExposure, Tools};
+
+# fn build() -> Result<(), nanocodex_tools::ToolsBuildError> {
+let tools = Tools::builder()
+    .exposure(ToolExposure::DirectAndCodeMode)
+    .build()?;
+# Ok(())
+# }
+```
+
+Matching Codex, direct-plus-Code-Mode exposure keeps `exec` terse and
+adds each typed `exec` declaration to the corresponding direct tool; Code
+Mode-only instead carries the complete nested catalog in `exec`. Selection
+changes model-visible exposure, not registration or dispatch behavior.
+Namespaced Code Mode names such as `image_gen__imagegen` remain available to
+`exec`; normal Code Mode exposes the Codex-compatible `image_gen.imagegen`
+Responses namespace and routes its namespaced call to the same handler.
+
 Macro tools execute serially unless `parallel = true` explicitly marks their
 local effects as safe to overlap. This does not change the provider wire
 protocol.
@@ -114,10 +138,12 @@ let tools = Tools::builder().provider(mcp).build()?;
 # }
 ```
 
-Handshakes and discovery start with the owning runtime. `mcp::Mcp` exposes only
-the provider-native `tool_search` initially. Search results contain loadable MCP
-namespaces for direct model calls and also activate the matching definitions for
-Code Mode, keeping large catalogs out of the initial tool list.
+Handshakes and discovery start with the owning runtime. Under
+`DirectAndCodeMode`, `mcp::Mcp` initially exposes the provider-native
+`tool_search`; Code Mode-only discovers the same deferred tools through
+`ALL_TOOLS`. Search results contain loadable MCP namespaces for direct model
+calls and also activate matching Code Mode definitions, keeping large catalogs
+out of the initial tool list.
 
 ## Companion workspace runtimes
 
@@ -134,8 +160,9 @@ tool implementation or an alternate mode for normal native applications.
 ## Going lower level
 
 The crate root intentionally contains only the normal registry path:
-[`Tools`], `ToolsBuilder`, `ToolsBuildError`, [`Tool`], `tool`, and the
-types required by the `Tool` methods, plus
+[`Tools`], `ToolsBuilder`, `ToolsBuildError`, [`Tool`], `tool`, and the types
+required by the `Tool` methods. [`ToolExposure`] is the advanced declaration
+policy for consumers that compare direct and Code Mode calls. The root also exposes
 [`ambient_sensitive_environment`](crate::ambient_sensitive_environment) for
 deliberately restoring proxy-safe credential markers to tool subprocesses.
 
