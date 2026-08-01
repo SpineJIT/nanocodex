@@ -2271,6 +2271,7 @@ fn handle_key(
 
     if key.modifiers.contains(KeyModifiers::ALT) {
         match key.code {
+            KeyCode::Backspace => app.delete_word_before_cursor(),
             KeyCode::Char('b') | KeyCode::Left => app.move_word_left(),
             KeyCode::Char('f') | KeyCode::Right => app.move_word_right(),
             _ => {}
@@ -2539,6 +2540,7 @@ fn handle_inline_historical_editor_key(
     if key.modifiers.contains(KeyModifiers::ALT) {
         match key.code {
             KeyCode::Enter => app.insert_char('\n'),
+            KeyCode::Backspace => app.delete_word_before_cursor(),
             KeyCode::Char('b') | KeyCode::Left => app.move_word_left(),
             KeyCode::Char('f') | KeyCode::Right => app.move_word_right(),
             _ => {}
@@ -4150,6 +4152,43 @@ mod tests {
 
         assert!(app.input.is_empty());
         assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn alt_backspace_deletes_the_previous_composer_word() {
+        let (commands, _worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        app.input = "one two".to_owned();
+        app.cursor = app.input.len();
+
+        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(
+            handle_key(key, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
+
+        assert_eq!(app.input, "one ");
+        assert_eq!(app.cursor, app.input.len());
+    }
+
+    #[test]
+    fn alt_backspace_deletes_the_previous_inline_edit_word() {
+        let (commands, _worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        app.main
+            .transcript
+            .push_editable_user("earlier prompt".to_owned(), 17);
+        app.move_up();
+        assert!(app.start_historical_edit());
+
+        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(
+            handle_key(key, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
+
+        assert_eq!(app.input, "earlier ");
+        assert_eq!(app.cursor, app.input.len());
     }
 
     async fn next_ws_json<S>(socket: &mut WebSocketStream<S>) -> eyre::Result<Value>
