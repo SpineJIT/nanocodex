@@ -122,28 +122,31 @@ impl SafariCookieSource {
     /// # Errors
     ///
     /// Returns an error on other platforms or when the store is unavailable.
-    pub fn standard() -> Result<Self, BrowserCookieSourceError> {
-        #[cfg(not(target_os = "macos"))]
-        {
-            Err(BrowserCookieSourceError::StandardProfileUnavailable { browser: "Safari" })
-        }
+    #[cfg(not(target_os = "macos"))]
+    pub const fn standard() -> Result<Self, BrowserCookieSourceError> {
+        Err(BrowserCookieSourceError::StandardProfileUnavailable { browser: "Safari" })
+    }
 
-        #[cfg(target_os = "macos")]
-        {
-            let home =
-                env::var_os("HOME").ok_or(BrowserCookieSourceError::HomeDirectoryUnavailable)?;
-            let home = PathBuf::from(home);
-            let candidates = [
-                home.join(
-                    "Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",
-                ),
-                home.join("Library/Cookies/Cookies.binarycookies"),
-            ];
-            let path = candidates.into_iter().find(|path| path.is_file()).ok_or(
-                BrowserCookieSourceError::StandardProfileUnavailable { browser: "Safari" },
-            )?;
-            Self::new(path)
-        }
+    /// Locates Safari's standard sandboxed cookie store on macOS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store is unavailable.
+    #[cfg(target_os = "macos")]
+    pub fn standard() -> Result<Self, BrowserCookieSourceError> {
+        let home = env::var_os("HOME").ok_or(BrowserCookieSourceError::HomeDirectoryUnavailable)?;
+        let home = PathBuf::from(home);
+        let candidates = [
+            home.join(
+                "Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",
+            ),
+            home.join("Library/Cookies/Cookies.binarycookies"),
+        ];
+        let path = candidates
+            .into_iter()
+            .find(|path| path.is_file())
+            .ok_or(BrowserCookieSourceError::StandardProfileUnavailable { browser: "Safari" })?;
+        Self::new(path)
     }
 
     /// Uses an explicit Safari/WebKit `.binarycookies` file.
