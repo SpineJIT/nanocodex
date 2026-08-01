@@ -3862,7 +3862,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -3880,7 +3880,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4913,7 +4913,7 @@ dependencies = [
 [[package]]
 name = "mpp"
 version = "0.11.0"
-source = "git+https://github.com/gakonst/mpp-rs?rev=ad1f4f79d918a1ca5605d5b417d7090238381328#ad1f4f79d918a1ca5605d5b417d7090238381328"
+source = "git+https://github.com/tempoxyz/mpp-rs?rev=3e37469bb19434982b433ae44ea8c713f7ea923a#3e37469bb19434982b433ae44ea8c713f7ea923a"
 dependencies = [
  "alloy",
  "anyhow",
@@ -6561,7 +6561,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6599,7 +6599,7 @@ dependencies = [
  "cfg_aliases 0.2.1",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
