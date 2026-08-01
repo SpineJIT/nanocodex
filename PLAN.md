@@ -3,123 +3,201 @@
 ## Objective
 
 Build high-quality reusable Rust building blocks for frontier OpenAI agents.
-Nanocodex makes a small number of deliberate choices about libraries, public
-APIs, performance, and observability while following the supported Codex
-harness behavior exactly. It does not reimplement policy already owned by the
-model or harness.
+Nanocodex makes a small number of deliberate choices about models, transport,
+ownership, tools, performance, and observability. The embeddable APIs are the
+product; the CLI, Ratatui application, hosted WASM deployments, managed-agent
+service, and evaluation harnesses are concrete consumers that prove those APIs.
 
-Every stable crate must be useful independently, documented from its own
+Every stable crate must remain useful independently, documented from its own
 README, tested through its public paths, benchmarked at the boundaries it can
-affect, and observable without adopting the Nanocodex CLI.
+affect, and observable without adopting the Nanocodex CLI. Experimental crates
+may move faster, but they must preserve the same ownership discipline and may
+not leak application policy into the stable graph.
 
-## PR #50 delivery boundary
+## Current baseline
 
-PR #50 is the only active delivery target. It must preserve behavior available
-on `master` unless a removal is explicit and covered by a regression or
-migration, and it must be independently mergeable.
+The PR #50 refactor and the `0.3.0` release are complete. The repository has
+since moved beyond that delivery boundary:
 
-1. **Re-establish Codex parity**
-   - Treat `openai/codex@35eaf3ffb0bf2001486c68c47a3d946b34d16634`
-     as the last authoritative reviewed checkpoint.
-   - Inspect and classify every later upstream commit before advancing that
-     checkpoint.
-   - Differentially verify prompt-cache identity and stable prefixes;
-     `AGENTS.md` and environment injection; typed history and
-     `previous_response_id`; reconnect/full replay; automatic/manual
-     compaction; steering/cancellation; completed-only commits; retries and
-     fallback; tool ordering, errors, panics, and process cleanup; and shared
-     ChatGPT authentication.
-   - Fix demonstrated mismatches test-first. Record intentional differences
-     explicitly; do not silently call them parity.
+- the stable crates own the OpenAI, tool, agent, observability, and facade
+  boundaries described in the workspace instructions;
+- retained VM-backed workspace tools, composable egress, and host-side secret
+  routing are available as experimental application infrastructure;
+- deterministic browser automation, a dedicated headed browser VM, and the
+  normal CLI browser provider are implemented;
+- reusable GPT Realtime voice sessions and the Ratatui voice consumer are
+  implemented with current Codex transport behavior;
+- native, Python, Node, browser WASM, Cloudflare Durable Object, and Rivet Actor
+  consumers exercise the same owned session API; and
+- nightly and stable release automation, differential workloads, retained
+  traces, and performance gates exist and must continue to protect the public
+  contracts.
 
-2. **Stabilize crate ownership and public paths**
-   - `nanocodex-oai-api` owns the complete OpenAI boundary and honest Tower
-     seams.
-   - `nanocodex-tools` owns tool implementations, Code Mode, MCP, and deferred
-     search.
-   - `nanocodex-agent` owns the private driver, lifecycle, state, branching,
-     snapshots, and rollouts.
-   - `nanocodex` remains a thin Alloy-style facade.
-   - Keep mutable run configuration, events plumbing, attempt factories,
-     response/turn IDs, queues, sockets, and replay bookkeeping private.
-   - Remove accidental exports, compatibility leftovers, duplicate bindings,
-     empty directories, unused dependencies/features, and unnecessary cfgs.
+Do not reopen completed refactor work unless a regression, current consumer, or
+measured boundary demonstrates a concrete problem.
 
-3. **Make the stable APIs legible**
-   - Give each stable crate a focused README included into crate docs.
-   - Put the normal consumer path first and advanced Tower/protocol surfaces
-     behind progressive disclosure.
-   - Compile complete public examples through canonical paths.
-   - Keep `OpenAiBuilder::{layer,service}` as the deliberate transport seam.
+## Delivery model
 
-4. **Lock in performance and observability**
-   - Define representative benchmarks and explicit thresholds for request
-     construction, history replay/checkpointing, context accounting and
-     compaction, event delivery, tool dispatch, Code Mode, MCP discovery/search,
-     and changed TUI state/render work.
-   - Follow init4-style bounded spans and explicit parent propagation while
-     keeping contractual events independent from tracing.
-   - Preserve full-fidelity ordered prompts, model traffic, reasoning and
-     encrypted reasoning, tool activity, steering, cancellation, token/cache
-     data, latency, and automatic `gpt-5.6-sol` USD cost.
+There is no longer one repository-wide pull request boundary. Work advances as
+small, independently mergeable vertical slices. Each slice must have a real
+consumer, preserve unrelated behavior, and leave `master` releasable.
 
-5. **Prove the complete PR path**
-   - Validate crate boundaries, formatting, warnings-denied Clippy, workspace
-     and all-target tests, rustdoc/doctests/examples, WASM, Node/browser, PyO3,
-     CLI/Ratatui, and a live native smoke.
-   - Run the stock-Codex differential suite.
-   - Terminal-Bench 2.1 milestone evaluation is delegated to the user's
-     separate thread. This thread does not bootstrap Harbor, alter eval inputs,
-     or wait on that result.
-   - Fix every real PR #50 CI failure and leave required checks green with no
-     known merge blocker.
+For each slice:
+
+1. establish the public or application-owned contract and its owner;
+2. implement the complete lifecycle, including cancellation and cleanup;
+3. add focused deterministic regressions and representative measurements;
+4. validate affected native, WASM, language-binding, example, and crate-boundary
+   consumers; and
+5. merge only with required checks green and no known migration ambiguity.
+
+Codex remains behavioral evidence rather than an API specification. Before a
+new parity claim, reconcile the authoritative checkpoint in the workspace
+instructions with the classifications already recorded in
+[`docs/CODEX_PARITY.md`](docs/CODEX_PARITY.md), update the local Codex checkout,
+and classify every intervening commit as port/evaluate/defer/out-of-scope. Do
+not let an unreviewed upstream change silently redefine Nanocodex behavior.
+
+## Active milestones
+
+### 1. Runtime and Code Mode parity
+
+- Land the focused Code Mode contract alignment from
+  [PR #95](https://github.com/gakonst/nanocodex/pull/95) independently of the
+  evaluation stack it came from.
+- Preserve one model-facing Code Mode tool, deferred runtime discovery, exact
+  tool ordering, caller-owned exposure policy, and the current provider-native
+  Responses namespace boundary.
+- Refresh the Codex parity ledger through a deliberately selected current
+  checkpoint. Port only relevant invariants with direct regression evidence;
+  keep app-server, approval, provider-portability, and unrelated TUI behavior
+  classified out of scope.
+
+### 2. Browser identity, placement, and visibility
+
+- Finish the private-browser desktop profile import in
+  [PR #93](https://github.com/gakonst/nanocodex/pull/93). Cookie extraction must
+  remain harness-owned, allowlisted, typed, non-mutating, and absent from the
+  model-callable schema.
+- Replace the single CLI browser boolean with deliberate caller-owned session
+  policy while preserving a migration path for bare `--browser`:
+  - `private-host`: a Nanocodex-owned host browser;
+  - `private-vm`: the existing isolated browser VM; and
+  - `user-chrome`: an explicitly enabled bridge to the user's running Chrome.
+- Keep presentation independent from placement. `background` and `visible` are
+  presentation choices; Chromium running under Xvfb is headed but is not
+  visible until a bounded display or screenshot-stream consumer exists.
+- Keep tab acquisition explicit and fail closed:
+  - private modes create owned tabs;
+  - user-Chrome mode creates a tab in a named Nanocodex group by default;
+  - taking over an existing tab requires an explicit user selection or exact
+    tab mention matched against freshly listed ID, title, URL, browser instance,
+    recency, and group metadata; and
+  - claimed user tabs remain in their existing group and are released rather
+    than closed at cleanup.
+- Implement user-Chrome control through a Nanocodex Chrome extension and a
+  versioned native-messaging host. Do not attach ordinary remote CDP to a
+  personal default profile and do not depend on the proprietary ChatGPT Chrome
+  extension or its protocol.
+- Lease every controlled tab to one browser session, surface user/debugger
+  interruption as cancellation, clean up agent-created tabs deterministically,
+  and keep open-tab inventory out of model context unless the caller explicitly
+  provides the selected tab.
+- Decide whether `private-vm` means the dedicated browser VM or a browser
+  co-located with the retained workspace VM before promising guest-localhost
+  testing. If the processes remain in different VMs, expose an explicit,
+  bounded forwarding path rather than relying on host-network accidents.
+- Preserve `BrowserTool` as an ordinary caller-owned provider. Any extension
+  backend must either support the declared action contract or expose an honest
+  capability-specific contract; unsupported actions must not be discovered as
+  usable.
+
+### 3. Application-owned terminals and managed sessions
+
+- Rebase and finish the narrow application-owned terminal contract in
+  [PR #79](https://github.com/gakonst/nanocodex/pull/79). Retained process state,
+  cancellation, output bounds, and descendant cleanup remain owned by the
+  tool runtime rather than the agent driver.
+- Review and land [PR #89](https://github.com/gakonst/nanocodex/pull/89) only as
+  a concrete experimental managed-session consumer: durable actors may own
+  Nanocodex sessions, idempotency, event replay, policy, disposable VMs, and
+  service projection, but the stable agent crates must not become an app server
+  or generic scheduler.
+- Keep payment, tenant, authentication, deployment, and secret-routing policy
+  in the consuming application. Lower `nanocodex-*` libraries own typed seams,
+  not one hosted product's policy.
+
+### 4. Evaluation as product evidence
+
+- Rebase and complete the VM-backed differential evaluation foundation in
+  [PR #61](https://github.com/gakonst/nanocodex/pull/61) after its extracted
+  Code Mode slice lands.
+- Keep [PR #72](https://github.com/gakonst/nanocodex/pull/72) stacked until the
+  base evaluation contract is merged, then validate StableBench with exact
+  retained artifacts, canonical verifier output, scorer provenance, model
+  usage, and cost.
+- Keep deterministic task correctness authoritative. Optional model scoring may
+  add evidence but must not overwrite verifier rewards or turn scorer failure
+  into a false correctness failure.
+- Re-evaluate the older recursive task-tooling experiment in
+  [PR #32](https://github.com/gakonst/nanocodex/pull/32) only after current
+  differential evidence identifies a concrete need. Do not merge a generic
+  recursive scheduler because the branch exists.
+- Never modify benchmark tasks, verifiers, images, or expected outputs to make
+  Nanocodex pass. Inspect exact JSONL, trajectories, retained files, verifier
+  logs, and cold-versus-warm timing before making an evaluation claim.
+
+### 5. Next release gate
+
+- Select the next version only after the included milestones and migrations are
+  known; do not infer a version number from unreleased workspace metadata.
+- Update root and per-crate changelogs, public READMEs, migration notes, and
+  release examples from the actual merged graph.
+- Run crate-boundary checks, rustfmt, warnings-denied Clippy, workspace and
+  all-target tests, rustdoc/doctests/examples, WASM, Node/browser, PyO3,
+  CLI/Ratatui, static VM guest, live native smoke, focused browser/VM trials,
+  and the relevant differential suites.
+- Publish only from a clean, reviewed commit with required checks green; retain
+  exact release and evaluation artifacts.
 
 ## Current execution order
 
-1. [x] Complete the [Codex parity ledger](docs/CODEX_PARITY.md) from the pinned
-   checkpoint through
-   `openai/codex@be2e4afcd7392339d6adbaf0d31b26316bcaa2ab`.
-2. [x] Finish the behavior-preserving rollout, model/run, tool/runtime, and
-   driver module decompositions.
-3. [x] Verify the documented parity contracts and fix confirmed mismatches
-   test-first.
-4. [x] Establish 39 benchmark thresholds, retained-trace TUI gates, and the
-   full-fidelity observability path.
-5. [x] Run the in-scope consumer, differential, documentation, and smoke gates.
-   Terminal-Bench milestone evaluation remains delegated to the user's
-   separate thread.
-6. [x] Verify remote PR #50 head `c55293c` as `MERGEABLE`/`CLEAN` with all
-   required checks green before this documentation audit.
-7. [x] Correct stale public guides, add a `0.2.x` migration map, and rerun the
-   focused documentation checks.
-8. [ ] Classify the ten currently unreviewed local Codex commits from
-   `be2e4afc` through `bb1af235` before advancing the parity checkpoint.
-9. [x] Expose nameable generic Tower service-factory types and the standalone
-   session's protocol-level tool definitions and paired outputs. Keep
-   `nanocodex-tools::Tools` composition in the batteries-included agent rather
-   than adding `Session::tools`.
-10. [ ] Rerun required PR checks after the closeout changes and confirm the new
-    remote head is mergeable.
-11. [x] Add the library-first GPT Realtime voice slice: typed 24 kHz PCM
-    input/output, API-key WebSocket and Codex-compatible ChatGPT WebRTC
-    transports, plus an experimental `nanocodex-voice` default-device and
-    background-agent lifecycle consumed by the thin Ratatui `/voice` adapter.
-    ChatGPT voice uses the coding session's
-    subscription credential and frameless sideband; when no host attestation
-    exists, it sends Codex's accepted unavailable-token envelope. The TUI
-    exposes Codex's current voice catalog through `/voice list` and named
-    starts, with Codex's current `cove` default and Frameless model. Realtime
-    coding handoffs atomically steer an active regular turn or start a new turn,
-    so spoken follow-ups remain interactive during tool execution.
+1. [x] Merge PR #50, ship `0.3.0`, and establish the layered stable SDK.
+2. [x] Land retained VM tools, browser/VM automation, Realtime voice, reusable
+   hosted transports, composable egress, Cloudflare, and Rivet consumers.
+3. [ ] Finish and merge the focused Code Mode parity slice in PR #95.
+4. [ ] Reconcile and advance the Codex parity checkpoint with a complete commit
+   classification and direct evidence for every adopted behavior.
+5. [ ] Fix, validate, and merge desktop profile import in PR #93.
+6. [ ] Build browser placement and presentation policy for private host and
+   private VM sessions, then prove both through the CLI consumer.
+7. [ ] Prototype the user-Chrome extension/native-host path; prove exact tab
+   claiming, grouping, visible cursor feedback, interruption, leasing, and
+   cleanup before exposing it as normal CLI policy.
+8. [ ] Rebase and decide PR #79, then review PR #89 against the stable-core and
+   application-policy boundaries above.
+9. [ ] Rebase and merge PR #61, then complete the stacked StableBench work in
+   PR #72 and record retained differential evidence.
+10. [ ] Decide whether PR #32 still solves a demonstrated problem or should be
+    replaced by a smaller application-owned experiment.
+11. [ ] Cut the next release only after all selected milestones pass the full
+    release gate.
 
 ## Current non-goals
 
-- No provider abstraction, generic app server, compatibility layer, approval
-  subsystem, or alternate agent runtime.
-- No browser audio-device ownership or generic realtime/app-server protocol in
-  the core library.
-- No new `.service(...)` transport design without a concrete consumer.
-- No cosmetic CLI/TUI lifecycle rewrite when existing behavior is accepted.
-- No further VM, browser, managed-agent, proxy, or experimental-crate work.
-- No benchmark, task, or verifier modification made solely to improve an eval
-  score.
+- No provider abstraction, broad model portability layer, generic agent app
+  server, compatibility framework, approval subsystem, or stable multi-agent
+  scheduler in the core SDK.
+- No caller-visible socket tasks, mutable run state, replay bookkeeping,
+  browser tab leases, VM internals, or transport response identifiers.
+- No model-selected browser placement, ambient takeover of arbitrary personal
+  tabs, default-profile remote-debugging escape hatch, or silent fallback from
+  an isolated browser to the user's authenticated browser.
+- No browser audio-device ownership or generic realtime protocol in the core
+  library.
+- No provider/payment behavior in public `nanocodex-*` libraries and no generic
+  secret manager in the tool runtime.
+- No cosmetic CLI/TUI lifecycle rewrite without a demonstrated correctness or
+  measured performance reason.
+- No benchmark, task, verifier, or retained-artifact modification made solely
+  to improve an evaluation result.
