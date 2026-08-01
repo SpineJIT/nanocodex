@@ -10,8 +10,10 @@ pub(crate) enum SessionRequest {
     WriteFile(WriteFileRequest),
     CreateDirectory(CreateDirectoryRequest),
     ReadFile(ReadFileRequest),
+    Memory(MemoryRequest),
     Execute(ExecuteRequest),
     Cancel(CancelRequest),
+    TerminateToolProcesses(TerminateToolProcessesRequest),
     Shutdown(ShutdownRequest),
 }
 
@@ -24,8 +26,10 @@ impl SessionRequest {
             Self::WriteFile(request) => request.id,
             Self::CreateDirectory(request) => request.id,
             Self::ReadFile(request) => request.id,
+            Self::Memory(request) => request.id,
             Self::Execute(request) => request.id,
             Self::Cancel(request) => request.id,
+            Self::TerminateToolProcesses(request) => request.id,
             Self::Shutdown(request) => request.id,
         }
     }
@@ -39,8 +43,10 @@ pub(crate) enum SessionResponse {
     WriteFile(ControlResponse),
     CreateDirectory(ControlResponse),
     ReadFile(ReadFileResponse),
+    Memory(MemoryResponse),
     Execute(ExecuteResponse),
     Cancel(ControlResponse),
+    TerminateToolProcesses(ControlResponse),
     Shutdown(ControlResponse),
 }
 
@@ -52,8 +58,10 @@ impl SessionResponse {
             Self::WriteFile(response)
             | Self::CreateDirectory(response)
             | Self::Cancel(response)
+            | Self::TerminateToolProcesses(response)
             | Self::Shutdown(response) => response.id,
             Self::ReadFile(response) => response.id,
+            Self::Memory(response) => response.id,
             Self::Execute(response) => response.id,
         }
     }
@@ -62,6 +70,12 @@ impl SessionResponse {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReadyRequest {
+    pub id: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TerminateToolProcessesRequest {
     pub id: u64,
 }
 
@@ -102,6 +116,12 @@ pub(crate) struct ReadFileRequest {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct MemoryRequest {
+    pub id: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ExecuteRequest {
     pub id: u64,
     pub program: String,
@@ -110,6 +130,10 @@ pub(crate) struct ExecuteRequest {
     pub environment: Vec<(String, String)>,
     pub timeout_millis: u64,
     pub max_output_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_mirror: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_mirror: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -132,6 +156,16 @@ pub(crate) struct ReadFileResponse {
     pub id: u64,
     #[serde(default, with = "optional_wire_bytes")]
     pub contents: Option<Vec<u8>>,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MemoryResponse {
+    pub id: u64,
+    pub total_kib: Option<u64>,
+    pub minimum_available_kib: Option<u64>,
+    pub oom_kills: u64,
     pub error: Option<String>,
 }
 
@@ -220,9 +254,9 @@ mod tests {
 
     use super::{
         CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest, ExecuteResponse,
-        ReadFileRequest, ReadFileResponse, ReadyRequest, SessionRequest, SessionResponse,
-        ShutdownRequest, ToolRequest, ToolResponse, WireToolContext, WireToolInput,
-        WriteFileRequest,
+        MemoryRequest, MemoryResponse, ReadFileRequest, ReadFileResponse, ReadyRequest,
+        SessionRequest, SessionResponse, ShutdownRequest, TerminateToolProcessesRequest,
+        ToolRequest, ToolResponse, WireToolContext, WireToolInput, WriteFileRequest,
     };
 
     #[test]
@@ -239,6 +273,23 @@ mod tests {
         let encoded = serde_json::to_string(&request).unwrap();
 
         assert_eq!(encoded, r#"{"kind":"shutdown","payload":{"id":9}}"#);
+    }
+
+    #[test]
+    fn tool_process_termination_has_a_stable_typed_shape() {
+        let request =
+            SessionRequest::TerminateToolProcesses(TerminateToolProcessesRequest { id: 8 });
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"kind":"terminate_tool_processes","payload":{"id":8}}"#
+        );
+
+        let response =
+            SessionResponse::TerminateToolProcesses(ControlResponse { id: 8, error: None });
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r#"{"kind":"terminate_tool_processes","payload":{"id":8,"error":null}}"#
+        );
     }
 
     #[test]
@@ -396,6 +447,8 @@ mod tests {
             environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
             timeout_millis: 60_000,
             max_output_bytes: 8_388_608,
+            stdout_mirror: None,
+            stderr_mirror: None,
         });
         assert_eq!(
             serde_json::to_string(&execute).unwrap(),
@@ -427,6 +480,23 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&cancel).unwrap(),
             r#"{"kind":"cancel","payload":{"id":6,"error":null}}"#
+        );
+
+        let memory = SessionRequest::Memory(MemoryRequest { id: 7 });
+        assert_eq!(
+            serde_json::to_string(&memory).unwrap(),
+            r#"{"kind":"memory","payload":{"id":7}}"#
+        );
+        let memory = SessionResponse::Memory(MemoryResponse {
+            id: 7,
+            total_kib: Some(524_288),
+            minimum_available_kib: Some(131_072),
+            oom_kills: 1,
+            error: None,
+        });
+        assert_eq!(
+            serde_json::to_string(&memory).unwrap(),
+            r#"{"kind":"memory","payload":{"id":7,"total_kib":524288,"minimum_available_kib":131072,"oom_kills":1,"error":null}}"#
         );
     }
 }

@@ -140,8 +140,8 @@ pub use runtime_disk::{GuestRuntimeDisk, GuestRuntimeDiskError, GuestRuntimeDisk
     )
 ))]
 pub use session::{
-    VmCommand, VmCommandOutput, VmCommandPartialOutput, VmToolSession, VmToolSessionError,
-    VmToolSessionHandle,
+    VmCommand, VmCommandOutput, VmCommandPartialOutput, VmMemoryObservation, VmToolSession,
+    VmToolSessionError, VmToolSessionHandle,
 };
 
 /// One VM-aware execution capability shared by all proxied workspace tools.

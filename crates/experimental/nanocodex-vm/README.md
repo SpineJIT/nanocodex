@@ -78,6 +78,30 @@ The default tool selection keeps web search, image generation, and
 `apply_patch`, and `view_image`, preserving their standard model-visible names
 and schemas.
 
+### Session control and cleanup
+
+Specialized applications that construct a lower-level
+[`tools::VmToolSession`] can run trusted setup and harness commands with
+[`tools::VmCommand`]. Commands have explicit time and combined-output bounds.
+Dropping an in-flight command request queues cancellation; the guest terminates
+the command's process group on cancellation, timeout, output overflow, or
+session shutdown.
+
+[`tools::VmCommand::mirror_output`] additionally truncates two harness-owned
+guest files before launch and updates them as stdout and stderr arrive. This is
+intended for observing a long-running command from another request. It does not
+relax the command's retained-output bound or change its terminal result.
+
+At an agent-lifecycle boundary,
+[`tools::VmToolSession::terminate_tool_processes`] cancels processes and
+interactive shells owned by the workspace-tool runtime while leaving the VM,
+filesystem, and host-control channel alive. It does not claim to kill a process
+that deliberately detached from the runtime's managed process group. Call
+[`tools::VmToolSession::memory_observation`] for best-effort peak host RSS,
+guest memory use, and guest OOM evidence. Missing telemetry is represented by
+absent fields so it cannot replace the command or agent failure being
+diagnosed.
+
 ## Host, VMM, and guest ownership
 
 The retained path has three processes:
@@ -242,8 +266,10 @@ The remaining control methods have these payloads:
 | `write_file` | `path`, base64 `contents`, Unix `mode`, optional `modified_unix_seconds` | `error` |
 | `create_directory` | `path`, Unix `mode`, optional `modified_unix_seconds` | `error` |
 | `read_file` | `path` | base64 `contents` or `error` |
-| `execute` | `program`, `arguments`, `current_directory`, `environment`, `timeout_millis`, `max_output_bytes` | `exit_code`, base64 `stdout`, base64 `stderr`, `error`, `timed_out`, `output_limit_exceeded` |
+| `memory` | none | optional `total_kib`, optional `minimum_available_kib`, `oom_kills`, `error` |
+| `execute` | `program`, `arguments`, `current_directory`, `environment`, `timeout_millis`, `max_output_bytes`, optional `stdout_mirror`, optional `stderr_mirror` | `exit_code`, base64 `stdout`, base64 `stderr`, `error`, `timed_out`, `output_limit_exceeded` |
 | `cancel` | `target_id` | `error` |
+| `terminate_tool_processes` | none | `error` |
 | `shutdown` | none | `error` |
 
 Concrete examples:
@@ -259,17 +285,24 @@ Concrete examples:
 {"kind":"execute","payload":{"id":5,"exit_code":0,"stdout":"b2s=","stderr":"","error":null,"timed_out":false,"output_limit_exceeded":false}}
 {"kind":"cancel","payload":{"id":6,"target_id":5}}
 {"kind":"cancel","payload":{"id":6,"error":null}}
-{"kind":"shutdown","payload":{"id":7}}
-{"kind":"shutdown","payload":{"id":7,"error":null}}
+{"kind":"memory","payload":{"id":7}}
+{"kind":"memory","payload":{"id":7,"total_kib":786432,"minimum_available_kib":524288,"oom_kills":0,"error":null}}
+{"kind":"terminate_tool_processes","payload":{"id":8}}
+{"kind":"terminate_tool_processes","payload":{"id":8,"error":null}}
+{"kind":"shutdown","payload":{"id":9}}
+{"kind":"shutdown","payload":{"id":9,"error":null}}
 ```
 
 `write_file` creates parents and publishes through a sibling temporary file
 plus rename. `read_file` accepts only regular files and caps contents at
 32 MiB. `execute` clears the inherited environment, uses only the supplied
 pairs, captures combined output up to the requested bound, and kills the
-process group on timeout, output overflow, cancellation, or shutdown. It is a
-bounded one-response operation rather than a streaming terminal; retained
-interactive shells use the `exec_command`/`write_stdin` tool protocol.
+process group on timeout, output overflow, cancellation, or shutdown. Optional
+mirror paths receive the same stdout and stderr incrementally but do not alter
+that bound. `execute` is a bounded one-response operation rather than a
+streaming terminal; retained interactive shells use the
+`exec_command`/`write_stdin` tool protocol. `memory` reports the guest's
+minimum observed `MemAvailable` and OOM-kill counter over the session.
 
 Dropping a host request removes its pending response and queues a `cancel` with
 a fresh ID. The cancellation queue is bounded by the same 63 admission

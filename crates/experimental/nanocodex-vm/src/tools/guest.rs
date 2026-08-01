@@ -6,7 +6,7 @@ use std::{
     process::{ExitStatus, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -19,6 +19,7 @@ use nix::{
 };
 use thiserror::Error;
 use tokio::{
+    fs::{File, OpenOptions},
     io::{
         AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
         BufReader,
@@ -30,8 +31,8 @@ use tokio::{
 
 use super::protocol::{
     CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest, ExecuteResponse,
-    ReadFileRequest, ReadFileResponse, SessionRequest, SessionResponse, ShutdownRequest,
-    ToolResponse, WriteFileRequest,
+    MemoryResponse, ReadFileRequest, ReadFileResponse, SessionRequest, SessionResponse,
+    ShutdownRequest, ToolResponse, WriteFileRequest,
 };
 
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -39,6 +40,103 @@ const MAX_CONTROL_FILE_BYTES: usize = 32 * 1024 * 1024;
 #[cfg(feature = "guest-runtime")]
 const FILESYSTEM_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
+const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct GuestMemoryMonitor {
+    total_kib: AtomicU64,
+    minimum_available_kib: AtomicU64,
+    initial_oom_kills: AtomicU64,
+    current_oom_kills: AtomicU64,
+    oom_baseline_ready: AtomicBool,
+}
+
+impl GuestMemoryMonitor {
+    async fn sample(&self) {
+        let (meminfo, vmstat) = tokio::join!(
+            tokio::fs::read_to_string("/proc/meminfo"),
+            tokio::fs::read_to_string("/proc/vmstat"),
+        );
+        if let Ok(meminfo) = meminfo
+            && let Some((total_kib, available_kib)) = parse_meminfo(&meminfo)
+        {
+            self.total_kib.store(total_kib, Ordering::Relaxed);
+            let _ = self
+                .minimum_available_kib
+                .fetch_min(available_kib, Ordering::Relaxed);
+        }
+        if let Ok(vmstat) = vmstat
+            && let Some(oom_kills) = parse_vmstat_oom_kills(&vmstat)
+        {
+            if self
+                .oom_baseline_ready
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.initial_oom_kills.store(oom_kills, Ordering::Relaxed);
+            }
+            self.current_oom_kills.store(oom_kills, Ordering::Relaxed);
+        }
+    }
+
+    async fn run(self: Arc<Self>) {
+        loop {
+            self.sample().await;
+            tokio::time::sleep(MEMORY_SAMPLE_INTERVAL).await;
+        }
+    }
+
+    fn response(&self, id: u64) -> MemoryResponse {
+        let total_kib = self.total_kib.load(Ordering::Relaxed);
+        let minimum_available_kib = self.minimum_available_kib.load(Ordering::Relaxed);
+        let available = total_kib > 0 && minimum_available_kib != u64::MAX;
+        MemoryResponse {
+            id,
+            total_kib: available.then_some(total_kib),
+            minimum_available_kib: available.then_some(minimum_available_kib),
+            oom_kills: self
+                .current_oom_kills
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.initial_oom_kills.load(Ordering::Relaxed)),
+            error: (!available).then(|| "guest /proc memory telemetry is unavailable".to_owned()),
+        }
+    }
+}
+
+fn parse_meminfo(contents: &str) -> Option<(u64, u64)> {
+    let mut total = None;
+    let mut available = None;
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(value) = value
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        match key {
+            "MemTotal" => total = Some(value),
+            "MemAvailable" => available = Some(value),
+            _ => {}
+        }
+        if total.is_some() && available.is_some() {
+            break;
+        }
+    }
+    Some((total?, available?))
+}
+
+fn parse_vmstat_oom_kills(contents: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let key = fields.next()?;
+        let value = fields.next()?;
+        (key == "oom_kill").then(|| value.parse().ok()).flatten()
+    })
+}
 
 /// Failure while serving VM tool requests inside the guest.
 #[derive(Debug, Error)]
@@ -111,6 +209,12 @@ where
             std::env::vars_os().collect(),
         ),
     );
+    let memory = Arc::new(GuestMemoryMonitor {
+        minimum_available_kib: AtomicU64::new(u64::MAX),
+        ..GuestMemoryMonitor::default()
+    });
+    memory.sample().await;
+    let memory_task = tokio::spawn(Arc::clone(&memory).run());
     let mut input = BufReader::new(input);
     let mut requests = JoinSet::<SessionResponse>::new();
     let mut active = HashMap::<u64, tokio::task::AbortHandle>::new();
@@ -156,14 +260,26 @@ where
                             });
                             write_response(&mut output, &response, max_frame_bytes).await?;
                         }
+                        SessionRequest::TerminateToolProcesses(request) => {
+                            runtime.control().cancel().await;
+                            let response =
+                                SessionResponse::TerminateToolProcesses(ControlResponse {
+                                    id: request.id,
+                                    error: None,
+                                });
+                            write_response(&mut output, &response, max_frame_bytes).await?;
+                        }
                         request => {
                             let id = request.id();
                             if active.contains_key(&id) {
                                 return Err(VmGuestError::DuplicateRequestId(id));
                             }
                             let runtime = Arc::clone(&runtime);
+                            let memory = Arc::clone(&memory);
                             let task =
-                                requests.spawn(async move { execute_request(runtime, request).await });
+                                requests.spawn(async move {
+                                    execute_request(runtime, memory, request).await
+                                });
                             active.insert(id, task);
                         }
                     }
@@ -175,6 +291,7 @@ where
     .await;
 
     runtime.control().cancel().await;
+    memory_task.abort();
     if let Some(request) = result? {
         let response = SessionResponse::Shutdown(sync(request).await);
         write_response(&mut output, &response, max_frame_bytes).await?;
@@ -215,6 +332,7 @@ async fn serve_test_io_with_frame_limit(
 
 async fn execute_request(
     runtime: Arc<WorkspaceToolRuntime>,
+    memory: Arc<GuestMemoryMonitor>,
     request: SessionRequest,
 ) -> SessionResponse {
     match request {
@@ -243,6 +361,7 @@ async fn execute_request(
             SessionResponse::CreateDirectory(create_directory(request).await)
         }
         SessionRequest::ReadFile(request) => SessionResponse::ReadFile(read_file(request).await),
+        SessionRequest::Memory(request) => SessionResponse::Memory(memory.response(request.id)),
         SessionRequest::Execute(request) => {
             SessionResponse::Execute(execute_command(request).await)
         }
@@ -250,6 +369,15 @@ async fn execute_request(
             SessionResponse::Cancel(ControlResponse {
                 id,
                 error: Some("cancel cannot be dispatched as a concurrent request".to_owned()),
+            })
+        }
+        SessionRequest::TerminateToolProcesses(request) => {
+            SessionResponse::TerminateToolProcesses(ControlResponse {
+                id: request.id,
+                error: Some(
+                    "tool-process termination cannot be dispatched as a concurrent request"
+                        .to_owned(),
+                ),
             })
         }
         SessionRequest::Shutdown(request) => SessionResponse::Shutdown(ControlResponse {
@@ -531,6 +659,14 @@ async fn read_file(request: ReadFileRequest) -> ReadFileResponse {
 }
 
 async fn execute_command(request: ExecuteRequest) -> ExecuteResponse {
+    let stdout_mirror = match open_output_mirror(request.stdout_mirror.as_deref()).await {
+        Ok(mirror) => mirror,
+        Err(error) => return failed_execute_response(request.id, error),
+    };
+    let stderr_mirror = match open_output_mirror(request.stderr_mirror.as_deref()).await {
+        Ok(mirror) => mirror,
+        Err(error) => return failed_execute_response(request.id, error),
+    };
     let environment = command_environment(std::env::vars_os(), &request.environment);
     let mut command = Command::new(&request.program);
     command
@@ -545,7 +681,15 @@ async fn execute_command(request: ExecuteRequest) -> ExecuteResponse {
     command.process_group(0);
 
     let timeout = Duration::from_millis(request.timeout_millis);
-    match command_output(&mut command, timeout, request.max_output_bytes).await {
+    match command_output(
+        &mut command,
+        timeout,
+        request.max_output_bytes,
+        stdout_mirror,
+        stderr_mirror,
+    )
+    .await
+    {
         Ok(CommandOutcome::Completed(output)) => ExecuteResponse {
             id: request.id,
             exit_code: Some(output.status.code().unwrap_or(1)),
@@ -573,15 +717,32 @@ async fn execute_command(request: ExecuteRequest) -> ExecuteResponse {
             timed_out: false,
             output_limit_exceeded: true,
         },
-        Err(error) => ExecuteResponse {
-            id: request.id,
-            exit_code: None,
-            stdout: None,
-            stderr: None,
-            error: Some(error.to_string()),
-            timed_out: false,
-            output_limit_exceeded: false,
-        },
+        Err(error) => failed_execute_response(request.id, error),
+    }
+}
+
+async fn open_output_mirror(path: Option<&str>) -> std::io::Result<Option<File>> {
+    match path {
+        Some(path) => OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
+}
+
+fn failed_execute_response(id: u64, error: std::io::Error) -> ExecuteResponse {
+    ExecuteResponse {
+        id,
+        exit_code: None,
+        stdout: None,
+        stderr: None,
+        error: Some(error.to_string()),
+        timed_out: false,
+        output_limit_exceeded: false,
     }
 }
 
@@ -615,6 +776,8 @@ async fn command_output(
     command: &mut Command,
     timeout: Duration,
     max_output_bytes: usize,
+    stdout_mirror: Option<File>,
+    stderr_mirror: Option<File>,
 ) -> std::io::Result<CommandOutcome> {
     let mut child = command.spawn()?;
     let process_group = child
@@ -637,12 +800,14 @@ async fn command_output(
         Arc::clone(&retained),
         max_output_bytes,
         limit_sender.clone(),
+        stdout_mirror,
     ));
     let mut stderr = tokio::spawn(read_bounded(
         stderr,
         Arc::clone(&retained),
         max_output_bytes,
         limit_sender,
+        stderr_mirror,
     ));
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
@@ -720,6 +885,7 @@ async fn read_bounded(
     retained: Arc<AtomicUsize>,
     limit: usize,
     limit_sender: mpsc::Sender<()>,
+    mut mirror: Option<File>,
 ) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
     let mut buffer = [0_u8; 8 * 1024];
@@ -727,7 +893,14 @@ async fn read_bounded(
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
+            if let Some(mirror) = &mut mirror {
+                mirror.flush().await?;
+            }
             break;
+        }
+        if let Some(mirror) = &mut mirror {
+            mirror.write_all(&buffer[..read]).await?;
+            mirror.flush().await?;
         }
         let offset = retained.fetch_add(read, Ordering::Relaxed);
         let allowed = limit.saturating_sub(offset).min(read);
@@ -743,26 +916,43 @@ async fn read_bounded(
 #[cfg(test)]
 mod tests {
     use std::{
+        env,
         ffi::OsString,
         fs::{self, File},
+        process, thread,
         time::{Duration, Instant, UNIX_EPOCH},
     };
 
     use nanocodex_tools::{ToolInput, contract::ToolOutputBody, standard::StandardTool};
+    use nix::sys::signal::Signal;
+    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
     use serde_json::{json, value::to_raw_value};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     use super::super::protocol::{
         CancelRequest, ExecuteRequest, ReadFileRequest, ReadyRequest, SessionRequest,
-        SessionResponse, ShutdownRequest, ToolRequest, WireToolContext, WireToolInput,
+        SessionResponse, ShutdownRequest, TerminateToolProcessesRequest, ToolRequest,
+        WireToolContext, WireToolInput,
     };
     use super::{
-        atomic_write_file, command_environment, create_directory_path, execute_command, read_file,
-        serve_test_io, serve_test_io_with_frame_limit,
+        atomic_write_file, command_environment, create_directory_path, execute_command,
+        parse_meminfo, parse_vmstat_oom_kills, read_file, serve_test_io,
+        serve_test_io_with_frame_limit,
     };
 
     const DEFAULT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+    const DETACHED_PROCESS_PID_FILE_ENV: &str = "NANOCODEX_VM_TEST_DETACHED_PID_FILE";
     const PATH_TRACING_IMAGE_BYTES: u64 = 48_262_737;
+
+    #[test]
+    fn parses_guest_peak_memory_inputs() {
+        let meminfo = "MemTotal:       524288 kB\nmalformed\nMemAvailable:   131071 kB\n";
+        assert_eq!(parse_meminfo(meminfo), Some((524_288, 131_071)));
+        assert_eq!(
+            parse_vmstat_oom_kills("pgfault 12\noom_kill 3\npgmajfault 1\n"),
+            Some(3)
+        );
+    }
 
     #[test]
     fn trusted_commands_inherit_guest_environment_and_apply_explicit_overrides() {
@@ -833,6 +1023,8 @@ mod tests {
             environment: Vec::new(),
             timeout_millis: 100,
             max_output_bytes: DEFAULT_OUTPUT_BYTES,
+            stdout_mirror: None,
+            stderr_mirror: None,
         })
         .await;
 
@@ -859,6 +1051,8 @@ mod tests {
             environment: Vec::new(),
             timeout_millis: 5_000,
             max_output_bytes: 8,
+            stdout_mirror: None,
+            stderr_mirror: None,
         })
         .await;
 
@@ -867,6 +1061,47 @@ mod tests {
         assert!(response.error.is_none());
         assert!(response.stdout.is_none());
         assert!(response.stderr.is_none());
+    }
+
+    #[tokio::test]
+    async fn command_output_is_mirrored_before_the_process_exits() {
+        let directory = tempfile::tempdir().unwrap();
+        let stdout = directory.path().join("stdout");
+        let stderr = directory.path().join("stderr");
+        let execution = tokio::spawn(execute_command(ExecuteRequest {
+            id: 1,
+            program: "/bin/sh".to_owned(),
+            arguments: vec![
+                "-c".to_owned(),
+                "printf first; printf diagnostic >&2; sleep 0.5; printf second".to_owned(),
+            ],
+            current_directory: "/".to_owned(),
+            environment: Vec::new(),
+            timeout_millis: 5_000,
+            max_output_bytes: DEFAULT_OUTPUT_BYTES,
+            stdout_mirror: Some(stdout.to_string_lossy().into_owned()),
+            stderr_mirror: Some(stderr.to_string_lossy().into_owned()),
+        }));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if fs::read(&stdout).is_ok_and(|contents| contents == b"first")
+                    && fs::read(&stderr).is_ok_and(|contents| contents == b"diagnostic")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("mirrors should expose initial output while the process runs");
+        assert!(!execution.is_finished());
+
+        let response = execution.await.unwrap();
+        assert_eq!(response.stdout.as_deref(), Some(b"firstsecond".as_slice()));
+        assert_eq!(response.stderr.as_deref(), Some(b"diagnostic".as_slice()));
+        assert_eq!(fs::read(stdout).unwrap(), b"firstsecond");
+        assert_eq!(fs::read(stderr).unwrap(), b"diagnostic");
     }
 
     #[tokio::test]
@@ -913,6 +1148,8 @@ mod tests {
                 environment: Vec::new(),
                 timeout_millis: 5_000,
                 max_output_bytes: DEFAULT_OUTPUT_BYTES,
+                stdout_mirror: None,
+                stderr_mirror: None,
             }),
             SessionRequest::Execute(ExecuteRequest {
                 id: 1,
@@ -922,6 +1159,8 @@ mod tests {
                 environment: Vec::new(),
                 timeout_millis: 5_000,
                 max_output_bytes: DEFAULT_OUTPUT_BYTES,
+                stdout_mirror: None,
+                stderr_mirror: None,
             }),
         ] {
             host_write
@@ -976,6 +1215,8 @@ mod tests {
                 environment: Vec::new(),
                 timeout_millis: 60_000,
                 max_output_bytes: DEFAULT_OUTPUT_BYTES,
+                stdout_mirror: None,
+                stderr_mirror: None,
             }),
             SessionRequest::Shutdown(ShutdownRequest { id: 1 }),
         ] {
@@ -1019,6 +1260,8 @@ mod tests {
                 environment: Vec::new(),
                 timeout_millis: 60_000,
                 max_output_bytes: DEFAULT_OUTPUT_BYTES,
+                stdout_mirror: None,
+                stderr_mirror: None,
             }),
             SessionRequest::Cancel(CancelRequest {
                 id: 1,
@@ -1032,6 +1275,8 @@ mod tests {
                 environment: Vec::new(),
                 timeout_millis: 5_000,
                 max_output_bytes: DEFAULT_OUTPUT_BYTES,
+                stdout_mirror: None,
+                stderr_mirror: None,
             }),
         ] {
             host_write
@@ -1075,6 +1320,230 @@ mod tests {
             SessionResponse::Shutdown(response) if response.id == 3 && response.error.is_none()
         ));
         guest_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_process_termination_kills_foreground_session_and_keeps_guest_ready() {
+        let workspace = tempfile::tempdir().unwrap();
+        let pid_file = workspace.path().join("foreground.pid");
+        let (host, guest) = tokio::io::duplex(64 * 1024);
+        let (host_read, mut host_write) = tokio::io::split(host);
+        let (guest_read, guest_write) = tokio::io::split(guest);
+        let guest_task = tokio::spawn({
+            let workspace = workspace.path().to_owned();
+            async move { serve_test_io(&workspace, guest_read, guest_write).await }
+        });
+        let command = format!("printf %s $$ > '{}'; exec sleep 30", pid_file.display());
+        let start = SessionRequest::Tool(ToolRequest {
+            id: 0,
+            tool: StandardTool::ExecCommand,
+            input: WireToolInput::from(ToolInput::Function(
+                to_raw_value(&json!({
+                    "cmd": command,
+                    "login": false,
+                    "yield_time_ms": 250,
+                }))
+                .unwrap(),
+            )),
+            context: WireToolContext {
+                model: "model".to_owned(),
+                session_id: "session".to_owned(),
+                call_id: "foreground".to_owned(),
+                output_token_budget: 10_000,
+            },
+        });
+        host_write
+            .write_all(&serde_json::to_vec(&start).unwrap())
+            .await
+            .unwrap();
+        host_write.write_all(b"\n").await.unwrap();
+
+        let mut responses = BufReader::new(host_read).lines();
+        let started = tokio::time::timeout(Duration::from_secs(2), responses.next_line())
+            .await
+            .expect("the foreground command must yield")
+            .unwrap()
+            .unwrap();
+        let SessionResponse::Tool(response) =
+            serde_json::from_str::<SessionResponse>(&started).unwrap()
+        else {
+            panic!("expected the foreground command response");
+        };
+        assert_eq!(response.id, 0);
+        assert!(response.error.is_none());
+        let execution = response.execution.expect("foreground command must execute");
+        assert!(
+            execution.success,
+            "foreground command failed: {:?}",
+            execution.output
+        );
+        let pid = fs::read_to_string(&pid_file)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(kill(Pid::from_raw(pid), None), Ok(()));
+
+        let terminate =
+            SessionRequest::TerminateToolProcesses(TerminateToolProcessesRequest { id: 1 });
+        host_write
+            .write_all(&serde_json::to_vec(&terminate).unwrap())
+            .await
+            .unwrap();
+        host_write.write_all(b"\n").await.unwrap();
+        let terminated = tokio::time::timeout(Duration::from_secs(2), responses.next_line())
+            .await
+            .expect("managed process termination must complete")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<SessionResponse>(&terminated).unwrap(),
+            SessionResponse::TerminateToolProcesses(response)
+                if response.id == 1 && response.error.is_none()
+        ));
+        assert_eq!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH));
+
+        let ready = SessionRequest::Ready(ReadyRequest { id: 2 });
+        host_write
+            .write_all(&serde_json::to_vec(&ready).unwrap())
+            .await
+            .unwrap();
+        host_write.write_all(b"\n").await.unwrap();
+        let ready = responses.next_line().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<SessionResponse>(&ready).unwrap(),
+            SessionResponse::Ready(response) if response.id == 2 && response.error.is_none()
+        ));
+
+        host_write
+            .write_all(
+                &serde_json::to_vec(&SessionRequest::Shutdown(ShutdownRequest { id: 3 })).unwrap(),
+            )
+            .await
+            .unwrap();
+        host_write.write_all(b"\n").await.unwrap();
+        drop(host_write);
+        let shutdown = responses.next_line().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<SessionResponse>(&shutdown).unwrap(),
+            SessionResponse::Shutdown(response) if response.id == 3 && response.error.is_none()
+        ));
+        guest_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_process_termination_preserves_deliberately_detached_process() {
+        let workspace = tempfile::tempdir().unwrap();
+        let pid_file = workspace.path().join("detached.pid");
+        let (host, guest) = tokio::io::duplex(64 * 1024);
+        let (host_read, mut host_write) = tokio::io::split(host);
+        let (guest_read, guest_write) = tokio::io::split(guest);
+        let guest_task = tokio::spawn({
+            let workspace = workspace.path().to_owned();
+            async move { serve_test_io(&workspace, guest_read, guest_write).await }
+        });
+        let test_executable = env::current_exe().unwrap();
+        let test_executable = shlex::try_quote(test_executable.to_str().unwrap()).unwrap();
+        let pid_file_argument = shlex::try_quote(pid_file.to_str().unwrap()).unwrap();
+        let command = format!(
+            "{DETACHED_PROCESS_PID_FILE_ENV}={pid_file_argument} {test_executable} \
+             --exact tools::guest::tests::deliberately_detached_process_child --nocapture \
+             >/dev/null 2>&1 </dev/null & child=$!; \
+             while [ ! -s {pid_file_argument} ]; do kill -0 \"$child\" || exit 1; sleep 0.01; done"
+        );
+        let start = SessionRequest::Tool(ToolRequest {
+            id: 0,
+            tool: StandardTool::ExecCommand,
+            input: WireToolInput::from(ToolInput::Function(
+                to_raw_value(&json!({
+                    "cmd": command,
+                    "login": false,
+                }))
+                .unwrap(),
+            )),
+            context: WireToolContext {
+                model: "model".to_owned(),
+                session_id: "session".to_owned(),
+                call_id: "detached".to_owned(),
+                output_token_budget: 10_000,
+            },
+        });
+        host_write
+            .write_all(&serde_json::to_vec(&start).unwrap())
+            .await
+            .unwrap();
+        host_write.write_all(b"\n").await.unwrap();
+
+        let mut responses = BufReader::new(host_read).lines();
+        let started = tokio::time::timeout(Duration::from_secs(2), responses.next_line())
+            .await
+            .expect("the detaching command must complete")
+            .unwrap()
+            .unwrap();
+        let SessionResponse::Tool(response) =
+            serde_json::from_str::<SessionResponse>(&started).unwrap()
+        else {
+            panic!("expected the detaching command response");
+        };
+        assert_eq!(response.id, 0);
+        assert!(response.error.is_none());
+        let execution = response.execution.expect("detaching command must execute");
+        assert!(
+            execution.success,
+            "detaching command failed: {:?}",
+            execution.output
+        );
+        let pid = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = fs::read_to_string(&pid_file) {
+                    break pid.parse::<i32>().unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the detached process must publish its PID");
+        assert_eq!(kill(Pid::from_raw(pid), None), Ok(()));
+
+        let terminate =
+            SessionRequest::TerminateToolProcesses(TerminateToolProcessesRequest { id: 1 });
+        host_write
+            .write_all(&serde_json::to_vec(&terminate).unwrap())
+            .await
+            .unwrap();
+        host_write.write_all(b"\n").await.unwrap();
+        let terminated = responses.next_line().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<SessionResponse>(&terminated).unwrap(),
+            SessionResponse::TerminateToolProcesses(response)
+                if response.id == 1 && response.error.is_none()
+        ));
+        assert_eq!(kill(Pid::from_raw(pid), None), Ok(()));
+        kill(Pid::from_raw(pid), Signal::SIGKILL).unwrap();
+
+        host_write
+            .write_all(
+                &serde_json::to_vec(&SessionRequest::Shutdown(ShutdownRequest { id: 2 })).unwrap(),
+            )
+            .await
+            .unwrap();
+        host_write.write_all(b"\n").await.unwrap();
+        drop(host_write);
+        let shutdown = responses.next_line().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<SessionResponse>(&shutdown).unwrap(),
+            SessionResponse::Shutdown(response) if response.id == 2 && response.error.is_none()
+        ));
+        guest_task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn deliberately_detached_process_child() {
+        let Some(pid_file) = env::var_os(DETACHED_PROCESS_PID_FILE_ENV) else {
+            return;
+        };
+        nix::unistd::setsid().unwrap();
+        fs::write(pid_file, process::id().to_string()).unwrap();
+        thread::sleep(Duration::from_secs(30));
     }
 
     #[tokio::test]
@@ -1230,6 +1699,8 @@ mod tests {
                 environment: Vec::new(),
                 timeout_millis: 5_000,
                 max_output_bytes: DEFAULT_OUTPUT_BYTES,
+                stdout_mirror: None,
+                stderr_mirror: None,
             }),
         ] {
             host_write
