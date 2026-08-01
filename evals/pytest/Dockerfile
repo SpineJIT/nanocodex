@@ -275,6 +275,6 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
 COPY bin/apt bin/python bin/toolbox-exec /opt/nanocodex-verifier/bin/
 RUN chmod 0755 /opt/nanocodex-verifier/bin/* && \
     ln -s python /opt/nanocodex-verifier/bin/python3 && \
-    for command in as curl expect gcc git ld mcopy mdir node readelf rg scp sftp socat ssh sshpass tesseract vim vncsnapshot oligotm primer3_core; do \
+    for command in as bash curl expect gcc git ld mcopy mdir node npm readelf rg scp sftp socat ssh sshpass tesseract vim vncsnapshot oligotm primer3_core; do \
         ln -s toolbox-exec "/opt/nanocodex-verifier/bin/$command"; \
     done

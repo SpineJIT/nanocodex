@@ -69,11 +69,18 @@ def _cli_tools_install_command(*, install_node: bool) -> str:
         )
 
     package_list = " ".join(packages)
-    command_checks = "; ".join(
+    command_checks = " && ".join(
         f"command -v {command} >/dev/null 2>&1" for command in checks
     )
+    fast_path_checks = (
+        "(test -s /etc/ssl/certs/ca-certificates.crt || "
+        "test -s /opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt) && "
+        f"{command_checks}"
+    )
     return (
-        node_modules_cleanup
+        "PATH=$PATH:/opt/nanocodex-verifier/bin; export PATH; "
+        f"if ! {{ {fast_path_checks}; }}; then "
+        + node_modules_cleanup
         + "if ldd --version 2>&1 | grep -qi musl || "
         "[ -f /etc/alpine-release ]; then "
         f"apk add --no-cache {package_list}; "
@@ -83,10 +90,8 @@ def _cli_tools_install_command(*, install_node: bool) -> str:
         f"{package_list}; "
         "elif command -v yum >/dev/null 2>&1; then "
         f"yum install -y {package_list}; "
-        "else "
-        "echo 'No supported package manager found; checking preinstalled tools' >&2; "
-        "fi; "
-        f"{command_checks}"
+        "else echo 'No supported package manager found' >&2; exit 127; fi; fi; "
+        + fast_path_checks
     )
 
 
