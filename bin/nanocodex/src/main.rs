@@ -244,12 +244,43 @@ mod tests {
         let tui = Cli::try_parse_from(["nanocodex", "--browser"]).unwrap();
         assert!(tui.agent.browser_enabled());
 
+        let brave =
+            Cli::try_parse_from(["nanocodex", "--browser=brave", "--cookies=true"]).unwrap();
+        assert!(brave.agent.browser_enabled());
+
+        let chromium = Cli::try_parse_from(["nanocodex", "--browser", "--cookies=true"]).unwrap();
+        assert!(chromium.agent.browser_enabled());
+
+        let chrome_source =
+            Cli::try_parse_from(["nanocodex", "--browser=brave", "--cookies=chrome"]).unwrap();
+        assert!(chrome_source.agent.browser_enabled());
+
+        let firefox_source =
+            Cli::try_parse_from(["nanocodex", "--browser", "--cookies=firefox"]).unwrap();
+        assert!(firefox_source.agent.browser_enabled());
+
+        let safari_source =
+            Cli::try_parse_from(["nanocodex", "--browser", "--cookies=safari"]).unwrap();
+        assert!(safari_source.agent.browser_enabled());
+
         let run =
             Cli::try_parse_from(["nanocodex", "run", "inspect example.com", "--browser"]).unwrap();
         let Some(Command::Run(run)) = run.command else {
             panic!("run command was not parsed");
         };
         assert!(run.agent.browser_enabled());
+    }
+
+    #[test]
+    fn browser_cookies_require_an_opted_in_browser() {
+        let error = Cli::try_parse_from(["nanocodex", "--cookies=true"])
+            .err()
+            .unwrap();
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]

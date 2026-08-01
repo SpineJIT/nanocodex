@@ -104,8 +104,30 @@ or an explicitly managed CDP endpoint.
   errors, network bodies, WebSocket messages, HAR, and React diagnostics.
 - Screenshots, PDF, visual/session/performance traces, video, CPU profiles,
   coverage, heap inspection, accessibility/axe, Lighthouse, and CrUX actions.
-- Harness-owned cookies/storage, virtual passkeys, allowlisted Brave handoff,
+- Harness-owned cookies/storage, virtual passkeys, allowlisted source-browser handoff,
   upload roots, browser egress policy, remote CDP, and libkrun VM composition.
+
+The Nanocodex CLI can copy a standard desktop browser profile's complete cookie
+database into either supported session-private browser. A bare cookie flag
+auto-detects a source; `brave`, `chrome`, `chromium`, `edge`, `firefox`, and
+`safari` select it explicitly:
+
+```console
+nanocodex --browser --cookies
+nanocodex --browser --cookies=chrome
+nanocodex --browser=brave --cookies=edge
+nanocodex --browser --cookies=firefox
+nanocodex --browser --cookies=safari
+```
+
+Chromium-family sources use their own executable as a short-lived decryption
+broker. Firefox is copied with SQLite's online backup API. Safari's bounded
+binary-cookie decoder may require granting the Nanocodex process macOS access
+to Safari's sandboxed profile. Source profiles are never mutated.
+
+The source profile is never mutated, and cookie values remain outside the
+model-callable browser schema. This mode deliberately gives the agent
+authenticated access to every site represented in the selected profile.
 
 ## Current boundaries
 
@@ -120,8 +142,8 @@ or an explicitly managed CDP endpoint.
   is runtime-only with provider registration, so enabling browser adds no model
   warmup schema bytes. The contract is not capability-filtered after discovery.
 - Lighthouse, CrUX, and video require caller-supplied external tooling or
-  credentials. Brave profile transfer is harness-only and intentionally absent
-  from the model-callable schema.
+  credentials. Brave profile transfer remains harness-owned and intentionally
+  absent from the model-callable schema.
 - Cloned browser handles share one session and serialized action stream. Call
   `Browser::close` or `BrowserVm::shutdown` when deterministic cleanup matters.
 - The crate consumes `nanocodex-vm` unconditionally today, so local-only builds

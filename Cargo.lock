@@ -5072,6 +5072,7 @@ dependencies = [
  "reflink-copy",
  "reqwest",
  "rusqlite",
+ "safari-binarycookies",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -7809,6 +7810,16 @@ name = "ryu-js"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
+
+[[package]]
+name = "safari-binarycookies"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e783a65d358025a7e136561508a39558145c6dcf3c6fdc67fbd33afda7629ac"
+dependencies = [
+ "thiserror 2.0.18",
+ "time",
+]
 
 [[package]]
 name = "same-file"

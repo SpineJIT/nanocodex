@@ -31,6 +31,7 @@ percent-encoding.workspace = true
 reflink-copy.workspace = true
 reqwest = { workspace = true, features = ["query", "stream"] }
 rusqlite = { workspace = true, features = ["backup"] }
+safari-binarycookies.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

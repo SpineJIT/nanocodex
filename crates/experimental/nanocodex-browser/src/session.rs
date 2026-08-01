@@ -10,18 +10,42 @@ use std::env;
 use rusqlite::{Connection, OpenFlags, backup::Backup};
 use url::Url;
 
-/// An allowlisted, cookie-backed snapshot of an existing Brave profile.
+/// A standard Chromium-family browser profile that can supply cookies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowserProfileKind {
+    Brave,
+    Chrome,
+    Chromium,
+    Edge,
+}
+
+impl BrowserProfileKind {
+    /// Returns the browser's display name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Brave => "Brave",
+            Self::Chrome => "Google Chrome",
+            Self::Chromium => "Chromium",
+            Self::Edge => "Microsoft Edge",
+        }
+    }
+}
+
+/// A cookie-backed snapshot of an existing Chromium-family profile.
 ///
 /// This is designed for authenticated headless automation while the ordinary
-/// Brave window remains open. Only cookies applicable to an explicitly allowed
-/// origin are copied. The source profile is never passed to the launched
-/// browser and is never mutated.
+/// source browser remains open. Callers may copy cookies applicable to an
+/// explicit origin allowlist or deliberately opt into every cookie in the
+/// selected profile. The source profile is never passed to the launched browser
+/// and is never mutated.
 #[derive(Clone, Debug)]
 pub struct BraveSession {
     executable: PathBuf,
     user_data_dir: PathBuf,
     profile_directory: PathBuf,
     allowed_origins: Vec<Url>,
+    copy_all_cookies: bool,
     include_site_data: bool,
 }
 
@@ -33,27 +57,76 @@ impl BraveSession {
     /// Returns an error when the platform has no standard location, the home
     /// directory is unavailable, or Brave is not installed there.
     pub fn standard() -> Result<Self, BraveSessionError> {
+        Self::standard_for(BrowserProfileKind::Brave)
+    }
+
+    /// Locates a standard Chromium-family installation and user-data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform has no standard location, the home
+    /// directory is unavailable, or the selected browser is not installed.
+    pub fn standard_for(browser: BrowserProfileKind) -> Result<Self, BraveSessionError> {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            Err(BraveSessionError::StandardInstallationUnavailable)
+            Err(BraveSessionError::StandardInstallationUnavailable {
+                browser: browser.name(),
+            })
         }
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let home = env::var_os("HOME").ok_or(BraveSessionError::HomeDirectoryUnavailable)?;
             #[cfg(target_os = "macos")]
-            let (executable, user_data_dir) = (
-                PathBuf::from("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
-                PathBuf::from(home).join("Library/Application Support/BraveSoftware/Brave-Browser"),
-            );
+            let (executable, user_data_dir) = match browser {
+                BrowserProfileKind::Brave => (
+                    PathBuf::from("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+                    PathBuf::from(&home)
+                        .join("Library/Application Support/BraveSoftware/Brave-Browser"),
+                ),
+                BrowserProfileKind::Chrome => (
+                    PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                    PathBuf::from(&home).join("Library/Application Support/Google/Chrome"),
+                ),
+                BrowserProfileKind::Chromium => (
+                    PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+                    PathBuf::from(&home).join("Library/Application Support/Chromium"),
+                ),
+                BrowserProfileKind::Edge => (
+                    PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+                    PathBuf::from(&home).join("Library/Application Support/Microsoft Edge"),
+                ),
+            };
+            #[cfg(target_os = "linux")]
+            let (executables, user_data_directory): (&[&str], &str) = match browser {
+                BrowserProfileKind::Brave => (
+                    &["/usr/bin/brave-browser", "/usr/bin/brave-browser-stable"],
+                    ".config/BraveSoftware/Brave-Browser",
+                ),
+                BrowserProfileKind::Chrome => (
+                    &["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"],
+                    ".config/google-chrome",
+                ),
+                BrowserProfileKind::Chromium => (
+                    &["/usr/bin/chromium", "/usr/bin/chromium-browser"],
+                    ".config/chromium",
+                ),
+                BrowserProfileKind::Edge => (
+                    &["/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable"],
+                    ".config/microsoft-edge",
+                ),
+            };
             #[cfg(target_os = "linux")]
             let (executable, user_data_dir) = (
-                ["/usr/bin/brave-browser", "/usr/bin/brave-browser-stable"]
-                    .into_iter()
+                executables
+                    .iter()
+                    .copied()
                     .map(PathBuf::from)
                     .find(|path| path.is_file())
-                    .ok_or(BraveSessionError::StandardInstallationUnavailable)?,
-                PathBuf::from(home).join(".config/BraveSoftware/Brave-Browser"),
+                    .ok_or(BraveSessionError::StandardInstallationUnavailable {
+                        browser: browser.name(),
+                    })?,
+                PathBuf::from(home).join(user_data_directory),
             );
 
             let session = Self::new(executable, user_data_dir);
@@ -62,7 +135,7 @@ impl BraveSession {
         }
     }
 
-    /// Creates a Brave session from explicit executable and user-data paths.
+    /// Creates a profile session from explicit executable and user-data paths.
     #[must_use]
     pub fn new(executable: impl Into<PathBuf>, user_data_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -70,6 +143,7 @@ impl BraveSession {
             user_data_dir: user_data_dir.into(),
             profile_directory: PathBuf::from("Default"),
             allowed_origins: Vec::new(),
+            copy_all_cookies: false,
             include_site_data: false,
         }
     }
@@ -89,9 +163,20 @@ impl BraveSession {
         self
     }
 
+    /// Copies every cookie from the selected source profile.
+    ///
+    /// This deliberately gives the dedicated browser the profile's complete
+    /// authenticated cookie state. Cookie values remain outside the
+    /// model-callable browser action schema.
+    #[must_use]
+    pub const fn copy_all_cookies(mut self) -> Self {
+        self.copy_all_cookies = true;
+        self
+    }
+
     /// Also copies `localStorage`, `IndexedDB`, and storage-bucket metadata.
     ///
-    /// Brave must be closed when the lazy browser launch takes this snapshot
+    /// The source browser must be closed when the lazy launch takes this snapshot
     /// because those stores use `LevelDB` and do not provide `SQLite`'s online
     /// backup guarantee. On APFS, Rust uses copy-on-write clones for the files,
     /// so the private snapshot consumes space only as either side changes.
@@ -101,7 +186,9 @@ impl BraveSession {
         self
     }
 
-    pub(crate) fn executable(&self) -> &Path {
+    /// Returns the source browser executable selected by this session.
+    #[must_use]
+    pub fn executable(&self) -> &Path {
         &self.executable
     }
 
@@ -113,17 +200,28 @@ impl BraveSession {
         self.include_site_data
     }
 
+    pub(crate) const fn copies_all_cookies(&self) -> bool {
+        self.copy_all_cookies
+    }
+
     pub(crate) fn trace_value(&self) -> serde_json::Value {
         serde_json::json!({
             "executable": self.executable,
             "userDataDirectory": self.user_data_dir,
             "profileDirectory": self.profile_directory,
             "allowedOrigins": self.allowed_origins,
+            "copyAllCookies": self.copy_all_cookies,
             "includeSiteData": self.include_site_data,
         })
     }
 
     pub(crate) fn validate_handoff_url(&self, url: &Url) -> Result<(), BraveSessionError> {
+        if self.copy_all_cookies
+            && matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+        {
+            return Ok(());
+        }
         if self
             .allowed_origins
             .iter()
@@ -181,14 +279,15 @@ impl BraveSession {
         tokio::fs::create_dir_all(&target_profile).await?;
         tokio::fs::copy(source_local_state, target_user_data_dir.join("Local State")).await?;
 
-        let allowed_hosts = self
-            .allowed_origins
-            .iter()
-            .filter_map(Url::host_str)
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
+        let allowed_hosts = (!self.copy_all_cookies).then(|| {
+            self.allowed_origins
+                .iter()
+                .filter_map(Url::host_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        });
         tokio::task::spawn_blocking(move || {
-            snapshot_cookies(&source_cookies, &target_cookies, &allowed_hosts)
+            snapshot_cookies(&source_cookies, &target_cookies, allowed_hosts.as_deref())
         })
         .await
         .map_err(BraveSessionError::SnapshotTask)??;
@@ -211,7 +310,7 @@ impl BraveSession {
 
     pub(crate) fn validate(&self) -> Result<(), BraveSessionError> {
         self.validate_paths()?;
-        if self.allowed_origins.is_empty() {
+        if self.allowed_origins.is_empty() && !self.copy_all_cookies {
             return Err(BraveSessionError::MissingAllowedOrigin);
         }
         for origin in &self.allowed_origins {
@@ -255,7 +354,7 @@ impl BraveSession {
 fn snapshot_cookies(
     source: &Path,
     target: &Path,
-    allowed_hosts: &[String],
+    allowed_hosts: Option<&[String]>,
 ) -> Result<(), BraveSessionError> {
     let source = Connection::open_with_flags(
         source,
@@ -266,28 +365,32 @@ fn snapshot_cookies(
     backup.run_to_completion(64, Duration::from_millis(5), None)?;
     drop(backup);
 
-    let mut statement = target.prepare("SELECT rowid, host_key FROM cookies")?;
-    let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut rejected = Vec::new();
-    for row in rows {
-        let (row_id, cookie_host) = row?;
-        if !allowed_hosts
-            .iter()
-            .any(|allowed| cookie_applies_to(&cookie_host, allowed))
+    if let Some(allowed_hosts) = allowed_hosts {
+        let mut statement = target.prepare("SELECT rowid, host_key FROM cookies")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut rejected = Vec::new();
+        for row in rows {
+            let (row_id, cookie_host) = row?;
+            if !allowed_hosts
+                .iter()
+                .any(|allowed| cookie_applies_to(&cookie_host, allowed))
+            {
+                rejected.push(row_id);
+            }
+        }
+        drop(statement);
+        let transaction = target.transaction()?;
         {
-            rejected.push(row_id);
+            let mut delete = transaction.prepare("DELETE FROM cookies WHERE rowid = ?1")?;
+            for row_id in rejected {
+                delete.execute([row_id])?;
+            }
         }
+        transaction.commit()?;
     }
-    drop(statement);
     let transaction = target.transaction()?;
-    {
-        let mut delete = transaction.prepare("DELETE FROM cookies WHERE rowid = ?1")?;
-        for row_id in rejected {
-            delete.execute([row_id])?;
-        }
-    }
     transaction.execute(
         "UPDATE cookies
          SET is_persistent = 1, has_expires = 1, expires_utc = ?1
@@ -350,35 +453,35 @@ fn copy_directory(source: &Path, target: &Path) -> Result<(), std::io::Error> {
 pub enum BraveSessionError {
     #[error("the home directory is unavailable")]
     HomeDirectoryUnavailable,
-    #[error("the standard Brave installation is unavailable on this platform")]
-    StandardInstallationUnavailable,
-    #[error("Brave executable does not exist at {path}")]
+    #[error("the standard {browser} installation is unavailable on this platform")]
+    StandardInstallationUnavailable { browser: &'static str },
+    #[error("source browser executable does not exist at {path}")]
     ExecutableUnavailable { path: PathBuf },
-    #[error("Brave user-data directory does not exist at {path}")]
+    #[error("source browser user-data directory does not exist at {path}")]
     UserDataUnavailable { path: PathBuf },
-    #[error("Brave profile directory must be one relative path component, got {directory}")]
+    #[error("source profile directory must be one relative path component, got {directory}")]
     InvalidProfileDirectory { directory: PathBuf },
     #[error("at least one HTTP(S) origin must be explicitly allowed")]
     MissingAllowedOrigin,
-    #[error("Brave session origin must contain only a scheme, host, and optional port: {origin}")]
+    #[error("profile session origin must contain only a scheme, host, and optional port: {origin}")]
     InvalidOrigin { origin: Url },
-    #[error("authentication handoff URL is outside the Brave session allowlist: {url}")]
+    #[error("authentication handoff URL is outside the profile session allowlist: {url}")]
     HandoffOriginNotAllowed { url: Url },
-    #[error("Brave cookie database is unavailable under {profile}")]
+    #[error("source cookie database is unavailable under {profile}")]
     CookiesUnavailable { profile: PathBuf },
     #[error(
-        "Brave must be closed before copying site data from {user_data_dir}; cookie-only snapshots remain available while Brave is running"
+        "the source browser must be closed before copying site data from {user_data_dir}; cookie-only snapshots remain available while it is running"
     )]
     SourceBrowserRunning { user_data_dir: PathBuf },
-    #[error("Brave session filesystem operation failed")]
+    #[error("profile session filesystem operation failed")]
     Io(#[from] std::io::Error),
-    #[error("Brave cookie snapshot failed")]
+    #[error("cookie snapshot failed")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("Brave cookie snapshot task failed")]
+    #[error("cookie snapshot task failed")]
     SnapshotTask(#[source] tokio::task::JoinError),
     #[error("the system clock is before the Unix epoch")]
     SystemClock(#[source] std::time::SystemTimeError),
-    #[error("temporary Brave cookie expiration does not fit Chromium's timestamp range")]
+    #[error("temporary cookie expiration does not fit Chromium's timestamp range")]
     CookieExpiryOverflow,
 }
 
@@ -464,7 +567,7 @@ mod tests {
         super::snapshot_cookies(
             &source_path,
             &target_path,
-            &["console.example.com".to_owned()],
+            Some(&["console.example.com".to_owned()]),
         )?;
 
         let source = Connection::open(source_path)?;
@@ -488,6 +591,55 @@ mod tests {
             target.query_row("SELECT is_persistent FROM cookies", [], |row| row
                 .get::<_, i64>(0))?,
             1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn all_cookie_snapshot_keeps_every_domain() -> Result<(), Box<dyn Error>> {
+        let directory = tempdir()?;
+        let source_path = directory.path().join("source.sqlite");
+        let target_path = directory.path().join("target.sqlite");
+        let source = Connection::open(&source_path)?;
+        source.execute(
+            "CREATE TABLE cookies(
+                host_key TEXT NOT NULL,
+                encrypted_value BLOB NOT NULL,
+                is_persistent INTEGER NOT NULL,
+                has_expires INTEGER NOT NULL,
+                expires_utc INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        source.execute(
+            "INSERT INTO cookies(
+                host_key, encrypted_value, is_persistent, has_expires, expires_utc
+            ) VALUES (?1, ?2, 0, 0, 0)",
+            (".example.com", b"first".as_slice()),
+        )?;
+        source.execute(
+            "INSERT INTO cookies(
+                host_key, encrypted_value, is_persistent, has_expires, expires_utc
+            ) VALUES (?1, ?2, 1, 1, 1)",
+            ("dashboard.stripe.com", b"second".as_slice()),
+        )?;
+        drop(source);
+
+        super::snapshot_cookies(&source_path, &target_path, None)?;
+
+        let target = Connection::open(target_path)?;
+        assert_eq!(
+            target.query_row("SELECT COUNT(*) FROM cookies", [], |row| row
+                .get::<_, i64>(0))?,
+            2
+        );
+        assert_eq!(
+            target.query_row(
+                "SELECT COUNT(*) FROM cookies WHERE is_persistent = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            2
         );
         Ok(())
     }

@@ -142,6 +142,7 @@ pub(crate) struct NativeBrowser {
     executable: Option<PathBuf>,
     cdp_endpoint: Option<Url>,
     brave_session: Option<BraveSession>,
+    launch_brave_executable: bool,
     virtual_authenticator: Option<VirtualAuthenticator>,
     react_diagnostics: Option<ReactDiagnostics>,
     egress_policy: Option<BrowserEgressPolicy>,
@@ -644,6 +645,7 @@ fn trace_browser_configuration(owner: &NativeBrowser) {
         "executable": owner.executable,
         "cdpEndpoint": owner.cdp_endpoint,
         "braveSession": owner.brave_session.as_ref().map(BraveSession::trace_value),
+        "launchBraveExecutable": owner.launch_brave_executable,
         "virtualAuthenticator": owner.virtual_authenticator.is_some(),
         "reactDiagnostics": owner.react_diagnostics.map(|diagnostics| {
             serde_json::json!({
@@ -673,6 +675,7 @@ impl Session {
         let executable = owner.executable.as_deref();
         let cdp_endpoint = owner.cdp_endpoint.as_ref();
         let brave_session = owner.brave_session.as_ref();
+        let launch_brave_executable = owner.launch_brave_executable;
         let virtual_authenticator = owner.virtual_authenticator;
         let react_diagnostics = owner.react_diagnostics;
         let egress_policy = owner.egress_policy.clone();
@@ -684,18 +687,19 @@ impl Session {
         tokio::fs::create_dir_all(&output_dir).await?;
         tokio::fs::create_dir_all(&download_dir).await?;
 
-        let imported_cookies = if let (Some(_), Some(brave_session)) = (cdp_endpoint, brave_session)
-        {
-            Some(export_brave_cookies(runtime_dir, brave_session).await?)
+        let opens_brave_profile = cdp_endpoint.is_none()
+            && executable.is_none()
+            && launch_brave_executable
+            && brave_session.is_some();
+        let imported_cookies = if !opens_brave_profile && let Some(brave_session) = brave_session {
+            Some(export_profile_cookies(runtime_dir, brave_session).await?)
         } else {
             None
         };
         if let Some(cookies) = &imported_cookies {
             trace_serialized("session.imported_brave_cookies", cookies);
         }
-        if cdp_endpoint.is_none()
-            && let Some(brave_session) = brave_session
-        {
+        if opens_brave_profile && let Some(brave_session) = brave_session {
             brave_session.prepare(&profile).await?;
         }
 
@@ -706,12 +710,13 @@ impl Session {
                 .user_data_dir(&profile)
                 .window_size(1280, 720)
                 .new_headless_mode();
-            if let Some(brave_session) = brave_session {
-                config = brave_launch_config(config)
-                    .chrome_executable(brave_session.executable())
-                    .arg("restore-last-session");
-            } else if let Some(executable) = executable {
+            if opens_brave_profile {
+                config = profile_launch_config(config).arg("restore-last-session");
+            }
+            if let Some(executable) = executable {
                 config = config.chrome_executable(executable);
+            } else if launch_brave_executable && let Some(brave_session) = brave_session {
+                config = config.chrome_executable(brave_session.executable());
             }
             if egress_policy.is_some() {
                 config = config
@@ -841,7 +846,7 @@ impl Session {
         runtime_dir: &Path,
         brave_session: &BraveSession,
     ) -> Result<(), BrowserError> {
-        let cookies = export_brave_cookies(runtime_dir, brave_session).await?;
+        let cookies = export_profile_cookies(runtime_dir, brave_session).await?;
         trace_serialized("session.refreshed_brave_cookies", &cookies);
         replace_browser_cookies(&self.browser, cookies).await?;
         Ok(())
@@ -1557,7 +1562,7 @@ fn validate_snapshot_wire(
     Ok(())
 }
 
-async fn export_brave_cookies(
+async fn export_profile_cookies(
     runtime_dir: &Path,
     brave_session: &BraveSession,
 ) -> Result<Vec<CookieParam>, BrowserError> {
@@ -1566,7 +1571,7 @@ async fn export_brave_cookies(
         .tempdir_in(runtime_dir)?;
     brave_session.prepare(broker_profile.path()).await?;
 
-    let config = brave_launch_config(
+    let config = profile_launch_config(
         BrowserConfig::builder()
             .user_data_dir(broker_profile.path())
             .new_headless_mode(),
@@ -1591,27 +1596,34 @@ async fn export_brave_cookies(
     let cookies = exported?;
     shutdown?;
 
-    let cookies = allowed_cookie_params(cookies, brave_session.allowed_origins());
+    let cookies = allowed_cookie_params(
+        cookies,
+        (!brave_session.copies_all_cookies()).then(|| brave_session.allowed_origins()),
+    );
     info!(
         target: "nanocodex_browser",
         browser_cookie_count = cookies.len(),
         browser_cookie_origin_count = brave_session.allowed_origins().len(),
-        "prepared allowlisted Brave cookies for a dedicated remote browser"
+        browser_cookie_all_origins = brave_session.copies_all_cookies(),
+        "prepared source-profile cookies for a dedicated browser"
     );
     Ok(cookies)
 }
 
-fn allowed_cookie_params(cookies: Vec<Cookie>, allowed_origins: &[Url]) -> Vec<CookieParam> {
-    let allowed_hosts = allowed_origins
-        .iter()
-        .filter_map(Url::host_str)
-        .collect::<Vec<_>>();
+fn allowed_cookie_params(
+    cookies: Vec<Cookie>,
+    allowed_origins: Option<&[Url]>,
+) -> Vec<CookieParam> {
+    let allowed_hosts =
+        allowed_origins.map(|origins| origins.iter().filter_map(Url::host_str).collect::<Vec<_>>());
     cookies
         .into_iter()
         .filter(|cookie| {
-            allowed_hosts
-                .iter()
-                .any(|allowed| cookie_applies_to(&cookie.domain, allowed))
+            allowed_hosts.as_ref().is_none_or(|hosts| {
+                hosts
+                    .iter()
+                    .any(|allowed| cookie_applies_to(&cookie.domain, allowed))
+            })
         })
         .filter_map(cookie_param)
         .collect()
@@ -2046,6 +2058,7 @@ impl NativeBrowser {
         executable: Option<PathBuf>,
         cdp_endpoint: Option<Url>,
         brave_session: Option<BraveSession>,
+        launch_brave_executable: bool,
         virtual_authenticator: Option<VirtualAuthenticator>,
         react_diagnostics: Option<ReactDiagnostics>,
         egress_policy: Option<BrowserEgressPolicy>,
@@ -2064,6 +2077,7 @@ impl NativeBrowser {
             executable,
             cdp_endpoint,
             brave_session,
+            launch_brave_executable,
             virtual_authenticator,
             react_diagnostics,
             egress_policy,
@@ -5725,7 +5739,7 @@ fn build_config(builder: BrowserConfigBuilder) -> Result<BrowserConfig, BrowserE
         .map_err(|message| BrowserError::Configuration { message })
 }
 
-fn brave_launch_config(builder: BrowserConfigBuilder) -> BrowserConfigBuilder {
+fn profile_launch_config(builder: BrowserConfigBuilder) -> BrowserConfigBuilder {
     // Chromiumoxide's Puppeteer-derived defaults select `password-store=basic`
     // and `use-mock-keychain`. Those are appropriate for an empty automation
     // profile but make real Brave cookie ciphertext undecryptable. Keep the
@@ -6420,8 +6434,8 @@ mod tests {
     use super::{
         BrowserConfig, Chromium, Diagnostics, GateSignals, MAX_ACTION_INPUT_BYTES,
         MAX_CONSOLE_ENTRIES, MAX_DIAGNOSTIC_TEXT_BYTES, MAX_NETWORK_REQUESTS, NetworkSource,
-        allowed_cookie_params, brave_launch_config, build_config, classify_gate, close_chromium,
-        cookie_param, diagnostic_limit, trace_browser_configuration, validate_url,
+        allowed_cookie_params, build_config, classify_gate, close_chromium, cookie_param,
+        diagnostic_limit, profile_launch_config, trace_browser_configuration, validate_url,
     };
     use crate::{
         BraveSession, Browser, BrowserAction, BrowserActionResult, BrowserConsoleEntry,
@@ -6666,10 +6680,25 @@ mod tests {
         ];
         let allowed = [url::Url::parse("https://console.example.com").expect("valid test origin")];
 
-        let parameters = allowed_cookie_params(cookies, &allowed);
+        let parameters = allowed_cookie_params(cookies, Some(&allowed));
 
         assert_eq!(parameters.len(), 1);
         assert_eq!(parameters[0].domain.as_deref(), Some(".example.com"));
+    }
+
+    #[test]
+    fn remote_cookie_mapping_can_preserve_every_domain() {
+        let cookies = vec![
+            test_cookie(".example.com", false, None),
+            test_cookie("sibling.example.net", false, None),
+            test_cookie("console.example.com", false, Some(true)),
+        ];
+
+        let parameters = allowed_cookie_params(cookies, None);
+
+        assert_eq!(parameters.len(), 2);
+        assert_eq!(parameters[0].domain.as_deref(), Some(".example.com"));
+        assert_eq!(parameters[1].domain.as_deref(), Some("sibling.example.net"));
     }
 
     #[tokio::test]
@@ -6751,7 +6780,7 @@ mod tests {
         profile: &std::path::Path,
         value: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let config = brave_launch_config(
+        let config = profile_launch_config(
             BrowserConfig::builder()
                 .user_data_dir(profile)
                 .new_headless_mode(),

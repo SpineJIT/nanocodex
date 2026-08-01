@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![deny(unsafe_code, rustdoc::broken_intra_doc_links)]
 
+mod cookie_source;
 mod features;
 mod native;
 mod session;
@@ -56,6 +57,7 @@ where
     }
 }
 
+pub use cookie_source::{BrowserCookieSourceError, FirefoxCookieSource, SafariCookieSource};
 pub use features::{
     BrowserAccessibilityAudit, BrowserAccessibilityImpact, BrowserAccessibilityViolation,
     BrowserAfterAction, BrowserAxeAudit, BrowserAxeFinding, BrowserAxeNode, BrowserBreakpoint,
@@ -80,7 +82,7 @@ pub use features::{
     BrowserWebVitals,
 };
 pub use native::{BrowserBuildError, BrowserError};
-pub use session::{BraveSession, BraveSessionError};
+pub use session::{BraveSession, BraveSessionError, BrowserProfileKind};
 
 const TOOL_DESCRIPTION: &str = r"Control one server-managed browser session.
 
@@ -3158,6 +3160,7 @@ pub struct BrowserBuilder {
     executable: Option<std::path::PathBuf>,
     cdp_endpoint: Option<url::Url>,
     brave_session: Option<BraveSession>,
+    launch_brave_executable: bool,
     virtual_authenticator: Option<VirtualAuthenticator>,
     react_diagnostics: Option<ReactDiagnostics>,
     egress_policy: Option<BrowserEgressPolicy>,
@@ -3198,6 +3201,20 @@ impl BrowserBuilder {
     #[must_use]
     pub fn brave_session(mut self, session: BraveSession) -> Self {
         self.brave_session = Some(session);
+        self.launch_brave_executable = true;
+        self
+    }
+
+    /// Seeds the selected browser with cookies from a Chromium-family profile.
+    ///
+    /// Unlike [`Self::brave_session`], this does not select Brave as the
+    /// browser executable. An explicitly configured Chrome or Chromium binary,
+    /// or the normal auto-detected browser, launches with the private cookie
+    /// snapshot instead.
+    #[must_use]
+    pub fn cookie_source(mut self, session: BraveSession) -> Self {
+        self.brave_session = Some(session);
+        self.launch_brave_executable = false;
         self
     }
 
@@ -3304,11 +3321,6 @@ impl BrowserBuilder {
     /// Returns an error when the private runtime directory cannot be created.
     pub fn build(self) -> Result<Browser, BrowserBuildError> {
         nanocodex_oai_api::transport::install_default_rustls_crypto_provider();
-        if self.executable.is_some() && self.brave_session.is_some() {
-            return Err(BrowserBuildError::Configuration {
-                message: "`executable` and `brave_session` cannot both be configured".to_owned(),
-            });
-        }
         if self.cdp_endpoint.is_some() && self.executable.is_some() {
             return Err(BrowserBuildError::Configuration {
                 message: "`cdp_endpoint` cannot be combined with `executable`".to_owned(),
@@ -3370,14 +3382,19 @@ impl BrowserBuilder {
             .transpose()
             .map_err(BrowserBuildError::Io)?;
         let egress_policy = self.egress_policy.or_else(|| {
-            self.brave_session.as_ref().map(|session| {
-                session
-                    .allowed_origins()
-                    .iter()
-                    .cloned()
-                    .fold(BrowserEgressPolicy::deny_by_default(), |policy, origin| {
-                        policy.allow_origin(origin)
-                    })
+            self.brave_session.as_ref().and_then(|session| {
+                if session.copies_all_cookies() {
+                    return None;
+                }
+                Some(
+                    session
+                        .allowed_origins()
+                        .iter()
+                        .cloned()
+                        .fold(BrowserEgressPolicy::deny_by_default(), |policy, origin| {
+                            policy.allow_origin(origin)
+                        }),
+                )
             })
         });
         Ok(Browser {
@@ -3385,6 +3402,7 @@ impl BrowserBuilder {
                 self.executable,
                 self.cdp_endpoint,
                 self.brave_session,
+                self.launch_brave_executable,
                 self.virtual_authenticator,
                 self.react_diagnostics,
                 egress_policy,
