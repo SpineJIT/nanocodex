@@ -1,6 +1,54 @@
 use super::*;
 
 #[tokio::test]
+async fn execution_environment_suppresses_host_context_discovery() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut socket).await?);
+        send_warmup(&mut socket, "resp-warmup").await?;
+
+        let request = next_json(&mut socket).await?.to_string();
+        assert!(request.contains("remote task prompt"));
+        assert!(request.contains("<current_date>2026-07-29</current_date>"));
+        assert!(request.contains("<timezone>Etc/UTC</timezone>"));
+        assert!(!request.contains("host-only instructions"));
+        assert!(!request.contains("# AGENTS.md instructions"));
+        send_final(&mut socket, "resp-final").await
+    });
+
+    let workspace = temporary_workspace("remote-empty-agents-context")?;
+    std::fs::write(workspace.join("AGENTS.md"), "host-only instructions\n")?;
+    let openai = OpenAi::builder("test-key")
+        .websocket_url(endpoint)
+        .build()?;
+    let (agent, events) = Nanocodex::builder(openai)
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .execution_environment(ExecutionEnvironment::new("2026-07-29", "Etc/UTC"))
+        .session_id(test_session_id())
+        .build()?;
+    assert_eq!(
+        agent
+            .prompt("remote task prompt")
+            .await?
+            .result()
+            .await?
+            .final_message(),
+        "done"
+    );
+
+    drop((agent, events));
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn ordinary_turns_keep_creation_time_agents_md() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);

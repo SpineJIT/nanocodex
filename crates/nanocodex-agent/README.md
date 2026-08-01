@@ -40,6 +40,30 @@ and process state. Cloning [`Nanocodex`] only clones its command capability;
 [`Nanocodex::spawn`] creates a clean sibling and [`Nanocodex::fork`] creates an
 independent branch from committed history.
 
+## Remote tool environments
+
+When tools execute in a VM or remote workspace, provide one coherent snapshot
+of the facts described to the model. This prevents host time and `AGENTS.md`
+discovery from being mixed with a different tool filesystem:
+
+```rust,no_run
+use nanocodex_agent::{ExecutionEnvironment, Nanocodex, OpenAi};
+
+# fn build(openai: OpenAi) -> Result<(), Box<dyn std::error::Error>> {
+let environment = ExecutionEnvironment::new("2026-07-29", "Etc/UTC")
+    .project_instructions("Preserve generated files under build/.");
+let (_agent, _events) = Nanocodex::builder(openai)
+    .execution_environment(environment)
+    .build()?;
+# Ok(())
+# }
+```
+
+Omit [`ExecutionEnvironment::project_instructions`] when the remote workspace
+has no project instructions. Without an execution environment, native agents
+continue discovering date, timezone, and project instructions from the local
+embedding host.
+
 ## Typed events
 
 [`AgentEvents`] is optional and independent from turn results. Its raw

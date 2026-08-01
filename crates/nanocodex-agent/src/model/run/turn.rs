@@ -343,6 +343,7 @@ where
         let current_context = session.context.capture(
             session.tools.working_directory(),
             session.tools.default_shell_name(),
+            self.context_source.execution_environment(),
         );
         let canonical_context = current_context.full_item();
         if let Some(update) = session.context.update(current_context) {
@@ -420,8 +421,11 @@ where
             let factory = self.attempt_factory(&tools).for_logical_turn(logical_turn);
             let user_content = prepare_user_input(&task.instruction).await;
             let mut context = ContextState::new(selected_agents_md, ContextBaseline::Missing);
-            let context_snapshot =
-                context.capture(tools.working_directory(), tools.default_shell_name());
+            let context_snapshot = context.capture(
+                tools.working_directory(),
+                tools.default_shell_name(),
+                self.context_source.execution_environment(),
+            );
             let mut history = task_input(user_content, &context_snapshot);
             if !self.pending_developer_messages.is_empty() {
                 let user = history

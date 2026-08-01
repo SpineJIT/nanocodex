@@ -69,10 +69,18 @@ pub(super) fn load_instructions(
             None
         }
     };
+    combine_instructions(global_instructions, project_instructions.as_deref())
+}
+
+pub(super) fn combine_instructions(
+    global_instructions: Option<&str>,
+    project_instructions: Option<&str>,
+) -> Option<String> {
     match (global_instructions, project_instructions) {
         (Some(global), Some(project)) => Some(format!("{global}{PROJECT_DOC_SEPARATOR}{project}")),
         (Some(global), None) => Some(global.to_owned()),
-        (None, project) => project,
+        (None, Some(project)) => Some(project.to_owned()),
+        (None, None) => None,
     }
 }
 
