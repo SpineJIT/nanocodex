@@ -145,6 +145,7 @@ impl MppArgs {
         )?;
         let provider = provider
             .with_expected_chain_id(TEMPO_MAINNET_CHAIN_ID)
+            .with_preferred_currency(NANOUSD_ADDRESS)
             .with_autoswap(AutoswapConfig::new(NANOUSD_ADDRESS, self.swap_slippage_bps));
         let provider = CappedChargeProvider {
             provider,
@@ -177,6 +178,13 @@ where
 {
     fn supports(&self, method: &str, intent: &str) -> bool {
         self.provider.supports(method, intent)
+    }
+
+    fn select_challenge<'a>(
+        &self,
+        challenges: &[&'a PaymentChallenge],
+    ) -> Option<&'a PaymentChallenge> {
+        self.provider.select_challenge(challenges)
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
@@ -377,11 +385,30 @@ mod tests {
         payments: Arc<AtomicUsize>,
         commits: Arc<AtomicUsize>,
         rollbacks: Arc<AtomicUsize>,
+        select_last: bool,
+    }
+
+    impl MockProvider {
+        fn selecting_last(mut self) -> Self {
+            self.select_last = true;
+            self
+        }
     }
 
     impl PaymentProvider for MockProvider {
         fn supports(&self, method: &str, intent: &str) -> bool {
             method == "tempo" && intent == "charge"
+        }
+
+        fn select_challenge<'a>(
+            &self,
+            challenges: &[&'a PaymentChallenge],
+        ) -> Option<&'a PaymentChallenge> {
+            if self.select_last {
+                challenges.last().copied()
+            } else {
+                challenges.first().copied()
+            }
         }
 
         async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
@@ -432,6 +459,24 @@ mod tests {
         }))
         .unwrap();
         PaymentChallenge::new("challenge", "api.example.com", "tempo", "charge", request)
+    }
+
+    #[test]
+    fn capped_provider_preserves_inner_challenge_selection() {
+        let provider = CappedChargeProvider {
+            provider: MockProvider::default().selecting_last(),
+            max_charge: DEFAULT_MAX_EGRESS_CHARGE,
+        };
+        let first = challenge("1");
+        let mut preferred = challenge("1");
+        preferred.id = "preferred".to_owned();
+
+        assert_eq!(
+            provider
+                .select_challenge(&[&first, &preferred])
+                .map(|challenge| challenge.id.as_str()),
+            Some("preferred")
+        );
     }
 
     #[tokio::test]
