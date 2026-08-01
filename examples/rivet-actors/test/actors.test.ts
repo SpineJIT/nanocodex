@@ -147,6 +147,7 @@ describe.sequential("Nanocodex Rivet Actors", () => {
     await expect(session.start(request)).resolves.toEqual({
       type: "turn_accepted",
       id: request.id,
+      input: request.input,
       replayed: false,
     });
     expect((await session.status()).active_turns).toContain(request.id);
@@ -169,6 +170,80 @@ describe.sequential("Nanocodex Rivet Actors", () => {
     expect(completed.final_message).toBe("DETACHED_OK");
     expect((await session.status()).active_turns).not.toContain(request.id);
     expect(modelRequests).toBe(requestsAfterDetachedCompletion);
+  });
+
+  test("synchronizes accepted turns and durable results across connected clients", async (context) => {
+    resetMock();
+    configureApiKey();
+    responseDelayMs = 100;
+    const { client } = await setupTest(context, registry);
+    const session = client.nanocodex.getOrCreate([`multiclient-${crypto.randomUUID()}`]);
+    const first = session.connect();
+    const second = session.connect();
+    const firstAccepted: string[] = [];
+    const secondAccepted: string[] = [];
+    const firstCompleted: string[] = [];
+    const secondCompleted: string[] = [];
+    first.on("turnAccepted", (turn) => firstAccepted.push(`${turn.id}:${turn.input}`));
+    second.on("turnAccepted", (turn) => secondAccepted.push(`${turn.id}:${turn.input}`));
+    first.on("turnCompleted", (turn) => firstCompleted.push(`${turn.id}:${turn.final_message}`));
+    second.on("turnCompleted", (turn) => secondCompleted.push(`${turn.id}:${turn.final_message}`));
+    await Promise.all([first.ready, second.ready]);
+
+    const request = {
+      id: "shared-turn",
+      input: "Reply with exactly SYNC_OK",
+    };
+    await session.start(request);
+    await vi.waitFor(() => {
+      expect(firstAccepted).toEqual(["shared-turn:Reply with exactly SYNC_OK"]);
+      expect(secondAccepted).toEqual(firstAccepted);
+    });
+    expect(await session.status()).toMatchObject({
+      active_turns: [request.id],
+      active_turn_details: [request],
+    });
+
+    const completed = await session.prompt(request);
+    expect(completed.final_message).toBe("SYNC_OK");
+    await vi.waitFor(() => {
+      expect(firstCompleted).toEqual(["shared-turn:SYNC_OK"]);
+      expect(secondCompleted).toEqual(firstCompleted);
+    });
+    const requestsAfterCompletion = modelRequests;
+    expect((await session.prompt(request)).final_message).toBe("SYNC_OK");
+    expect(modelRequests).toBe(requestsAfterCompletion);
+    await Promise.all([first.dispose(), second.dispose()]);
+  });
+
+  test("reconstructs an active prompt for a client that reconnects mid-turn", async (context) => {
+    resetMock();
+    configureApiKey();
+    responseDelayMs = 1_000;
+    const { client } = await setupTest(context, registry);
+    const session = client.nanocodex.getOrCreate([`reconnect-${crypto.randomUUID()}`]);
+    const first = session.connect();
+    await first.ready;
+    const request = {
+      id: "reconnected-turn",
+      input: "Reply with exactly RECONNECTED_OK",
+    };
+    await session.start(request);
+    await first.dispose();
+
+    const reconnected = session.connect();
+    const completed: string[] = [];
+    reconnected.on("turnCompleted", (turn) => completed.push(`${turn.id}:${turn.final_message}`));
+    await reconnected.ready;
+    expect(await reconnected.status()).toMatchObject({
+      active_turns: [request.id],
+      active_turn_details: [request],
+    });
+    expect((await reconnected.prompt(request)).final_message).toBe("RECONNECTED_OK");
+    await vi.waitFor(() => {
+      expect(completed).toEqual(["reconnected-turn:RECONNECTED_OK"]);
+    });
+    await reconnected.dispose();
   });
 
   test("single-flights rotating subscription credentials and retries a rejected upgrade", async (context) => {

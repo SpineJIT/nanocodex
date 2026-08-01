@@ -82,9 +82,17 @@ In another terminal:
 ```sh
 npm run repl --prefix examples/rivet-actors
 npm run smoke --prefix examples/rivet-actors
+npm run multiclient --prefix examples/rivet-actors
 npm run stress --prefix examples/rivet-actors
 npm run brutalize --prefix examples/rivet-actors
 ```
+
+`multiclient` attaches two independent realtime clients to one actor and
+requires both to receive the same accepted prompt, Nanocodex event stream, and
+durably committed terminal result. The browser uses the same broadcasts, so
+tabs or devices connected with the same actor key stay synchronized. A newly
+connected client also reconstructs any active prompt from `status()` before
+joining its remaining event stream.
 
 The REPL is intentionally disposable. It stores only the Rivet endpoint,
 actor key, and an unfinished turn ID/input in `.nanocodex/rivet-repl.json`.
