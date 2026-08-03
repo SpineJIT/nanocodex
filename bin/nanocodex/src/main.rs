@@ -3,6 +3,17 @@ mod browser;
 mod config;
 #[cfg(feature = "tempo")]
 mod credits;
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+mod eval;
+#[cfg(not(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+)))]
+#[path = "eval_unsupported.rs"]
+mod eval;
 mod mcp;
 #[cfg_attr(not(feature = "tempo"), path = "mpp_disabled.rs")]
 mod mpp;
@@ -66,6 +77,8 @@ enum Command {
     /// Inspect or purchase Nanocodex NANOUSD credits.
     #[cfg(feature = "tempo")]
     Credits(credits::Credits),
+    /// Run and inspect durable VM-backed agent evaluations.
+    Eval(eval::Eval),
     /// Internal entrypoint for one dedicated libkrun VMM process.
     #[command(hide = true)]
     VmRunConfig(vm::VmRunConfig),
@@ -133,6 +146,7 @@ async fn run(cli: Cli) -> Result<()> {
         Some(Command::Auth(command)) => command.run().await,
         #[cfg(feature = "tempo")]
         Some(Command::Credits(command)) => command.run().await,
+        Some(Command::Eval(command)) => command.run().await,
         Some(Command::VmRunConfig(_)) => unreachable!("VMM commands run before Tokio starts"),
         Some(Command::Run(command)) => {
             let _observability = command.observability.install(false, command.agent.cwd())?;

@@ -37,6 +37,11 @@ export default defineConfig({
   },
   worker: { format: "es" },
   server: {
+    proxy: {
+      "/api/evals": {
+        target: process.env.NANOCODEX_EVALS_API ?? "http://127.0.0.1:8788",
+      },
+    },
     fs: {
       allow: [repositoryRoot],
     },

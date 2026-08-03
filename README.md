@@ -11,7 +11,9 @@
 
 **[Install](#install)** · **[Agent API](#minimal-api-example)** ·
 **[Thesis](#thesis)** · **[Components](#components)** ·
-**[VM-backed tools](#vm-backed-tools)** · **[Documentation](#documentation)**
+**[VM-backed tools](#vm-backed-tools)** ·
+**[Evaluation](crates/experimental/nanocodex-eval/README.md)** ·
+**[Documentation](#documentation)**
 
 [ci]: https://github.com/gakonst/nanocodex/actions/workflows/ci.yml
 [crates]: https://crates.io/crates/nanocodex
@@ -252,9 +254,11 @@ Components whose public contracts are still maturing live under
 | --- | --- |
 | [`nanocodex-voice`](crates/experimental/nanocodex-voice/README.md) | Desktop GPT Realtime audio and reusable voice-to-agent lifecycle |
 | [`nanocodex-vm`](crates/experimental/nanocodex-vm/README.md) | VM lifecycle and images plus retained guest-backed workspace tools |
+| [`nanocodex-eval`](crates/experimental/nanocodex-eval/README.md) | VM-backed evaluation, canonical verification, durable evidence, and live stock-Codex differential analysis |
 
 The CLI is a consumer of these crates. Voice and VM-backed tools remain thin,
-opt-in adapters over the stable library contracts.
+opt-in adapters over the stable library contracts for normal agent sessions;
+VM-backed execution is mandatory for benchmark eval commands.
 
 ### CLI and language bindings
 
@@ -294,6 +298,7 @@ requirements, and macOS signing.
 - [Migration from 0.2.x](docs/MIGRATING.md)
 - [Examples](examples/README.md)
 - [Benchmarks and retained measurements](benchmarks/)
+- [VM evaluation and stock-Codex differential runs](crates/experimental/nanocodex-eval/README.md)
 - [VM-backed tools and egress](docs/VM.md)
 
 ## License

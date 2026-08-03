@@ -55,6 +55,51 @@ development instrument, not a general product ranking. The comparison links
 each disagreement back to its retained trial so compatibility gaps can be
 inspected directly.
 
+### Live eval view
+
+The Evals route switches from its static published snapshot to a live,
+runner-independent task matrix when the local evidence endpoint is available.
+Start the read-only server with one or more differential sweep output or parent
+directories:
+
+```bash
+npm run evals:server -- \
+  --static dist-evals \
+  /path/to/wave-a/output/sweep \
+  /path/to/wave-b/output/sweep
+```
+
+Build the standalone bundle first with `npm run evals:build`; `--static` serves
+it and the API from one process. For development, use `npm run evals:dev`, or
+run the complete website normally. Both proxy `/api/evals` to
+`http://127.0.0.1:8788`; set `NANOCODEX_EVALS_API` to use another endpoint.
+The browser receives an initial snapshot and subsequent updates over
+server-sent events, with automatic reconnect after an interruption.
+
+The server is deliberately loopback-only and is not routed by the production
+Cloudflare Worker; deployed `/api/evals*` requests return 404 unless an operator
+explicitly runs this separate process and supplies a same-origin proxy. It reads
+durable manifests, compact comparison reports, and the latest
+progress heartbeat. It folds infrastructure replacement chains back into their
+original trial coordinate, ignores cleaned reportless restart tombstones, and
+reports host CPU, memory, swap, and filesystem capacity. Clicking a completed
+coordinate loads its task instruction, structured report, final agent messages,
+and bounded canonical verifier stdout/stderr through an opaque case ID. The
+server does not provide arbitrary file or workspace access and does not serve
+raw prompts, reasoning, or tool transcripts. Host health is serialized only as
+normalized utilization percentages; exact CPU count, memory, swap, disk size,
+scheduler limits, host paths, network addresses, tailnet names, and credential
+shapes are excluded or redacted. Completed reports are cached in memory. Live
+progress files are followed from their last parsed byte, reportless tombstones
+are reconsidered when new evidence arrives, and structured progress coordinates
+keep tasks with the same short name distinct. Watching the dashboard therefore
+does not repeatedly parse full logs or interfere with VM disk cleanup and shared
+image/runtime caches.
+
+For tailnet-only access from the eval host, keep both processes bound to
+loopback and proxy the Vite port with Tailscale Serve. Inspect the host's
+existing Serve configuration before adding the route.
+
 The homepage is also a real embedded-agent demo with three deliberately thin
 layers:
 
