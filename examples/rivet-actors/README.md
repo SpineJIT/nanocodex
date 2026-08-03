@@ -135,7 +135,10 @@ The smoke also forces the real model to write, execute, and read through
 AgentOS, starts a native Python HTTP server, creates a signed preview, and
 fetches that preview from outside Rivet. It requires completed Nanocodex
 `tool.call`/`tool.result` event pairs, so it verifies the WASM tool loop,
-isolated VM, and public proxy rather than only a text response.
+isolated VM, and public proxy rather than only a text response. If one client
+request reaches the Rivet gateway deadline while the actor turn is still
+active, the smoke reattaches with the same turn ID instead of starting another
+model call.
 
 The stress driver reuses persistent actor connections and bounds fan-out to
 avoid benchmarking the gateway's per-route rate limiter. Tune

@@ -68,7 +68,7 @@ try {
   if (restored.final_message !== "EDGE_OK") {
     throw new Error(`restored session lost history: ${restored.final_message}`);
   }
-  const toolTurn = await session.turn({
+  const toolTurn = await awaitDurableTurn({
     id: randomUUID(),
     input: "Use sandbox_write_file to write exactly RIVET_SANDBOX_OK to index.html. Verify it with sandbox_exec and sandbox_read_file. Call sandbox_start_process with command `python3`, args [`-m`, `http.server`, `3000`, `--bind`, `0.0.0.0`, `--directory`, `/workspace`], and ready_port 3000. After it reports the port ready, call sandbox_preview for port 3000. Reply with only the preview URL.",
   });
@@ -103,11 +103,37 @@ try {
     status: "ok",
   }));
 } finally {
-  await events.dispose();
+  await cleanupSession();
+}
+
+async function awaitDurableTurn(request: { id: string; input: string }) {
+  await session.start(request);
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await session.turn(request);
+    } catch (error) {
+      lastError = error;
+      const status = await session.status();
+      if (!status.active_turns.includes(request.id)) throw error;
+    }
+  }
+  throw lastError;
+}
+
+async function cleanupSession(): Promise<void> {
+  await events.dispose().catch(() => {});
   if (sandboxProcessId !== undefined) {
     await session.process.kill(sandboxProcessId).catch(() => {});
   }
-  await session.reset();
+  const status = await session.status().catch(() => undefined);
+  await Promise.all((status?.active_turns ?? []).map((id) => session.cancel(id).catch(() => {})));
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const current = await session.status().catch(() => undefined);
+    if (!current || current.active_turns.length === 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  await session.reset().catch(() => {});
 }
 
 function parseToolResult(value: unknown): Record<string, unknown> | undefined {
