@@ -156,14 +156,17 @@ file permissions and token lifetime, and does not copy the rotating refresh
 token:
 
 ```sh
+# The first invocation can set RIVET_CLOUD_TOKEN; Rivet stores it in
+# ~/.rivet/credentials for subsequent deploys.
 export RIVET_CLOUD_TOKEN=cloud_api_xxxxx
 npm run deploy:subscription --prefix examples/rivet-actors
 ```
 
 This is the same access-token-only policy as the Cloudflare demo. It keeps
 working until the current access token expires or ChatGPT rejects it; then run
-`codex login` and deploy again. `NANOCODEX_CODEX_AUTH_FILE`, `CODEX_HOME`, and
-`RIVET_NAMESPACE` override the auth path and target namespace.
+`codex login` and deploy again. Once the Rivet CLI has cached credentials,
+`RIVET_CLOUD_TOKEN` may be omitted. `NANOCODEX_CODEX_AUTH_FILE`, `CODEX_HOME`,
+and `RIVET_NAMESPACE` override the auth path and target namespace.
 
 For a long-lived deployment, give the auth actor dedicated rotating
 subscription credentials instead. This still does not require
