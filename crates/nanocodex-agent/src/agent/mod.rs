@@ -98,6 +98,7 @@ mod spawn;
 mod turn;
 
 pub use builder::NanocodexBuilder;
+pub use context_source::ExecutionEnvironment;
 pub use handle::{AgentHandle, Nanocodex};
 pub use session_context::AgentSessionContext;
 pub use turn::{PromptRoute, Turn, TurnControl, TurnResult};

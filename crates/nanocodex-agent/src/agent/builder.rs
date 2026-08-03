@@ -108,6 +108,17 @@ impl<F> NanocodexBuilder<F> {
         self
     }
 
+    /// Describes the remote environment where model-visible tools execute.
+    ///
+    /// This replaces host date/time discovery and host `AGENTS.md` discovery
+    /// together, so one agent never mixes context from two machines. The
+    /// snapshot remains fixed for this agent lifecycle.
+    #[must_use]
+    pub fn execution_environment(mut self, environment: ExecutionEnvironment) -> Self {
+        self.codex.context.set_execution_environment(environment);
+        self
+    }
+
     /// Sets the root agent's `UUIDv7` session identity.
     ///
     /// The root identity also seeds its checkpoint lineage. Spawned siblings
@@ -234,6 +245,7 @@ where
     <F::Service as Service<ResponsesAttempt>>::Future: AgentSend,
 {
     validate(&builder.config, builder.prompt_cache.key.as_deref())?;
+    validate_execution_environment(builder.codex.context.execution_environment())?;
     let config = Arc::new(builder.config);
     let factory = builder.factory;
     let service_factory: ServiceFactory<F::Service> = Arc::new(move |config| factory.make(config));
@@ -247,6 +259,68 @@ where
         builder.resume,
         service_factory,
     )
+}
+
+fn validate_execution_environment(environment: Option<&ExecutionEnvironment>) -> Result<()> {
+    let Some(environment) = environment else {
+        return Ok(());
+    };
+    if environment.current_date.trim().is_empty() {
+        return Err(NanocodexError::InvalidRequest(
+            "execution-environment current date must not be empty".to_owned(),
+        ));
+    }
+    if !is_iso_date(environment.current_date.trim()) {
+        return Err(NanocodexError::InvalidRequest(
+            "execution-environment current date must use YYYY-MM-DD".to_owned(),
+        ));
+    }
+    if environment.timezone.trim().is_empty() {
+        return Err(NanocodexError::InvalidRequest(
+            "execution-environment timezone must not be empty".to_owned(),
+        ));
+    }
+    if environment
+        .project_instructions
+        .as_deref()
+        .is_some_and(|instructions| instructions.trim().is_empty())
+    {
+        return Err(NanocodexError::InvalidRequest(
+            "execution-environment project instructions must not be empty".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_iso_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let Some(year) = decimal(&bytes[..4]) else {
+        return false;
+    };
+    let Some(month) = decimal(&bytes[5..7]) else {
+        return false;
+    };
+    let Some(day) = decimal(&bytes[8..]) else {
+        return false;
+    };
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&day)
+}
+
+fn decimal(bytes: &[u8]) -> Option<u32> {
+    bytes.iter().try_fold(0_u32, |value, byte| {
+        byte.is_ascii_digit()
+            .then(|| value * 10 + u32::from(*byte - b'0'))
+    })
 }
 
 #[cfg(test)]
@@ -263,6 +337,34 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn execution_environment_requires_complete_model_visible_context() {
+        assert!(
+            validate_execution_environment(Some(&ExecutionEnvironment::new(
+                "2026-07-29",
+                "Etc/UTC",
+            )))
+            .is_ok()
+        );
+        assert!(
+            validate_execution_environment(Some(&ExecutionEnvironment::new("July 29", "Etc/UTC",)))
+                .is_err()
+        );
+        assert!(
+            validate_execution_environment(Some(&ExecutionEnvironment::new(
+                "2026-02-29",
+                "Etc/UTC",
+            )))
+            .is_err()
+        );
+        assert!(
+            validate_execution_environment(Some(
+                &ExecutionEnvironment::new("2026-07-29", "Etc/UTC").project_instructions(" "),
+            ))
+            .is_err()
+        );
+    }
 
     #[derive(Clone)]
     struct ObservingFactory {
