@@ -21,6 +21,7 @@ COPY py/bindings/Cargo.toml py/bindings/Cargo.toml
 COPY crates/nanocodex/Cargo.toml crates/nanocodex/Cargo.toml
 COPY crates/nanocodex-agent/Cargo.toml crates/nanocodex-agent/Cargo.toml
 COPY crates/experimental/nanocodex-browser/Cargo.toml crates/experimental/nanocodex-browser/Cargo.toml
+COPY crates/experimental/nanocodex-egress/Cargo.toml crates/experimental/nanocodex-egress/Cargo.toml
 COPY crates/experimental/nanocodex-voice/Cargo.toml crates/experimental/nanocodex-voice/Cargo.toml
 COPY crates/experimental/nanocodex-vm/Cargo.toml crates/experimental/nanocodex-vm/Cargo.toml
 COPY crates/nanocodex-oai-api/Cargo.toml crates/nanocodex-oai-api/Cargo.toml
@@ -41,6 +42,8 @@ RUN mkdir -p bin/nanocodex/src \
         crates/nanocodex-agent/benches \
         crates/experimental/nanocodex-browser/src \
         crates/experimental/nanocodex-browser/benches \
+        crates/experimental/nanocodex-egress/src \
+        crates/experimental/nanocodex-egress/benches \
         crates/experimental/nanocodex-voice/src \
         crates/experimental/nanocodex-vm/src/bin \
         crates/experimental/nanocodex-vm/benches \
@@ -63,6 +66,8 @@ RUN mkdir -p bin/nanocodex/src \
     printf '\n' > crates/experimental/nanocodex-browser/src/lib.rs && \
     printf 'fn main() {}\n' > crates/experimental/nanocodex-browser/benches/browser_protocol.rs && \
     printf 'fn main() {}\n' > crates/experimental/nanocodex-browser/benches/browser_vm.rs && \
+    printf '\n' > crates/experimental/nanocodex-egress/src/lib.rs && \
+    printf 'fn main() {}\n' > crates/experimental/nanocodex-egress/benches/proxy_round_trip.rs && \
     printf '\n' > crates/experimental/nanocodex-voice/src/lib.rs && \
     printf '\n' > crates/experimental/nanocodex-vm/src/lib.rs && \
     printf 'fn main() {}\n' > crates/experimental/nanocodex-vm/src/bin/nanocodex-vm-guest.rs && \
@@ -105,6 +110,8 @@ RUN --mount=type=cache,id=nanocodex-cargo-registry,target=/usr/local/cargo/regis
         crates/nanocodex/src/lib.rs \
         crates/nanocodex-agent/src/lib.rs \
         crates/experimental/nanocodex-browser/src/lib.rs \
+        crates/experimental/nanocodex-egress/src/lib.rs \
+        crates/experimental/nanocodex-egress/benches/proxy_round_trip.rs \
         crates/experimental/nanocodex-voice/src/lib.rs \
         crates/experimental/nanocodex-vm/src/lib.rs \
         crates/nanocodex-oai-api/src/lib.rs \

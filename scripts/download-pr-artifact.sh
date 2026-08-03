@@ -19,7 +19,7 @@ if [[ ! "$artifact" =~ ^[A-Za-z0-9._-]+$ ]]; then
 fi
 
 repository=${GH_REPO:-gakonst/nanocodex}
-workflow=nightly.yml
+workflow=harbor-nightly.yml
 
 command -v gh >/dev/null 2>&1 || {
     echo "gh is required to download PR artifacts" >&2
@@ -47,7 +47,7 @@ runs=$(
         --json conclusion,databaseId,displayTitle,status,url
 )
 run=$(
-    jq -c --arg title "PR #$pr artifacts" \
+    jq -c --arg title "PR #$pr Harbor artifact" \
         'map(select(.displayTitle == $title)) | first // empty' <<<"$runs"
 )
 if [[ -z "$run" ]]; then
