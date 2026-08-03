@@ -6,21 +6,19 @@ const VIRTUAL_WORKSPACE = "/workspace";
 const PREVIEW_PORTS = [3000, 5173, 8000, 8080] as const;
 const MAX_COMMAND_CHARS = 32 * 1024;
 const MAX_FILE_BYTES = 1024 * 1024;
-const MAX_OUTPUT_CHARS = 128 * 1024;
+const MAX_OUTPUT_BYTES = 128 * 1024;
 const MAX_LIST_ENTRIES = 512;
 const MAX_TIMEOUT_MS = 120_000;
 
 export function vercelSandboxTools(sessionId: string): ToolMap {
-  let sandboxPromise: Promise<Sandbox> | undefined;
-  const sandbox = () => sandboxPromise ??= Sandbox.getOrCreate({
-    name: `nanocodex-${sessionId}`,
-    runtime: "node24",
-    persistent: true,
-    timeout: 10 * 60_000,
-    ports: [...PREVIEW_PORTS],
-    keepLastSnapshots: { count: 3, expiration: 7 * 24 * 60 * 60_000 },
-    tags: { application: "nanocodex", session: sessionId.slice(0, 64) },
-  });
+  return createVercelSandboxTools(() => prepareSandbox(sessionId));
+}
+
+export function createVercelSandboxTools(
+  createSandbox: () => Promise<Pick<Sandbox, "domain" | "fs" | "runCommand">>,
+): ToolMap {
+  let sandboxPromise: ReturnType<typeof createSandbox> | undefined;
+  const sandbox = () => sandboxPromise ??= createSandbox();
 
   return {
     sandbox_exec: {
@@ -69,7 +67,57 @@ export function vercelSandboxTools(sessionId: string): ToolMap {
         const stat = await sandboxHandle.fs.stat(path);
         if (!stat.isFile()) throw new Error("path is not a file");
         if (stat.size > MAX_FILE_BYTES) throw new Error("file exceeds 1 MiB");
-        return { path: virtualPath(path), content: await sandboxHandle.fs.readFile(path, "utf8") };
+        const content = await sandboxHandle.fs.readFile(path);
+        if (content.byteLength > MAX_FILE_BYTES) throw new Error("file exceeds 1 MiB");
+        let text: string;
+        try {
+          text = new TextDecoder("utf-8", { fatal: true }).decode(content);
+        } catch {
+          throw new Error("file is not valid UTF-8");
+        }
+        return { path: virtualPath(path), content: text };
+      },
+    },
+    sandbox_start_process: {
+      description: "Start a detached process in this session's isolated Vercel Sandbox, optionally waiting for a TCP port to become ready.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Command to start." },
+          cwd: { type: "string", description: "Workspace-relative working directory." },
+          ready_port: { type: "integer", minimum: 1024, maximum: 65_535 },
+          ready_timeout_ms: { type: "integer", minimum: 1, maximum: MAX_TIMEOUT_MS },
+        },
+        required: ["command"],
+        additionalProperties: false,
+      },
+      handler: async (input) => {
+        const value = objectInput(input);
+        const command = requiredString(value.command, "command", MAX_COMMAND_CHARS);
+        const cwd = workspacePath(optionalString(value.cwd, "cwd") ?? ".");
+        const readyPort = optionalInteger(value.ready_port, "ready_port", 1024, 65_535);
+        const readyTimeout = optionalInteger(
+          value.ready_timeout_ms,
+          "ready_timeout_ms",
+          1,
+          MAX_TIMEOUT_MS,
+        ) ?? 30_000;
+        const sandboxHandle = await sandbox();
+        const process = await sandboxHandle.runCommand({
+          cmd: "bash",
+          args: ["-lc", command],
+          cwd,
+          detached: true,
+        });
+        if (readyPort !== undefined) {
+          await waitForPort(sandboxHandle, readyPort, readyTimeout);
+        }
+        return {
+          process_id: process.cmdId,
+          command,
+          status: "running",
+          ...(readyPort === undefined ? {} : { ready_port: readyPort }),
+        };
       },
     },
     sandbox_write_file: {
@@ -86,7 +134,7 @@ export function vercelSandboxTools(sessionId: string): ToolMap {
       handler: async (input) => {
         const value = objectInput(input);
         const path = workspacePath(requiredString(value.path, "path", 1024));
-        const content = requiredString(value.content, "content", MAX_FILE_BYTES);
+        const content = requiredContent(value.content);
         const bytes = Buffer.byteLength(content, "utf8");
         if (bytes > MAX_FILE_BYTES) throw new Error("content exceeds 1 MiB");
         const sandboxHandle = await sandbox();
@@ -134,6 +182,47 @@ export function vercelSandboxTools(sessionId: string): ToolMap {
   };
 }
 
+async function prepareSandbox(sessionId: string): Promise<Sandbox> {
+  const sandbox = await Sandbox.getOrCreate({
+    name: `nanocodex-${sessionId}`,
+    runtime: "node24",
+    persistent: true,
+    timeout: 10 * 60_000,
+    ports: [...PREVIEW_PORTS],
+    keepLastSnapshots: { count: 3, expiration: 7 * 24 * 60 * 60_000 },
+    tags: { application: "nanocodex", session: sessionId.slice(0, 64) },
+  });
+  const linked = await sandbox.runCommand({
+    cmd: "bash",
+    args: [
+      "-lc",
+      `if [ -e ${VIRTUAL_WORKSPACE} ] || [ -L ${VIRTUAL_WORKSPACE} ]; then test "$(readlink -f ${VIRTUAL_WORKSPACE})" = ${WORKSPACE}; else ln -s ${WORKSPACE} ${VIRTUAL_WORKSPACE}; fi`,
+    ],
+    sudo: true,
+    timeoutMs: 10_000,
+  });
+  if (linked.exitCode !== 0) {
+    throw new Error(`failed to prepare /workspace: ${await linked.stderr()}`);
+  }
+  return sandbox;
+}
+
+async function waitForPort(
+  sandbox: Pick<Sandbox, "runCommand">,
+  port: number,
+  timeoutMs: number,
+): Promise<void> {
+  const result = await sandbox.runCommand({
+    cmd: "bash",
+    args: [
+      "-lc",
+      `until (exec 3<>/dev/tcp/127.0.0.1/${port}) 2>/dev/null; do sleep 0.1; done`,
+    ],
+    timeoutMs,
+  });
+  if (result.exitCode !== 0) throw new Error(`port ${port} did not become ready`);
+}
+
 export function workspacePath(raw: string): string {
   if (!raw || raw.length > 1024 || raw.includes("\0")) throw new Error("path must be 1-1024 characters");
   let relative = raw;
@@ -158,6 +247,12 @@ function objectInput(input: unknown): Record<string, unknown> {
 function requiredString(value: unknown, name: string, maxChars: number): string {
   if (typeof value !== "string" || value.length === 0) throw new Error(`${name} must be a non-empty string`);
   if (value.length > maxChars) throw new Error(`${name} is too long`);
+  return value;
+}
+
+function requiredContent(value: unknown): string {
+  if (typeof value !== "string") throw new Error("content must be a string");
+  if (value.length > MAX_FILE_BYTES) throw new Error("content exceeds 1 MiB");
   return value;
 }
 
@@ -196,7 +291,18 @@ function pathParameters(): Record<string, unknown> {
 }
 
 function truncate(value: string): { text: string; truncated: boolean } {
-  return value.length <= MAX_OUTPUT_CHARS
-    ? { text: value, truncated: false }
-    : { text: value.slice(0, MAX_OUTPUT_CHARS), truncated: true };
+  const encoded = new TextEncoder().encode(value);
+  if (encoded.byteLength <= MAX_OUTPUT_BYTES) return { text: value, truncated: false };
+  let end = MAX_OUTPUT_BYTES;
+  while (end > 0) {
+    try {
+      return {
+        text: new TextDecoder("utf-8", { fatal: true }).decode(encoded.subarray(0, end)),
+        truncated: true,
+      };
+    } catch {
+      end -= 1;
+    }
+  }
+  return { text: "", truncated: true };
 }
