@@ -21,6 +21,10 @@ nanocodex credits buy 25 --json --no-wait
 nanocodex credits wait ord_... --order-token ...
 ```
 
+The CLI defaults to the hosted credits service at
+`https://nanocodex-api.paradigm.xyz`. Override it with `--api-url` or
+`NANOCODEX_CREDITS_API_URL` when running a local service.
+
 In Stripe mode, `credits buy` creates an order and opens the returned hosted
 Stripe Checkout URL in the system browser. `--no-open` prints the URL for SSH
 and other headless environments. The CLI then polls the capability-protected

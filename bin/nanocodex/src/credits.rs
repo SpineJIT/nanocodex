@@ -3,10 +3,11 @@ use std::{path::PathBuf, process::Command, time::Duration};
 use clap::{Args, Subcommand};
 use eyre::{Result, eyre};
 use nanousd::{
-    CreateOrderRequest, CreateOrderResponse, CreditsClient, DEFAULT_API_URL, NANOUSD_DECIMALS,
-    Order, OrderStatus,
+    CreateOrderRequest, CreateOrderResponse, CreditsClient, NANOUSD_DECIMALS, Order, OrderStatus,
 };
 use tempo_alloy::accounts::TempoAccountsStore;
+
+const DEFAULT_CREDITS_API_URL: &str = "https://nanocodex-api.paradigm.xyz";
 
 #[derive(Args)]
 pub(crate) struct Credits {
@@ -18,7 +19,7 @@ pub(crate) struct Credits {
         long,
         global = true,
         env = "NANOCODEX_CREDITS_API_URL",
-        default_value = DEFAULT_API_URL
+        default_value = DEFAULT_CREDITS_API_URL
     )]
     api_url: String,
 
@@ -327,10 +328,9 @@ mod tests {
     }
 
     #[test]
-    fn credits_api_url_defaults_to_loopback() {
+    fn credits_api_url_defaults_to_hosted_service() {
         let cli = TestCli::try_parse_from(["nanocodex-credits", "status"]).unwrap();
 
-        assert_eq!(cli.credits.api_url, DEFAULT_API_URL);
-        assert!(cli.credits.api_url.starts_with("http://127.0.0.1:"));
+        assert_eq!(cli.credits.api_url, DEFAULT_CREDITS_API_URL);
     }
 }
