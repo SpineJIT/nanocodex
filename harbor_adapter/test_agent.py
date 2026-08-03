@@ -53,6 +53,13 @@ class CliToolInstallContractTests(unittest.TestCase):
             self.assertIn(package_manager, command)
         for executable in ("curl", "bash", "node", "npm", "rg"):
             self.assertIn(f"command -v {executable}", command)
+        self.assertLess(command.index("command -v curl"), command.index("apk add"))
+        self.assertIn("PATH=$PATH:/opt/nanocodex-verifier/bin", command)
+        self.assertIn(
+            "/opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt",
+            command,
+        )
+        self.assertIn("/etc/pki/tls/certs/ca-bundle.crt", command)
         self.assertIn(
             '"/opt/nanocodex-toolbox/usr/share/nodejs"',
             command,
@@ -68,6 +75,162 @@ class CliToolInstallContractTests(unittest.TestCase):
         self.assertNotIn("command -v npm", command)
         for package in ("ca-certificates", "curl", "bash", "ripgrep"):
             self.assertIn(package, command)
+
+    def test_preinstalled_tools_skip_package_managers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            certificate = root / "ca-certificates.crt"
+            certificate.write_text("test certificate", encoding="utf-8")
+            marker = root / "package-manager-ran"
+            for command in ("curl", "bash", "rg", "node", "npm"):
+                executable = bin_dir / command
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o755)
+            for manager in ("apk", "apt-get", "yum"):
+                executable = bin_dir / manager
+                executable.write_text(
+                    f"#!/bin/sh\ntouch {marker}\nexit 99\n", encoding="utf-8"
+                )
+                executable.chmod(0o755)
+
+            command = _cli_tools_install_command(install_node=True).replace(
+                "/etc/ssl/certs/ca-certificates.crt", str(certificate)
+            )
+            subprocess.run(
+                ["sh", "-c", command],
+                check=True,
+                env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+            )
+
+            self.assertFalse(marker.exists())
+
+    def test_native_curl_without_native_ca_uses_package_manager(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            task_certificate = root / "task-ca-certificates.crt"
+            toolbox_certificate = root / "toolbox-ca-certificates.crt"
+            toolbox_certificate.write_text("test certificate", encoding="utf-8")
+            marker = root / "package-manager-ran"
+            for command in ("curl", "bash", "rg"):
+                executable = bin_dir / command
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o755)
+            apt_get = bin_dir / "apt-get"
+            apt_get.write_text(
+                "#!/bin/sh\n"
+                f"touch {marker}\n"
+                f"printf 'test certificate' > {task_certificate}\n",
+                encoding="utf-8",
+            )
+            apt_get.chmod(0o755)
+
+            command = _cli_tools_install_command(install_node=False).replace(
+                "/opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt",
+                str(toolbox_certificate),
+            ).replace(
+                "/etc/ssl/certs/ca-certificates.crt",
+                str(task_certificate),
+            )
+            subprocess.run(
+                ["sh", "-c", command],
+                check=True,
+                env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+            )
+
+            self.assertTrue(marker.exists())
+            self.assertTrue(task_certificate.exists())
+
+    def test_toolbox_curl_with_toolbox_ca_skips_package_managers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            toolbox_bin = root / "toolbox-bin"
+            bin_dir.mkdir()
+            toolbox_bin.mkdir()
+            task_certificate = root / "missing-task-ca-certificates.crt"
+            toolbox_certificate = root / "toolbox-ca-certificates.crt"
+            toolbox_certificate.write_text("test certificate", encoding="utf-8")
+            marker = root / "package-manager-ran"
+            for command in ("bash", "rg"):
+                executable = bin_dir / command
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o755)
+            curl = toolbox_bin / "curl"
+            curl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            curl.chmod(0o755)
+            apt_get = bin_dir / "apt-get"
+            apt_get.write_text(
+                f"#!/bin/sh\ntouch {marker}\nexit 99\n", encoding="utf-8"
+            )
+            apt_get.chmod(0o755)
+
+            command = (
+                _cli_tools_install_command(install_node=False)
+                .replace("/opt/nanocodex-verifier/bin", str(toolbox_bin))
+                .replace(
+                    "/opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt",
+                    str(toolbox_certificate),
+                )
+                .replace(
+                    "/etc/ssl/certs/ca-certificates.crt",
+                    str(task_certificate),
+                )
+            )
+            subprocess.run(
+                ["/bin/sh", "-c", command],
+                check=True,
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertFalse(marker.exists())
+            self.assertFalse(task_certificate.exists())
+
+    def test_yum_ca_bundle_is_an_accepted_native_certificate_location(self) -> None:
+        command = _cli_tools_install_command(install_node=False)
+
+        self.assertIn(
+            "test -s /etc/ssl/certs/ca-certificates.crt || "
+            "test -s /etc/pki/tls/certs/ca-bundle.crt",
+            command,
+        )
+
+    def test_missing_tool_uses_package_manager_then_rechecks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            certificate = root / "ca-certificates.crt"
+            certificate.write_text("test certificate", encoding="utf-8")
+            marker = root / "package-manager-ran"
+            for command in ("curl", "bash"):
+                executable = bin_dir / command
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o755)
+            apt_get = bin_dir / "apt-get"
+            apt_get.write_text(
+                "#!/bin/sh\n"
+                f"touch {marker}\n"
+                f"printf '#!/bin/sh\\nexit 0\\n' > {bin_dir / 'rg'}\n"
+                f"chmod 0755 {bin_dir / 'rg'}\n",
+                encoding="utf-8",
+            )
+            apt_get.chmod(0o755)
+
+            command = _cli_tools_install_command(install_node=False).replace(
+                "/etc/ssl/certs/ca-certificates.crt", str(certificate)
+            )
+            subprocess.run(
+                ["sh", "-c", command],
+                check=True,
+                env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+            )
+
+            self.assertTrue(marker.exists())
+            self.assertTrue((bin_dir / "rg").exists())
 
     def test_agent_install_applies_the_tool_policy_before_uploading(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -639,7 +802,7 @@ class VerifierOverlayContractTests(unittest.TestCase):
         self.assertIn('"install -y curl gcc"', verifier)
         self.assertIn("        gcc \\", dockerfile)
         self.assertIn("        libc6-dev", dockerfile)
-        self.assertIn("for command in as curl expect gcc git ld", dockerfile)
+        self.assertIn("for command in as bash curl expect gcc git ld", dockerfile)
         self.assertIn('export GCC_EXEC_PREFIX="$root/usr/lib/gcc/"', toolbox_exec)
         self.assertIn('set -- "--sysroot=$root" "$@"', toolbox_exec)
         self.assertIn(
@@ -774,6 +937,21 @@ class VerifierOverlayContractTests(unittest.TestCase):
 
 
 class EnvironmentToolboxContractTests(unittest.TestCase):
+    def test_toolbox_exposes_every_agent_install_fallback(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        dockerfile = (repository / "evals" / "pytest" / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        toolbox_exec = (
+            repository / "evals" / "pytest" / "bin" / "toolbox-exec"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("as bash curl", dockerfile)
+        self.assertIn("node npm readelf rg", dockerfile)
+        self.assertIn("nodejs \\\n        npm", dockerfile)
+        self.assertIn('npm)', toolbox_exec)
+        self.assertIn('npm/bin/npm-cli.js', toolbox_exec)
+
     def test_node_modules_fast_path_and_merge_preserve_task_entries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -789,8 +967,10 @@ class EnvironmentToolboxContractTests(unittest.TestCase):
                     task_root = root / f"task-{has_task_modules}"
                     verifier = task_root / "opt" / "nanocodex-verifier"
                     task_modules = task_root / "usr" / "share" / "nodejs"
+                    bash = task_root / "bin" / "bash"
                     verifier.parent.mkdir(parents=True)
                     task_modules.parent.mkdir(parents=True)
+                    bash.parent.mkdir(parents=True)
                     if has_task_modules:
                         task_modules.mkdir()
                         owned_module = task_modules / "font-awesome"
@@ -807,6 +987,7 @@ class EnvironmentToolboxContractTests(unittest.TestCase):
                                 toolbox_root=str(toolbox),
                                 verifier_root=str(verifier),
                                 node_modules_root=str(task_modules),
+                                bash_path=str(bash),
                             ),
                         ],
                         check=True,
@@ -827,6 +1008,7 @@ class EnvironmentToolboxContractTests(unittest.TestCase):
                         )
                     else:
                         self.assertEqual(task_modules.readlink(), toolbox_modules)
+                    self.assertEqual(bash.readlink(), verifier / "bin" / "bash")
 
 
 class TaskImageCacheContractTests(unittest.IsolatedAsyncioTestCase):
@@ -1085,6 +1267,11 @@ class RunCancellationContractTests(unittest.IsolatedAsyncioTestCase):
 
             command = agent.exec_as_agent.await_args.args[1]
             self.assertIn("set -o pipefail", command)
+            self.assertIn('SSL_CERT_FILE="$ca_bundle"', command)
+            self.assertIn(
+                "/opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt",
+                command,
+            )
             self.assertIn('tee "$events_tmp"', command)
             self.assertNotIn("tee /logs/agent/events.jsonl", command)
             self.assertNotIn('mv "$events_tmp"', command)

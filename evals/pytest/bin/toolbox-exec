@@ -13,6 +13,15 @@ case "$command_name" in
         done
         executable="$root/usr/bin/node"
         ;;
+    npm)
+        for candidate in /usr/local/bin/npm /usr/bin/npm; do
+            if [ -x "$candidate" ]; then
+                exec "$candidate" "$@"
+            fi
+        done
+        set -- "$root/usr/share/nodejs/npm/bin/npm-cli.js" "$@"
+        executable="$root/usr/bin/node"
+        ;;
     vim)
         executable="$root/usr/bin/vim.basic"
         ;;

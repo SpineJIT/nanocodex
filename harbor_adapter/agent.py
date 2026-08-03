@@ -69,11 +69,28 @@ def _cli_tools_install_command(*, install_node: bool) -> str:
         )
 
     package_list = " ".join(packages)
-    command_checks = "; ".join(
-        f"command -v {command} >/dev/null 2>&1" for command in checks
+    command_checks = " && ".join(
+        [
+            "curl_path=$(command -v curl)",
+            *(
+                f"command -v {command} >/dev/null 2>&1"
+                for command in checks
+                if command != "curl"
+            ),
+        ]
+    )
+    fast_path_checks = (
+        f"{command_checks} && "
+        'case "$curl_path" in '
+        "/opt/nanocodex-verifier/bin/curl) "
+        "test -s /opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt ;; "
+        "*) { test -s /etc/ssl/certs/ca-certificates.crt || "
+        "test -s /etc/pki/tls/certs/ca-bundle.crt; } ;; esac"
     )
     return (
-        node_modules_cleanup
+        "PATH=$PATH:/opt/nanocodex-verifier/bin; export PATH; "
+        f"if ! {{ {fast_path_checks}; }}; then "
+        + node_modules_cleanup
         + "if ldd --version 2>&1 | grep -qi musl || "
         "[ -f /etc/alpine-release ]; then "
         f"apk add --no-cache {package_list}; "
@@ -83,10 +100,8 @@ def _cli_tools_install_command(*, install_node: bool) -> str:
         f"{package_list}; "
         "elif command -v yum >/dev/null 2>&1; then "
         f"yum install -y {package_list}; "
-        "else "
-        "echo 'No supported package manager found; checking preinstalled tools' >&2; "
-        "fi; "
-        f"{command_checks}"
+        "else echo 'No supported package manager found' >&2; exit 127; fi; fi; "
+        + fast_path_checks
     )
 
 
@@ -281,8 +296,16 @@ class NanocodexAgent(BaseInstalledAgent):
         await self._stage_agents_md(environment)
         arguments = self._run_arguments(instruction)
         agent_command = (
+            "if [ -s /etc/ssl/certs/ca-certificates.crt ]; then "
+            "ca_bundle=/etc/ssl/certs/ca-certificates.crt; "
+            "elif [ -s /etc/pki/tls/certs/ca-bundle.crt ]; then "
+            "ca_bundle=/etc/pki/tls/certs/ca-bundle.crt; "
+            "elif [ -s /opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt ]; then "
+            "ca_bundle=/opt/nanocodex-toolbox/etc/ssl/certs/ca-certificates.crt; "
+            "else echo 'No CA certificate bundle found' >&2; exit 1; fi; "
             f'api_key=$(<{self._API_KEY_FILE}) && test -n "$api_key" && '
             f'rm -f {self._API_KEY_FILE} && OPENAI_API_KEY="$api_key" '
+            'SSL_CERT_FILE="$ca_bundle" '
             + (
                 "NANOCODEX_SUBAGENT_JSONL=1 "
                 if getattr(self, "_subagents", False)
