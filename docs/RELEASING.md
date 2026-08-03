@@ -11,15 +11,6 @@ Each successful run publishes an immutable `nightly-<full SHA>` prerelease and
 refreshes the rolling `nightly` prerelease with the same binaries and
 `SHA256SUMS`. The rolling tag is what `nanocodex update --nightly` follows.
 
-The independent `Harbor Nightly` workflow builds and verifies the static Harbor
-agent. It publishes `harbor-nightly-<full SHA>` and rolling `harbor-nightly`
-prereleases, so a Harbor build failure cannot block CLI binaries or updates.
-
-The separate `Docker` workflow publishes multi-architecture GHCR images. Tag
-pushes publish the version plus `latest`; scheduled or manually selected
-nightly runs publish `nightly` plus `nightly-<full SHA>`; commit dispatches
-publish the full SHA only.
-
 ## JavaScript package previews
 
 Every pull request and every commit merged to `master` builds and tests the

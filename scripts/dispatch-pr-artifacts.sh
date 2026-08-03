@@ -13,7 +13,7 @@ if [[ ! "$pr" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 repository=${GH_REPO:-gakonst/nanocodex}
-workflows=(nightly.yml harbor-nightly.yml)
+workflow=nightly.yml
 
 command -v gh >/dev/null 2>&1 || {
     echo "gh is required to dispatch PR artifacts" >&2
@@ -46,13 +46,9 @@ else
     workflow_ref=$head_ref
 fi
 
-for workflow in "${workflows[@]}"; do
-    gh workflow run "$workflow" --repo "$repository" --ref "$workflow_ref" \
-        --field "pr=$pr"
-done
+gh workflow run "$workflow" --repo "$repository" --ref "$workflow_ref" \
+    --field "pr=$pr"
 
-printf 'Dispatched PR #%s artifacts for %s.\n' "$pr" "$head_sha"
-for workflow in "${workflows[@]}"; do
-    printf 'Track it with: gh run list --repo %s --workflow %s --event workflow_dispatch\n' \
-        "$repository" "$workflow"
-done
+printf 'Dispatched PR #%s CLI artifacts for %s.\n' "$pr" "$head_sha"
+printf 'Track it with: gh run list --repo %s --workflow %s --event workflow_dispatch\n' \
+    "$repository" "$workflow"
