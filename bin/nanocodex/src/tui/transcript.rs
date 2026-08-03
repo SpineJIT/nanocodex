@@ -889,6 +889,7 @@ struct RenderedFormula {
     full_source: Arc<str>,
     visual_top: usize,
     column: u16,
+    source_column: u16,
 }
 
 #[derive(Clone)]
@@ -2154,6 +2155,9 @@ impl RenderedText {
     fn with_formulas(text: Text<'static>, width: u16, formulas: Vec<MarkdownFormula>) -> Self {
         let mut formula_rows = vec![false; text.lines.len()];
         for formula in &formulas {
+            if !formula.block {
+                continue;
+            }
             let end = formula
                 .line
                 .saturating_add(usize::from(formula.formula.rows()))
@@ -2181,6 +2185,7 @@ impl RenderedText {
                 formula: formula.formula,
                 full_source: formula.full_source,
                 column: formula.column,
+                source_column: formula.source_column,
             })
             .collect();
         Self {
@@ -2347,12 +2352,17 @@ impl RenderedText {
             if formula_bottom <= scroll || formula.visual_top >= viewport_bottom {
                 continue;
             }
-            let x = i32::from(formula.column);
+            let source_fallback = math_fallback || selected;
+            let x = i32::from(if source_fallback {
+                formula.source_column
+            } else {
+                formula.column
+            });
             let y = i32::try_from(formula.visual_top)
                 .unwrap_or(i32::MAX)
                 .saturating_sub(i32::try_from(scroll).unwrap_or(i32::MAX));
             let widget = FormulaWidget::new(&formula.formula).position(SignedPosition::new(x, y));
-            if math_fallback || selected {
+            if source_fallback {
                 widget
                     .compact_source_fallback(formula.full_source.as_ref())
                     .source_fallback_style(Style::default())
@@ -2935,6 +2945,66 @@ with $\mathbf{u}$ denoting velocity."
                 .iter()
                 .all(|cell| !cell.symbol().starts_with('\u{10eeee}'))
         );
+        renderer.shutdown();
+    }
+
+    #[test]
+    fn inline_formula_shares_a_transcript_row_with_prose() {
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let cache = tempfile::tempdir().unwrap();
+        let renderer = Ratatex::builder(TerminalProfile::kitty(PixelSize::new(10, 40), false))
+            .cache_dir(cache.path())
+            .on_update(move || {
+                let _ = wake_tx.try_send(());
+            })
+            .build()
+            .unwrap();
+        let mut transcript = Transcript::default();
+        transcript.set_math_renderer(renderer.clone());
+        transcript.push(TranscriptItem::Assistant(
+            r"The bound \(d\le P(n)^2\) controls boundary obstructions.".to_owned(),
+        ));
+
+        let _ = transcript.height_from(0, 80);
+        wait_for_math_render(&wake_rx);
+        transcript.invalidate_math_layouts();
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(transcript.widget(0, None, None, "empty"), frame.area());
+            })
+            .unwrap();
+        let formula_row = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(80)
+            .position(|row| {
+                row.iter()
+                    .any(|cell| cell.symbol().starts_with('\u{10eeee}'))
+            })
+            .unwrap();
+        let row = terminal.backend().buffer().content[formula_row * 80..(formula_row + 1) * 80]
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(row.contains("The bound "));
+        assert!(row.contains(" controls boundary obstructions."));
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    transcript
+                        .widget(0, None, None, "empty")
+                        .math_fallback(true),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+        let fallback = terminal.backend().to_string();
+        assert!(fallback.contains(r"\(d\le P(n)^2\)"));
+        assert!(fallback.contains(" controls boundary obstructions."));
         renderer.shutdown();
     }
 

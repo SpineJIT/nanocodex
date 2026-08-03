@@ -7,6 +7,7 @@ use ratatui::{
 use std::{
     borrow::Cow,
     fmt::Write as _,
+    ops::Range,
     sync::{Arc, OnceLock},
 };
 use syntect::{
@@ -72,7 +73,7 @@ fn render_agent_markdown_inner(
 ) -> RenderedAgentMarkdown {
     let (prepared, formulas) = renderer.map_or_else(
         || (Cow::Borrowed(source), Vec::new()),
-        |_| prepare_display_math(source),
+        |_| prepare_math(source),
     );
     let mut writer = MarkdownWriter::new(width, &formulas, renderer, previous, math_fallback);
     let mut options = Options::empty();
@@ -122,15 +123,36 @@ pub(super) struct MarkdownFormula {
     pub(super) full_source: Arc<str>,
     pub(super) line: usize,
     pub(super) column: u16,
+    pub(super) source_column: u16,
+    pub(super) block: bool,
 }
 
-struct DisplayFormula {
+struct MarkdownMath {
     source: String,
     full_source: String,
+    display: bool,
 }
 
-fn prepare_display_math(source: &str) -> (Cow<'_, str>, Vec<DisplayFormula>) {
-    let regions = ratatex::display_math(source);
+struct MathRegion<'a> {
+    source: &'a str,
+    full_source: &'a str,
+    range: Range<usize>,
+    display: bool,
+}
+
+fn prepare_math(source: &str) -> (Cow<'_, str>, Vec<MarkdownMath>) {
+    let display = ratatex::display_math(source);
+    let mut regions = display
+        .iter()
+        .map(|region| MathRegion {
+            source: region.source(),
+            full_source: region.full_source(),
+            range: region.range(),
+            display: true,
+        })
+        .collect::<Vec<_>>();
+    regions.extend(inline_math(source, &display));
+    regions.sort_unstable_by_key(|region| region.range.start);
     if regions.is_empty() {
         return (Cow::Borrowed(source), Vec::new());
     }
@@ -138,13 +160,18 @@ fn prepare_display_math(source: &str) -> (Cow<'_, str>, Vec<DisplayFormula>) {
     let mut formulas = Vec::with_capacity(regions.len());
     let mut cursor = 0;
     for region in regions {
-        let range = region.range();
+        let range = region.range;
         prepared.push_str(&source[cursor..range.start]);
         let index = formulas.len();
-        let _ = write!(prepared, "\n\n<!--ratatex-display:{index}-->\n\n");
-        formulas.push(DisplayFormula {
-            source: region.source().to_owned(),
-            full_source: region.full_source().to_owned(),
+        if region.display {
+            let _ = write!(prepared, "\n\n<!--ratatex-display:{index}-->\n\n");
+        } else {
+            let _ = write!(prepared, "<!--ratatex-inline:{index}-->");
+        }
+        formulas.push(MarkdownMath {
+            source: region.source.to_owned(),
+            full_source: region.full_source.to_owned(),
+            display: region.display,
         });
         cursor = range.end;
     }
@@ -152,12 +179,97 @@ fn prepare_display_math(source: &str) -> (Cow<'_, str>, Vec<DisplayFormula>) {
     (Cow::Owned(prepared), formulas)
 }
 
-fn display_math_marker(html: &str) -> Option<usize> {
-    html.trim()
-        .strip_prefix("<!--ratatex-display:")?
-        .strip_suffix("-->")?
+fn inline_math<'a>(source: &'a str, display: &[ratatex::DisplayMath<'a>]) -> Vec<MathRegion<'a>> {
+    let mut protected = display
+        .iter()
+        .map(ratatex::DisplayMath::range)
+        .collect::<Vec<_>>();
+    let mut code_block_start = None;
+    for (event, range) in Parser::new(source).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => code_block_start = Some(range.start),
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(start) = code_block_start.take() {
+                    protected.push(start..range.end);
+                }
+            }
+            Event::Code(_) => protected.push(range),
+            _ => {}
+        }
+    }
+    protected.sort_unstable_by_key(|range| range.start);
+
+    let mut regions = Vec::new();
+    let mut cursor = 0;
+    let mut protected_index = 0;
+    while cursor < source.len() {
+        if let Some(range) = protected.get(protected_index) {
+            if cursor >= range.end {
+                protected_index += 1;
+                continue;
+            }
+            if range.contains(&cursor) {
+                cursor = range.end;
+                continue;
+            }
+        }
+        if source[cursor..].starts_with(r"\(")
+            && !is_escaped_at(source, cursor)
+            && let Some(end_start) = find_inline_math_end(source, cursor + 2)
+        {
+            let end = end_start + 2;
+            let body = &source[cursor + 2..end_start];
+            if !body.trim().is_empty() && !body.contains('\n') {
+                regions.push(MathRegion {
+                    source: body.trim(),
+                    full_source: &source[cursor..end],
+                    range: cursor..end,
+                    display: false,
+                });
+                cursor = end;
+                continue;
+            }
+        }
+        cursor += source[cursor..].chars().next().map_or(1, char::len_utf8);
+    }
+    regions
+}
+
+fn find_inline_math_end(source: &str, mut cursor: usize) -> Option<usize> {
+    while cursor < source.len() {
+        if source[cursor..].starts_with(r"\)") && !is_escaped_at(source, cursor) {
+            return Some(cursor);
+        }
+        cursor += source[cursor..].chars().next().map_or(1, char::len_utf8);
+    }
+    None
+}
+
+fn is_escaped_at(source: &str, index: usize) -> bool {
+    source[..index]
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
+enum MathMarker {
+    Display(usize),
+    Inline(usize),
+}
+
+fn math_marker(html: &str) -> Option<MathMarker> {
+    let marker = html.trim().strip_suffix("-->")?;
+    if let Some(index) = marker.strip_prefix("<!--ratatex-display:") {
+        return index.parse().ok().map(MathMarker::Display);
+    }
+    marker
+        .strip_prefix("<!--ratatex-inline:")?
         .parse()
         .ok()
+        .map(MathMarker::Inline)
 }
 
 #[cfg(test)]
@@ -779,7 +891,7 @@ struct MarkdownWriter<'a> {
     code_block: Option<CodeBlock>,
     table: Option<TableState>,
     image: Option<MarkdownImage>,
-    formulas: &'a [DisplayFormula],
+    formulas: &'a [MarkdownMath],
     renderer: Option<&'a Ratatex>,
     previous_formulas: &'a [StreamingFormulaFrame],
     math_fallback: MathFallback,
@@ -812,7 +924,7 @@ struct TableState {
 impl<'a> MarkdownWriter<'a> {
     fn new(
         width: u16,
-        formulas: &'a [DisplayFormula],
+        formulas: &'a [MarkdownMath],
         renderer: Option<&'a Ratatex>,
         previous_formulas: &'a [StreamingFormulaFrame],
         math_fallback: MathFallback,
@@ -976,16 +1088,16 @@ impl<'a> MarkdownWriter<'a> {
             Event::TaskListMarker(checked) => {
                 self.append_text(if checked { "[✓] " } else { "[ ] " });
             }
-            Event::Html(html) | Event::InlineHtml(html) => {
-                if let Some(index) = display_math_marker(&html) {
-                    self.append_display_math(index);
-                } else {
+            Event::Html(html) | Event::InlineHtml(html) => match math_marker(&html) {
+                Some(MathMarker::Display(index)) => self.append_display_math(index),
+                Some(MathMarker::Inline(index)) => self.append_inline_math(index),
+                None => {
                     let plain = strip_html(&html);
                     if !plain.is_empty() {
                         self.append_text(&plain);
                     }
                 }
-            }
+            },
             Event::FootnoteReference(label) => self.append_text(&format!("[{label}]")),
             Event::Start(Tag::Table(_)) => self.table = Some(TableState::default()),
             Event::Start(
@@ -1058,6 +1170,7 @@ impl<'a> MarkdownWriter<'a> {
         let Some(formula) = self.formulas.get(index) else {
             return;
         };
+        debug_assert!(formula.display);
         let source = formula.source.clone();
         let full_source = formula.full_source.clone();
         self.flush_current();
@@ -1074,11 +1187,11 @@ impl<'a> MarkdownWriter<'a> {
         });
         match state {
             FormulaState::Ready(formula) => {
-                self.append_ready_formula(index, formula, full_source, column);
+                self.append_ready_display_formula(index, formula, full_source, column);
             }
             FormulaState::Pending => {
                 if let Some(previous) = self.previous_formula(index, &source, max_columns) {
-                    self.append_ready_formula(index, previous, full_source, column);
+                    self.append_ready_display_formula(index, previous, full_source, column);
                 } else if self.math_fallback.hides_pending() {
                     self.append_hidden_formula();
                 } else {
@@ -1087,7 +1200,7 @@ impl<'a> MarkdownWriter<'a> {
             }
             FormulaState::Failed(_) if self.math_fallback.hides_failed() => {
                 if let Some(previous) = self.previous_formula(index, &source, max_columns) {
-                    self.append_ready_formula(index, previous, full_source, column);
+                    self.append_ready_display_formula(index, previous, full_source, column);
                 } else {
                     self.append_hidden_formula();
                 }
@@ -1096,6 +1209,50 @@ impl<'a> MarkdownWriter<'a> {
                 self.append_formula_source(&full_source);
             }
         }
+    }
+
+    fn append_inline_math(&mut self, index: usize) {
+        let Some(formula) = self.formulas.get(index) else {
+            return;
+        };
+        debug_assert!(!formula.display);
+        let source = formula.source.clone();
+        let full_source = formula.full_source.clone();
+        self.ensure_prefix();
+        let column = self.current_width();
+        let max_columns = self.width.saturating_sub(column).max(1);
+        let state = self.renderer.map_or(FormulaState::Unsupported, |renderer| {
+            renderer.request(&source, max_columns)
+        });
+        let ready = match state {
+            FormulaState::Ready(formula) => Some(formula),
+            FormulaState::Pending => self.previous_formula(index, &source, max_columns),
+            FormulaState::Failed(_) | FormulaState::Unsupported => None,
+        };
+        if let Some(formula) = ready
+            && formula.rows() == 1
+        {
+            let source_width =
+                UnicodeWidthStr::width(full_source.as_str()).min(usize::from(u16::MAX)) as u16;
+            let reserved = formula.columns().max(source_width);
+            if reserved <= self.width.saturating_sub(column) {
+                let formula_column =
+                    column.saturating_add(reserved.saturating_sub(formula.columns()) / 2);
+                self.current
+                    .push(Span::raw(" ".repeat(usize::from(reserved))));
+                self.rendered_formulas.push(MarkdownFormula {
+                    index,
+                    formula,
+                    full_source: full_source.into(),
+                    line: self.lines.len(),
+                    column: formula_column,
+                    source_column: column,
+                    block: false,
+                });
+                return;
+            }
+        }
+        self.append_text(&full_source);
     }
 
     fn previous_formula(
@@ -1122,14 +1279,16 @@ impl<'a> MarkdownWriter<'a> {
             .cloned()
     }
 
-    fn append_ready_formula(
+    fn append_ready_display_formula(
         &mut self,
         index: usize,
         formula: Arc<Formula>,
         full_source: String,
-        column: u16,
+        content_column: u16,
     ) {
         self.current.clear();
+        let available = self.width.saturating_sub(content_column);
+        let column = content_column.saturating_add(available.saturating_sub(formula.columns()) / 2);
         let line = self.lines.len();
         self.lines
             .extend((0..formula.rows()).map(|_| Line::raw(" ")));
@@ -1139,6 +1298,8 @@ impl<'a> MarkdownWriter<'a> {
             full_source: full_source.into(),
             line,
             column,
+            source_column: column,
+            block: true,
         });
     }
 
@@ -1170,6 +1331,14 @@ impl<'a> MarkdownWriter<'a> {
             self.current
                 .push(Span::styled(prefix, Style::default().fg(Color::Green)));
         }
+    }
+
+    fn current_width(&self) -> u16 {
+        self.current
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum::<usize>()
+            .min(usize::from(u16::MAX)) as u16
     }
 
     fn flush_current(&mut self) {
@@ -1510,6 +1679,69 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_graphics_preserves_inline_math_as_text() {
+        let renderer = Ratatex::builder(TerminalProfile::unsupported(PixelSize::default()))
+            .build()
+            .unwrap();
+        let rendered = render_agent_markdown_with_math(
+            r"The bound \(d\le P(n)^2\) is sufficient.",
+            60,
+            &renderer,
+        );
+        let text = rendered
+            .text
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains(r"The bound \(d\le P(n)^2\) is sufficient."));
+        assert!(rendered.formulas.is_empty());
+        renderer.shutdown();
+    }
+
+    #[test]
+    fn inline_math_renders_inside_the_surrounding_markdown_line() {
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+        let cache = tempfile::tempdir().unwrap();
+        let renderer = Ratatex::builder(TerminalProfile::kitty(PixelSize::new(10, 40), false))
+            .cache_dir(cache.path())
+            .on_update(move || {
+                let _ = wake_tx.try_send(());
+            })
+            .build()
+            .unwrap();
+        let source = r"- The bound \(d\le P(n)^2\) for boundary obstructions.";
+
+        let pending = render_agent_markdown_with_math(source, 80, &renderer);
+        let pending_text = pending
+            .text
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(pending_text.contains(r"\(d\le P(n)^2\)"));
+        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let rendered = render_agent_markdown_with_math(source, 80, &renderer);
+        assert_eq!(rendered.formulas.len(), 1);
+        let formula = &rendered.formulas[0];
+        assert!(!formula.block);
+        assert_eq!(formula.formula.rows(), 1);
+        let line = rendered.text.lines[formula.line]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(line.contains("• The bound "));
+        assert!(line.contains(" for boundary obstructions."));
+        assert!(!line.contains(r"\le"));
+        renderer.shutdown();
+    }
+
+    #[test]
     fn display_math_becomes_placeholder_rows() {
         let (wake_tx, wake_rx) = mpsc::sync_channel(1);
         let cache = tempfile::tempdir().unwrap();
@@ -1585,6 +1817,10 @@ After";
 
         assert_eq!(formula.line, maxwell + 2);
         assert_eq!(next, formula.line + usize::from(formula.formula.rows()));
+        assert_eq!(
+            formula.column,
+            2 + (78_u16.saturating_sub(formula.formula.columns())) / 2
+        );
         renderer.shutdown();
     }
 
