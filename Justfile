@@ -13,6 +13,7 @@ hosted_agent_pr_provenance := hosted_agent_artifact + ".pr.json"
 hosted_agent_release_tag := env_var_or_default("NANOCODEX_HOSTED_AGENT_RELEASE_TAG", "nightly")
 hosted_agent_url := "https://github.com/gakonst/nanocodex/releases/download/" + hosted_agent_release_tag + "/nanocodex-x86_64-unknown-linux-musl"
 default_eval := "evals/terminal-bench-2.yaml"
+default_fast_eval := "evals/terminal-bench-2-1-fast.yaml"
 default_jobs := ".nanocodex/harbor/jobs"
 setup_jobs := ".nanocodex/harbor/setup"
 prepare_concurrency := env_var_or_default("HARBOR_PREPARE_CONCURRENCY", "4")
@@ -298,6 +299,12 @@ prepare-task task config=default_eval:
 eval config=default_eval: build-agent
     @test -x "{{harbor}}" || { echo "run 'just bootstrap' first" >&2; exit 2; }
     @job_name="$(date +%Y-%m-%d__%H-%M-%S)-eval-$BASHPID"; \
+        HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --job-name "$job_name" --n-concurrent "{{eval_concurrency}}"
+
+# Run the pinned Terminal-Bench suite with OpenAI priority processing enabled.
+eval-fast config=default_fast_eval: build-agent
+    @test -x "{{harbor}}" || { echo "run 'just bootstrap' first" >&2; exit 2; }
+    @job_name="$(date +%Y-%m-%d__%H-%M-%S)-eval-fast-$BASHPID"; \
         HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --job-name "$job_name" --n-concurrent "{{eval_concurrency}}"
 
 # Run one registry task through the configured agent, environment, and verifier.

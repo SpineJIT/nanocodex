@@ -73,6 +73,15 @@ pub(crate) struct AgentArgs {
     #[arg(long, env = "OPENAI_REASONING_MODE", default_value_t)]
     reasoning_mode: ReasoningMode,
 
+    /// Use priority processing for model requests.
+    #[arg(
+        long,
+        env = "NANOCODEX_FAST_MODE",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    fast_mode: bool,
+
     /// Replace the standard system/developer instructions.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     instructions: Option<String>,
@@ -159,6 +168,10 @@ impl AgentArgs {
 
     pub(crate) const fn thinking(&self) -> Thinking {
         self.thinking
+    }
+
+    pub(crate) const fn fast_mode(&self) -> bool {
+        self.fast_mode
     }
 
     pub(crate) const fn model(&self) -> Model {
@@ -265,6 +278,7 @@ impl AgentArgs {
             .model(self.model)
             .reasoning_mode(self.reasoning_mode)
             .thinking(self.thinking)
+            .fast_mode(self.fast_mode)
             .workspace(session.workspace)
             .codex_home(codex_home);
         if let Some(session_id) = session.session_id {
@@ -522,6 +536,17 @@ mod tests {
             .expect("the CLI should expose the subagents argument");
 
         assert_eq!(subagents.get_default_values(), ["false"]);
+    }
+
+    #[test]
+    fn fast_mode_is_opt_in() {
+        let command = crate::Cli::command();
+        let fast_mode = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "fast_mode")
+            .expect("the CLI should expose the fast-mode argument");
+
+        assert_eq!(fast_mode.get_default_values(), ["false"]);
     }
 
     #[test]
