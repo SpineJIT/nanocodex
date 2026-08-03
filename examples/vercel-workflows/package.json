@@ -1,0 +1,39 @@
+{
+  "name": "nanocodex-vercel-workflows-example",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "build": "next build",
+    "check": "npm run typecheck && npm test && npm run build",
+    "deploy:subscription": "node scripts/deploy-subscription.mjs",
+    "dev": "next dev",
+    "dev:subscription": "node scripts/dev-subscription.mjs",
+    "multiclient": "node scripts/multiclient-smoke.mjs",
+    "prebuild": "node scripts/prepare-wasm.mjs",
+    "start": "next start",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@vercel/functions": "3.7.6",
+    "nanocodex": "file:../../js/bindings",
+    "next": "16.2.12",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "uuid": "14.0.1",
+    "workflow": "4.8.0",
+    "ws": "8.21.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.15",
+    "@types/react": "19.2.11",
+    "@types/react-dom": "19.2.3",
+    "@types/ws": "8.18.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

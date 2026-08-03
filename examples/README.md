@@ -15,6 +15,8 @@ All language consumers live at this repository boundary:
   package directly, with no install or build step.
 - Rivet Actors: `rivet-actors/` runs the same harness as a durable,
   SQLite-backed Rivet Actor.
+- Vercel Workflows: `vercel-workflows/` runs Nanocodex as a durable Workflow
+  actor with replayable state and synchronized native WebSocket clients.
 
 From the repository root:
 
@@ -38,6 +40,7 @@ just smoke-python
 just smoke-wasm-node
 just build-react-example
 just build-rivet-example
+just build-vercel-example
 ```
 
 `voice` is the dead-simple non-TUI desktop consumer. It uses the same
