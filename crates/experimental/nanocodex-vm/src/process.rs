@@ -14,7 +14,7 @@ use crate::{
     krun::{KrunVm, VmError},
 };
 
-const PROCESS_CONFIG_VERSION: u32 = 1;
+const PROCESS_CONFIG_VERSION: u32 = 2;
 
 /// Complete owned input for one dedicated VMM process.
 ///

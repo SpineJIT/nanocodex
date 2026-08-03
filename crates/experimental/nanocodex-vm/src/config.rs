@@ -9,6 +9,15 @@ pub enum RootFilesystem {
     Directory(PathBuf),
     /// A raw ext4 image attached as the guest's writable root block device.
     Ext4(PathBuf),
+    /// A guest OverlayFS with an immutable ext4 lower and writable ext4 upper.
+    OverlayExt4 {
+        /// Read-only disk containing the static Nanocodex guest runtime.
+        runtime: PathBuf,
+        /// Read-only prepared task root.
+        lower: PathBuf,
+        /// Writable sparse disk receiving all attempt mutations.
+        upper: PathBuf,
+    },
 }
 
 /// Network access supplied to the guest by libkrun.
@@ -170,6 +179,30 @@ impl VmConfig {
         }
     }
 
+    /// Creates a VM whose effective root is assembled by the guest.
+    ///
+    /// The runtime disk boots read-only as `/dev/vda`; the immutable lower is
+    /// `/dev/vdb`; and the writable upper is `/dev/vdc`. Additional block
+    /// devices are attached after those three devices.
+    pub fn overlay_ext4(
+        runtime: impl Into<PathBuf>,
+        lower: impl Into<PathBuf>,
+        upper: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            root: RootFilesystem::OverlayExt4 {
+                runtime: runtime.into(),
+                lower: lower.into(),
+                upper: upper.into(),
+            },
+            cpus: 2,
+            memory_mib: 1_024,
+            network: Network::Internet,
+            block_devices: Vec::new(),
+            shared_directories: Vec::new(),
+        }
+    }
+
     /// Sets the number of virtual CPUs.
     #[must_use]
     pub const fn cpus(mut self, cpus: u8) -> Self {
@@ -205,11 +238,15 @@ impl VmConfig {
         self
     }
 
-    /// Returns the host root filesystem path.
+    /// Returns the host filesystem path that libkrun boots as the guest root.
+    ///
+    /// For an OverlayFS configuration this is the small runtime disk; inspect
+    /// [`Self::root_filesystem`] for its lower and upper layers.
     #[must_use]
     pub fn root(&self) -> &Path {
         match &self.root {
             RootFilesystem::Directory(path) | RootFilesystem::Ext4(path) => path,
+            RootFilesystem::OverlayExt4 { runtime, .. } => runtime,
         }
     }
 
@@ -301,6 +338,21 @@ mod tests {
         assert_eq!(
             config.root_filesystem(),
             &RootFilesystem::Ext4(PathBuf::from("rootfs.ext4"))
+        );
+    }
+
+    #[test]
+    fn overlay_root_owns_runtime_lower_and_upper_disks() {
+        let config = VmConfig::overlay_ext4("runtime.ext4", "base.ext4", "upper.ext4");
+
+        assert_eq!(config.root(), Path::new("runtime.ext4"));
+        assert_eq!(
+            config.root_filesystem(),
+            &RootFilesystem::OverlayExt4 {
+                runtime: PathBuf::from("runtime.ext4"),
+                lower: PathBuf::from("base.ext4"),
+                upper: PathBuf::from("upper.ext4"),
+            }
         );
     }
 
