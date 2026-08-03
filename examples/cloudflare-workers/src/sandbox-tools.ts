@@ -214,7 +214,9 @@ export function createCloudflareSandboxTools(
       },
     },
     sandbox_preview: {
-      description: "Expose a server running in the sandbox through a temporary public preview URL.",
+      // Keep this definition byte-stable so snapshots created before the
+      // Worker-fronted preview implementation can resume safely.
+      description: "Expose a server running in the sandbox through a temporary public Cloudflare Tunnel URL.",
       parameters: portParameters(),
       handler: async (input) => {
         const port = requiredPort(objectInput(input).port);
