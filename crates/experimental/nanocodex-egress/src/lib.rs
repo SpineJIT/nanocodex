@@ -1714,7 +1714,7 @@ enum ForwardError {
     DeniedUpstream,
     #[error("egress proxy stopped while the request was queued")]
     Unavailable,
-    #[error("egress layer or origin request failed: {0}")]
+    #[error("egress layer or origin request failed: {0:#}")]
     Layer(#[source] reqwest_middleware::Error),
 }
 
@@ -1779,6 +1779,26 @@ mod tests {
         );
 
         assert!(matches!(result, Err(LeafCertificateError::InvalidDnsName)));
+    }
+
+    #[test]
+    fn layer_errors_preserve_the_middleware_error_chain() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("required amount 104650 exceeds maximum 100000")]
+        struct ChargeLimitExceeded;
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("payment failed")]
+        struct PaymentFailed(#[source] ChargeLimitExceeded);
+
+        let error = ForwardError::Layer(reqwest_middleware::Error::middleware(PaymentFailed(
+            ChargeLimitExceeded,
+        )));
+
+        assert_eq!(
+            error.to_string(),
+            "egress layer or origin request failed: payment failed: required amount 104650 exceeds maximum 100000"
+        );
     }
 
     #[test]
