@@ -1,0 +1,146 @@
+name: Harbor Nightly
+run-name: "${{ inputs.pr && format('PR #{0} Harbor artifact', inputs.pr) || 'Harbor Nightly' }}"
+
+permissions: {}
+
+on:
+  schedule:
+    - cron: "15 6 * * *"
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to build without publishing a release
+        required: false
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ inputs.pr && format('pr-harbor-artifact-{0}', inputs.pr) || 'harbor-nightly' }}
+  cancel-in-progress: ${{ inputs.pr != '' }}
+
+jobs:
+  build:
+    if: github.repository == 'gakonst/nanocodex'
+    name: build Harbor static x86_64 Linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.pr && format('refs/pull/{0}/head', inputs.pr) || github.sha }}
+          persist-credentials: false
+      - name: Record exact source revision
+        shell: bash
+        run: echo "BUILD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Build static Harbor agent
+        shell: bash
+        env:
+          TAG_NAME: ${{ inputs.pr && format('pr-{0}', inputs.pr) || 'harbor-nightly' }}
+        run: |
+          mkdir dist
+          docker build \
+            --platform linux/amd64 \
+            --build-arg CARGO_PROFILE=release \
+            --build-arg TAG_NAME="$TAG_NAME" \
+            --build-arg VERGEN_GIT_SHA="$BUILD_SHA" \
+            --file harbor_adapter/nanocodex.Dockerfile \
+            --target artifact \
+            --output type=local,dest=dist \
+            .
+          mv dist/nanocodex dist/nanocodex-x86_64-unknown-linux-musl
+      - name: Verify the Harbor artifact is portable
+        shell: bash
+        run: |
+          file dist/nanocodex-x86_64-unknown-linux-musl
+          docker run --rm \
+            --volume "$PWD/dist:/dist:ro" \
+            alpine:3.21 \
+            /dist/nanocodex-x86_64-unknown-linux-musl --version
+          docker run --rm \
+            --volume "$PWD/dist:/dist:ro" \
+            ubuntu:22.04 \
+            /dist/nanocodex-x86_64-unknown-linux-musl --version
+      - name: Stage PR provenance and checksum
+        if: github.event_name == 'workflow_dispatch' && inputs.pr != ''
+        shell: bash
+        env:
+          ARTIFACT: nanocodex-x86_64-unknown-linux-musl
+          PR_NUMBER: ${{ inputs.pr }}
+        run: |
+          cd dist
+          sha256sum "$ARTIFACT" > "$ARTIFACT.sha256"
+          printf '{"repository":"%s","pr":%s,"sha":"%s","artifact":"%s","run_id":%s}\n' \
+            "$GITHUB_REPOSITORY" "$PR_NUMBER" "$BUILD_SHA" "$ARTIFACT" \
+            "$GITHUB_RUN_ID" > PR_BUILD.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nanocodex-x86_64-unknown-linux-musl
+          path: dist/*
+          if-no-files-found: error
+          retention-days: ${{ inputs.pr && 7 || 1 }}
+
+  publish:
+    if: >-
+      github.repository == 'gakonst/nanocodex' &&
+      (github.event_name != 'workflow_dispatch' || inputs.pr == '')
+    name: publish immutable and rolling Harbor nightlies
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nanocodex-x86_64-unknown-linux-musl
+          path: dist
+      - name: Generate checksum
+        shell: bash
+        run: |
+          cd dist
+          sha256sum nanocodex-x86_64-unknown-linux-musl > SHA256SUMS
+      - name: Publish immutable and rolling Harbor releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          immutable_tag="harbor-nightly-${GITHUB_SHA}"
+          short_sha="${GITHUB_SHA:0:10}"
+          release_name="Nanocodex Harbor Nightly ($(date -u +%Y-%m-%d), ${short_sha})"
+          notes_file=$(mktemp)
+          {
+            printf "Automated Harbor build from [\`%s\`](https://github.com/%s/commit/%s).\n\n" "$short_sha" "$GITHUB_REPOSITORY" "$GITHUB_SHA"
+            printf "This channel is independent from the Nanocodex CLI nightly release.\n"
+          } > "$notes_file"
+
+          if gh release view "$immutable_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$immutable_tag" --repo "$GITHUB_REPOSITORY" \
+              --title "$release_name" --notes-file "$notes_file" --prerelease
+          else
+            gh release create "$immutable_tag" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "$release_name" \
+              --notes-file "$notes_file" --prerelease
+          fi
+          gh release upload "$immutable_tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/harbor-nightly" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/harbor-nightly" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref='refs/tags/harbor-nightly' -f sha="$GITHUB_SHA" >/dev/null
+          fi
+
+          if gh release view harbor-nightly --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit harbor-nightly --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "Nanocodex Harbor Nightly" \
+              --notes-file "$notes_file" --prerelease
+          else
+            gh release create harbor-nightly --repo "$GITHUB_REPOSITORY" \
+              --title "Nanocodex Harbor Nightly" --notes-file "$notes_file" --prerelease
+          fi
+          gh release upload harbor-nightly dist/* --repo "$GITHUB_REPOSITORY" --clobber

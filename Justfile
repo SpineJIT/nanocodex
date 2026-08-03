@@ -10,7 +10,7 @@ hosted_agent_artifact_dir := agent_artifact_dir + "/daytona-amd64"
 hosted_agent_artifact := hosted_agent_artifact_dir + "/nanocodex"
 hosted_agent_checksum := hosted_agent_artifact + ".sha256"
 hosted_agent_pr_provenance := hosted_agent_artifact + ".pr.json"
-hosted_agent_release_tag := env_var_or_default("NANOCODEX_HOSTED_AGENT_RELEASE_TAG", "nightly")
+hosted_agent_release_tag := env_var_or_default("NANOCODEX_HOSTED_AGENT_RELEASE_TAG", "harbor-nightly")
 hosted_agent_url := "https://github.com/gakonst/nanocodex/releases/download/" + hosted_agent_release_tag + "/nanocodex-x86_64-unknown-linux-musl"
 default_eval := "evals/terminal-bench-2.yaml"
 default_fast_eval := "evals/terminal-bench-2-1-fast.yaml"
@@ -277,8 +277,8 @@ download-agent-hosted:
     ./scripts/download-harbor-agent.sh "{{hosted_agent_release_tag}}" "{{hosted_agent_artifact}}"
     @test -f "{{hosted_agent_artifact}}" && test -x "{{hosted_agent_artifact}}" && test -s "{{hosted_agent_checksum}}"
 
-# Ask the existing release workflow to build every binary from the exact head of
-# one open PR. Nothing is built for ordinary pull_request events.
+# Ask the CLI and Harbor artifact workflows to build from the exact head of one
+# open PR. Nothing is built for ordinary pull_request events.
 build-pr-artifacts pr:
     ./scripts/dispatch-pr-artifacts.sh "{{pr}}"
 
