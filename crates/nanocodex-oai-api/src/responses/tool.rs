@@ -17,9 +17,21 @@ pub enum ToolDefinition {
         strict: bool,
         /// JSON Schema accepted as function arguments.
         parameters: JsonSchema,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip)]
         /// Optional JSON Schema produced by the function.
+        ///
+        /// This is client-owned Code Mode metadata and is not part of the
+        /// Responses tool declaration sent to the model.
         output_schema: Option<JsonSchema>,
+    },
+    /// Responses namespace containing related function tools.
+    Namespace {
+        /// Model-visible namespace name.
+        name: Box<str>,
+        /// Guidance describing the namespace as a whole.
+        description: Box<str>,
+        /// Function declarations exposed under this namespace.
+        tools: Vec<Self>,
     },
     /// Free-form custom tool constrained by a grammar.
     Custom {
@@ -93,6 +105,20 @@ impl ToolDefinition {
         }
     }
 
+    /// Creates a Responses namespace from function tool declarations.
+    #[must_use]
+    pub fn namespace(
+        name: impl Into<Box<str>>,
+        description: impl Into<Box<str>>,
+        tools: impl IntoIterator<Item = Self>,
+    ) -> Self {
+        Self::Namespace {
+            name: name.into(),
+            description: description.into(),
+            tools: tools.into_iter().collect(),
+        }
+    }
+
     /// Creates a provider-native deferred-tool search definition.
     ///
     /// ```
@@ -150,7 +176,9 @@ impl ToolDefinition {
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            Self::Function { name, .. } | Self::Custom { name, .. } => name,
+            Self::Function { name, .. }
+            | Self::Namespace { name, .. }
+            | Self::Custom { name, .. } => name,
             Self::ToolSearch { .. } => "tool_search",
         }
     }
@@ -159,7 +187,9 @@ impl ToolDefinition {
     #[must_use]
     pub fn description(&self) -> &str {
         match self {
-            Self::Function { description, .. } | Self::Custom { description, .. } => description,
+            Self::Function { description, .. }
+            | Self::Namespace { description, .. }
+            | Self::Custom { description, .. } => description,
             Self::ToolSearch { description, .. } => description,
         }
     }
@@ -171,7 +201,7 @@ impl ToolDefinition {
             Self::Function { parameters, .. } | Self::ToolSearch { parameters, .. } => {
                 Some(parameters)
             }
-            Self::Custom { .. } => None,
+            Self::Namespace { .. } | Self::Custom { .. } => None,
         }
     }
 
@@ -180,7 +210,7 @@ impl ToolDefinition {
     pub const fn output_schema(&self) -> Option<&JsonSchema> {
         match self {
             Self::Function { output_schema, .. } => output_schema.as_ref(),
-            Self::Custom { .. } | Self::ToolSearch { .. } => None,
+            Self::Namespace { .. } | Self::Custom { .. } | Self::ToolSearch { .. } => None,
         }
     }
 }
@@ -252,6 +282,46 @@ mod tests {
     use serde_json::json;
 
     use super::{JsonSchema, ToolDefinition};
+
+    #[test]
+    fn namespace_serializes_function_children_without_client_output_metadata() {
+        let definition = ToolDefinition::namespace(
+            "image_gen",
+            "Tools in the image_gen namespace.",
+            [ToolDefinition::function(
+                "imagegen",
+                "Generate an image.",
+                json!({
+                    "type": "object",
+                    "properties": {"prompt": {"type": "string"}},
+                    "required": ["prompt"],
+                    "additionalProperties": false
+                }),
+            )
+            .with_output_schema(json!({"type": "object"}))],
+        );
+
+        assert_eq!(
+            serde_json::to_value(definition).unwrap(),
+            json!({
+                "type": "namespace",
+                "name": "image_gen",
+                "description": "Tools in the image_gen namespace.",
+                "tools": [{
+                    "type": "function",
+                    "name": "imagegen",
+                    "description": "Generate an image.",
+                    "strict": false,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"prompt": {"type": "string"}},
+                        "required": ["prompt"],
+                        "additionalProperties": false
+                    }
+                }]
+            })
+        );
+    }
 
     #[test]
     fn tool_search_serializes_the_provider_native_shape() {

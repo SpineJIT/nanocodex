@@ -193,6 +193,12 @@ that batteries-included composition. Consumers implementing their own loop can
 install definitions with [`SessionBuilder::tool_definitions`] and return paired
 tool outputs with [`session::ResponseInput::items`].
 
+[`tools::ToolDefinition::namespace`] represents the provider-native Responses
+namespace shape for related function tools. Function output schemas remain
+client-owned execution metadata: they are available through
+[`tools::ToolDefinition::output_schema`] for Code Mode declarations but are not
+serialized into the provider's function declaration.
+
 ## Going lower level
 
 The crate root keeps the normal conversation path and shared input policy

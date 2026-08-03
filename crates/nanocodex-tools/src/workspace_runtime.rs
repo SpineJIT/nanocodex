@@ -150,7 +150,7 @@ impl WorkspaceToolRuntimeControl {
 
 #[cfg(test)]
 mod tests {
-    use nanocodex_oai_api::tools::{ToolInput, ToolOutputBody};
+    use nanocodex_oai_api::tools::ToolInput;
     use serde_json::value::to_raw_value;
     use tempfile::tempdir;
 
@@ -220,10 +220,6 @@ mod tests {
             .await;
 
         assert!(output.success);
-        let ToolOutputBody::Text(output) = output.output else {
-            panic!("shell command should return text");
-        };
-        let output = serde_json::from_str::<serde_json::Value>(&output).unwrap();
-        assert_eq!(output["output"], "from-image");
+        assert_eq!(output.code_mode_value()["output"], "from-image");
     }
 }

@@ -171,9 +171,14 @@ fn exposes_codex_imagegen_shape() {
 
     assert_eq!(spec["name"], "image_gen__imagegen");
     assert_eq!(spec["strict"], false);
-    assert_eq!(
-        spec.pointer("/parameters/properties/referenced_image_paths/maxItems"),
-        Some(&json!(5))
+    assert!(
+        spec.pointer("/parameters/properties/referenced_image_paths/maxItems")
+            .is_none()
+    );
+    assert!(
+        spec.pointer("/parameters/properties/referenced_image_paths/items/description")
+            .and_then(Value::as_str)
+            .is_some_and(|description| description.contains("AbsolutePathBufGuard::new"))
     );
     assert!(
         spec["description"]

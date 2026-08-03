@@ -1,5 +1,16 @@
 use super::*;
 
+/// Nanocodex's model-visible tool exposure policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ToolExposure {
+    /// Expose normal tools only through Code Mode's `exec` entrypoint.
+    #[default]
+    CodeModeOnly,
+    /// Expose `exec` and `wait` before ordinary direct tools, while retaining
+    /// the same handlers for calls composed through Code Mode.
+    DirectAndCodeMode,
+}
+
 /// A lazily populated family of Code Mode tools.
 ///
 /// Providers start with the agent driver, advertise only their small direct
@@ -12,7 +23,16 @@ pub trait DynamicToolProvider: Send + Sync {
     /// Returns the provider's always-visible tools, such as `tool_search`.
     fn direct_tools(&self) -> Vec<Arc<dyn Tool>>;
 
-    /// Returns deferred tools currently activated for new Code Mode cells.
+    /// Returns the provider's direct tools for one model exposure policy.
+    ///
+    /// Providers normally expose the same tools under either policy. In
+    /// particular, discovery entrypoints such as `tool_search` remain visible
+    /// while the tools they discover stay deferred.
+    fn direct_tools_for_exposure(&self, _exposure: ToolExposure) -> Vec<Arc<dyn Tool>> {
+        self.direct_tools()
+    }
+
+    /// Returns deferred tools currently callable from new Code Mode cells.
     fn available_definitions(&self) -> Vec<ToolDefinition>;
 
     /// Returns whether this provider currently exposes `name`.
@@ -22,16 +42,16 @@ pub trait DynamicToolProvider: Send + Sync {
             .any(|definition| definition.name() == name)
     }
 
-    /// Returns whether an activated deferred tool is safe to execute in parallel.
+    /// Returns whether a callable deferred tool is safe to execute in parallel.
     ///
     /// Providers are conservative by default. Implementations must return
-    /// `true` only for a currently activated tool with explicit safety
+    /// `true` only for a currently callable tool with explicit safety
     /// metadata.
     fn supports_parallel_tool_calls(&self, _name: &str) -> bool {
         false
     }
 
-    /// Executes an activated deferred tool, or returns `None` when this provider
+    /// Executes a callable deferred tool, or returns `None` when this provider
     /// does not currently expose `name`.
     ///
     /// The owning runtime converts handler panics into a failed `aborted`
@@ -47,6 +67,7 @@ pub trait DynamicToolProvider: Send + Sync {
 /// Declarative selection of the built-in tools installed for an agent.
 #[derive(Clone)]
 pub struct Tools {
+    exposure: ToolExposure,
     workspace: bool,
     web_search: bool,
     image_generation: bool,
@@ -55,12 +76,15 @@ pub struct Tools {
     process_environment: Arc<Vec<(OsString, OsString)>>,
     remote_http_client: Option<reqwest::Client>,
     pub(super) registered: Vec<Arc<dyn Tool>>,
+    pub(super) provider_direct: Vec<Arc<dyn Tool>>,
     pub(super) providers: Vec<Arc<dyn DynamicToolProvider>>,
+    pub(super) deferred_tools_guidance_enabled: bool,
 }
 
 impl Default for Tools {
     fn default() -> Self {
         Self {
+            exposure: ToolExposure::default(),
             workspace: true,
             web_search: true,
             image_generation: true,
@@ -69,7 +93,9 @@ impl Default for Tools {
             process_environment: Arc::new(Vec::new()),
             remote_http_client: None,
             registered: Vec::new(),
+            provider_direct: Vec::new(),
             providers: Vec::new(),
+            deferred_tools_guidance_enabled: false,
         }
     }
 }
@@ -79,6 +105,7 @@ impl fmt::Debug for Tools {
         let remote_http_client_configured = self.remote_http_client.is_some();
         formatter
             .debug_struct("Tools")
+            .field("exposure", &self.exposure)
             .field("workspace", &self.workspace)
             .field("web_search", &self.web_search)
             .field("image_generation", &self.image_generation)
@@ -93,6 +120,14 @@ impl fmt::Debug for Tools {
                 "registered",
                 &self
                     .registered
+                    .iter()
+                    .map(|tool| tool.definition().name().to_owned())
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "provider_direct",
+                &self
+                    .provider_direct
                     .iter()
                     .map(|tool| tool.definition().name().to_owned())
                     .collect::<Vec<_>>(),
@@ -114,6 +149,12 @@ impl Tools {
     #[must_use]
     pub const fn into_builder(self) -> ToolsBuilder {
         ToolsBuilder { tools: self }
+    }
+
+    /// Returns the model-visible tool exposure policy.
+    #[must_use]
+    pub const fn exposure(&self) -> ToolExposure {
+        self.exposure
     }
 
     /// Returns whether the standard workspace tools are enabled.
@@ -198,6 +239,17 @@ pub enum ToolsBuildError {
 }
 
 impl ToolsBuilder {
+    /// Selects whether registered tools are also exposed directly to the model.
+    ///
+    /// The default is [`ToolExposure::CodeModeOnly`]. This changes only the
+    /// model-visible declaration set; all registered handlers remain callable
+    /// from Code Mode.
+    #[must_use]
+    pub const fn exposure(mut self, exposure: ToolExposure) -> Self {
+        self.tools.exposure = exposure;
+        self
+    }
+
     /// Starts from an empty built-in tool set.
     #[must_use]
     pub const fn without_defaults(mut self) -> Self {
@@ -278,8 +330,8 @@ impl ToolsBuilder {
     #[must_use]
     pub fn provider<P: DynamicToolProvider + 'static>(mut self, provider: P) -> Self {
         let provider: Arc<dyn DynamicToolProvider> = Arc::new(provider);
-        self.tools.registered.extend(provider.direct_tools());
         self.tools.providers.push(provider);
+        self.refresh_provider_direct();
         self
     }
 
@@ -288,7 +340,8 @@ impl ToolsBuilder {
     /// # Errors
     ///
     /// Returns an error for empty, duplicate, or enabled built-in tool names.
-    pub fn build(self) -> Result<Tools, ToolsBuildError> {
+    pub fn build(mut self) -> Result<Tools, ToolsBuildError> {
+        self.refresh_provider_direct();
         if self
             .tools
             .working_directory
@@ -305,8 +358,18 @@ impl ToolsBuilder {
         {
             return Err(ToolsBuildError::EmptyDefaultShell);
         }
-        let mut names = HashSet::with_capacity(self.tools.registered.len());
-        for tool in &self.tools.registered {
+        let mut names = HashSet::with_capacity(
+            self.tools
+                .registered
+                .len()
+                .saturating_add(self.tools.provider_direct.len()),
+        );
+        for tool in self
+            .tools
+            .registered
+            .iter()
+            .chain(&self.tools.provider_direct)
+        {
             let definition = tool.definition();
             let name = definition.name();
             if name.is_empty() {
@@ -320,6 +383,21 @@ impl ToolsBuilder {
             }
         }
         Ok(self.tools)
+    }
+
+    fn refresh_provider_direct(&mut self) {
+        self.tools.deferred_tools_guidance_enabled = self.tools.providers.iter().any(|provider| {
+            provider
+                .direct_tools()
+                .iter()
+                .any(|tool| matches!(tool.definition(), ToolDefinition::ToolSearch { .. }))
+        });
+        self.tools.provider_direct = self
+            .tools
+            .providers
+            .iter()
+            .flat_map(|provider| provider.direct_tools_for_exposure(self.tools.exposure))
+            .collect();
     }
 }
 

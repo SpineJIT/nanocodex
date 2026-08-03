@@ -4,6 +4,7 @@ mod catalog;
 mod client;
 mod config;
 mod oauth;
+mod resources;
 mod stdio;
 
 use std::{
@@ -17,7 +18,7 @@ use std::{
 
 use crate::{DynamicToolProvider, Tool, ToolContext, ToolInput, ToolOutput, ToolResult};
 use async_trait::async_trait;
-use catalog::{ProviderState, ToolEntry};
+use catalog::{ConnectedCatalog, ProviderState, ToolEntry};
 use nanocodex_oai_api::tools::ToolDefinition;
 use rmcp::model::CallToolRequestParams;
 use serde::Deserialize;
@@ -308,8 +309,14 @@ impl McpHandle {
                         )
                     })
                     .collect();
-                self.state
-                    .complete_server(server_name, generation, Ok(entries));
+                self.state.complete_server(
+                    server_name,
+                    generation,
+                    Ok(ConnectedCatalog {
+                        client: connected.client,
+                        entries,
+                    }),
+                );
                 Ok(count)
             }
             Err(error) => {
@@ -466,7 +473,7 @@ impl DynamicToolProvider for Mcp {
                 let result = client::connect(&name, &config, oauth_store, oauth_metadata, &span)
                     .await
                     .map(|connected| {
-                        connected
+                        let entries = connected
                             .tools
                             .into_iter()
                             .map(|tool| {
@@ -479,7 +486,11 @@ impl DynamicToolProvider for Mcp {
                                     config.supports_parallel_tool_calls,
                                 )
                             })
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<_>>();
+                        ConnectedCatalog {
+                            client: connected.client,
+                            entries,
+                        }
                     });
                 span.record(
                     "status",
@@ -493,8 +504,8 @@ impl DynamicToolProvider for Mcp {
                     "otel.status_code",
                     if result.is_ok() { "OK" } else { "ERROR" },
                 );
-                if let Ok(tools) = &result {
-                    span.record("tool.count", tools.len());
+                if let Ok(catalog) = &result {
+                    span.record("tool.count", catalog.entries.len());
                 }
                 state.complete_server(&name, 0, result);
             }));
@@ -502,7 +513,14 @@ impl DynamicToolProvider for Mcp {
     }
 
     fn direct_tools(&self) -> Vec<Arc<dyn Tool>> {
-        vec![Arc::clone(&self.search) as Arc<dyn Tool>]
+        vec![
+            Arc::new(resources::ListMcpResourceTemplates::new(Arc::clone(
+                &self.state,
+            ))) as Arc<dyn Tool>,
+            Arc::new(resources::ListMcpResources::new(Arc::clone(&self.state))),
+            Arc::new(resources::ReadMcpResource::new(Arc::clone(&self.state))),
+            Arc::clone(&self.search) as Arc<dyn Tool>,
+        ]
     }
 
     fn available_definitions(&self) -> Vec<ToolDefinition> {
@@ -510,12 +528,12 @@ impl DynamicToolProvider for Mcp {
     }
 
     fn contains(&self, name: &str) -> bool {
-        self.state.active_entry(name).is_some()
+        self.state.entry(name).is_some()
     }
 
     fn supports_parallel_tool_calls(&self, name: &str) -> bool {
         self.state
-            .active_entry(name)
+            .entry(name)
             .is_some_and(|entry| entry.supports_parallel_tool_calls)
     }
 
@@ -525,7 +543,7 @@ impl DynamicToolProvider for Mcp {
         input: Value,
         _context: ToolContext<'_>,
     ) -> Option<ToolOutput> {
-        let entry = self.state.active_entry(name)?;
+        let entry = self.state.ready_entry(name).await?;
         let Value::Object(arguments) = input else {
             return Some(ToolOutput::error(format!(
                 "MCP tool {name} requires an object argument"
@@ -742,7 +760,8 @@ fn search_description(servers: &[NamedServer]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ToolOutputBody, contract::DEFAULT_TOOL_OUTPUT_TOKENS};
+    use crate::runtime::ToolRuntime;
+    use crate::{ToolOutputBody, Tools, contract::DEFAULT_TOOL_OUTPUT_TOKENS};
     use futures_util::future::join_all;
     use nanocodex_oai_api::MODEL;
     use serde_json::value::to_raw_value;
@@ -808,6 +827,130 @@ mod tests {
                     "additionalProperties": false
                 }
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn code_mode_only_matches_codex_mcp_exposure() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mcp-stdio-server.mjs");
+        let mcp = Mcp::builder()
+            .server(
+                "fixture",
+                McpServer::stdio("node").arg(fixture.to_string_lossy()),
+            )
+            .build()
+            .unwrap();
+        let handle = mcp.handle();
+        assert_eq!(handle.reload("fixture").await.unwrap(), 1);
+
+        let tools = Tools::builder()
+            .without_defaults()
+            .provider(mcp)
+            .build()
+            .unwrap();
+        let runtime = ToolRuntime::new_with_tools(".", None, None, &tools);
+        let specs = runtime.model_specs("test-session");
+        assert_eq!(
+            specs.iter().map(ToolDefinition::name).collect::<Vec<_>>(),
+            ["exec", "wait", "tool_search"],
+            "Code Mode-only must retain the discovery primitive while deferring MCP tools"
+        );
+
+        let description = specs[0].description();
+        for tool in [
+            "### `list_mcp_resource_templates`",
+            "### `list_mcp_resources`",
+            "### `read_mcp_resource`",
+        ] {
+            assert!(description.contains(tool), "missing {tool}: {description}");
+        }
+        assert!(description.contains("Some deferred nested tools may be omitted"));
+        assert!(
+            !description.contains("### `mcp__fixture__echo`"),
+            "deferred MCP schemas must not inflate the stable request prefix"
+        );
+
+        assert_eq!(
+            runtime
+                .model_contract("test-session")
+                .1
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            [
+                "list_mcp_resource_templates",
+                "list_mcp_resources",
+                "mcp__fixture__echo",
+                "read_mcp_resource",
+            ],
+            "all deferred MCP tools must be callable through Code Mode from its first cell"
+        );
+
+        let resources = runtime
+            .execute_tool(
+                "list_mcp_resources",
+                ToolInput::Function(to_raw_value(&json!({})).unwrap()),
+                test_context("test-session", "list-resources"),
+            )
+            .await;
+        assert!(resources.success);
+        assert_eq!(
+            resources.code_mode_value()["resources"],
+            json!([
+                {
+                    "server": "fixture",
+                    "uri": "fixture://first",
+                    "name": "fixture-first",
+                    "mimeType": "text/plain"
+                },
+                {
+                    "server": "fixture",
+                    "uri": "fixture://second",
+                    "name": "fixture-second",
+                    "mimeType": "text/plain"
+                }
+            ]),
+            "aggregate listing must exhaust every server's pagination"
+        );
+
+        let templates = runtime
+            .execute_tool(
+                "list_mcp_resource_templates",
+                ToolInput::Function(to_raw_value(&json!({})).unwrap()),
+                test_context("test-session", "list-resource-templates"),
+            )
+            .await;
+        assert!(templates.success);
+        assert_eq!(
+            templates.code_mode_value()["resourceTemplates"][0],
+            json!({
+                "server": "fixture",
+                "uriTemplate": "fixture://item/{id}",
+                "name": "fixture-item",
+                "mimeType": "text/plain"
+            })
+        );
+
+        let read = runtime
+            .execute_tool(
+                "read_mcp_resource",
+                ToolInput::Function(
+                    to_raw_value(&json!({
+                        "server": "fixture",
+                        "uri": "fixture://first"
+                    }))
+                    .unwrap(),
+                ),
+                test_context("test-session", "read-resource"),
+            )
+            .await;
+        assert!(read.success);
+        assert_eq!(read.code_mode_value()["server"], "fixture");
+        assert_eq!(read.code_mode_value()["uri"], "fixture://first");
+        assert_eq!(
+            read.code_mode_value()["contents"][0]["text"],
+            "fixture resource body"
         );
     }
 

@@ -711,7 +711,7 @@ mod tests {
     use nanocodex::{oai::MODEL, tools::ToolContext};
     use nanocodex_observability::{LogFormat, LogOutput, ObservabilityBuilder};
     use nanocodex_tools::{
-        ToolInput, Tools,
+        ToolExposure, ToolInput, Tools,
         contract::DEFAULT_TOOL_OUTPUT_TOKENS,
         runtime::{DynamicToolProvider, ToolRuntime},
     };
@@ -803,7 +803,11 @@ enabled = false
         let mut args = args();
         args.mcp_codex_config = true;
         let mcp = args.build(codex_home.path()).unwrap().unwrap();
-        let tools = Tools::builder().provider(mcp.provider).build().unwrap();
+        let tools = Tools::builder()
+            .exposure(ToolExposure::DirectAndCodeMode)
+            .provider(mcp.provider)
+            .build()
+            .unwrap();
         let encoded = serde_json::to_string(
             &ToolRuntime::new_with_tools(".", None, None, &tools).model_specs("test-session"),
         )
@@ -1110,7 +1114,7 @@ tool_timeout_sec = 9.5
     }
 
     #[tokio::test]
-    async fn defaults_add_only_deferred_search_to_the_initial_tool_context() {
+    async fn defaults_keep_mcp_tool_schemas_deferred_in_code_mode_only() {
         let baseline_tools = Tools::builder().build().unwrap();
         let baseline = serde_json::to_vec(
             &ToolRuntime::new_with_tools(".", None, None, &baseline_tools)
@@ -1127,10 +1131,11 @@ tool_timeout_sec = 9.5
         .unwrap();
         let encoded = String::from_utf8(with_defaults.clone()).unwrap();
 
-        assert!(encoded.contains("tool_search"));
-        assert!(encoded.contains("openaiDeveloperDocs"));
-        assert!(encoded.contains("tempo"));
-        assert!(encoded.contains("cloudflare"));
+        assert!(encoded.contains("\"type\":\"tool_search\""));
+        assert!(encoded.contains("Some deferred nested tools may be omitted"));
+        assert!(encoded.contains("list_mcp_resource_templates"));
+        assert!(encoded.contains("list_mcp_resources"));
+        assert!(encoded.contains("read_mcp_resource"));
         assert!(!encoded.contains("mcp__openaiDeveloperDocs__"));
         assert!(!encoded.contains("mcp__tempo__"));
         assert!(!encoded.contains("mcp__cloudflare__"));

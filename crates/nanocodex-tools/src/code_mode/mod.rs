@@ -41,7 +41,6 @@ const INITIAL_YIELD: Duration = if cfg!(test) {
 const DEFAULT_WAIT_YIELD: Duration = Duration::from_secs(10);
 const OBSERVER_YIELD_GRACE: Duration = Duration::from_secs(1);
 const MIN_YIELD_FOR_OBSERVER_GRACE: Duration = Duration::from_secs(10);
-const NESTED_YIELD_GRACE: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT_NESTED_CALLS: usize = 128;
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const EXEC_PRAGMA_PREFIX: &str = "// @exec:";
@@ -140,7 +139,7 @@ struct CellObservationState {
 #[derive(Default)]
 struct ObservationBuffer {
     content: Vec<ToolOutputContent>,
-    nested_calls: Vec<(u64, NestedToolCall)>,
+    nested_calls: Vec<ObservedNestedCall>,
     notifications: Vec<CodeModeNotification>,
 }
 
@@ -160,12 +159,8 @@ enum CellUpdate {
         call_id: String,
         name: String,
         input: Value,
-        yield_after: Option<Duration>,
     },
-    NestedCall {
-        id: u64,
-        call: NestedToolCall,
-    },
+    NestedCall(ObservedNestedCall),
     Notification(CodeModeNotification),
     Content(ToolOutputContent),
     Yielded,
@@ -229,6 +224,13 @@ struct CompletedNestedCall {
     id: u64,
     value: Value,
     call: NestedToolCall,
+    shell_session_id: Option<i64>,
+}
+
+struct ObservedNestedCall {
+    id: u64,
+    call: NestedToolCall,
+    shell_session_id: Option<i64>,
 }
 
 enum CellTerminal {
@@ -343,7 +345,6 @@ impl CodeModeRuntime {
             .max_output_tokens
             .unwrap_or(context.output_token_budget)
             .max(1);
-        let extend_for_nested_calls = source.yield_time_ms.is_none();
         tracing::Span::current().record("output.max_tokens", output_token_budget);
         let context = context.with_output_token_budget(output_token_budget);
         let stored = self.stored.lock().await.clone();
@@ -376,7 +377,6 @@ impl CodeModeRuntime {
             started_at,
             ObservationMode::YieldAfter(yield_after),
             Some(output_token_budget),
-            extend_for_nested_calls,
             observer,
         )
         .await;
@@ -446,7 +446,6 @@ impl CodeModeRuntime {
                 started_at,
                 ObservationMode::Terminate,
                 Some(continued_output_token_budget),
-                false,
                 observer,
             )
             .await;
@@ -471,7 +470,6 @@ impl CodeModeRuntime {
             started_at,
             ObservationMode::YieldAfter(yield_time),
             Some(output_token_budget),
-            false,
             observer,
         )
         .await;
@@ -797,7 +795,6 @@ async fn observe_cell(
     started_at: Instant,
     mode: ObservationMode,
     max_output_tokens: Option<usize>,
-    extend_for_nested_calls: bool,
     observer: &mut dyn CodeModeObserver,
 ) -> (CodeModeExecution, bool) {
     let (yield_after, terminating) = match mode {
@@ -834,27 +831,16 @@ async fn observe_cell(
                 call_id,
                 name,
                 input,
-                yield_after: nested_yield_after,
             }) => {
-                if let Some(nested_yield_after) = nested_yield_after
-                    && let Some(yield_timer) = yield_timer.as_mut()
-                {
-                    maybe_extend_cell_yield(
-                        yield_timer.as_mut(),
-                        extend_for_nested_calls,
-                        nested_yield_after,
-                        &name,
-                    );
-                }
                 observer.update(CodeModeUpdate::NestedCallStarted {
                     call_id: &call_id,
                     name: &name,
                     input: &input,
                 });
             }
-            Some(CellUpdate::NestedCall { id, call }) => {
-                observer.update(CodeModeUpdate::NestedCallCompleted(&call));
-                observation.buffered.nested_calls.push((id, call));
+            Some(CellUpdate::NestedCall(call)) => {
+                observer.update(CodeModeUpdate::NestedCallCompleted(&call.call));
+                observation.buffered.nested_calls.push(call);
             }
             Some(CellUpdate::Notification(notification)) => {
                 observation.buffered.notifications.push(notification);
@@ -967,40 +953,12 @@ async fn observe_cell(
     }
 }
 
-fn maybe_extend_cell_yield(
-    mut timer: std::pin::Pin<&mut tokio::time::Sleep>,
-    enabled: bool,
-    nested_yield_after: Duration,
-    tool_name: &str,
-) {
-    if !enabled {
-        return;
-    }
-    let Some(extended_deadline) = tokio::time::Instant::now()
-        .checked_add(nested_yield_after)
-        .and_then(|deadline| deadline.checked_add(NESTED_YIELD_GRACE))
-    else {
-        return;
-    };
-    if extended_deadline <= timer.deadline() {
-        return;
-    }
-    timer.as_mut().reset(extended_deadline);
-    tracing::info!(
-        target: "nanocodex_tools",
-        stage = "code_mode.yield_extended",
-        tool.name = tool_name,
-        nested.yield_ms = nested_yield_after.as_millis(),
-        "extended Code Mode yield for nested tool wait"
-    );
-}
-
 fn running_observation(
     cell_id: u64,
     started_at: Instant,
     content: Vec<ToolOutputContent>,
     max_output_tokens: Option<usize>,
-    nested_calls: Vec<(u64, NestedToolCall)>,
+    nested_calls: Vec<ObservedNestedCall>,
     notifications: Vec<CodeModeNotification>,
 ) -> (CodeModeExecution, bool) {
     (
@@ -1023,7 +981,7 @@ fn observed_execution(
     started_at: Instant,
     mut content: Vec<ToolOutputContent>,
     max_output_tokens: Option<usize>,
-    nested_calls: Vec<(u64, NestedToolCall)>,
+    nested_calls: Vec<ObservedNestedCall>,
     notifications: Vec<CodeModeNotification>,
 ) -> CodeModeExecution {
     expose_running_shell_sessions(&mut content, &nested_calls);
@@ -1038,25 +996,20 @@ fn observed_execution(
 
 fn expose_running_shell_sessions(
     content: &mut Vec<ToolOutputContent>,
-    nested_calls: &[(u64, NestedToolCall)],
+    nested_calls: &[ObservedNestedCall],
 ) {
     let mut running = BTreeSet::new();
-    for (_, call) in nested_calls {
+    for observed in nested_calls {
+        let call = &observed.call;
         if !matches!(call.name.as_str(), "exec_command" | "write_stdin") {
             continue;
         }
-        let ToolOutputBody::Text(result) = &call.output else {
-            continue;
-        };
-        let result_session_id = serde_json::from_str::<Value>(result)
-            .ok()
-            .and_then(|result| result.get("session_id")?.as_i64());
         if call.name == "write_stdin"
             && let Some(input_session_id) = call.input.get("session_id").and_then(Value::as_i64)
         {
             running.remove(&input_session_id);
         }
-        if let Some(session_id) = result_session_id {
+        if let Some(session_id) = observed.shell_session_id {
             running.insert(session_id);
         }
     }
@@ -1107,9 +1060,8 @@ impl EmbeddedHost {
                     let Some(completed) = completed else {
                         continue;
                     };
-                    let id = completed.id;
                     let call = self.send_completed_call(cell_id, completed)?;
-                    let _ = updates.send(CellUpdate::NestedCall { id, call });
+                    let _ = updates.send(CellUpdate::NestedCall(call));
                 }
                 event = self.read_event() => {
                     let event = event.map_err(HostFailure::new)?;
@@ -1132,12 +1084,10 @@ impl EmbeddedHost {
                             id, name, input, ..
                         } => {
                             let nested_call_id = format!("{}/code-{id}", context.call_id);
-                            let yield_after = nested_tool_yield_after(&name, &input);
                             let _ = updates.send(CellUpdate::NestedCallStarted {
                                 call_id: nested_call_id,
                                 name: name.clone(),
                                 input: input.clone(),
-                                yield_after,
                             });
                             let permit = Arc::clone(&nested_call_permits);
                             let supports_parallel = tools.supports_parallel_tool_calls(&name);
@@ -1209,7 +1159,7 @@ impl EmbeddedHost {
         &mut self,
         cell_id: u64,
         completed: CompletedNestedCall,
-    ) -> Result<NestedToolCall, HostFailure> {
+    ) -> Result<ObservedNestedCall, HostFailure> {
         self.send_tool_result(
             cell_id,
             completed.id,
@@ -1217,31 +1167,12 @@ impl EmbeddedHost {
             completed.call.success,
         )
         .map_err(HostFailure::new)?;
-        Ok(completed.call)
+        Ok(ObservedNestedCall {
+            id: completed.id,
+            call: completed.call,
+            shell_session_id: completed.shell_session_id,
+        })
     }
-}
-
-fn nested_tool_yield_after(name: &str, input: &Value) -> Option<Duration> {
-    let input = input.as_object()?;
-    let (default, minimum, maximum) = match name {
-        "write_stdin"
-            if input
-                .get("chars")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .is_empty() =>
-        {
-            (5_000, 5_000, 300_000)
-        }
-        "exec_command" => (10_000, 250, 30_000),
-        "write_stdin" => (250, 250, 30_000),
-        _ => return None,
-    };
-    let requested = input
-        .get("yield_time_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(default);
-    Some(Duration::from_millis(requested.clamp(minimum, maximum)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1372,9 +1303,9 @@ impl HostFailure {
     }
 }
 
-fn ordered_calls(mut calls: Vec<(u64, NestedToolCall)>) -> Vec<NestedToolCall> {
-    calls.sort_unstable_by_key(|(id, _)| *id);
-    calls.into_iter().map(|(_, call)| call).collect()
+fn ordered_calls(mut calls: Vec<ObservedNestedCall>) -> Vec<NestedToolCall> {
+    calls.sort_unstable_by_key(|call| call.id);
+    calls.into_iter().map(|call| call.call).collect()
 }
 
 async fn execute_nested_call(
@@ -1400,9 +1331,14 @@ async fn execute_nested_call(
     let execution = tools.execute_nested(&name, input.clone(), context).await;
     let duration_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let value = execution.code_mode_value();
+    let shell_session_id = execution
+        .process_trace()
+        .and_then(|process| process.session_id)
+        .or_else(|| value.get("session_id").and_then(Value::as_i64));
     CompletedNestedCall {
         id,
         value,
+        shell_session_id,
         call: NestedToolCall {
             call_id,
             name,

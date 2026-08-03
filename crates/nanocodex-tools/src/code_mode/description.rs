@@ -1,8 +1,10 @@
-use std::fmt::Write as _;
+use std::{collections::BTreeSet, fmt::Write as _};
 
 use nanocodex_oai_api::{responses::JsonSchema, tools::ToolDefinition};
 use serde_json::Value;
 
+const DEFERRED_NESTED_TOOLS_GUIDANCE: &str = r"Some deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.
+To find one, filter `ALL_TOOLS` by `name` and `description`.";
 // Based on https://modelcontextprotocol.io/specification/draft/schema#calltoolresult.
 const MCP_TYPESCRIPT_PREAMBLE: &str = r#"type Role = "user" | "assistant";
 type MetaObject = Record<string, unknown>;
@@ -82,7 +84,7 @@ type CallToolResult<TStructured = { [key: string]: unknown }> = {
 };"#;
 const EXEC_DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose tool calls
 - Evaluates the provided JavaScript code in a fresh V8 isolate as an async module.
-- All nested tools are on global `tools`. For configured or deferred capabilities omitted here, check `ALL_TOOLS` before searching the workspace, then call a match as `await tools[tool.name](...)`.
+- All nested tools are available on the global `tools` object, for example `await tools.exec_command(...)`. Tool names are exposed as normalized JavaScript identifiers, for example `await tools.mcp__ologs__get_profile(...)`.
 - Nested tool methods take either a string or an object as their input argument.
 - Nested tools return either an object or a string, based on the description.
 - Runs raw JavaScript -- no Node, no file system, no network access, no console.
@@ -103,15 +105,22 @@ const EXEC_DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose too
 - `notify(value: string | number | boolean | undefined | null)`: immediately injects an extra `custom_tool_call_output` for the current `exec` call. Values are stringified like `text(...)`.
 - `setTimeout(callback: () => void, delayMs?: number)`: schedules a callback to run later and returns a timeout id. Pending timeouts do not keep `exec` alive by themselves; await an explicit promise if you need to wait for one.
 - `clearTimeout(timeoutId?: number)`: cancels a timeout created by `setTimeout`.
-- `ALL_TOOLS`: enumerable `name`/`description` plus explicit `input_schema`/`output_schema`.
+- `ALL_TOOLS`: metadata for the enabled nested tools as `{ name, description }` entries.
 - `yield_control()`: yields the accumulated output to the model immediately while the script keeps running."#;
 
 pub(super) fn exec_description(
     definitions: &[ToolDefinition],
-    has_deferred_search: bool,
+    has_deferred_tools: bool,
+    code_mode_only: bool,
 ) -> String {
     let mut description = EXEC_DESCRIPTION.to_owned();
-    if has_deferred_search
+    if has_deferred_tools {
+        let _ = write!(description, "\n\n{DEFERRED_NESTED_TOOLS_GUIDANCE}");
+    }
+    if !code_mode_only {
+        return description;
+    }
+    if has_deferred_tools
         || definitions.iter().any(|spec| {
             spec.output_schema()
                 .and_then(|schema| mcp_structured_content_schema(schema.as_value()))
@@ -123,30 +132,18 @@ pub(super) fn exec_description(
             "\n\nShared MCP Types:\n```ts\n{MCP_TYPESCRIPT_PREAMBLE}\n```"
         );
     }
+    let mut rendered_namespaces = BTreeSet::new();
     for spec in definitions {
-        let (input_name, input_type) = match spec {
-            ToolDefinition::Function { .. } => (
-                "args",
-                spec.parameters()
-                    .map(JsonSchema::as_value)
-                    .map_or_else(|| "unknown".to_owned(), render_json_schema_to_typescript),
-            ),
-            ToolDefinition::Custom { .. } => ("input", "string".to_owned()),
-            ToolDefinition::ToolSearch { .. } => continue,
-        };
-        let output_type = match spec.output_schema().map(JsonSchema::as_value) {
-            Some(schema) => match mcp_structured_content_schema(schema) {
-                Some(structured) => {
-                    let structured = render_json_schema_to_typescript(structured);
-                    if structured == "unknown" {
-                        "CallToolResult".to_owned()
-                    } else {
-                        format!("CallToolResult<{structured}>")
-                    }
-                }
-                None => render_json_schema_to_typescript(schema),
-            },
-            None => "unknown".to_owned(),
+        if let Some((namespace, _)) = code_mode_namespace_and_name(spec.name())
+            && rendered_namespaces.insert(namespace)
+        {
+            let _ = write!(
+                description,
+                "\n\n## {namespace}\nTools in the {namespace} namespace."
+            );
+        }
+        let Some(declaration) = exec_tool_declaration(spec) else {
+            continue;
         };
         let global_name = normalize_identifier(spec.name());
         let heading = if global_name == spec.name() {
@@ -156,13 +153,61 @@ pub(super) fn exec_description(
         };
         let _ = write!(
             description,
-            "\n\n{heading}\n{}\n\nexec tool declaration:\n```ts\n\
-declare const tools: {{ {global_name}({input_name}: {input_type}): Promise<{output_type}>; }};\n\
-```",
+            "\n\n{heading}\n{}\n\n{declaration}",
             spec.description(),
         );
     }
     description
+}
+
+pub(crate) fn augment_definition_for_code_mode(mut definition: ToolDefinition) -> ToolDefinition {
+    let Some(declaration) = exec_tool_declaration(&definition) else {
+        return definition;
+    };
+    match &mut definition {
+        ToolDefinition::Function { description, .. }
+        | ToolDefinition::Custom { description, .. } => {
+            *description = format!("{description}\n\n{declaration}").into();
+        }
+        ToolDefinition::Namespace { .. } | ToolDefinition::ToolSearch { .. } => {}
+    }
+    definition
+}
+
+fn exec_tool_declaration(spec: &ToolDefinition) -> Option<String> {
+    let (input_name, input_type) = match spec {
+        ToolDefinition::Function { .. } => (
+            "args",
+            spec.parameters()
+                .map(JsonSchema::as_value)
+                .map_or_else(|| "unknown".to_owned(), render_json_schema_to_typescript),
+        ),
+        ToolDefinition::Custom { .. } => ("input", "string".to_owned()),
+        ToolDefinition::Namespace { .. } | ToolDefinition::ToolSearch { .. } => return None,
+    };
+    let output_type = match spec.output_schema().map(JsonSchema::as_value) {
+        Some(schema) => match mcp_structured_content_schema(schema) {
+            Some(structured) => {
+                let structured = render_json_schema_to_typescript(structured);
+                if structured == "unknown" {
+                    "CallToolResult".to_owned()
+                } else {
+                    format!("CallToolResult<{structured}>")
+                }
+            }
+            None => render_json_schema_to_typescript(schema),
+        },
+        None => "unknown".to_owned(),
+    };
+    let global_name = normalize_identifier(spec.name());
+    Some(format!(
+        "exec tool declaration:\n```ts\ndeclare const tools: {{ {global_name}({input_name}: {input_type}): Promise<{output_type}>; }};\n```"
+    ))
+}
+
+fn code_mode_namespace_and_name(name: &str) -> Option<(&str, &str)> {
+    let (namespace, name) = name.split_once("__")?;
+    (!namespace.is_empty() && !name.is_empty()).then_some((namespace, name))
 }
 
 fn mcp_structured_content_schema(output_schema: &Value) -> Option<&Value> {
@@ -384,9 +429,11 @@ fn render_literal(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use nanocodex_oai_api::tools::ToolDefinition;
     use serde_json::json;
 
-    use super::render_json_schema_to_typescript;
+    use super::{exec_description, render_json_schema_to_typescript};
+    use crate::code_mode_order::sort_definitions;
 
     #[test]
     fn renders_described_object_as_typescript() {
@@ -403,5 +450,67 @@ mod tests {
             render_json_schema_to_typescript(&schema),
             "{\n  choice: \"one\" | \"two\";\n  // How many.\n  count?: number;\n}"
         );
+    }
+
+    #[test]
+    fn renders_nullable_schema_types() {
+        let schema = json!({
+            "type": ["array", "null"],
+            "items": {"type": "string"}
+        });
+        assert_eq!(
+            render_json_schema_to_typescript(&schema),
+            "Array<string> | null"
+        );
+    }
+
+    #[test]
+    fn sorts_plain_tools_before_namespaces_and_renders_namespace_header() {
+        let mut definitions = vec![
+            ToolDefinition::function(
+                "image_gen__imagegen",
+                "Generate an image.",
+                json!({"type": "object"}),
+            ),
+            ToolDefinition::function("write_stdin", "Write input.", json!({"type": "object"})),
+            ToolDefinition::function("apply_patch", "Apply a patch.", json!({"type": "object"})),
+        ];
+        sort_definitions(&mut definitions);
+        assert_eq!(
+            definitions
+                .iter()
+                .map(ToolDefinition::name)
+                .collect::<Vec<_>>(),
+            ["apply_patch", "write_stdin", "image_gen__imagegen"]
+        );
+
+        let description = exec_description(&definitions, false, true);
+        let namespace = description
+            .find("## image_gen\nTools in the image_gen namespace.")
+            .unwrap();
+        assert!(description.find("### `write_stdin`").unwrap() < namespace);
+        assert!(namespace < description.find("### `image_gen__imagegen`").unwrap());
+    }
+
+    #[test]
+    fn normal_code_mode_keeps_the_exec_description_terse() {
+        let definitions = vec![ToolDefinition::function(
+            "update_plan",
+            "Update the plan.",
+            json!({"type": "object"}),
+        )];
+
+        let description = exec_description(&definitions, false, false);
+
+        assert!(
+            description.contains(
+                "All nested tools are available on the global `tools` object, for example"
+            )
+        );
+        assert!(description.contains(
+            "`ALL_TOOLS`: metadata for the enabled nested tools as `{ name, description }` entries."
+        ));
+        assert!(!description.contains("### `update_plan`"));
+        assert!(!description.contains("declare const tools"));
     }
 }

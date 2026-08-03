@@ -355,15 +355,16 @@ async fn deferred_browser_is_discoverable_without_model_schema_bytes() -> Result
             r#"
 const browser = ALL_TOOLS.find((tool) => tool.name === "browser");
 if (!browser) throw new Error("browser metadata missing");
-const schema = JSON.stringify(browser.input_schema);
+if (typeof browser.description !== "string") {
+  throw new Error("browser description missing");
+}
 const opened = await tools[browser.name]({
   action: "open",
   url: "https://example.com"
 });
 text({
   name: browser.name,
-  hasOpen: schema.includes('"open"'),
-  hasSnapshot: schema.includes('"snapshot"'),
+  hasDescription: browser.description.length > 0,
   opened
 });
 "#,
@@ -375,8 +376,7 @@ text({
     assert_eq!(execution.nested_calls.len(), 1);
     let output: Value = serde_json::from_str(execution_text(&execution.output)?)?;
     assert_eq!(output["name"], "browser");
-    assert_eq!(output["hasOpen"], true);
-    assert_eq!(output["hasSnapshot"], true);
+    assert_eq!(output["hasDescription"], true);
     assert_eq!(output["opened"]["action"], "open");
     assert_eq!(recording.actions()?.len(), 1);
     Ok(())

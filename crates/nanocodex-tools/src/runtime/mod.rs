@@ -11,7 +11,7 @@ mod tests;
 pub use execution::{ToolRuntime, ToolRuntimeControl};
 pub(crate) use registry::ToolRegistry;
 pub use schema::schema_for;
-pub use selection::{DynamicToolProvider, Tools, ToolsBuildError, ToolsBuilder};
+pub use selection::{DynamicToolProvider, ToolExposure, Tools, ToolsBuildError, ToolsBuilder};
 
 use std::{
     any::Any,

@@ -37,10 +37,16 @@ pub(crate) struct ToolEntry {
 struct Catalog {
     entries: BTreeMap<String, Arc<ToolEntry>>,
     active: BTreeSet<String>,
+    clients: BTreeMap<String, Client>,
     failures: BTreeMap<String, String>,
     search_index: Option<Arc<SearchIndex>>,
     pending_servers: BTreeSet<String>,
     generations: BTreeMap<String, u64>,
+}
+
+pub(crate) struct ConnectedCatalog {
+    pub client: Client,
+    pub entries: Vec<ToolEntry>,
 }
 
 struct SearchIndex {
@@ -120,6 +126,7 @@ impl ProviderState {
             catalog: Mutex::new(Catalog {
                 entries: BTreeMap::new(),
                 active: BTreeSet::new(),
+                clients: BTreeMap::new(),
                 failures: BTreeMap::new(),
                 search_index: None,
                 pending_servers,
@@ -134,14 +141,14 @@ impl ProviderState {
         &self,
         server_name: &str,
         generation: u64,
-        result: Result<Vec<ToolEntry>, String>,
+        result: Result<ConnectedCatalog, String>,
     ) {
         let mut catalog = self.catalog();
         if catalog.generations.get(server_name).copied() != Some(generation) {
             return;
         }
         match result {
-            Ok(entries) => {
+            Ok(ConnectedCatalog { client, entries }) => {
                 let removed = catalog
                     .entries
                     .iter()
@@ -167,6 +174,7 @@ impl ProviderState {
                         .entries
                         .insert(entry.canonical_name.clone(), Arc::new(entry));
                 }
+                catalog.clients.insert(server_name.to_owned(), client);
                 let available = catalog.entries.keys().cloned().collect::<BTreeSet<_>>();
                 catalog.active.retain(|name| available.contains(name));
             }
@@ -265,20 +273,42 @@ impl ProviderState {
     pub(crate) fn available_definitions(&self) -> Vec<ToolDefinition> {
         let catalog = self.catalog();
         catalog
-            .active
-            .iter()
-            .filter_map(|name| catalog.entries.get(name))
+            .entries
+            .values()
             .map(|entry| entry.definition.clone())
             .collect()
     }
 
-    pub(crate) fn active_entry(&self, name: &str) -> Option<Arc<ToolEntry>> {
+    pub(crate) fn entry(&self, name: &str) -> Option<Arc<ToolEntry>> {
+        self.catalog().entries.get(name).cloned()
+    }
+
+    pub(crate) async fn ready_entry(&self, name: &str) -> Option<Arc<ToolEntry>> {
+        self.wait_for_startup().await;
+        self.entry(name)
+    }
+
+    pub(crate) async fn client(&self, server_name: &str) -> Result<Client, String> {
+        self.wait_for_startup().await;
         let catalog = self.catalog();
-        catalog
-            .active
-            .contains(name)
-            .then(|| catalog.entries.get(name).cloned())
-            .flatten()
+        if let Some(client) = catalog.clients.get(server_name) {
+            return Ok(Arc::clone(client));
+        }
+        if let Some(error) = catalog.failures.get(server_name) {
+            return Err(format!(
+                "MCP server `{server_name}` is unavailable: {error}"
+            ));
+        }
+        Err(format!("unknown MCP server `{server_name}`"))
+    }
+
+    pub(crate) async fn clients(&self) -> Vec<(String, Client)> {
+        self.wait_for_startup().await;
+        self.catalog()
+            .clients
+            .iter()
+            .map(|(name, client)| (name.clone(), Arc::clone(client)))
+            .collect()
     }
 
     async fn wait_for_startup(&self) {
