@@ -11,7 +11,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import yaml
 from harbor.models.agent.context import AgentContext
@@ -24,7 +24,12 @@ from harbor_adapter.agent import (
     _remote_binary_install_command,
 )
 from harbor_adapter.codex import ParityCodexAgent
-from harbor_adapter.environment import _toolbox_mount_setup_command
+from harbor_adapter import environment as environment_adapter
+from harbor_adapter.environment import (
+    _ensure_task_image,
+    _immutable_task_identity,
+    _toolbox_mount_setup_command,
+)
 from harbor_adapter.verifier import (
     _VERIFIER_OVERLAY_PATH_VALIDATION,
     _toolbox_library_path_setup_command,
@@ -790,6 +795,115 @@ class EnvironmentToolboxContractTests(unittest.TestCase):
                         )
                     else:
                         self.assertEqual(task_modules.readlink(), toolbox_modules)
+
+
+class TaskImageCacheContractTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        environment_adapter._TASK_IMAGES.clear()
+        environment_adapter._TASK_IMAGE_LOCKS.clear()
+
+    def tearDown(self) -> None:
+        environment_adapter._TASK_IMAGES.clear()
+        environment_adapter._TASK_IMAGE_LOCKS.clear()
+
+    async def test_prepared_package_image_survives_a_fresh_process_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package_cache = root / "packages"
+            environment_dir = (
+                package_cache / "org" / "task" / ("a" * 64) / "environment"
+            )
+            environment_dir.mkdir(parents=True)
+            dockerfile = environment_dir / "Dockerfile"
+            dockerfile.touch()
+            records = root / "records"
+            build = AsyncMock(return_value="nanocodex/task:prepared")
+
+            with (
+                patch.object(environment_adapter, "PACKAGE_CACHE_DIR", package_cache),
+                patch.object(environment_adapter, "_TASK_IMAGE_RECORDS_DIR", records),
+                patch.object(environment_adapter, "ensure_docker_image_built", build),
+                patch.object(
+                    environment_adapter,
+                    "docker_image_exists",
+                    AsyncMock(return_value=True),
+                ) as image_exists,
+            ):
+                first = await _ensure_task_image(
+                    environment_name="task",
+                    environment_dir=environment_dir,
+                    dockerfile_path=dockerfile,
+                    platform="linux/amd64",
+                    logger=logging.getLogger(__name__),
+                )
+                environment_adapter._TASK_IMAGES.clear()
+                second = await _ensure_task_image(
+                    environment_name="task",
+                    environment_dir=environment_dir,
+                    dockerfile_path=dockerfile,
+                    platform="linux/amd64",
+                    logger=logging.getLogger(__name__),
+                )
+
+            self.assertEqual(first, "nanocodex/task:prepared")
+            self.assertEqual(second, first)
+            build.assert_awaited_once()
+            image_exists.assert_awaited_once_with(first)
+            self.assertEqual(len(list(records.glob("*.json"))), 1)
+
+    async def test_missing_prepared_image_rebuilds_and_replaces_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package_cache = root / "packages"
+            environment_dir = (
+                package_cache / "org" / "task" / ("b" * 64) / "environment"
+            )
+            environment_dir.mkdir(parents=True)
+            dockerfile = environment_dir / "Dockerfile"
+            dockerfile.touch()
+            records = root / "records"
+
+            with (
+                patch.object(environment_adapter, "PACKAGE_CACHE_DIR", package_cache),
+                patch.object(environment_adapter, "_TASK_IMAGE_RECORDS_DIR", records),
+                patch.object(
+                    environment_adapter,
+                    "ensure_docker_image_built",
+                    AsyncMock(side_effect=["old-image", "new-image"]),
+                ) as build,
+                patch.object(
+                    environment_adapter,
+                    "docker_image_exists",
+                    AsyncMock(return_value=False),
+                ),
+            ):
+                await _ensure_task_image(
+                    environment_name="task",
+                    environment_dir=environment_dir,
+                    dockerfile_path=dockerfile,
+                    platform="linux/arm64",
+                    logger=logging.getLogger(__name__),
+                )
+                environment_adapter._TASK_IMAGES.clear()
+                image = await _ensure_task_image(
+                    environment_name="task",
+                    environment_dir=environment_dir,
+                    dockerfile_path=dockerfile,
+                    platform="linux/arm64",
+                    logger=logging.getLogger(__name__),
+                )
+
+            self.assertEqual(image, "new-image")
+            self.assertEqual(build.await_count, 2)
+            record = json.loads(next(records.glob("*.json")).read_text())
+            self.assertEqual(record["image"], "new-image")
+
+    def test_mutable_local_task_does_not_receive_a_persistent_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment_dir = Path(directory) / "environment"
+            environment_dir.mkdir()
+
+            self.assertIsNone(_immutable_task_identity(environment_dir))
 
 
 class InterruptedRunContractTests(unittest.TestCase):

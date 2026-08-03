@@ -1,13 +1,19 @@
 """Docker optimizations for the local Harbor loop."""
 
 import asyncio
+import hashlib
+import json
+import os
+import re
 import shlex
 from pathlib import Path
 from typing import Any, override
 
+from harbor.constants import PACKAGE_CACHE_DIR
 from harbor.environments.docker.docker import DockerEnvironment
 from harbor.environments.docker.utils import (
     default_docker_platform,
+    docker_image_exists,
     ensure_docker_image_built,
 )
 from harbor.models.trial.config import ServiceVolumeConfig
@@ -16,6 +22,90 @@ _TOOLBOX_ROOT = "/opt/nanocodex-toolbox"
 _VERIFIER_ROOT = "/opt/nanocodex-verifier"
 _TOOLBOX_BUILD_LOCK = asyncio.Lock()
 _TOOLBOX_IMAGES: dict[tuple[Path, str], str] = {}
+_TASK_IMAGE_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
+_TASK_IMAGES: dict[tuple[str, str], str] = {}
+_TASK_IMAGE_RECORDS_DIR = Path(".nanocodex/harbor/task-images")
+_CONTENT_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _immutable_task_identity(environment_dir: Path) -> str | None:
+    """Return an identity only for Harbor's content-addressed package cache."""
+    try:
+        relative = environment_dir.resolve().relative_to(PACKAGE_CACHE_DIR.resolve())
+    except ValueError:
+        return None
+    parts = relative.parts
+    if len(parts) != 4 or parts[-1] != "environment":
+        return None
+    if not _CONTENT_HASH_RE.fullmatch(parts[-2]):
+        return None
+    return "/".join(parts[:-1])
+
+
+def _task_image_record_path(identity: str, platform: str) -> Path:
+    key = hashlib.sha256(f"{identity}\0{platform}".encode()).hexdigest()
+    return _TASK_IMAGE_RECORDS_DIR / f"{key}.json"
+
+
+async def _prepared_task_image(identity: str, platform: str) -> str | None:
+    path = _task_image_record_path(identity, platform)
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if record.get("identity") != identity or record.get("platform") != platform:
+            return None
+        image = record.get("image")
+        if not isinstance(image, str) or not image:
+            return None
+    except (AttributeError, json.JSONDecodeError, OSError):
+        return None
+    return image if await docker_image_exists(image) else None
+
+
+def _record_task_image(identity: str, platform: str, image: str) -> None:
+    path = _task_image_record_path(identity, platform)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(
+            {"version": 1, "identity": identity, "platform": platform, "image": image},
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+async def _ensure_task_image(
+    *,
+    environment_name: str,
+    environment_dir: Path,
+    dockerfile_path: Path,
+    platform: str,
+    logger: Any,
+) -> str:
+    identity = _immutable_task_identity(environment_dir)
+    cache_identity = identity or str(environment_dir.resolve())
+    key = (cache_identity, platform)
+    lock = _TASK_IMAGE_LOCKS.setdefault(key, asyncio.Lock())
+    async with lock:
+        if image := _TASK_IMAGES.get(key):
+            return image
+        if identity and (image := await _prepared_task_image(identity, platform)):
+            _TASK_IMAGES[key] = image
+            return image
+        image = await ensure_docker_image_built(
+            docker_name=f"nanocodex/{environment_name}-task",
+            docker_build_context=environment_dir,
+            dockerfile_path=dockerfile_path,
+            build_args={},
+            platform=platform,
+            logger=logger,
+        )
+        _TASK_IMAGES[key] = image
+        if identity:
+            _record_task_image(identity, platform, image)
+        return image
 
 
 def _toolbox_mount_setup_command(
@@ -88,11 +178,10 @@ class FastDockerEnvironment(DockerEnvironment):
                     return image
 
             task_image, toolbox_image = await asyncio.gather(
-                ensure_docker_image_built(
-                    docker_name=f"nanocodex/{self.environment_name}-task",
-                    docker_build_context=self.environment_dir,
+                _ensure_task_image(
+                    environment_name=self.environment_name,
+                    environment_dir=self.environment_dir,
                     dockerfile_path=task_dockerfile,
-                    build_args={},
                     platform=platform,
                     logger=self.logger,
                 ),
