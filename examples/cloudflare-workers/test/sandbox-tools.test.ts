@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { createCloudflareSandboxTools, workspacePath } from "../src/sandbox-tools";
+import {
+  cloudflareSandboxPreviewUrl,
+  createCloudflareSandboxTools,
+  openSandboxPreviewCapability,
+  workspacePath,
+} from "../src/sandbox-tools";
 
 const MIB = 1024 * 1024;
 const OUTPUT_LIMIT = 128 * 1024;
@@ -27,6 +32,44 @@ describe("Cloudflare sandbox workspace paths", () => {
     "x".repeat(1025),
   ])("rejects an invalid or escaping path: %s", (path) => {
     expect(() => workspacePath(path)).toThrow();
+  });
+});
+
+describe("Cloudflare sandbox preview URLs", () => {
+  it("seals the session and port in a same-origin capability route", async () => {
+    const sessionId = "019fc927-b280-79a7-8445-1b9996ad2fb0";
+    const url = await cloudflareSandboxPreviewUrl(
+      "https://agent.example",
+      "preview-secret",
+      sessionId,
+      8080,
+    );
+    expect(url).toMatch(/^https:\/\/agent\.example\/sandbox-preview\/[A-Za-z0-9_-]+\/$/);
+    expect(url).not.toContain(sessionId);
+    const capability = new URL(url).pathname.split("/")[2]!;
+    await expect(openSandboxPreviewCapability("preview-secret", capability)).resolves.toEqual({
+      sessionId,
+      port: 8080,
+    });
+    await expect(openSandboxPreviewCapability("wrong-secret", capability)).rejects.toThrow(
+      "invalid preview capability",
+    );
+  });
+
+  it.each([
+    "ftp://agent.example",
+    "https://user:secret@agent.example",
+    "https://agent.example/path",
+    "https://agent.example/?query=true",
+  ])("rejects a non-origin preview base: %s", async (origin) => {
+    await expect(cloudflareSandboxPreviewUrl(
+      origin,
+      "preview-secret",
+      "session-id",
+      8080,
+    )).rejects.toThrow(
+      "public origin must be an HTTP(S) origin",
+    );
   });
 });
 
@@ -283,6 +326,26 @@ describe("Cloudflare sandbox tools", () => {
       autoCleanup: true,
     });
     expect(process.waitForPort).toHaveBeenCalledWith(8080, { timeout: 12_345 });
+  });
+
+  it("uses a Worker-fronted preview provider after initializing the sandbox", async () => {
+    const sandbox = makeSandbox();
+    const factory = vi.fn(async () => sandbox);
+    const preview = vi.fn(async (port: number) => ({
+      port,
+      url: `https://agent.example/sandbox-preview/session/${port}/`,
+      persistent: false,
+    }));
+    const tools = createCloudflareSandboxTools(factory, preview);
+
+    await expect(invoke(tools, "sandbox_preview", { port: 8080 })).resolves.toEqual({
+      port: 8080,
+      url: "https://agent.example/sandbox-preview/session/8080/",
+      persistent: false,
+    });
+    expect(factory).toHaveBeenCalledTimes(1);
+    expect(preview).toHaveBeenCalledWith(8080);
+    expect(sandbox.tunnels.get).not.toHaveBeenCalled();
   });
 
   it("rejects invalid managed-process inputs before starting anything", async () => {

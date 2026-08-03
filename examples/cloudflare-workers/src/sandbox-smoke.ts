@@ -9,10 +9,18 @@ export async function cloudflareSandboxSmokeSetup(
   namespace: DurableObjectNamespace<Sandbox>,
   probeId: string,
   localBucket: boolean,
+  publicOrigin: string,
+  previewSecret: string,
 ): Promise<Record<string, unknown>> {
   const started = Date.now();
   const marker = `CLOUDFLARE_SANDBOX_OK_${probeId}`;
-  let tools = cloudflareSandboxTools(namespace, probeId, localBucket);
+  let tools = cloudflareSandboxTools(
+    namespace,
+    probeId,
+    localBucket,
+    publicOrigin,
+    previewSecret,
+  );
   try {
     // Wrangler's emulated R2 watcher takes its initial filesystem snapshot
     // asynchronously after mountBucket() returns. Let that baseline settle so
@@ -93,8 +101,8 @@ export async function cloudflareSandboxSmokeSetup(
     }));
     assert(process.ready_port === 8000, "managed process did not report port readiness");
     const preview = record(await invoke(tools, "sandbox_preview", { port: 8000 }));
-    const previewUrl = new URL("/probe.txt", String(preview.url));
-    assert(previewUrl.protocol === "https:", `tunnel returned an invalid URL: ${previewUrl.href}`);
+    const previewUrl = new URL("probe.txt", String(preview.url));
+    assert(previewUrl.protocol === "https:", `preview returned an invalid URL: ${previewUrl.href}`);
 
     return {
       status: "ready",

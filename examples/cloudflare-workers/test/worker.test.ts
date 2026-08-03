@@ -114,7 +114,11 @@ describe("Nanocodex Durable Object Worker", () => {
 
   it("rejects invalid routes and deletes only the named session", async () => {
     expect((await SELF.fetch("https://example.test/sessions/not-a-session")).status).toBe(404);
+    expect((await SELF.fetch("https://example.test/sandbox-preview/not-a-session/8080/")).status).toBe(404);
     const created = await createSession();
+    expect((await SELF.fetch(
+      `https://example.test/sandbox-preview/${created.session_id}/80/`,
+    )).status).toBe(404);
     const deleted = await SELF.fetch(`https://example.test/sessions/${created.session_id}`, {
       method: "DELETE",
     });

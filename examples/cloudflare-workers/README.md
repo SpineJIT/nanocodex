@@ -14,6 +14,8 @@ client WebSocket ──> Worker router ──> one NanocodexSession object per s
                                          └─ Cloudflare Sandbox DO + container
                                               └─ /workspace mounted to per-session R2 prefix
 
+preview capability ──> Worker router ──> session Sandbox container port
+
 ChatGPT subscription ───────────────> one NanocodexSubscriptionAuth object
                                          └─ SQLite token rotation + 401 recovery
 ```
@@ -38,9 +40,11 @@ The caller-defined `sandbox_exec`, `sandbox_start_process`, `sandbox_read_file`,
 `sandbox_write_file`, `sandbox_list_files`, and `sandbox_preview` tools run
 untrusted work in a separate Cloudflare Sandbox container. The Sandbox uses the
 current RPC transport, scopes its R2 mount to the Nanocodex session ID, and
-creates zero-configuration Quick Tunnel preview URLs. Nanocodex remains the only
-model and tool-loop owner; the Sandbox SDK supplies execution isolation and
-storage.
+proxies opaque capability-scoped preview URLs through the existing Worker
+hostname. The authenticated preview token reveals neither the session capability
+nor server credentials, and avoids requiring wildcard DNS or a separate Quick
+Tunnel process. Nanocodex remains the only model and tool-loop owner; the
+Sandbox SDK supplies execution isolation and storage.
 
 ## Run locally
 
@@ -170,7 +174,10 @@ Create the R2 bucket once per Cloudflare account. Each actor receives only its
 `/sessions/<session-id>/` prefix inside the mounted `/workspace`; model
 credentials remain in the Worker and are not injected into the container.
 After deployment, ask the agent to create a small server on port 8080 in the
-background and call `sandbox_preview` to get a public `trycloudflare.com` URL.
+background and call `sandbox_preview` to get a public URL on the same Worker
+origin. HTTP and WebSocket preview traffic is forwarded to that exact per-session
+container and port. The opaque URL is a bearer capability for the preview only;
+rotating `NANOCODEX_ADMIN_TOKEN` invalidates outstanding preview URLs.
 
 At the time this example was validated, the ChatGPT edge rejected direct
 Cloudflare Worker egress with HTTP 403. That is an upstream egress-policy

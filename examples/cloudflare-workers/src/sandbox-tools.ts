@@ -7,6 +7,7 @@ const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_OUTPUT_BYTES = 128 * 1024;
 const MAX_LIST_ENTRIES = 512;
 const MAX_TIMEOUT_MS = 120_000;
+const PREVIEW_AAD = new TextEncoder().encode("nanocodex-cloudflare-sandbox-preview-v1");
 
 type SandboxToolClient = {
   exec(
@@ -54,8 +55,24 @@ export function cloudflareSandboxTools(
   namespace: DurableObjectNamespace<Sandbox>,
   sessionId: string,
   localBucket = false,
+  publicOrigin?: string,
+  previewSecret?: string,
 ): ToolMap {
-  return createCloudflareSandboxTools(() => prepareSandbox(namespace, sessionId, localBucket));
+  return createCloudflareSandboxTools(
+    () => prepareSandbox(namespace, sessionId, localBucket),
+    publicOrigin === undefined || previewSecret === undefined
+      ? undefined
+      : async (port) => ({
+          port,
+          url: await cloudflareSandboxPreviewUrl(
+            publicOrigin,
+            previewSecret,
+            sessionId,
+            port,
+          ),
+          persistent: false,
+        }),
+  );
 }
 
 export async function destroyCloudflareSandbox(
@@ -67,6 +84,7 @@ export async function destroyCloudflareSandbox(
 
 export function createCloudflareSandboxTools(
   createSandbox: () => Promise<SandboxToolClient>,
+  createPreview?: (port: number) => Promise<{ port: number; url: string; persistent: boolean }>,
 ): ToolMap {
   let sandboxPromise: Promise<SandboxToolClient> | undefined;
   const sandbox = () => sandboxPromise ??= createSandbox();
@@ -196,15 +214,121 @@ export function createCloudflareSandboxTools(
       },
     },
     sandbox_preview: {
-      description: "Expose a server running in the sandbox through a temporary public Cloudflare Tunnel URL.",
+      description: "Expose a server running in the sandbox through a temporary public preview URL.",
       parameters: portParameters(),
       handler: async (input) => {
         const port = requiredPort(objectInput(input).port);
+        await sandbox();
+        if (createPreview) return createPreview(port);
         const tunnel = await (await sandbox()).tunnels.get(port);
         return { port, url: tunnel.url, persistent: false };
       },
     },
   };
+}
+
+export async function cloudflareSandboxPreviewUrl(
+  publicOrigin: string,
+  previewSecret: string,
+  sessionId: string,
+  port: number,
+): Promise<string> {
+  const origin = new URL(publicOrigin);
+  if (!["http:", "https:"].includes(origin.protocol)
+    || origin.username
+    || origin.password
+    || origin.href !== `${origin.origin}/`) {
+    throw new Error("public origin must be an HTTP(S) origin");
+  }
+  const capability = await sealSandboxPreview(previewSecret, sessionId, port);
+  return new URL(`/sandbox-preview/${capability}/`, origin).href;
+}
+
+export async function openSandboxPreviewCapability(
+  previewSecret: string,
+  capability: string,
+): Promise<{ sessionId: string; port: number }> {
+  if (!/^[A-Za-z0-9_-]{64,256}$/.test(capability)) throw new Error("invalid preview capability");
+  const sealed = decodeBase64Url(capability);
+  if (sealed.byteLength <= 12) throw new Error("invalid preview capability");
+  const iv = sealed.subarray(0, 12);
+  const ciphertext = sealed.subarray(12);
+  let plaintext: ArrayBuffer;
+  try {
+    plaintext = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv, additionalData: PREVIEW_AAD },
+      await previewKey(previewSecret),
+      ciphertext,
+    );
+  } catch {
+    throw new Error("invalid preview capability");
+  }
+  const [sessionId, rawPort, ...extra] = new TextDecoder().decode(plaintext).split("\n");
+  const port = Number(rawPort);
+  if (!sessionId || extra.length > 0 || !Number.isInteger(port) || port < 1024 || port > 65_535) {
+    throw new Error("invalid preview capability");
+  }
+  return { sessionId, port };
+}
+
+export async function proxyCloudflareSandboxPreview(
+  namespace: DurableObjectNamespace<Sandbox>,
+  sessionId: string,
+  port: number,
+  request: Request,
+  path: string,
+): Promise<Response> {
+  const incoming = new URL(request.url);
+  const targetPath = path.startsWith("/") ? path : `/${path}`;
+  const target = new URL(`http://sandbox.internal${targetPath}${incoming.search}`);
+  const forwarded = new Request(target, request);
+  const sandbox = sandboxHandle(namespace, sessionId);
+  if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+    return sandbox.wsConnect(forwarded, port);
+  }
+  return sandbox.containerFetch(forwarded, port);
+}
+
+async function sealSandboxPreview(
+  previewSecret: string,
+  sessionId: string,
+  port: number,
+): Promise<string> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData: PREVIEW_AAD },
+    await previewKey(previewSecret),
+    new TextEncoder().encode(`${sessionId}\n${port}`),
+  ));
+  const sealed = new Uint8Array(iv.byteLength + ciphertext.byteLength);
+  sealed.set(iv);
+  sealed.set(ciphertext, iv.byteLength);
+  return encodeBase64Url(sealed);
+}
+
+async function previewKey(secret: string): Promise<CryptoKey> {
+  if (!secret) throw new Error("preview secret is required");
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
+  return crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+function encodeBase64Url(value: Uint8Array): string {
+  return btoa(String.fromCharCode(...value))
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/, "");
+}
+
+function decodeBase64Url(value: string): Uint8Array {
+  const standard = value.replaceAll("-", "+").replaceAll("_", "/");
+  const padded = standard.padEnd(Math.ceil(standard.length / 4) * 4, "=");
+  let decoded: string;
+  try {
+    decoded = atob(padded);
+  } catch {
+    throw new Error("invalid preview capability");
+  }
+  return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
 }
 
 async function prepareSandbox(

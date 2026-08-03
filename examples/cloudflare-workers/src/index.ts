@@ -10,7 +10,11 @@ import type {
 } from "nanocodex";
 import { Agent } from "nanocodex/browser";
 import nanocodexWasm from "./nanocodex.wasm";
-import { cloudflareSandboxTools } from "./sandbox-tools";
+import {
+  cloudflareSandboxTools,
+  openSandboxPreviewCapability,
+  proxyCloudflareSandboxPreview,
+} from "./sandbox-tools";
 import { cloudflareSandboxSmokeFinish, cloudflareSandboxSmokeSetup } from "./sandbox-smoke";
 import { webAsset } from "./web";
 import {
@@ -62,6 +66,7 @@ export interface Env {
 
 type SessionRow = {
   session_id: string;
+  public_origin: string;
   snapshot: string | null;
   completed_turns: number;
   last_active: number;
@@ -111,7 +116,8 @@ export default {
       const stub = env.NANOCODEX_SESSIONS.getByName(sessionId);
       const initialized = await stub.fetch("https://session.internal/initialize", {
         method: "PUT",
-        body: sessionId,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, public_origin: url.origin }),
       });
       if (!initialized.ok) return json({ error: "session initialization failed" }, { status: 503 });
       const websocketUrl = new URL(`/sessions/${sessionId}/ws`, url);
@@ -137,7 +143,13 @@ export default {
       if (request.method === "POST") {
         const probeId = `probe-${uuidV7()}`;
         try {
-          return json(await cloudflareSandboxSmokeSetup(env.Sandbox, probeId, localBucket));
+          return json(await cloudflareSandboxSmokeSetup(
+            env.Sandbox,
+            probeId,
+            localBucket,
+            url.origin,
+            env.NANOCODEX_ADMIN_TOKEN,
+          ));
         } catch (error) {
           return json({ status: "failed", probe_id: probeId, error: errorMessage(error) }, { status: 503 });
         }
@@ -163,6 +175,37 @@ export default {
       return json({ error: "method_not_allowed" }, { status: 405 });
     }
 
+    const previewMatch = url.pathname.match(/^\/sandbox-preview\/([A-Za-z0-9_-]{64,256})(\/.*)?$/);
+    if (previewMatch) {
+      let preview: { sessionId: string; port: number };
+      try {
+        preview = await openSandboxPreviewCapability(
+          env.NANOCODEX_ADMIN_TOKEN,
+          previewMatch[1]!,
+        );
+      } catch {
+        return json({ error: "not_found" }, { status: 404 });
+      }
+      if (!SESSION_ID.test(preview.sessionId) && !PROBE_ID.test(preview.sessionId)) {
+        return json({ error: "not_found" }, { status: 404 });
+      }
+      try {
+        return await proxyCloudflareSandboxPreview(
+          env.Sandbox,
+          preview.sessionId,
+          preview.port,
+          request,
+          previewMatch[2] ?? "/",
+        );
+      } catch {
+        return json({ error: "sandbox_preview_unavailable" }, { status: 502 });
+      }
+    }
+
+    if (url.pathname.startsWith("/sandbox-preview/")) {
+      return json({ error: "not_found" }, { status: 404 });
+    }
+
     const match = url.pathname.match(/^\/sessions\/([^/]+)(?:\/(ws))?$/);
     if (!match || !SESSION_ID.test(match[1] ?? "")) {
       return json({ error: "not_found" }, { status: 404 });
@@ -173,9 +216,16 @@ export default {
       if (request.method !== "GET" || request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
         return new Response("Expected WebSocket upgrade", { status: 426 });
       }
-      return stub.fetch("https://session.internal/socket", request);
+      return stub.fetch(
+        `https://session.internal/socket?public_origin=${encodeURIComponent(url.origin)}`,
+        request,
+      );
     }
-    if (request.method === "GET") return stub.fetch("https://session.internal/state");
+    if (request.method === "GET") {
+      return stub.fetch(
+        `https://session.internal/state?public_origin=${encodeURIComponent(url.origin)}`,
+      );
+    }
     if (request.method === "DELETE") return stub.fetch("https://session.internal/session", { method: "DELETE" });
     return json({ error: "method_not_allowed" }, { status: 405 });
   },
@@ -195,6 +245,7 @@ export class NanocodexSession extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS session_state (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         session_id TEXT NOT NULL UNIQUE,
+        public_origin TEXT NOT NULL DEFAULT '',
         snapshot TEXT,
         completed_turns INTEGER NOT NULL DEFAULT 0,
         last_active INTEGER NOT NULL
@@ -205,20 +256,55 @@ export class NanocodexSession extends DurableObject<Env> {
         completed_at INTEGER NOT NULL
       );
     `);
+    const sessionColumns = this.ctx.storage.sql.exec<{ name: string }>(
+      "PRAGMA table_info(session_state)",
+    ).toArray();
+    if (!sessionColumns.some((column) => column.name === "public_origin")) {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE session_state ADD COLUMN public_origin TEXT NOT NULL DEFAULT ''",
+      );
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    const forwardedOrigin = url.searchParams.get("public_origin");
+    if (forwardedOrigin !== null && validPublicOrigin(forwardedOrigin) && this.#sessionId()) {
+      this.ctx.storage.sql.exec(
+        "UPDATE session_state SET public_origin = ? WHERE singleton = 1",
+        forwardedOrigin,
+      );
+    }
     if (request.method === "PUT" && url.pathname === "/initialize") {
-      const sessionId = await request.text();
-      if (!SESSION_ID.test(sessionId)) return new Response(null, { status: 400 });
+      const body = await request.text();
+      if (body.length > 2048) return new Response(null, { status: 400 });
+      let initialization: { session_id?: unknown; public_origin?: unknown };
+      try {
+        initialization = JSON.parse(body) as typeof initialization;
+      } catch {
+        return new Response(null, { status: 400 });
+      }
+      const sessionId = initialization.session_id;
+      const publicOrigin = initialization.public_origin;
+      if (typeof sessionId !== "string"
+        || !SESSION_ID.test(sessionId)
+        || typeof publicOrigin !== "string"
+        || !validPublicOrigin(publicOrigin)) {
+        return new Response(null, { status: 400 });
+      }
       const currentId = this.#sessionId();
       if (currentId && currentId !== sessionId) return new Response(null, { status: 409 });
       if (!currentId) {
         this.ctx.storage.sql.exec(
-          "INSERT INTO session_state (singleton, session_id, last_active) VALUES (1, ?, ?)",
+          "INSERT INTO session_state (singleton, session_id, public_origin, last_active) VALUES (1, ?, ?, ?)",
           sessionId,
+          publicOrigin,
           Date.now(),
+        );
+      } else {
+        this.ctx.storage.sql.exec(
+          "UPDATE session_state SET public_origin = ? WHERE singleton = 1",
+          publicOrigin,
         );
       }
       return new Response(null, { status: 204 });
@@ -430,6 +516,8 @@ export class NanocodexSession extends DurableObject<Env> {
           this.env.Sandbox,
           session.session_id,
           this.env.NANOCODEX_SANDBOX_LOCAL === "true",
+          session.public_origin || undefined,
+          this.env.NANOCODEX_ADMIN_TOKEN,
         ),
         runtimeInfo: {
           description: "Return information about the current agent runtime.",
@@ -532,7 +620,7 @@ export class NanocodexSession extends DurableObject<Env> {
 
   #session(): SessionRow | undefined {
     return this.ctx.storage.sql.exec<SessionRow>(
-      "SELECT session_id, snapshot, completed_turns, last_active FROM session_state WHERE singleton = 1",
+      "SELECT session_id, public_origin, snapshot, completed_turns, last_active FROM session_state WHERE singleton = 1",
     ).toArray()[0];
   }
 
@@ -706,6 +794,18 @@ function modelAuthMode(env: Env): ModelAuthMode {
 function authorized(request: Request, expected: string): boolean {
   const value = request.headers.get("authorization");
   return value !== null && value === `Bearer ${expected}`;
+}
+
+function validPublicOrigin(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol)
+      && !url.username
+      && !url.password
+      && url.href === `${url.origin}/`;
+  } catch {
+    return false;
+  }
 }
 
 function uuidV7(): string {
