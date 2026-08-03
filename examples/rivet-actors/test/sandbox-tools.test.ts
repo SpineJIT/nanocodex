@@ -164,7 +164,7 @@ describe("Rivet AgentOS tools", () => {
     })).resolves.toEqual({
       port: 3000,
       path: "/fetch/preview-token",
-      url: "https://example.rivet.dev/gateway/actor-123/request/fetch/preview-token?rvt-namespace=nanocodex-production&rvt-token=pk_public",
+      url: "https://example.rivet.dev/gateway/actor-123@pk_public/request/fetch/preview-token",
       expires_at: "2030-01-01T00:00:00.000Z",
       persistent: false,
     });

@@ -249,9 +249,7 @@ function publicPreviewUrl(context: AgentOsActionContext, path: string): string {
     if (!namespace || !token.startsWith("pk_")) {
       throw new Error("NANOCODEX_PUBLIC_URL must contain a namespace and client-safe pk_ token");
     }
-    url.pathname = `${url.pathname.replace(/\/$/, "")}/gateway/${encodeURIComponent(context.actorId)}/request${path}`;
-    url.searchParams.set("rvt-namespace", namespace);
-    url.searchParams.set("rvt-token", token);
+    url.pathname = `${url.pathname.replace(/\/$/, "")}/gateway/${encodeURIComponent(context.actorId)}@${encodeURIComponent(token)}/request${path}`;
     return url.toString();
   }
   url.pathname = `${url.pathname.replace(/\/$/, "")}${path}`;
