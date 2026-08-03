@@ -240,6 +240,13 @@ impl LogicalMarkdown {
     }
 
     pub(super) fn copy_range(&self, selected: &str) -> Option<String> {
+        self.copy_range_exact(selected).or_else(|| {
+            let stripped = strip_rendered_markdown_chrome(selected)?;
+            self.copy_range_exact(&stripped)
+        })
+    }
+
+    fn copy_range_exact(&self, selected: &str) -> Option<String> {
         let selected_key = compact_whitespace(selected);
         if selected_key.is_empty() {
             return None;
@@ -370,6 +377,29 @@ fn strip_code_gutters(selected: &str) -> Option<String> {
             };
             stripped_any = true;
             body.strip_prefix(' ').unwrap_or(body)
+        })
+        .collect::<Vec<_>>();
+    stripped_any.then(|| lines.join("\n"))
+}
+
+fn strip_rendered_markdown_chrome(selected: &str) -> Option<String> {
+    let mut stripped_any = false;
+    let lines = selected
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            if index == 0 && line.trim_start_matches(' ') == "● Nanocodex" {
+                stripped_any = true;
+                return "";
+            }
+            let mut body = line.trim_start_matches(' ');
+            let mut stripped_line = false;
+            while let Some(rest) = body.strip_prefix('│') {
+                stripped_any = true;
+                stripped_line = true;
+                body = rest.strip_prefix(' ').unwrap_or(rest);
+            }
+            if stripped_line { body } else { line }
         })
         .collect::<Vec<_>>();
     stripped_any.then(|| lines.join("\n"))
@@ -1645,6 +1675,49 @@ After";
         assert_eq!(
             restore_markdown_links(selected.to_owned(), source),
             "const first = 1;\nconst second = 2;"
+        );
+    }
+
+    #[test]
+    fn semantic_copy_strips_rendered_block_quote_gutters() {
+        let source = "Intro\n\n> got an awesome group speaking\n>\n> @rauch (Vercel)\n> @sqs (Amp)\n>\n> october 12-14";
+        let selected = "Intro\n\n  │ got an awesome group speaking\n\n  │ @rauch (Vercel)\n  │ @sqs (Amp)\n\n  │ october 12-14";
+
+        assert_eq!(
+            restore_markdown_links(selected.to_owned(), source),
+            "Intro\ngot an awesome group speaking\n@rauch (Vercel)\n@sqs (Amp)\noctober 12-14"
+        );
+    }
+
+    #[test]
+    fn semantic_copy_of_a_whole_rendered_quote_drops_the_header_and_gutters() {
+        let source = "Intro\n\n> got an awesome group speaking\n>\n> @rauch (Vercel)\n> @sqs (Amp)\n>\n> october 12-14";
+        let selected = render_agent_markdown(source, 120)
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            restore_markdown_links(selected, source),
+            "Intro\ngot an awesome group speaking\n@rauch (Vercel)\n@sqs (Amp)\noctober 12-14"
+        );
+    }
+
+    #[test]
+    fn semantic_copy_prefers_a_literal_vertical_bar_over_gutter_stripping() {
+        assert_eq!(
+            restore_markdown_links(
+                "│ literal text".to_owned(),
+                "│ literal text\n\nliteral text"
+            ),
+            "│ literal text"
         );
     }
 
