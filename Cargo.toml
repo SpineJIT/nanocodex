@@ -15,6 +15,7 @@ members = [
     "crates/nanocodex-tools",
     "crates/nanocodex-tools/macros",
     "examples",
+    "examples/exe-dev",
     "js/bindings",
     "py/bindings",
 ]
