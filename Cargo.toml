@@ -218,6 +218,12 @@ strip = "symbols"
 panic = "unwind"
 codegen-units = 16
 
+# Nightlies favor fast feedback while retaining fully optimized portable code.
+# Stable releases continue to use the thin-LTO release profile above.
+[profile.nightly]
+inherits = "release"
+lto = false
+
 # Opt-in builds can favor maximum runtime performance over build time, matching
 # Reth's maxperf profile without raising the minimum CPU level of binaries.
 [profile.maxperf]

@@ -1,5 +1,5 @@
 use clap::Args;
-use eyre::Result;
+use eyre::{Result, eyre};
 
 #[derive(Args)]
 pub(crate) struct Eval {}

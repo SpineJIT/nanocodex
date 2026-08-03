@@ -329,24 +329,16 @@ fn checksum_for(manifest: &[u8], asset_name: &str) -> Result<String> {
     bail!("SHA256SUMS does not contain {asset_name}")
 }
 
-const fn release_asset_name() -> Result<&'static str> {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    return Ok("nanocodex-x86_64-unknown-linux-gnu");
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    return Ok("nanocodex-aarch64-unknown-linux-gnu");
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    return Ok("nanocodex-aarch64-apple-darwin");
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    return Ok("nanocodex-x86_64-apple-darwin");
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    return Ok("nanocodex-x86_64-pc-windows-msvc.exe");
+fn release_asset_name() -> Result<&'static str> {
+    release_asset_name_for(std::env::consts::OS, std::env::consts::ARCH)
+}
 
-    #[allow(unreachable_code)]
-    Err(eyre!(
-        "self-update is not supported on {} {}",
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    ))
+fn release_asset_name_for(os: &str, arch: &str) -> Result<&'static str> {
+    match (os, arch) {
+        ("linux", "x86_64") => Ok("nanocodex-x86_64-unknown-linux-gnu"),
+        ("macos", "aarch64") => Ok("nanocodex-aarch64-apple-darwin"),
+        _ => Err(eyre!("self-update is not supported on {os} {arch}")),
+    }
 }
 
 #[cfg(test)]
@@ -386,6 +378,21 @@ mod tests {
             release_api(false, Some(&Version::new(0, 2, 0))),
             format!("{TAGGED_RELEASE_API}/v0.2.0")
         );
+    }
+
+    #[test]
+    fn publishes_only_linux_x86_64_and_apple_silicon_assets() {
+        assert_eq!(
+            release_asset_name_for("linux", "x86_64").unwrap(),
+            "nanocodex-x86_64-unknown-linux-gnu"
+        );
+        assert_eq!(
+            release_asset_name_for("macos", "aarch64").unwrap(),
+            "nanocodex-aarch64-apple-darwin"
+        );
+        assert!(release_asset_name_for("linux", "aarch64").is_err());
+        assert!(release_asset_name_for("macos", "x86_64").is_err());
+        assert!(release_asset_name_for("windows", "x86_64").is_err());
     }
 
     #[test]

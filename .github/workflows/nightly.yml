@@ -35,18 +35,9 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: nanocodex-x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            artifact: nanocodex-aarch64-unknown-linux-gnu
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: nanocodex-aarch64-apple-darwin
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            artifact: nanocodex-x86_64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: nanocodex-x86_64-pc-windows-msvc.exe
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -71,21 +62,14 @@ jobs:
           TAG_NAME: ${{ inputs.pr && format('pr-{0}', inputs.pr) || 'nightly' }}
         run: |
           VERGEN_GIT_SHA="$BUILD_SHA" \
-            cargo build --locked --release \
+            cargo build --locked --profile nightly \
               --package nanocodex-bin --bin nanocodex --features tempo \
               --target ${{ matrix.target }}
-      - name: Stage Unix artifact
-        if: runner.os != 'Windows'
+      - name: Stage artifact
         shell: bash
         run: |
           mkdir dist
-          cp "target/${{ matrix.target }}/release/nanocodex" "dist/${{ matrix.artifact }}"
-      - name: Stage Windows artifact
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path dist
-          Copy-Item "target/${{ matrix.target }}/release/nanocodex.exe" "dist/${{ matrix.artifact }}"
+          cp "target/${{ matrix.target }}/nightly/nanocodex" "dist/${{ matrix.artifact }}"
       - name: Stage PR provenance and checksum
         if: github.event_name == 'workflow_dispatch' && inputs.pr != ''
         shell: bash
