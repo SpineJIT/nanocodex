@@ -150,6 +150,7 @@ jobs:
             js/tui-react/package-lock.json
             examples/node/package-lock.json
             examples/rivet-actors/package-lock.json
+            examples/vercel-workflows/package-lock.json
             examples/react-vite/package-lock.json
       - uses: taiki-e/install-action@3522286d40783523f9c7880e33f785905b4c20d0 # v2
         with:
@@ -171,6 +172,7 @@ jobs:
           npm ci --prefix js/tui-react
           npm ci --prefix examples/node
           npm ci --prefix examples/rivet-actors
+          npm ci --prefix examples/vercel-workflows
           npm ci --prefix examples/react-vite
       - name: Test JS runtime
         working-directory: js/bindings
@@ -187,6 +189,7 @@ jobs:
           node --test examples/browser-cdn/*.test.mjs
           npm test --prefix examples/node
           npm run check --prefix examples/rivet-actors
+          npm run check --prefix examples/vercel-workflows
           npm test --prefix examples/react-vite
           npm run build --prefix examples/react-vite
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

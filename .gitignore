@@ -32,6 +32,11 @@ examples/rivet-actors/dist/
 examples/rivet-actors/node_modules/
 examples/react-vite/dist/
 examples/rivet-actors/web/dist/
+examples/vercel-workflows/.next/
+examples/vercel-workflows/.vercel/
+examples/vercel-workflows/.workflow-data/
+examples/vercel-workflows/node_modules/
+examples/vercel-workflows/workflows/nanocodex.wasm
 examples/react-vite/node_modules/
 examples/react-vite/test-results/
 jobs/

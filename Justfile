@@ -44,6 +44,7 @@ bootstrap-bindings:
     npm ci --prefix js/bindings
     npm ci --prefix examples/node
     npm ci --prefix examples/react-vite
+    npm ci --prefix examples/vercel-workflows
 
 # Compile and install the PyO3 extension into its isolated development environment.
 build-python:
@@ -89,6 +90,11 @@ build-react-example: build-wasm
 build-rivet-example: build-wasm
     npm ci --prefix examples/rivet-actors
     npm run check --prefix examples/rivet-actors
+
+# Type-check, test, and bundle the Vercel Workflow actor consumer.
+build-vercel-example: build-wasm
+    npm ci --prefix examples/vercel-workflows
+    npm run check --prefix examples/vercel-workflows
 
 # Run the React frontend and API Worker together in Cloudflare's Vite environment.
 dev-react-example:
