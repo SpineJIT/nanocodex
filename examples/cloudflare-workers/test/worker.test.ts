@@ -57,6 +57,26 @@ describe("Nanocodex Durable Object Worker", () => {
     });
   });
 
+  it("keeps the destructive sandbox probe behind the admin token", async () => {
+    const denied = await SELF.fetch("https://example.test/admin/sandbox-smoke", { method: "POST" });
+    expect(denied.status).toBe(401);
+    expect(await denied.json()).toEqual({ error: "unauthorized" });
+
+    const wrongMethod = await SELF.fetch("https://example.test/admin/sandbox-smoke", {
+      headers: authorization,
+    });
+    expect(wrongMethod.status).toBe(405);
+    expect(await wrongMethod.json()).toEqual({ error: "method_not_allowed" });
+
+    const invalidFinish = await SELF.fetch("https://example.test/admin/sandbox-smoke", {
+      method: "DELETE",
+      headers: authorization,
+      body: JSON.stringify({ probe_id: "not-a-probe" }),
+    });
+    expect(invalidFinish.status).toBe(400);
+    expect(await invalidFinish.json()).toEqual({ error: "invalid_probe" });
+  });
+
   it("hibernates client sockets and validates the bounded protocol without loading WASM", async () => {
     const created = await createSession();
     const response = await SELF.fetch(created.websocket_url.replace("wss:", "https:"), {

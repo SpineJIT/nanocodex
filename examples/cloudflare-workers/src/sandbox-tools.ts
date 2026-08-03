@@ -4,17 +4,72 @@ import type { ToolMap } from "nanocodex";
 const WORKSPACE = "/workspace";
 const MAX_COMMAND_CHARS = 32 * 1024;
 const MAX_FILE_BYTES = 1024 * 1024;
-const MAX_OUTPUT_CHARS = 128 * 1024;
+const MAX_OUTPUT_BYTES = 128 * 1024;
 const MAX_LIST_ENTRIES = 512;
 const MAX_TIMEOUT_MS = 120_000;
+
+type SandboxToolClient = {
+  exec(
+    command: string,
+    options: { cwd: string; timeout: number },
+  ): Promise<{
+    success: boolean;
+    exitCode: number;
+    stdout: string;
+    stderr: string;
+    duration: number;
+  }>;
+  startProcess(
+    command: string,
+    options: { cwd: string; autoCleanup: true },
+  ): Promise<{
+    id: string;
+    pid?: number;
+    command: string;
+    status: string;
+    getStatus(): Promise<string>;
+    waitForPort(port: number, options: { timeout: number }): Promise<void>;
+  }>;
+  readFile(
+    path: string,
+    options: { encoding: "none" },
+  ): Promise<{ size: number; content: ReadableStream<Uint8Array> }>;
+  writeFile(
+    path: string,
+    content: string,
+    options: { encoding: "utf-8" },
+  ): Promise<unknown>;
+  listFiles(
+    path: string,
+    options: { includeHidden: true },
+  ): Promise<{
+    files: Array<{ name: string; type: string; size: number }>;
+  }>;
+  tunnels: {
+    get(port: number): Promise<{ url: string }>;
+  };
+};
 
 export function cloudflareSandboxTools(
   namespace: DurableObjectNamespace<Sandbox>,
   sessionId: string,
   localBucket = false,
 ): ToolMap {
-  let sandboxPromise: Promise<Sandbox> | undefined;
-  const sandbox = () => sandboxPromise ??= prepareSandbox(namespace, sessionId, localBucket);
+  return createCloudflareSandboxTools(() => prepareSandbox(namespace, sessionId, localBucket));
+}
+
+export async function destroyCloudflareSandbox(
+  namespace: DurableObjectNamespace<Sandbox>,
+  sessionId: string,
+): Promise<void> {
+  await sandboxHandle(namespace, sessionId).destroy();
+}
+
+export function createCloudflareSandboxTools(
+  createSandbox: () => Promise<SandboxToolClient>,
+): ToolMap {
+  let sandboxPromise: Promise<SandboxToolClient> | undefined;
+  const sandbox = () => sandboxPromise ??= createSandbox();
 
   return {
     sandbox_exec: {
@@ -58,6 +113,43 @@ export function cloudflareSandboxTools(
         return { path, content: await readBounded(result.content) };
       },
     },
+    sandbox_start_process: {
+      description: "Start a managed background process in this session's Cloudflare Sandbox, optionally waiting for an HTTP port to become ready.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Command to start." },
+          cwd: { type: "string", description: "Workspace-relative working directory." },
+          ready_port: { type: "integer", minimum: 1024, maximum: 65_535 },
+          ready_timeout_ms: { type: "integer", minimum: 1, maximum: MAX_TIMEOUT_MS },
+        },
+        required: ["command"],
+        additionalProperties: false,
+      },
+      handler: async (input) => {
+        const value = objectInput(input);
+        const command = requiredString(value.command, "command", MAX_COMMAND_CHARS);
+        const cwd = workspacePath(optionalString(value.cwd, "cwd") ?? ".");
+        const readyPort = optionalPort(value.ready_port, "ready_port");
+        const readyTimeout = optionalInteger(
+          value.ready_timeout_ms,
+          "ready_timeout_ms",
+          1,
+          MAX_TIMEOUT_MS,
+        ) ?? 30_000;
+        const process = await (await sandbox()).startProcess(command, { cwd, autoCleanup: true });
+        if (readyPort !== undefined) {
+          await process.waitForPort(readyPort, { timeout: readyTimeout });
+        }
+        return {
+          process_id: process.id,
+          pid: process.pid,
+          command: process.command,
+          status: await process.getStatus(),
+          ...(readyPort === undefined ? {} : { ready_port: readyPort }),
+        };
+      },
+    },
     sandbox_write_file: {
       description: "Write a UTF-8 text file inside this session's isolated workspace (maximum 1 MiB).",
       parameters: {
@@ -72,7 +164,7 @@ export function cloudflareSandboxTools(
       handler: async (input) => {
         const value = objectInput(input);
         const path = workspacePath(requiredString(value.path, "path", 1024));
-        const content = requiredString(value.content, "content", MAX_FILE_BYTES);
+        const content = requiredContent(value.content);
         const bytes = new TextEncoder().encode(content).byteLength;
         if (bytes > MAX_FILE_BYTES) throw new Error("content exceeds 1 MiB");
         await (await sandbox()).writeFile(path, content, { encoding: "utf-8" });
@@ -120,12 +212,7 @@ async function prepareSandbox(
   sessionId: string,
   localBucket: boolean,
 ): Promise<Sandbox> {
-  const sandbox = getSandbox(namespace, `nanocodex-${sessionId}`, {
-    normalizeId: true,
-    sleepAfter: "10m",
-    transport: "rpc",
-    labels: { application: "nanocodex", session: sessionId },
-  });
+  const sandbox = sandboxHandle(namespace, sessionId);
   try {
     await sandbox.mountBucket("NANOCODEX_WORKSPACES", WORKSPACE, {
       prefix: `/sessions/${sessionId}/`,
@@ -135,6 +222,18 @@ async function prepareSandbox(
     if (!errorMessage(error).toLowerCase().includes("mount path already in use")) throw error;
   }
   return sandbox;
+}
+
+function sandboxHandle(
+  namespace: DurableObjectNamespace<Sandbox>,
+  sessionId: string,
+): Sandbox {
+  return getSandbox(namespace, `nanocodex-${sessionId}`, {
+    normalizeId: true,
+    sleepAfter: "10m",
+    transport: "rpc",
+    labels: { application: "nanocodex", session: sessionId },
+  });
 }
 
 export function workspacePath(raw: string): string {
@@ -178,9 +277,13 @@ function optionalInteger(
 }
 
 function requiredPort(value: unknown): number {
-  const port = optionalInteger(value, "port", 1024, 65_535);
+  const port = optionalPort(value, "port");
   if (port === undefined) throw new Error("port is required");
   return port;
+}
+
+function optionalPort(value: unknown, name: string): number | undefined {
+  return optionalInteger(value, name, 1024, 65_535);
 }
 
 function pathParameters(): Record<string, unknown> {
@@ -210,7 +313,14 @@ async function readBounded(stream: ReadableStream<Uint8Array>): Promise<string> 
       const next = await reader.read();
       if (next.done) break;
       size += next.value.byteLength;
-      if (size > MAX_FILE_BYTES) throw new Error("file exceeds 1 MiB");
+      if (size > MAX_FILE_BYTES) {
+        try {
+          await reader.cancel("file exceeds 1 MiB");
+        } catch {
+          // Preserve the deterministic size error if cancellation also fails.
+        }
+        throw new Error("file exceeds 1 MiB");
+      }
       chunks.push(next.value);
     }
   } finally {
@@ -222,13 +332,34 @@ async function readBounded(stream: ReadableStream<Uint8Array>): Promise<string> 
     content.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return new TextDecoder().decode(content);
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(content);
+  } catch {
+    throw new Error("file is not valid UTF-8");
+  }
 }
 
 function truncate(value: string): { text: string; truncated: boolean } {
-  return value.length <= MAX_OUTPUT_CHARS
-    ? { text: value, truncated: false }
-    : { text: value.slice(0, MAX_OUTPUT_CHARS), truncated: true };
+  const encoded = new TextEncoder().encode(value);
+  if (encoded.byteLength <= MAX_OUTPUT_BYTES) return { text: value, truncated: false };
+  let end = MAX_OUTPUT_BYTES;
+  while (end > 0) {
+    try {
+      return {
+        text: new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(encoded.subarray(0, end)),
+        truncated: true,
+      };
+    } catch {
+      end -= 1;
+    }
+  }
+  return { text: "", truncated: true };
+}
+
+function requiredContent(value: unknown): string {
+  if (typeof value !== "string") throw new Error("content must be a string");
+  if (value.length > MAX_FILE_BYTES) throw new Error("content exceeds 1 MiB");
+  return value;
 }
 
 function errorMessage(error: unknown): string {

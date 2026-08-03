@@ -34,12 +34,13 @@ resumes complete client-owned typed history from SQLite. See Cloudflare's
 and [WebSocket hibernation](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
 documentation for the underlying behavior.
 
-The caller-defined `sandbox_exec`, `sandbox_read_file`, `sandbox_write_file`,
-`sandbox_list_files`, and `sandbox_preview` tools run untrusted work in a
-separate Cloudflare Sandbox container. The Sandbox uses the current RPC
-transport, scopes its R2 mount to the Nanocodex session ID, and creates
-zero-configuration Quick Tunnel preview URLs. Nanocodex remains the only model
-and tool-loop owner; the Sandbox SDK supplies execution isolation and storage.
+The caller-defined `sandbox_exec`, `sandbox_start_process`, `sandbox_read_file`,
+`sandbox_write_file`, `sandbox_list_files`, and `sandbox_preview` tools run
+untrusted work in a separate Cloudflare Sandbox container. The Sandbox uses the
+current RPC transport, scopes its R2 mount to the Nanocodex session ID, and
+creates zero-configuration Quick Tunnel preview URLs. Nanocodex remains the only
+model and tool-loop owner; the Sandbox SDK supplies execution isolation and
+storage.
 
 ## Run locally
 
@@ -94,6 +95,7 @@ Start workerd in one terminal and run the live probes in another:
 
 ```sh
 npm run repl --prefix examples/cloudflare-workers
+npm run smoke:sandbox --prefix examples/cloudflare-workers
 npm run smoke --prefix examples/cloudflare-workers
 npm run multiclient --prefix examples/cloudflare-workers
 npm run stress --prefix examples/cloudflare-workers
@@ -116,10 +118,18 @@ inference. If the Worker process itself dies before a turn commits, reopening
 the REPL resubmits the same turn from the last committed snapshot; a partial
 provider response cannot be resumed.
 
-The smoke performs real model turns, verifies duplicate suppression, detaches
-its client, waits for idle teardown, reconnects to the durable snapshot, proves
-that a follow-on remembers history, and requires a completed `runtimeInfo` tool
-call/result pair.
+`smoke:sandbox` bypasses the model and directly attacks the same bounded tool
+handlers used by the agent. It checks write/exec/read/list behavior, non-zero
+exits, output and timeout limits, path traversal and oversized-write rejection,
+a managed port-8000 process and preview, and R2 persistence across container
+destruction. Its fixed `POST`/`DELETE /admin/sandbox-smoke` flow requires the
+admin bearer token; the external probe fetches the preview like a browser, then
+the finish request destroys the disposable container and verifies the remount.
+
+The model smoke performs real model turns, verifies duplicate suppression,
+detaches its client, waits for idle teardown, reconnects to the durable snapshot,
+proves that a follow-on remembers history, and requires completed write, exec,
+and read tool call/result pairs.
 `multiclient` attaches at least two clients before prompting and requires every
 client to receive the same accepted turn, assistant-delta stream, event count,
 and terminal result without reconnecting.
@@ -152,6 +162,8 @@ npx wrangler secret put CHATGPT_REFRESH_TOKEN
 npx wrangler secret put CHATGPT_ACCOUNT_ID
 npx wrangler secret put NANOCODEX_ADMIN_TOKEN
 npx wrangler deploy
+NANOCODEX_WORKER_URL=https://nanocodex-durable-agent.<subdomain>.workers.dev \
+NANOCODEX_ADMIN_TOKEN=<admin-token> npm run smoke:sandbox
 ```
 
 Create the R2 bucket once per Cloudflare account. Each actor receives only its

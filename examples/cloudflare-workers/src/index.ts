@@ -11,6 +11,7 @@ import type {
 import { Agent } from "nanocodex/browser";
 import nanocodexWasm from "./nanocodex.wasm";
 import { cloudflareSandboxTools } from "./sandbox-tools";
+import { cloudflareSandboxSmokeFinish, cloudflareSandboxSmokeSetup } from "./sandbox-smoke";
 import { webAsset } from "./web";
 import {
   NanocodexSubscriptionAuth,
@@ -37,6 +38,7 @@ const OPENAI_WEBSOCKET_BETA = "responses_websockets=2026-02-06";
 const CHATGPT_WEBSOCKET_URL = "wss://chatgpt.com/backend-api/codex/responses";
 const CHATGPT_API_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const PROBE_ID = /^probe-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const encoder = new TextEncoder();
 const ENCODED_PONG = JSON.stringify({ type: "pong" });
 
@@ -124,6 +126,39 @@ export default {
       if (request.method === "GET") return auth.fetch("https://auth.internal/status");
       if (request.method === "DELETE") {
         return auth.fetch("https://auth.internal/credentials", { method: "DELETE" });
+      }
+      return json({ error: "method_not_allowed" }, { status: 405 });
+    }
+    if (url.pathname === "/admin/sandbox-smoke") {
+      if (!env.NANOCODEX_ADMIN_TOKEN || !authorized(request, env.NANOCODEX_ADMIN_TOKEN)) {
+        return json({ error: "unauthorized" }, { status: 401 });
+      }
+      const localBucket = env.NANOCODEX_SANDBOX_LOCAL === "true";
+      if (request.method === "POST") {
+        const probeId = `probe-${uuidV7()}`;
+        try {
+          return json(await cloudflareSandboxSmokeSetup(env.Sandbox, probeId, localBucket));
+        } catch (error) {
+          return json({ status: "failed", probe_id: probeId, error: errorMessage(error) }, { status: 503 });
+        }
+      }
+      if (request.method === "DELETE") {
+        const body = await request.text();
+        if (body.length > 2048) return json({ error: "invalid_probe" }, { status: 400 });
+        let probeId: unknown;
+        try {
+          probeId = (JSON.parse(body) as { probe_id?: unknown }).probe_id;
+        } catch {
+          return json({ error: "invalid_probe" }, { status: 400 });
+        }
+        if (typeof probeId !== "string" || !PROBE_ID.test(probeId)) {
+          return json({ error: "invalid_probe" }, { status: 400 });
+        }
+        try {
+          return json(await cloudflareSandboxSmokeFinish(env.Sandbox, probeId, localBucket));
+        } catch (error) {
+          return json({ status: "failed", probe_id: probeId, error: errorMessage(error) }, { status: 503 });
+        }
       }
       return json({ error: "method_not_allowed" }, { status: 405 });
     }
