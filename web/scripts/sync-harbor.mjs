@@ -1,8 +1,14 @@
 import { execFile } from "node:child_process";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { selectComparison, sha256, validateExperimentPlan } from "./harbor-comparison.ts";
+import {
+  candidateProvenanceEvidence,
+  parseRetainedLock,
+  policyEvidence,
+} from "./harbor-evidence.ts";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryPath = resolve(
@@ -13,6 +19,9 @@ const detailDirectory = resolve(outputDirectory, "trials");
 const indexPath = resolve(outputDirectory, "index.json");
 const summaryPath = resolve(outputDirectory, "summary.json");
 const homepageSummaryPath = resolve(projectRoot, "src", "data", "harbor-summary.json");
+const experimentPlanDirectory = resolve(
+  process.env.NANOCODEX_HARBOR_EXPERIMENTS ?? resolve(repositoryPath, "evals", "harbor-comparisons"),
+);
 const detailSchemaVersion = 3;
 const execFileAsync = promisify(execFile);
 
@@ -133,6 +142,7 @@ async function discoverJobStores() {
       const rootKey = artifactRoot.slice(1);
       stores.push({
         path: resolve(worktree.path, artifactRoot, "harbor", "jobs"),
+        worktreePath: worktree.path,
         branch: worktree.branch,
         key: `${branchKey}-${rootKey}`,
         source: `${worktree.branch}/${artifactRoot}/harbor/jobs`,
@@ -140,6 +150,7 @@ async function discoverJobStores() {
       });
       stores.push({
         path: resolve(worktree.path, artifactRoot, "harbor", "codex-jobs"),
+        worktreePath: worktree.path,
         branch: worktree.branch,
         key: `${branchKey}-${rootKey}-codex`,
         source: `${worktree.branch}/${artifactRoot}/harbor/codex-jobs`,
@@ -184,6 +195,7 @@ async function buildTrial(jobName, trialName, trialPath, context) {
     trialName,
     source: result.source ?? null,
     taskRef: result?.task_id?.ref ?? null,
+    taskDigest: result.task_checksum ?? null,
     status,
     reward: typeof reward === "number" ? reward : null,
     startedAt: result.started_at ?? null,
@@ -221,6 +233,10 @@ async function buildTrial(jobName, trialName, trialPath, context) {
         }
       : null,
     detailUrl,
+    runtimeInstructionEvidence: {
+      systemPromptDigest: metadata.system_prompt_sha256 ?? null,
+      agentsMdDigest: metadata.agents_md_sha256 ?? null,
+    },
   };
 
   const [existingDetail, detailStat, ...sourceStats] = await Promise.all([
@@ -337,6 +353,41 @@ async function buildTrial(jobName, trialName, trialPath, context) {
   return summary;
 }
 
+function resolvedDatasetDigest(config, trials) {
+  const refs = (config?.datasets ?? []).map((dataset) => dataset.ref).filter(Boolean);
+  if (refs.length === 1 && /^sha256:[0-9a-f]{64}$/.test(refs[0])) return refs[0];
+  const resolvedTasks = [...new Set(trials.map((trial) => JSON.stringify([trial.source, trial.taskDigest])))]
+    .sort()
+    .map((task) => JSON.parse(task));
+  return sha256(`${JSON.stringify(resolvedTasks)}\n`);
+}
+
+function assignDatasetDigest(trials, datasetDigest) {
+  for (const trial of trials) trial.datasetDigest = datasetDigest;
+}
+
+async function readExperimentPlans() {
+  const entries = await readdir(experimentPlanDirectory, { withFileTypes: true }).catch(() => []);
+  const plans = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const path = resolve(experimentPlanDirectory, entry.name);
+    const contents = await readFile(path, "utf8");
+    const digest = sha256(contents);
+    const expectedFilename = `${digest.slice("sha256:".length)}.json`;
+    if (basename(path) !== expectedFilename) {
+      console.warn(`Skipping Harbor comparison plan ${path}: filename must be ${expectedFilename}`);
+      continue;
+    }
+    try {
+      plans.push({ plan: validateExperimentPlan(JSON.parse(contents), entry.name), digest });
+    } catch (error) {
+      console.warn(`Skipping Harbor comparison plan ${path}: ${error.message}`);
+    }
+  }
+  return plans;
+}
+
 const jobs = [];
 
 for (const store of await discoverJobStores()) {
@@ -346,6 +397,12 @@ for (const store of await discoverJobStores()) {
     const jobPath = resolve(store.path, jobEntry.name);
     const result = await readJson(resolve(jobPath, "result.json"));
     if (!result?.finished_at) continue;
+    const [config, lockContents] = await Promise.all([
+      readJson(resolve(jobPath, "config.json"), {}),
+      readFile(resolve(jobPath, "lock.json"), "utf8").catch(() => null),
+    ]);
+    const lock = parseRetainedLock(lockContents, resolve(jobPath, "lock.json"));
+    const experimentPlan = await readJson(resolve(jobPath, "experiment-plan.json"));
     const runner = runnerFromResult(result, store.fallbackRunner);
 
     const trialEntries = await readdir(jobPath, { withFileTypes: true });
@@ -362,6 +419,8 @@ for (const store of await discoverJobStores()) {
     }
 
     trials.sort((left, right) => (left.taskName ?? "").localeCompare(right.taskName ?? ""));
+    const datasetDigest = resolvedDatasetDigest(config, trials);
+    assignDatasetDigest(trials, datasetDigest);
     jobs.push({
       key: `${store.key}:${runner}:${jobEntry.name}`,
       id: result.id ?? `${store.key}-${jobEntry.name}`,
@@ -376,6 +435,10 @@ for (const store of await discoverJobStores()) {
       completedTrials: result?.stats?.n_completed_trials ?? trials.length,
       erroredTrials: result?.stats?.n_errored_trials ?? 0,
       retries: result?.stats?.n_retries ?? 0,
+      lockDigest: lockContents ? sha256(lockContents) : null,
+      experimentPlanDigest: experimentPlan?.digest ?? null,
+      policy: policyEvidence(lock, runner, trials),
+      candidateProvenanceDigest: candidateProvenanceEvidence(lock, runner),
       mean: jobMean(result),
       tokens: {
         input: result?.stats?.n_input_tokens ?? 0,
@@ -389,99 +452,7 @@ for (const store of await discoverJobStores()) {
 
 jobs.sort((left, right) => new Date(right.finishedAt).getTime() - new Date(left.finishedAt).getTime());
 
-function taskSet(job) {
-  return job.trials.map((trial) => trial.taskName).sort().join("\n");
-}
-
-function buildComparison(allJobs) {
-  const harnessJobs = allJobs.filter((job) => job.runner === "harness" && job.trials.length > 1);
-  const codexJobs = allJobs.filter((job) => job.runner === "codex" && job.trials.length > 1);
-  const candidates = [];
-  for (const harnessJob of harnessJobs) {
-    const harnessTasks = taskSet(harnessJob);
-    for (const codexJob of codexJobs) {
-      if (harnessJob.trials.length !== codexJob.trials.length) continue;
-      if (harnessTasks !== taskSet(codexJob)) continue;
-      candidates.push({ harnessJob, codexJob });
-    }
-  }
-  candidates.sort(
-    (left, right) =>
-      right.harnessJob.trials.length - left.harnessJob.trials.length ||
-      Math.max(
-        new Date(right.harnessJob.finishedAt).getTime(),
-        new Date(right.codexJob.finishedAt).getTime(),
-      ) -
-        Math.max(
-          new Date(left.harnessJob.finishedAt).getTime(),
-          new Date(left.codexJob.finishedAt).getTime(),
-        ),
-  );
-  const pair = candidates[0];
-  if (!pair) return null;
-
-  const codexTrials = new Map(pair.codexJob.trials.map((trial) => [trial.taskName, trial]));
-  let harnessWins = 0;
-  let codexWins = 0;
-  let ties = 0;
-  const tasks = pair.harnessJob.trials.map((harnessTrial) => {
-    const codexTrial = codexTrials.get(harnessTrial.taskName);
-    const harnessReward = harnessTrial.reward ?? 0;
-    const codexReward = codexTrial?.reward ?? 0;
-    const outcome =
-      harnessReward > codexReward
-        ? "harness"
-        : codexReward > harnessReward
-          ? "codex"
-          : "tie";
-    if (outcome === "harness") harnessWins += 1;
-    else if (outcome === "codex") codexWins += 1;
-    else ties += 1;
-    return {
-      taskName: harnessTrial.taskName,
-      outcome,
-      harness: {
-        id: harnessTrial.id,
-        status: harnessTrial.status,
-        reward: harnessTrial.reward,
-        durationMs: harnessTrial.durationMs,
-      },
-      codex: {
-        id: codexTrial?.id ?? null,
-        status: codexTrial?.status ?? "error",
-        reward: codexTrial?.reward ?? null,
-        durationMs: codexTrial?.durationMs ?? null,
-      },
-    };
-  });
-  const summarizeJob = (job) => ({
-    key: job.key,
-    name: job.name,
-    branch: job.branch,
-    finishedAt: job.finishedAt,
-    durationMs: job.durationMs,
-    agentDurationMs: job.trials.reduce(
-      (total, trial) => total + (trial.agentDurationMs ?? 0),
-      0,
-    ),
-    passed: job.trials.filter((trial) => trial.status === "passed").length,
-    score: job.mean,
-    model: job.trials[0]?.model ?? null,
-    effort: job.trials[0]?.effort ?? null,
-    modelCalls: job.trials.reduce((total, trial) => total + trial.modelCalls, 0),
-    tokens: job.tokens,
-  });
-  return {
-    taskCount: tasks.length,
-    harness: summarizeJob(pair.harnessJob),
-    codex: summarizeJob(pair.codexJob),
-    delta: (pair.harnessJob.mean ?? 0) - (pair.codexJob.mean ?? 0),
-    headToHead: { harness: harnessWins, codex: codexWins, ties },
-    tasks,
-  };
-}
-
-const comparison = buildComparison(jobs);
+const comparison = selectComparison(await readExperimentPlans(), jobs);
 const index = {
   generatedAt: new Date().toISOString(),
   source: "linked worktree Harbor records",
@@ -506,6 +477,6 @@ await Promise.all([
 ]);
 console.log(
   `Synced ${index.jobCount} Harbor jobs and ${index.trialCount} trials${
-    comparison ? `; matched ${comparison.taskCount}-task Nanocodex/Codex comparison` : ""
+    comparison ? `; matched ${comparison.pairCount} paired Nanocodex/Codex attempts` : ""
   }`,
 );

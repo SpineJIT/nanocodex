@@ -24,6 +24,8 @@ type TrialSummary = {
   trialName: string;
   source: string | null;
   taskRef: string | null;
+  taskDigest: string | null;
+  datasetDigest?: string;
   status: TrialStatus;
   reward: number | null;
   startedAt: string | null;
@@ -64,6 +66,8 @@ type HarborJob = {
   completedTrials: number;
   erroredTrials: number;
   retries: number;
+  lockDigest: string | null;
+  experimentPlanDigest: string | null;
   mean: number | null;
   tokens: {
     input: number;
@@ -94,6 +98,9 @@ type ComparisonJob = {
 
 type ComparisonTask = {
   taskName: string;
+  datasetDigest: string;
+  taskDigest: string;
+  attemptIndex: number;
   outcome: Runner | "tie";
   harness: {
     id: string;
@@ -110,7 +117,23 @@ type ComparisonTask = {
 };
 
 export type EvalComparison = {
+  planId: string;
+  planDigest: string;
+  datasetDigest: string;
+  attemptCount: number;
   taskCount: number;
+  pairCount: number;
+  policy: {
+    model: string;
+    effort: string;
+    systemInstructionsDigest: string;
+    environmentDigest: string;
+    verifierDigest: string;
+    timeoutPolicyDigest: string;
+    resourcePolicyDigest: string;
+    toolAvailabilityDigest: string;
+  };
+  candidateProvenance: { harness: string; codex: string };
   harness: ComparisonJob;
   codex: ComparisonJob;
   delta: number;
@@ -321,17 +344,19 @@ export function Harbor() {
           </p>
           <h1>Evals</h1>
           <p>
-            Same model, same effort, same {comparison?.taskCount ?? "retained"} public tasks.
+            {comparison
+              ? `One frozen experiment plan, ${comparison.taskCount} public tasks, and ${comparison.pairCount} paired attempts. `
+              : "Retained development runs. "}
             We run these constantly to decide what to build next. Codex is the baseline, and every
             result links to the verifier and trajectory that produced it.
           </p>
         </div>
         <div className="gate-score">
-          <span>Matched development set</span>
+          <span>{comparison ? "Matched development set" : "Latest retained run"}</span>
           <strong>{comparison?.taskCount ?? defaultGate.completedTrials}</strong>
           <p>
             {comparison
-              ? `public tasks · same model and effort`
+              ? `${comparison.pairCount} paired attempts · immutable plan`
               : `${defaultGate.completedTrials} completed trials`}
           </p>
         </div>
@@ -363,7 +388,7 @@ export function Harbor() {
               <h2 id="comparison-title">Tasks to investigate</h2>
             </div>
             <p>
-              {comparison.harness.model} · {comparison.harness.effort} effort · public development set
+              {comparison.policy.model} · {comparison.policy.effort} effort · plan {comparison.planDigest.slice(7, 19)}
             </p>
           </header>
           <table className="comparison-table">
@@ -376,8 +401,11 @@ export function Harbor() {
             </thead>
             <tbody>
               {decisiveTasks.map((task) => (
-                <tr key={task.taskName}>
-                  <th scope="row">{taskLabel(task.taskName)}</th>
+                <tr key={`${task.taskDigest}:${task.attemptIndex}`}>
+                  <th scope="row">
+                    {taskLabel(task.taskName)}
+                    {comparison.attemptCount > 1 ? ` · attempt ${task.attemptIndex + 1}` : ""}
+                  </th>
                   <td>
                     <button
                       className={`comparison-result ${task.codex.status}`}
@@ -401,8 +429,8 @@ export function Harbor() {
             </tbody>
           </table>
           <footer>
-            The disagreement set is the useful part: {comparison.headToHead.harness + comparison.headToHead.codex} tasks
-            differed and {comparison.headToHead.ties} had the same outcome. Click any result to inspect the retained trial.
+            The disagreement set is the useful part: {comparison.headToHead.harness + comparison.headToHead.codex} paired
+            attempts differed and {comparison.headToHead.ties} had the same outcome. Click any result to inspect the retained trial.
           </footer>
         </section>
       ) : null}

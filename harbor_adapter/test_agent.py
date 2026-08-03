@@ -1,6 +1,7 @@
 """Source-level contracts for the Harbor nanocodex adapter."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ from harbor_adapter.agent import (
     SUPPORTED_MODELS,
     NanocodexAgent,
     _cli_tools_install_command,
+    _retained_instruction_evidence,
     _remote_binary_install_command,
 )
 from harbor_adapter.codex import ParityCodexAgent
@@ -424,6 +426,26 @@ class WebSearchContractTests(unittest.TestCase):
             self.assertNotIn("subagents", config["agents"][0]["kwargs"])
 
 class ContextParityContractTests(unittest.TestCase):
+    def test_instruction_evidence_retains_content_digests(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            system_prompt = root / "system.md"
+            agents_md = root / "AGENTS.md"
+            system_prompt.write_bytes(b"system prompt\n")
+            agents_md.write_bytes(b"agent instructions\n")
+
+            evidence = _retained_instruction_evidence(system_prompt, agents_md)
+
+        self.assertEqual(
+            evidence,
+            {
+                "system_prompt_sha256": "sha256:"
+                + hashlib.sha256(b"system prompt\n").hexdigest(),
+                "agents_md_sha256": "sha256:"
+                + hashlib.sha256(b"agent instructions\n").hexdigest(),
+            },
+        )
+
     def test_history_eval_arms_use_the_same_context_files(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         nanocodex_config = yaml.safe_load(

@@ -10,6 +10,8 @@ from harbor.agents.installed.codex import Codex
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
+from harbor_adapter.agent import _retained_instruction_evidence
+
 
 class ParityCodexAgent(Codex):
     """Run Codex with the nanocodex prompt and shared eval AGENTS.md exactly."""
@@ -63,6 +65,12 @@ class ParityCodexAgent(Codex):
     def populate_context_post_run(self, context: AgentContext) -> None:
         super().populate_context_post_run(context)
         self._verify_model_context()
+        context.metadata.update(
+            _retained_instruction_evidence(
+                self._system_prompt_path,
+                self._agents_md_path,
+            )
+        )
 
     def _verify_model_context(self) -> None:
         rollout_files = list((self.logs_dir / "sessions").rglob("rollout-*.jsonl"))
