@@ -10,7 +10,9 @@ client WebSocket ──> Worker router ──> one NanocodexSession object per s
                                          ├─ Rust/WASM Nanocodex driver
                                          ├─ persistent model WebSocket
                                          ├─ hibernatable client sockets
-                                         └─ SQLite snapshot + terminal turns
+                                         ├─ SQLite snapshot + terminal turns
+                                         └─ Cloudflare Sandbox DO + container
+                                              └─ /workspace mounted to per-session R2 prefix
 
 ChatGPT subscription ───────────────> one NanocodexSubscriptionAuth object
                                          └─ SQLite token rotation + 401 recovery
@@ -32,6 +34,13 @@ resumes complete client-owned typed history from SQLite. See Cloudflare's
 and [WebSocket hibernation](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
 documentation for the underlying behavior.
 
+The caller-defined `sandbox_exec`, `sandbox_read_file`, `sandbox_write_file`,
+`sandbox_list_files`, and `sandbox_preview` tools run untrusted work in a
+separate Cloudflare Sandbox container. The Sandbox uses the current RPC
+transport, scopes its R2 mount to the Nanocodex session ID, and creates
+zero-configuration Quick Tunnel preview URLs. Nanocodex remains the only model
+and tool-loop owner; the Sandbox SDK supplies execution isolation and storage.
+
 ## Run locally
 
 From the repository root, build the optimized WASM package and install the
@@ -41,6 +50,11 @@ example:
 just build-wasm
 npm ci --prefix examples/cloudflare-workers
 ```
+
+Docker must be running because Wrangler builds the Sandbox container. Local
+R2 bindings are emulated by Wrangler; set `NANOCODEX_SANDBOX_LOCAL=true` in a
+local `.dev.vars` file when you want the mounted workspace synchronized through
+the local R2 binding path.
 
 Sign in once with Codex, then start the subscription-backed Worker:
 
@@ -132,12 +146,19 @@ Node-based consumers may continue to use Code Mode when their host permits it.
 ```sh
 npm run check --prefix examples/cloudflare-workers
 cd examples/cloudflare-workers
+npx wrangler r2 bucket create nanocodex-sandbox-workspaces
 npx wrangler secret put CHATGPT_ACCESS_TOKEN
 npx wrangler secret put CHATGPT_REFRESH_TOKEN
 npx wrangler secret put CHATGPT_ACCOUNT_ID
 npx wrangler secret put NANOCODEX_ADMIN_TOKEN
 npx wrangler deploy
 ```
+
+Create the R2 bucket once per Cloudflare account. Each actor receives only its
+`/sessions/<session-id>/` prefix inside the mounted `/workspace`; model
+credentials remain in the Worker and are not injected into the container.
+After deployment, ask the agent to create a small server on port 8080 in the
+background and call `sandbox_preview` to get a public `trycloudflare.com` URL.
 
 At the time this example was validated, the ChatGPT edge rejected direct
 Cloudflare Worker egress with HTTP 403. That is an upstream egress-policy

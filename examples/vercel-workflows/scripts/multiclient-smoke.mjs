@@ -13,7 +13,7 @@ const clients = await Promise.all([openClient(sessionId), openClient(sessionId)]
 try {
   await Promise.all(clients.map((client) => client.waitFor((message) => message.type === "ready")));
   const turnId = crypto.randomUUID();
-  const input = "Reply with exactly VERCEL_SYNC_OK and nothing else.";
+  const input = "Use sandbox_write_file to write VERCEL_SANDBOX_OK to probe.txt, use sandbox_exec to run cat on it, and verify it with sandbox_read_file. Then reply with exactly VERCEL_SANDBOX_OK.";
   const prompt = await fetch(
     new URL(`/api/sessions/${encodeURIComponent(sessionId)}/prompt`, baseUrl),
     {
@@ -36,16 +36,26 @@ try {
     return {
       final_message: completed.final_message,
       events: client.events.filter((event) => event.type === "event" && event.turn_id === turnId).length,
+      tools: client.events
+        .filter((event) => event.type === "event"
+          && event.turn_id === turnId
+          && event.event?.type === "tool.call")
+        .map((event) => event.event.payload?.tool),
     };
   }));
-  if (observations.some((result) => result.final_message.trim() !== "VERCEL_SYNC_OK")) {
+  if (observations.some((result) => result.final_message.trim() !== "VERCEL_SANDBOX_OK")) {
     throw new Error(`unexpected terminal messages: ${JSON.stringify(observations)}`);
+  }
+  const requiredTools = ["sandbox_write_file", "sandbox_exec", "sandbox_read_file"];
+  if (observations.some((result) => requiredTools.some((tool) => !result.tools.includes(tool)))) {
+    throw new Error(`a synchronized client missed sandbox tool events: ${JSON.stringify(observations)}`);
   }
   process.stdout.write(`${JSON.stringify({
     session_id: sessionId,
     accepted_clients: clients.length,
     completed_clients: observations.length,
     event_counts: observations.map((result) => result.events),
+    tool_calls: requiredTools,
     status: "ok",
   })}\n`);
 } finally {

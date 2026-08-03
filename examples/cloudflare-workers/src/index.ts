@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { ContainerProxy, Sandbox } from "@cloudflare/sandbox";
 import type {
   DefaultAgent,
   EventWatcher,
@@ -9,6 +10,7 @@ import type {
 } from "nanocodex";
 import { Agent } from "nanocodex/browser";
 import nanocodexWasm from "./nanocodex.wasm";
+import { cloudflareSandboxTools } from "./sandbox-tools";
 import { webAsset } from "./web";
 import {
   NanocodexSubscriptionAuth,
@@ -16,6 +18,7 @@ import {
 } from "./subscription-auth";
 
 export { NanocodexSubscriptionAuth } from "./subscription-auth";
+export { ContainerProxy, Sandbox };
 
 import {
   type ActiveTurn,
@@ -40,10 +43,13 @@ const ENCODED_PONG = JSON.stringify({ type: "pong" });
 export interface Env {
   NANOCODEX_SESSIONS: DurableObjectNamespace<NanocodexSession>;
   NANOCODEX_AUTH: DurableObjectNamespace<NanocodexSubscriptionAuth>;
+  Sandbox: DurableObjectNamespace<Sandbox>;
+  NANOCODEX_WORKSPACES: R2Bucket;
   OPENAI_API_KEY?: string;
   NANOCODEX_ADMIN_TOKEN: string;
   NANOCODEX_AUTH_MODE?: string;
   AGENT_IDLE_TIMEOUT_MS?: string;
+  NANOCODEX_SANDBOX_LOCAL?: string;
   OPENAI_WEBSOCKET_URL?: string;
   CHATGPT_ACCESS_TOKEN?: string;
   CHATGPT_ACCOUNT_ID?: string;
@@ -376,7 +382,7 @@ export class NanocodexSession extends DurableObject<Env> {
       sessionId: session.session_id,
       resume,
       workspace: "/workspace",
-      instructions: "You are Nanocodex running inside a Cloudflare Durable Object.",
+      instructions: "You are Nanocodex running inside a Cloudflare Durable Object. Use the sandbox_* tools for code, files, and previews; their /workspace is isolated and persisted in R2 for this session.",
       // Workers forbid eval/new Function. Direct mode keeps caller-defined
       // tools in the WASM lifecycle while dispatching handlers through the
       // typed host bridge without dynamic code generation.
@@ -385,10 +391,20 @@ export class NanocodexSession extends DurableObject<Env> {
         ? openAiWebSocket
         : (endpoint, id, request) => openSubscriptionWebSocket(auth, endpoint, id, request),
       tools: {
+        ...cloudflareSandboxTools(
+          this.env.Sandbox,
+          session.session_id,
+          this.env.NANOCODEX_SANDBOX_LOCAL === "true",
+        ),
         runtimeInfo: {
           description: "Return information about the current agent runtime.",
           parameters: { type: "object", additionalProperties: false },
-          handler: () => ({ runtime: "cloudflare-durable-object", session_id: session.session_id }),
+          handler: () => ({
+            runtime: "cloudflare-durable-object",
+            sandbox: "cloudflare-container-r2-workspace",
+            session_id: session.session_id,
+            workspace: "/workspace",
+          }),
         },
       },
     });

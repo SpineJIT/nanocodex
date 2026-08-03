@@ -153,7 +153,7 @@ async function runPending(active: Connection, activeGeneration: number): Promise
     observeTurn(accepted.id, accepted.input);
     setStatus(accepted.replayed ? "resuming" : "running", "ok");
     setActivity((accepted.replayed ? "rejoined " : "started ") + shortId(pending.id) + "; detach any time");
-    const completed = await active.prompt(pending);
+    const completed = await active.turn(pending);
     if (activeGeneration === generation) completeTurn(completed.id, completed.final_message);
   } catch (error) {
     if (activeGeneration === generation) failTurn(pending.id, errorMessage(error));

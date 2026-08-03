@@ -31,12 +31,23 @@ browser B ─ WebSocket Function ─┘             │
                                               │
                                               ▼
                                   Nanocodex WASM Function step
-                                  Responses WebSocket → OpenAI
+                                     ├─ Responses WebSocket → OpenAI
+                                     └─ named persistent Vercel Sandbox
+                                          └─ files, commands, preview domains
 ```
 
 The WebSocket connection itself is disposable and bounded by the Vercel
 Function duration. The browser reconnects automatically. The Workflow run,
 snapshot, prompt hook, and output stream are the durable pieces.
+
+Every Workflow actor also owns a named Vercel Sandbox. The caller-defined
+`sandbox_exec`, `sandbox_read_file`, `sandbox_write_file`,
+`sandbox_list_files`, and `sandbox_preview` tools use its isolated Firecracker
+VM. Persistent sandboxes automatically snapshot their filesystem when a VM
+session stops and resume it on the next turn. The demo exposes ports 3000,
+5173, 8000, and 8080 for previews. Vercel OIDC authenticates Sandbox SDK calls
+inside the deployment, so no Vercel access token is passed to Nanocodex or the
+guest VM.
 
 ## Local development
 
@@ -86,7 +97,12 @@ The deployment helper:
 4. builds and packs the current repository's Nanocodex WASM package into a
    temporary deployment directory; and
 5. deploys that staged app to Production without committing generated WASM or
-   credentials.
+credentials.
+
+Fluid Compute applies to the Next.js Functions that host WebSocket tails and
+Workflow steps. Vercel Sandbox is a separate persistent Firecracker service;
+the example uses both rather than treating Fluid function memory as the code
+workspace.
 
 No refresh token is copied. When the access token expires or is rejected, run
 `codex login` and deploy again. To restrict creation of new sessions, set a
@@ -102,7 +118,8 @@ npm run multiclient --prefix examples/vercel-workflows
 
 The smoke test creates one Workflow actor, connects two independent
 WebSockets, submits one prompt, and requires both clients to observe its
-acceptance, model event stream, and terminal result.
+acceptance, sandbox write/exec/read tool calls, model event stream, and terminal
+result.
 
 ## Browser demo
 
@@ -112,6 +129,8 @@ acceptance, model event stream, and terminal result.
 4. Send a prompt from either client.
 5. Detach or reload during inference; both clients resume the same durable
    stream and terminal result.
+6. Ask it to start a server on port 3000 and use `sandbox_preview`; open the
+   returned `vercel.run` URL.
 
 The browser stores only the session capability, a bounded transcript, active
 turn metadata, and its own stream cursor. Model credentials stay in the server

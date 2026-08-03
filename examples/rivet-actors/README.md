@@ -3,10 +3,15 @@
 This example runs the real Rust/WASM Nanocodex harness as a durable
 [Rivet Actor](https://rivet.dev/docs/actors/). Nanocodex is already an agent
 harness, so it runs directly in the actor host with one owner for model history,
-tools, retries, and cancellation. The example depends directly on RivetKit and
-does not install `@rivet-dev/agentos`, Pi, or another agent harness. RivetKit
-itself currently retains a separate legacy `@rivet-dev/agent-os-core` runtime
-dependency; it has no Pi packages in its dependency tree.
+tools, retries, and cancellation. Rivet AgentOS supplies only the actor-owned
+isolated VM, persistent filesystem, processes, and preview routing underneath
+Nanocodex's caller-defined tools; its optional agent/session adapters are not
+used.
+
+The published AgentOS core currently declares Pi software as a transitive npm
+dependency. This example never imports, mounts, or invokes it. The dependency
+guard rejects direct Pi dependencies and source imports, while allowing that
+dormant upstream package to remain in AgentOS's lockfile subtree.
 
 ## Architecture
 
@@ -15,6 +20,11 @@ Each `nanocodex` actor owns one conversation:
 - the live WASM driver, event watcher, and turns live in ephemeral `c.vars`;
 - the typed Nanocodex snapshot and terminal idempotency records live in the
   actor's embedded SQLite database;
+- the AgentOS root filesystem is chunked into the same actor-owned SQLite
+  storage and restored automatically across VM sleep/wake cycles;
+- `sandbox_exec`, `sandbox_read_file`, `sandbox_write_file`,
+  `sandbox_list_files`, and `sandbox_preview` expose bounded AgentOS operations
+  to Nanocodex without putting model credentials in the guest;
 - a completed turn is transactionally committed before its action returns or
   broadcasts `turnCompleted`;
 - duplicate turn IDs share one in-flight promise or replay the stored terminal
@@ -48,8 +58,8 @@ npm ci --prefix examples/rivet-actors
 npm run check --prefix examples/rivet-actors
 ```
 
-The dependency check fails if the lockfile acquires AgentOS's Pi adapter or any
-of the upstream Pi harness packages.
+The dependency check fails if this application directly declares or imports a
+Pi adapter or upstream Pi harness package.
 
 Log in to Codex with the ChatGPT subscription you want to use, then start the
 real subscription server:
@@ -120,9 +130,10 @@ demo page from the same container. A fresh hosted page selects its same-origin
 a deployment without embedding it in source by adding
 `?endpoint=https%3A%2F%2F...` to the page URL.
 
-The smoke also forces the real model to invoke `runtimeInfo` and requires a
-completed Nanocodex `tool.call`/`tool.result` event pair, so it verifies the
-WASM tool loop rather than only a text response.
+The smoke also forces the real model to write, execute, and read through
+AgentOS and requires completed Nanocodex `tool.call`/`tool.result` event pairs,
+so it verifies the WASM tool loop and isolated VM rather than only a text
+response.
 
 The stress driver reuses persistent actor connections and bounds fan-out to
 avoid benchmarking the gateway's per-route rate limiter. Tune
@@ -194,7 +205,7 @@ const connection = session.connect();
 connection.on("agentEvent", (event) => console.log(event));
 connection.on("turnCompleted", (result) => console.log(result));
 
-await session.prompt({ id: crypto.randomUUID(), input: "Hello" });
+await session.turn({ id: crypto.randomUUID(), input: "Hello" });
 await session.unload(); // snapshot remains durable
 await connection.dispose();
 ```
@@ -206,7 +217,9 @@ Rivet automatically sleeps idle actors after 30 seconds.
 
 Rivet Actors can run on Rivet Compute or a self-hosted Rivet platform. The
 included production image builds Nanocodex WASM, compiles the actor server, and
-starts it without a TypeScript runtime dependency. From the repository root,
+starts it without a TypeScript runtime dependency. AgentOS's native sidecar is
+installed with the production dependencies and its actor runtime socket is
+enabled by the AgentOS registry setup. From the repository root,
 get a cloud token from the Rivet dashboard's **Connect > Rivet Cloud** page and
 deploy with API-key model authentication:
 
@@ -235,6 +248,12 @@ export RIVET_PUBLIC_ENDPOINT='https://<namespace>:pk_...@api.rivet.dev'
 npm run smoke --prefix examples/rivet-actors
 npm run repl --prefix examples/rivet-actors
 ```
+
+Set `NANOCODEX_PUBLIC_URL` on the deployment to the browser-safe base endpoint
+when you want `sandbox_preview` to return an absolute URL; otherwise it returns
+the actor-relative `/fetch/<token>` path. Preview tokens survive actor sleep,
+while the server process itself must be restarted after wake. Workspace files
+survive automatically.
 
 The browser bundle is static and can be published on any static host after
 `npm run build:web --prefix examples/rivet-actors`; paste the same public

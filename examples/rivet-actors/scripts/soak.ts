@@ -63,7 +63,7 @@ for (let wave = 0; wave < waves; wave += 1) {
     await Promise.all(sessions.map(({ connection }) => connection.ready));
     const seedStarted = performance.now();
     const seeded = await Promise.allSettled(sessions.map(async ({ connection, request }) => {
-      const result = await connection.prompt(request);
+      const result = await connection.turn(request);
       if (result.final_message !== request.input.slice("Reply with exactly ".length)) {
         throw new Error(`unexpected seed result: ${result.final_message}`);
       }
@@ -83,7 +83,7 @@ for (let wave = 0; wave < waves; wave += 1) {
       const settled = await Promise.allSettled(sessions.flatMap(({ connection, request }) =>
         Array.from({ length: batchSize }, async () => {
           const started = performance.now();
-          const result = await connection.prompt(request);
+          const result = await connection.turn(request);
           latencies.record(performance.now() - started);
           return result;
         })));

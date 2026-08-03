@@ -94,6 +94,21 @@ afterAll(async () => {
 });
 
 describe.sequential("Nanocodex Rivet Actors", () => {
+  test("runs commands against the actor-owned persistent AgentOS filesystem", async (context) => {
+    resetMock();
+    configureApiKey();
+    const { client } = await setupTest(context, registry);
+    const session = client.nanocodex.getOrCreate([`agentos-${crypto.randomUUID()}`]);
+
+    const executed = await session.exec("printf AGENTOS_OK > /workspace/probe.txt", {
+      cwd: "/workspace",
+      captureStdio: true,
+    });
+    expect(executed.exitCode).toBe(0);
+    expect(Buffer.from(await session.readFile("/workspace/probe.txt")).toString("utf8"))
+      .toBe("AGENTOS_OK");
+  });
+
   test("commits, deduplicates, unloads, and restores a WASM session", async (context) => {
     resetMock();
     configureApiKey();
@@ -105,20 +120,20 @@ describe.sequential("Nanocodex Rivet Actors", () => {
     await connection.ready;
 
     const request = { id: "turn-1", input: "Reply with exactly EDGE_OK and nothing else." };
-    const [first, duplicate] = await Promise.all([session.prompt(request), session.prompt(request)]);
+    const [first, duplicate] = await Promise.all([session.turn(request), session.turn(request)]);
     expect(first.final_message).toBe("EDGE_OK");
     expect(duplicate).toEqual(first);
     const requestsAfterFirstTurn = modelRequests;
     expect(requestsAfterFirstTurn).toBeGreaterThanOrEqual(1);
-    await expect(session.prompt({ ...request, input: "different" })).rejects.toThrow(/different input/);
+    await expect(session.turn({ ...request, input: "different" })).rejects.toThrow(/different input/);
 
-    const replay = await session.prompt(request);
+    const replay = await session.turn(request);
     expect(replay).toEqual(first);
     expect(modelRequests).toBe(requestsAfterFirstTurn);
 
     await session.unload();
     expect((await session.status()).agent_loaded).toBe(false);
-    const restored = await session.prompt({
+    const restored = await session.turn({
       id: "turn-2",
       input: "What exact token did I ask you to return previously? Reply with only that token.",
     });
@@ -166,7 +181,7 @@ describe.sequential("Nanocodex Rivet Actors", () => {
     expect(requestsAfterDetachedCompletion).toBeGreaterThan(0);
 
     await session.start(request);
-    const completed = await session.prompt(request);
+    const completed = await session.turn(request);
     expect(completed.final_message).toBe("DETACHED_OK");
     expect((await session.status()).active_turns).not.toContain(request.id);
     expect(modelRequests).toBe(requestsAfterDetachedCompletion);
@@ -204,14 +219,14 @@ describe.sequential("Nanocodex Rivet Actors", () => {
       active_turn_details: [request],
     });
 
-    const completed = await session.prompt(request);
+    const completed = await session.turn(request);
     expect(completed.final_message).toBe("SYNC_OK");
     await vi.waitFor(() => {
       expect(firstCompleted).toEqual(["shared-turn:SYNC_OK"]);
       expect(secondCompleted).toEqual(firstCompleted);
     });
     const requestsAfterCompletion = modelRequests;
-    expect((await session.prompt(request)).final_message).toBe("SYNC_OK");
+    expect((await session.turn(request)).final_message).toBe("SYNC_OK");
     expect(modelRequests).toBe(requestsAfterCompletion);
     await Promise.all([first.dispose(), second.dispose()]);
   });
@@ -239,7 +254,7 @@ describe.sequential("Nanocodex Rivet Actors", () => {
       active_turns: [request.id],
       active_turn_details: [request],
     });
-    expect((await reconnected.prompt(request)).final_message).toBe("RECONNECTED_OK");
+    expect((await reconnected.turn(request)).final_message).toBe("RECONNECTED_OK");
     await vi.waitFor(() => {
       expect(completed).toEqual(["reconnected-turn:RECONNECTED_OK"]);
     });
@@ -265,7 +280,7 @@ describe.sequential("Nanocodex Rivet Actors", () => {
 
     rejectNextSubscriptionUpgrade = true;
     const session = client.nanocodex.getOrCreate([`subscription-${crypto.randomUUID()}`]);
-    const result = await session.prompt({ id: "subscription-turn", input: "Reply with exactly SUB_OK" });
+    const result = await session.turn({ id: "subscription-turn", input: "Reply with exactly SUB_OK" });
     expect(result.final_message).toBe("SUB_OK");
     expect(refreshCount).toBe(2);
     expect(await auth.status(createCapabilityProof("status"))).toMatchObject({
@@ -287,7 +302,7 @@ describe.sequential("Nanocodex Rivet Actors", () => {
       revision: 0,
     });
     const session = client.nanocodex.getOrCreate([`access-only-${crypto.randomUUID()}`]);
-    const result = await session.prompt({
+    const result = await session.turn({
       id: "access-only-turn",
       input: "Reply with exactly ACCESS_ONLY_OK",
     });
@@ -302,11 +317,11 @@ describe.sequential("Nanocodex Rivet Actors", () => {
     configureApiKey();
     const { client } = await setupTest(context, registry);
     const session = client.nanocodex.getOrCreate([`bounds-${crypto.randomUUID()}`]);
-    await expect(session.prompt({ id: "oversized", input: "x".repeat(1024 * 1024 + 1) }))
+    await expect(session.turn({ id: "oversized", input: "x".repeat(1024 * 1024 + 1) }))
       .rejects.toThrow(/exceeds 1 MiB/);
 
     responseDelayMs = 20;
-    const turns = Array.from({ length: 17 }, (_, index) => session.prompt({
+    const turns = Array.from({ length: 17 }, (_, index) => session.turn({
       id: `bounded-${index}`,
       input: `Reply with exactly BOUNDED_${index}`,
     }));

@@ -10,8 +10,9 @@ import type {
   TurnUsage,
 } from "nanocodex";
 import { Agent } from "nanocodex/browser";
-import { actor, event, UserError } from "rivetkit";
-import { db, type RawAccess } from "rivetkit/db";
+import { agentOS } from "@rivet-dev/agentos";
+import { event, UserError } from "rivetkit";
+import type { RawAccess } from "rivetkit/db";
 
 import type { SubscriptionSnapshot, SubscriptionStatus } from "./auth.js";
 import { type AuthCapabilityProof, createCapabilityProof } from "./auth-capability.js";
@@ -21,6 +22,12 @@ import {
   openApiKeyWebSocket,
   openSubscriptionWebSocket,
 } from "./model-websocket.js";
+import {
+  type AgentOsActionContext,
+  agentOsPreviewOptions,
+  agentOsRuntimeOptions,
+  rivetSandboxTools,
+} from "./sandbox-tools.js";
 
 const MAX_PROMPT_BYTES = 1024 * 1024;
 const MAX_ACTIVE_TURNS = 16;
@@ -115,7 +122,7 @@ type InternalActorClient = {
   };
 };
 
-type SessionContext = {
+type SessionContext = AgentOsActionContext & {
   vars: SessionVars;
   db: RawAccess;
   actorId: string;
@@ -125,7 +132,9 @@ type SessionContext = {
   keepAwake<T>(promise: Promise<T>): Promise<T>;
 };
 
-export const nanocodex = actor({
+export const nanocodex = agentOS({
+  ...agentOsRuntimeOptions,
+  preview: agentOsPreviewOptions,
   state: {},
   createVars: (): SessionVars => ({
     agent: undefined,
@@ -134,29 +143,7 @@ export const nanocodex = actor({
     inFlight: new Map(),
     turns: new Map(),
   }),
-  db: db({
-    onMigrate: async (database) => {
-      await database.execute(`
-        CREATE TABLE IF NOT EXISTS session_state (
-          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-          snapshot TEXT,
-          completed_turns INTEGER NOT NULL DEFAULT 0,
-          last_active INTEGER NOT NULL DEFAULT 0
-        )
-      `);
-      await database.execute(`
-        CREATE TABLE IF NOT EXISTS terminal_turns (
-          id TEXT PRIMARY KEY,
-          input_hash TEXT NOT NULL,
-          payload TEXT NOT NULL,
-          completed_at INTEGER NOT NULL
-        )
-      `);
-      await database.execute(
-        "INSERT OR IGNORE INTO session_state (singleton, last_active) VALUES (1, 0)",
-      );
-    },
-  }),
+  onWake: async (c: SessionContext) => migrateSessionDatabase(c.db),
   events: {
     agentEvent: event<AgentEvent>(),
     turnAccepted: event<TurnAccepted>(),
@@ -164,7 +151,7 @@ export const nanocodex = actor({
     turnFailed: event<TurnFailed>(),
   },
   actions: {
-    start: async (c, request: PromptRequest): Promise<TurnAccepted> => {
+    start: async (c: SessionContext, request: PromptRequest): Promise<TurnAccepted> => {
       const started = startPrompt(c, request, true);
       void started.operation.catch(() => {});
       const admission = await started.admission;
@@ -175,23 +162,23 @@ export const nanocodex = actor({
         replayed: started.replayed || admission.kind === "terminal",
       };
     },
-    prompt: async (c, request: PromptRequest): Promise<TurnCompleted> => {
+    turn: async (c: SessionContext, request: PromptRequest): Promise<TurnCompleted> => {
       return startPrompt(c, request, false).operation;
     },
-    steer: async (c, id: string, input: string): Promise<void> => {
+    steer: async (c: SessionContext, id: string, input: string): Promise<void> => {
       validateTurnId(id);
       validateInput(input);
       const turn = c.vars.turns.get(id);
       if (!turn) throw userError(`turn ${id} is not active`);
       await turn.steer({ input });
     },
-    cancel: async (c, id: string): Promise<void> => {
+    cancel: async (c: SessionContext, id: string): Promise<void> => {
       validateTurnId(id);
       const turn = c.vars.turns.get(id);
       if (!turn) throw userError(`turn ${id} is not active`);
       await turn.cancel();
     },
-    status: async (c): Promise<SessionStatus> => {
+    status: async (c: SessionContext): Promise<SessionStatus> => {
       const row = await sessionRow(c.db);
       return {
         session_id: sessionUuid(c.actorId),
@@ -207,14 +194,14 @@ export const nanocodex = actor({
         auth_mode: modelAuthMode(),
       };
     },
-    unload: async (c): Promise<void> => {
+    unload: async (c: SessionContext): Promise<void> => {
       if (c.vars.inFlight.size > 0) throw userError("cannot unload while turns are active");
       await shutdown(c);
     },
-    reset: async (c): Promise<void> => {
+    reset: async (c: SessionContext): Promise<void> => {
       if (c.vars.inFlight.size > 0) throw userError("cannot reset while turns are active");
       await shutdown(c);
-      await c.db.transaction(async (transaction) => {
+      await c.db.transaction(async (transaction: RawAccess) => {
         await transaction.execute("DELETE FROM terminal_turns");
         await transaction.execute(
           "UPDATE session_state SET snapshot = NULL, completed_turns = 0, last_active = 0 WHERE singleton = 1",
@@ -382,15 +369,21 @@ async function createAgent(context: SessionContext): Promise<DefaultAgent> {
   const mode = modelAuthMode();
   const common = {
     apiBaseUrl: mode === "chatgpt" ? CHATGPT_API_BASE_URL : undefined,
-    instructions: "You are Nanocodex running as a durable Rivet Actor.",
+    instructions: "You are Nanocodex running as a durable Rivet Actor. Use the sandbox_* tools for code, files, and previews; their /workspace is an isolated persistent AgentOS VM filesystem for this actor.",
     module: await wasmBytes,
     resume,
     sessionId: sessionUuid(context.actorId),
     tools: {
+      ...rivetSandboxTools(context, sessionUuid(context.actorId)),
       runtimeInfo: {
         description: "Return information about the current agent runtime.",
         parameters: { type: "object", additionalProperties: false },
-        handler: () => ({ runtime: "rivet-actor", session_id: sessionUuid(context.actorId) }),
+        handler: () => ({
+          runtime: "rivet-actor",
+          sandbox: "rivet-agentos-persistent-vm",
+          session_id: sessionUuid(context.actorId),
+          workspace: "/workspace",
+        }),
       },
     },
     websocketUrl: process.env.OPENAI_WEBSOCKET_URL
@@ -422,6 +415,28 @@ async function createAgent(context: SessionContext): Promise<DefaultAgent> {
   watcher.onEvent((agentEvent) => context.broadcast("agentEvent", agentEvent));
   context.vars.events = watcher;
   return agent;
+}
+
+async function migrateSessionDatabase(database: RawAccess): Promise<void> {
+  await database.execute(`
+    CREATE TABLE IF NOT EXISTS session_state (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      snapshot TEXT,
+      completed_turns INTEGER NOT NULL DEFAULT 0,
+      last_active INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  await database.execute(`
+    CREATE TABLE IF NOT EXISTS terminal_turns (
+      id TEXT PRIMARY KEY,
+      input_hash TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      completed_at INTEGER NOT NULL
+    )
+  `);
+  await database.execute(
+    "INSERT OR IGNORE INTO session_state (singleton, last_active) VALUES (1, 0)",
+  );
 }
 
 function subscriptionActorProvider(context: SessionContext) {

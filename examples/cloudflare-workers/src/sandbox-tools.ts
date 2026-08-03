@@ -1,0 +1,236 @@
+import { getSandbox, type Sandbox } from "@cloudflare/sandbox";
+import type { ToolMap } from "nanocodex";
+
+const WORKSPACE = "/workspace";
+const MAX_COMMAND_CHARS = 32 * 1024;
+const MAX_FILE_BYTES = 1024 * 1024;
+const MAX_OUTPUT_CHARS = 128 * 1024;
+const MAX_LIST_ENTRIES = 512;
+const MAX_TIMEOUT_MS = 120_000;
+
+export function cloudflareSandboxTools(
+  namespace: DurableObjectNamespace<Sandbox>,
+  sessionId: string,
+  localBucket = false,
+): ToolMap {
+  let sandboxPromise: Promise<Sandbox> | undefined;
+  const sandbox = () => sandboxPromise ??= prepareSandbox(namespace, sessionId, localBucket);
+
+  return {
+    sandbox_exec: {
+      description: "Run a shell command in this session's isolated Cloudflare Sandbox workspace.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Shell command to run." },
+          cwd: { type: "string", description: "Workspace-relative working directory." },
+          timeout_ms: { type: "integer", minimum: 1, maximum: MAX_TIMEOUT_MS },
+        },
+        required: ["command"],
+        additionalProperties: false,
+      },
+      handler: async (input) => {
+        const value = objectInput(input);
+        const command = requiredString(value.command, "command", MAX_COMMAND_CHARS);
+        const cwd = workspacePath(optionalString(value.cwd, "cwd") ?? ".");
+        const timeout = optionalInteger(value.timeout_ms, "timeout_ms", 1, MAX_TIMEOUT_MS) ?? 60_000;
+        const result = await (await sandbox()).exec(command, { cwd, timeout });
+        const stdout = truncate(result.stdout);
+        const stderr = truncate(result.stderr);
+        return {
+          success: result.success,
+          exit_code: result.exitCode,
+          stdout: stdout.text,
+          stderr: stderr.text,
+          stdout_truncated: stdout.truncated,
+          stderr_truncated: stderr.truncated,
+          duration_ms: result.duration,
+        };
+      },
+    },
+    sandbox_read_file: {
+      description: "Read a UTF-8 text file from this session's isolated workspace (maximum 1 MiB).",
+      parameters: pathParameters(),
+      handler: async (input) => {
+        const path = workspacePath(requiredString(objectInput(input).path, "path", 1024));
+        const result = await (await sandbox()).readFile(path, { encoding: "none" });
+        if (result.size > MAX_FILE_BYTES) throw new Error("file exceeds 1 MiB");
+        return { path, content: await readBounded(result.content) };
+      },
+    },
+    sandbox_write_file: {
+      description: "Write a UTF-8 text file inside this session's isolated workspace (maximum 1 MiB).",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Workspace-relative file path." },
+          content: { type: "string", description: "Complete UTF-8 file content." },
+        },
+        required: ["path", "content"],
+        additionalProperties: false,
+      },
+      handler: async (input) => {
+        const value = objectInput(input);
+        const path = workspacePath(requiredString(value.path, "path", 1024));
+        const content = requiredString(value.content, "content", MAX_FILE_BYTES);
+        const bytes = new TextEncoder().encode(content).byteLength;
+        if (bytes > MAX_FILE_BYTES) throw new Error("content exceeds 1 MiB");
+        await (await sandbox()).writeFile(path, content, { encoding: "utf-8" });
+        return { path, bytes_written: bytes };
+      },
+    },
+    sandbox_list_files: {
+      description: "List files in a directory inside this session's isolated workspace.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Workspace-relative directory; defaults to the workspace root." },
+        },
+        additionalProperties: false,
+      },
+      handler: async (input) => {
+        const value = objectInput(input);
+        const path = workspacePath(optionalString(value.path, "path") ?? ".");
+        const result = await (await sandbox()).listFiles(path, { includeHidden: true });
+        return {
+          path,
+          entries: result.files.slice(0, MAX_LIST_ENTRIES).map((entry) => ({
+            name: entry.name,
+            type: entry.type,
+            size: entry.size,
+          })),
+          truncated: result.files.length > MAX_LIST_ENTRIES,
+        };
+      },
+    },
+    sandbox_preview: {
+      description: "Expose a server running in the sandbox through a temporary public Cloudflare Tunnel URL.",
+      parameters: portParameters(),
+      handler: async (input) => {
+        const port = requiredPort(objectInput(input).port);
+        const tunnel = await (await sandbox()).tunnels.get(port);
+        return { port, url: tunnel.url, persistent: false };
+      },
+    },
+  };
+}
+
+async function prepareSandbox(
+  namespace: DurableObjectNamespace<Sandbox>,
+  sessionId: string,
+  localBucket: boolean,
+): Promise<Sandbox> {
+  const sandbox = getSandbox(namespace, `nanocodex-${sessionId}`, {
+    normalizeId: true,
+    sleepAfter: "10m",
+    transport: "rpc",
+    labels: { application: "nanocodex", session: sessionId },
+  });
+  try {
+    await sandbox.mountBucket("NANOCODEX_WORKSPACES", WORKSPACE, {
+      prefix: `/sessions/${sessionId}/`,
+      ...(localBucket ? { localBucket: true as const } : {}),
+    });
+  } catch (error) {
+    if (!errorMessage(error).toLowerCase().includes("mount path already in use")) throw error;
+  }
+  return sandbox;
+}
+
+export function workspacePath(raw: string): string {
+  if (!raw || raw.length > 1024 || raw.includes("\0")) throw new Error("path must be 1-1024 characters");
+  let relative = raw;
+  if (relative === WORKSPACE) relative = ".";
+  else if (relative.startsWith(`${WORKSPACE}/`)) relative = relative.slice(WORKSPACE.length + 1);
+  else if (relative.startsWith("/")) throw new Error("path must be relative to /workspace");
+  const parts = relative.split("/").filter((part) => part !== "" && part !== ".");
+  if (parts.includes("..")) throw new Error("path must not contain '..'");
+  return parts.length === 0 ? WORKSPACE : `${WORKSPACE}/${parts.join("/")}`;
+}
+
+function objectInput(input: unknown): Record<string, unknown> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("tool input must be an object");
+  return input as Record<string, unknown>;
+}
+
+function requiredString(value: unknown, name: string, maxChars: number): string {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`${name} must be a non-empty string`);
+  if (value.length > maxChars) throw new Error(`${name} is too long`);
+  return value;
+}
+
+function optionalString(value: unknown, name: string): string | undefined {
+  if (value === undefined) return undefined;
+  return requiredString(value, name, 1024);
+}
+
+function optionalInteger(
+  value: unknown,
+  name: string,
+  minimum: number,
+  maximum: number,
+): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isInteger(value) || (value as number) < minimum || (value as number) > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return value as number;
+}
+
+function requiredPort(value: unknown): number {
+  const port = optionalInteger(value, "port", 1024, 65_535);
+  if (port === undefined) throw new Error("port is required");
+  return port;
+}
+
+function pathParameters(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: { path: { type: "string", description: "Workspace-relative file path." } },
+    required: ["path"],
+    additionalProperties: false,
+  };
+}
+
+function portParameters(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: { port: { type: "integer", minimum: 1024, maximum: 65_535 } },
+    required: ["port"],
+    additionalProperties: false,
+  };
+}
+
+async function readBounded(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      size += next.value.byteLength;
+      if (size > MAX_FILE_BYTES) throw new Error("file exceeds 1 MiB");
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const content = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    content.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(content);
+}
+
+function truncate(value: string): { text: string; truncated: boolean } {
+  return value.length <= MAX_OUTPUT_CHARS
+    ? { text: value, truncated: false }
+    : { text: value.slice(0, MAX_OUTPUT_CHARS), truncated: true };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

@@ -1,0 +1,6 @@
+FROM docker.io/cloudflare/sandbox:0.12.4
+
+EXPOSE 3000
+EXPOSE 5173
+EXPOSE 8000
+EXPOSE 8080
