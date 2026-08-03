@@ -344,6 +344,20 @@ class ModelContractTests(unittest.TestCase):
                 )
 
 
+class RolloutContractTests(unittest.TestCase):
+    def test_eval_runs_always_disable_rollout_persistence(self) -> None:
+        agent = object.__new__(NanocodexAgent)
+        agent._model = DEFAULT_MODEL
+        agent._effort = "low"
+        agent._web_search = False
+        agent._subagents = False
+
+        arguments = agent._run_arguments("test prompt")
+        rollouts = arguments.index("--rollouts")
+
+        self.assertEqual(arguments[rollouts : rollouts + 2], ["--rollouts", "false"])
+
+
 class WebSearchContractTests(unittest.TestCase):
     def test_run_arguments_always_pass_web_search_explicitly(self) -> None:
         agent = object.__new__(NanocodexAgent)
