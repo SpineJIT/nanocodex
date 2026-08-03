@@ -1,0 +1,43 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "nanocodex-durable-agent",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-29",
+  "rules": [
+    {
+      "type": "CompiledWasm",
+      "globs": ["src/**/*.wasm"],
+      "fallthrough": true
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true,
+      "persist": true
+    }
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "NANOCODEX_SESSIONS",
+        "class_name": "NanocodexSession"
+      },
+      {
+        "name": "NANOCODEX_AUTH",
+        "class_name": "NanocodexSubscriptionAuth"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["NanocodexSession", "NanocodexSubscriptionAuth"]
+    }
+  ],
+  "vars": {
+    "AGENT_IDLE_TIMEOUT_MS": "30000",
+    "NANOCODEX_AUTH_MODE": "chatgpt"
+  }
+}
