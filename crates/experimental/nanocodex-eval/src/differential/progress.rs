@@ -23,6 +23,17 @@ pub(super) struct PendingProgressRecord {
     arm: &'static str,
     kind: String,
     summary: Option<String>,
+    coordinate: Option<ProgressCoordinate>,
+}
+
+#[derive(Clone, Serialize)]
+pub(super) struct ProgressCoordinate {
+    task_name: String,
+    task_content_digest: String,
+    thinking: String,
+    nanocodex_tool_mode: String,
+    codex_tool_mode: String,
+    trial: usize,
 }
 
 pub(super) struct LaneProgressState {
@@ -40,9 +51,24 @@ pub(super) struct LiveApiDiff {
 
 #[derive(Default)]
 pub(super) struct LiveApiArm {
-    requests: Vec<ApiRequestPayload>,
+    pub(super) turns: Vec<LiveApiTurn>,
     source_offsets: BTreeMap<u64, usize>,
     active_offset: Option<usize>,
+    initial_request_seen: bool,
+    first_prompt_cache_key: Option<String>,
+    previous_response_id: Option<String>,
+    previous_call_ids: BTreeSet<String>,
+}
+
+pub(super) struct LiveApiTurn {
+    pub(super) phase: String,
+    pub(super) request: serde_json::Value,
+    pub(super) response: Option<serde_json::Value>,
+    polling: Option<DetectedPollingTurn>,
+    previous_response_id: Option<String>,
+    previous_call_ids: BTreeSet<String>,
+    replayed_call_ids: BTreeSet<String>,
+    pub(super) response_events: Vec<serde_json::Value>,
 }
 
 pub(super) struct LiveApiNotice {
@@ -60,6 +86,8 @@ pub(super) struct ProgressRecord {
     kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coordinate: Option<ProgressCoordinate>,
 }
 
 impl DiffProgress {
@@ -120,6 +148,7 @@ impl DiffProgress {
                                 arm: "runner",
                                 kind: "heartbeat".to_owned(),
                                 summary: Some(heartbeat_summary(&lanes, elapsed_ms)),
+                                coordinate: None,
                             },
                         )
                         .await?;
@@ -146,16 +175,49 @@ impl DiffProgress {
         kind: impl Into<String>,
         summary: impl Into<String>,
     ) {
+        let summary = summary.into();
+        self.emit_record(arm, kind.into(), summary, None);
+    }
+
+    pub(super) fn emit_comparison_started(
+        &self,
+        task: &Task,
+        profile: DifferentialProfile,
+        trial: usize,
+        summary: impl Into<String>,
+    ) {
+        self.emit_record(
+            "runner",
+            "comparison.started".to_owned(),
+            summary.into(),
+            Some(ProgressCoordinate {
+                task_name: task.name().to_owned(),
+                task_content_digest: task.content_digest().to_owned(),
+                thinking: profile.thinking.as_str().to_owned(),
+                nanocodex_tool_mode: profile.nanocodex_tool_mode.as_str().to_owned(),
+                codex_tool_mode: profile.codex_tool_mode.as_str().to_owned(),
+                trial,
+            }),
+        );
+    }
+
+    fn emit_record(
+        &self,
+        arm: &'static str,
+        kind: String,
+        summary: String,
+        coordinate: Option<ProgressCoordinate>,
+    ) {
         let Some(active) = &self.active else {
             return;
         };
-        let summary = summary.into();
         let _ = active.sender.send(PendingProgressRecord {
             observed_at: Utc::now(),
             elapsed_ms: elapsed_ms(active.started),
             arm,
-            kind: kind.into(),
+            kind,
             summary: (!summary.is_empty()).then_some(summary),
+            coordinate,
         });
     }
 
@@ -329,28 +391,30 @@ impl LiveApiDiff {
         if !matches!(arm, "nanocodex" | "codex") {
             return Vec::new();
         }
-        self.arms
-            .entry(arm)
-            .or_default()
-            .observe(direction, phase, request_index, event);
+        let changed =
+            self.arms
+                .entry(arm)
+                .or_default()
+                .observe(direction, phase, request_index, event);
+        if !changed {
+            return Vec::new();
+        }
         let mut notices = Vec::new();
         let (Some(nanocodex), Some(codex)) = (self.arms.get("nanocodex"), self.arms.get("codex"))
         else {
             return notices;
         };
-        let nanocodex_trace = build_event_loop_trace(&nanocodex.requests);
-        let codex_trace = build_event_loop_trace(&codex.requests);
-        let aligned = nanocodex_trace.turns.len().min(codex_trace.turns.len());
+        let aligned = nanocodex.turns.len().min(codex.turns.len());
         while self.compared_requests < aligned {
             let offset = self.compared_requests;
             let request_number = offset.saturating_add(1);
             let nanocodex_request = serde_json::json!({
-                "phase": nanocodex_trace.turns[offset].get("phase"),
-                "request": nanocodex_trace.turns[offset].get("request"),
+                "phase": nanocodex.turns[offset].phase,
+                "request": nanocodex.turns[offset].request,
             });
             let codex_request = serde_json::json!({
-                "phase": codex_trace.turns[offset].get("phase"),
-                "request": codex_trace.turns[offset].get("request"),
+                "phase": codex.turns[offset].phase,
+                "request": codex.turns[offset].request,
             });
             let mut differences = Vec::new();
             diff_json(
@@ -364,17 +428,18 @@ impl LiveApiDiff {
         }
         while self.compared_responses < aligned {
             let offset = self.compared_responses;
-            if !live_api_turn_terminal(&nanocodex.requests[offset])
-                || !live_api_turn_terminal(&codex.requests[offset])
-            {
+            let (Some(nanocodex_response), Some(codex_response)) = (
+                nanocodex.turns[offset].response.as_ref(),
+                codex.turns[offset].response.as_ref(),
+            ) else {
                 break;
-            }
+            };
             let request_number = offset.saturating_add(1);
             let nanocodex_response = serde_json::json!({
-                "response": nanocodex_trace.turns[offset].get("response"),
+                "response": nanocodex_response,
             });
             let codex_response = serde_json::json!({
-                "response": codex_trace.turns[offset].get("response"),
+                "response": codex_response,
             });
             let mut differences = Vec::new();
             diff_json(
@@ -384,9 +449,8 @@ impl LiveApiDiff {
                 &mut differences,
             );
             notices.push(live_api_notice(request_number, "response", &differences));
-            let nanocodex_polling =
-                detected_polling_turn(&nanocodex.requests[offset].response_events);
-            let codex_polling = detected_polling_turn(&codex.requests[offset].response_events);
+            let nanocodex_polling = nanocodex.turns[offset].polling.as_ref();
+            let codex_polling = codex.turns[offset].polling.as_ref();
             if nanocodex_polling.is_some() || codex_polling.is_some() {
                 let shape = |polling: Option<&DetectedPollingTurn>| {
                     polling.map(|polling| {
@@ -410,7 +474,7 @@ impl LiveApiDiff {
                         },
                     )
                 };
-                let matches = shape(nanocodex_polling.as_ref()) == shape(codex_polling.as_ref());
+                let matches = shape(nanocodex_polling) == shape(codex_polling);
                 notices.push(LiveApiNotice {
                     kind: if matches {
                         "api.polling.match"
@@ -419,8 +483,8 @@ impl LiveApiDiff {
                     },
                     summary: format!(
                         "turn {request_number} poll-only response · nanocodex={} · codex={}",
-                        format_polling(nanocodex_polling.as_ref()),
-                        format_polling(codex_polling.as_ref()),
+                        format_polling(nanocodex_polling),
+                        format_polling(codex_polling),
                     ),
                 });
             }
@@ -431,45 +495,78 @@ impl LiveApiDiff {
 }
 
 impl LiveApiArm {
-    fn observe(
+    pub(super) fn observe(
         &mut self,
         direction: &str,
         phase: &str,
         request_index: Option<u64>,
         event: &serde_json::Value,
-    ) {
+    ) -> bool {
         if direction == "outbound" && api_event_type(event).as_deref() == Some("response.create") {
-            let offset = self.requests.len();
-            let encoded = serde_json::to_vec(event).unwrap_or_default();
-            self.requests.push(ApiRequestPayload {
-                request_index: request_index
-                    .unwrap_or_else(|| u64::try_from(offset).unwrap_or(u64::MAX).saturating_add(1)),
-                phase: Some(phase.to_owned()),
-                payload: event.clone(),
-                sha256: hex::encode(Sha256::digest(encoded)),
+            let offset = self.turns.len();
+            if !self.initial_request_seen {
+                self.first_prompt_cache_key = event
+                    .get("prompt_cache_key")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                self.initial_request_seen = true;
+            }
+            let replayed_call_ids = request_call_ids(event);
+            let context = EventLoopNormalizeContext {
+                stage: EventLoopValueStage::Request,
+                first_prompt_cache_key: self.first_prompt_cache_key.as_deref(),
+                previous_response_id: self.previous_response_id.as_deref(),
+                previous_call_ids: &self.previous_call_ids,
+                replayed_call_ids: &replayed_call_ids,
+            };
+            self.turns.push(LiveApiTurn {
+                phase: phase.to_owned(),
+                request: normalize_event_loop_value(event, None, &context),
+                response: None,
+                polling: None,
+                previous_response_id: self.previous_response_id.clone(),
+                previous_call_ids: self.previous_call_ids.clone(),
+                replayed_call_ids,
                 response_events: Vec::new(),
             });
             if let Some(request_index) = request_index {
                 self.source_offsets.insert(request_index, offset);
             }
             self.active_offset = Some(offset);
+            true
         } else if direction == "inbound"
             && let Some(offset) = request_index
                 .and_then(|request_index| self.source_offsets.get(&request_index).copied())
                 .or(self.active_offset)
-            && let Some(request) = self.requests.get_mut(offset)
+            && let Some(turn) = self.turns.get_mut(offset)
         {
-            request.response_events.push(event.clone());
+            let kind = api_event_type(event);
+            if kind.as_deref().is_some_and(is_semantic_response_event) {
+                turn.response_events.push(event.clone());
+            }
+            if !kind.as_deref().is_some_and(is_terminal_api_event) || turn.response.is_some() {
+                return false;
+            }
+            let context = EventLoopNormalizeContext {
+                stage: EventLoopValueStage::Response,
+                first_prompt_cache_key: self.first_prompt_cache_key.as_deref(),
+                previous_response_id: turn.previous_response_id.as_deref(),
+                previous_call_ids: &turn.previous_call_ids,
+                replayed_call_ids: &turn.replayed_call_ids,
+            };
+            turn.response = Some(event_loop_response_signature(
+                &turn.response_events,
+                &context,
+            ));
+            turn.polling = detected_polling_turn(&turn.response_events);
+            self.previous_response_id = response_id(&turn.response_events);
+            self.previous_call_ids = response_call_ids(&turn.response_events);
+            turn.response_events.clear();
+            true
+        } else {
+            false
         }
     }
-}
-
-pub(super) fn live_api_turn_terminal(request: &ApiRequestPayload) -> bool {
-    request
-        .response_events
-        .iter()
-        .filter_map(api_event_type)
-        .any(|kind| is_terminal_api_event(&kind))
 }
 
 pub(super) fn live_api_notice(
@@ -528,6 +625,7 @@ pub(super) async fn write_progress_record(
         arm: pending.arm,
         kind: pending.kind,
         summary: pending.summary,
+        coordinate: pending.coordinate,
     };
     let mut encoded = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
     encoded.push(b'\n');
@@ -546,8 +644,8 @@ pub(super) async fn write_progress_record(
 }
 
 pub(super) fn heartbeat_needed(lanes: &BTreeMap<&'static str, LaneProgressState>) -> bool {
-    !lanes.is_empty()
-        && ["nanocodex", "codex"].into_iter().any(|arm| {
+    lanes.is_empty()
+        || ["nanocodex", "codex"].into_iter().any(|arm| {
             lanes.get(arm).is_none_or(|lane| {
                 !matches!(lane.kind.as_str(), "attempt.completed" | "attempt.failed")
             })

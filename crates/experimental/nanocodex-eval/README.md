@@ -140,8 +140,10 @@ directories, diagnostic evidence, and shared cache entries are not removed.
 
 ### Exact resume behavior
 
-`comparison.json` is the durable coordinate boundary and is published
-atomically. Resume validates the sweep manifest, scans those checkpoints, and
+`comparison.json` is the durable coordinate boundary. Its contents and the
+directory entry that publishes it are synced before completion is returned;
+the comparison directory itself is likewise synced into the sweep root before
+work starts. Resume validates the sweep manifest, scans those checkpoints, and
 filters the original ordered queue:
 
 ```text

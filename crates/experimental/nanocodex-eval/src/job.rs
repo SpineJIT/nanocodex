@@ -246,7 +246,7 @@ fn prepare_parent_directory(path: &Path) -> io::Result<PathBuf> {
     create_durable_directory_all(&absolute)
 }
 
-fn create_durable_directory_all(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn create_durable_directory_all(path: &Path) -> io::Result<PathBuf> {
     create_durable_directory_all_with_sync(path, sync_directory)
 }
 
@@ -349,12 +349,12 @@ fn validate_created_directory(directory: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         format!(

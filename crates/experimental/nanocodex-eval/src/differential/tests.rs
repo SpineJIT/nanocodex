@@ -25,18 +25,20 @@ use super::{
     DifferentialMemoryProfile, DifferentialMemoryProfiles, DifferentialProfile,
     DifferentialReportSummary, DifferentialSweepManifest, DifferentialSweepProfile,
     DifferentialSweepTask, Evaluator, InfrastructureReplacementState, LaneProgressState,
-    NanocodexToolMode, ScheduledComparison, ShellPollingSummary, Task, TrajectoryProjection,
-    build_event_loop_trace, capture_proxy_vm_base_url, cleanup_incomplete_differential_upper_disks,
-    compare_api_exchanges, detected_code_mode_empty_stdin_calls, detected_polling_turn, diff_json,
-    differential_comparison_name, differential_pair_memory_mb, differential_sweep_profiles,
-    event_loop_difference_categories, heartbeat_needed, heartbeat_summary,
-    initial_differential_schedule, inspect_api_exchanges, join_differential_arms,
-    memory_with_slack, newly_completed_lines, next_guest_memory_after_oom,
+    LiveApiArm, NanocodexToolMode, ScheduledComparison, ShellPollingSummary, Task,
+    TrajectoryProjection, build_event_loop_trace, capture_proxy_vm_base_url,
+    cleanup_incomplete_differential_upper_disks, compare_api_exchanges,
+    create_durable_comparison_directory_with_sync, detected_code_mode_empty_stdin_calls,
+    detected_polling_turn, diff_json, differential_comparison_name, differential_pair_memory_mb,
+    differential_sweep_profiles, event_loop_difference_categories, heartbeat_needed,
+    heartbeat_summary, initial_differential_schedule, inspect_api_exchanges,
+    join_differential_arms, memory_with_slack, newly_completed_lines, next_guest_memory_after_oom,
     normalize_retained_arm_tool_calls, read_api_request_payloads,
     read_optional_codex_cloud_config_cache, reanalyze, releasable_differential_arm_memory_mb,
     resume_differential_schedule, retained_differential_summary, run_arm,
     stage_diff_codex_ca_bundle, summarize_nanocodex, task_lane_available,
     validate_differential_profile, validate_differential_profiles, write_json_atomic,
+    write_json_atomic_with_sync,
 };
 
 #[test]
@@ -44,6 +46,36 @@ fn capture_proxy_uses_the_direct_gvproxy_host_route() {
     assert_eq!(
         capture_proxy_vm_base_url(4312),
         "http://192.168.127.254:4312"
+    );
+}
+
+#[test]
+fn differential_completion_syncs_each_published_directory_entry() {
+    let output = tempdir().unwrap();
+    let comparison = output.path().join("comparison");
+    let mut synced = Vec::new();
+    create_durable_comparison_directory_with_sync(output.path(), &comparison, |directory| {
+        synced.push(directory.to_path_buf());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(synced, [output.path()]);
+
+    synced.clear();
+    let report = comparison.join("comparison.json");
+    write_json_atomic_with_sync(
+        &report,
+        &serde_json::json!({"complete": true}),
+        |directory| {
+            synced.push(directory.to_path_buf());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(synced, [comparison]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(report).unwrap()).unwrap(),
+        serde_json::json!({"complete": true})
     );
 }
 
@@ -1014,6 +1046,7 @@ fn codex_progress_waits_for_complete_jsonl_records() {
 #[test]
 fn heartbeat_reports_each_lanes_last_observed_state() {
     let mut lanes = std::collections::BTreeMap::new();
+    assert!(heartbeat_needed(&lanes));
     lanes.insert(
         "nanocodex",
         LaneProgressState {
@@ -1040,6 +1073,70 @@ fn heartbeat_reports_each_lanes_last_observed_state() {
     lanes.get_mut("nanocodex").unwrap().kind = "attempt.completed".to_owned();
     lanes.get_mut("codex").unwrap().kind = "attempt.completed".to_owned();
     assert!(!heartbeat_needed(&lanes));
+}
+
+#[test]
+fn live_api_diff_ignores_stream_churn_until_a_terminal_boundary() {
+    let mut arm = LiveApiArm::default();
+    assert!(arm.observe(
+        "outbound",
+        "generation",
+        Some(7),
+        &serde_json::json!({"type": "response.create", "input": []}),
+    ));
+    for delta in 0..10_000 {
+        assert!(!arm.observe(
+            "inbound",
+            "generation",
+            Some(7),
+            &serde_json::json!({
+                "type": "response.output_text.delta",
+                "delta": delta.to_string(),
+            }),
+        ));
+    }
+    assert!(arm.turns[0].response_events.is_empty());
+    assert!(arm.observe(
+        "inbound",
+        "generation",
+        Some(7),
+        &serde_json::json!({
+            "type": "response.completed",
+            "response": {"id": "response-7", "status": "completed"},
+        }),
+    ));
+    assert!(arm.turns[0].response_events.is_empty());
+}
+
+#[test]
+fn incremental_live_api_normalization_matches_retained_analysis() {
+    let requests = event_loop_fixture("session", "cache", "response");
+    let expected = build_event_loop_trace(&requests);
+    let mut arm = LiveApiArm::default();
+    for request in &requests {
+        assert!(arm.observe(
+            "outbound",
+            request.phase.as_deref().unwrap(),
+            Some(request.request_index),
+            &request.payload,
+        ));
+        for event in &request.response_events {
+            arm.observe(
+                "inbound",
+                request.phase.as_deref().unwrap(),
+                Some(request.request_index),
+                event,
+            );
+        }
+    }
+
+    assert_eq!(arm.turns.len(), expected.turns.len());
+    for (actual, expected) in arm.turns.iter().zip(&expected.turns) {
+        assert_eq!(Some(actual.phase.as_str()), expected["phase"].as_str());
+        assert_eq!(actual.request, expected["request"]);
+        assert_eq!(actual.response.as_ref().unwrap(), &expected["response"]);
+        assert!(actual.response_events.is_empty());
+    }
 }
 
 #[test]
@@ -1129,6 +1226,41 @@ async fn progress_log_retains_interleaved_lanes_in_observation_order() {
     );
     assert_eq!(records[2]["sequence"], 3);
     assert_eq!(records[2]["arm"], "nanocodex");
+}
+
+#[tokio::test]
+async fn progress_log_retains_structured_comparison_identity() {
+    let task =
+        Task::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting"))
+            .unwrap();
+    let temporary = tempdir().unwrap();
+    let path = temporary.path().join("progress.jsonl");
+    let (progress, recorder) = DiffProgress::start(path.clone(), tokio::time::Instant::now())
+        .await
+        .unwrap();
+    progress.emit_comparison_started(
+        &task,
+        DifferentialProfile::new(
+            nanocodex_agent::Thinking::High,
+            NanocodexToolMode::CodeMode,
+            CodexToolMode::CodeModeOnly,
+        ),
+        4,
+        "started",
+    );
+    recorder.finish(progress).await.unwrap();
+
+    let record: serde_json::Value =
+        serde_json::from_str(fs::read_to_string(path).unwrap().trim()).unwrap();
+    assert_eq!(record["coordinate"]["task_name"], task.name());
+    assert_eq!(
+        record["coordinate"]["task_content_digest"],
+        task.content_digest()
+    );
+    assert_eq!(record["coordinate"]["thinking"], "high");
+    assert_eq!(record["coordinate"]["nanocodex_tool_mode"], "code_mode");
+    assert_eq!(record["coordinate"]["codex_tool_mode"], "code_mode_only");
+    assert_eq!(record["coordinate"]["trial"], 4);
 }
 
 #[tokio::test]

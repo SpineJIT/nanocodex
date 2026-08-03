@@ -813,11 +813,11 @@ pub(super) enum EventLoopValueStage {
 }
 
 pub(super) struct EventLoopNormalizeContext<'a> {
-    stage: EventLoopValueStage,
-    first_prompt_cache_key: Option<&'a str>,
-    previous_response_id: Option<&'a str>,
-    previous_call_ids: &'a BTreeSet<String>,
-    replayed_call_ids: &'a BTreeSet<String>,
+    pub(super) stage: EventLoopValueStage,
+    pub(super) first_prompt_cache_key: Option<&'a str>,
+    pub(super) previous_response_id: Option<&'a str>,
+    pub(super) previous_call_ids: &'a BTreeSet<String>,
+    pub(super) replayed_call_ids: &'a BTreeSet<String>,
 }
 
 pub(super) fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {

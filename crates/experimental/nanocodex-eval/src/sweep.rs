@@ -202,11 +202,9 @@ impl Sweep {
         let tasks = &self.tasks;
         let agents = &self.agents;
         let trials = self.trials.get();
-        (1..=trials).flat_map(move |trial| {
-            tasks.iter().flat_map(move |task| {
-                agents
-                    .iter()
-                    .map(move |agent| SweepAttempt { task, agent, trial })
+        tasks.iter().flat_map(move |task| {
+            agents.iter().flat_map(move |agent| {
+                (1..=trials).map(move |trial| SweepAttempt { task, agent, trial })
             })
         })
     }
@@ -476,11 +474,20 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(sweep.attempt_count(), 8);
-        assert_eq!(expanded[0].1, "low");
-        assert_eq!(expanded[0].2, 1);
-        assert_eq!(expanded[1].1, "high");
-        assert_eq!(expanded[2].0, "nanoeval/uppercase-message");
-        assert_eq!(expanded[4].2, 2);
+        assert_eq!(
+            expanded,
+            [
+                ("nanoeval/write-greeting", "low", 1),
+                ("nanoeval/write-greeting", "low", 2),
+                ("nanoeval/write-greeting", "high", 1),
+                ("nanoeval/write-greeting", "high", 2),
+                ("nanoeval/uppercase-message", "low", 1),
+                ("nanoeval/uppercase-message", "low", 2),
+                ("nanoeval/uppercase-message", "high", 1),
+                ("nanoeval/uppercase-message", "high", 2),
+            ]
+            .map(|(task, agent, trial)| (task.to_owned(), agent.to_owned(), trial))
+        );
     }
 
     #[test]

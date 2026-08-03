@@ -43,6 +43,7 @@ use crate::{
     evaluator::{
         AdmissionAttempt, AdmissionController, AdmissionPermit, AttemptAgent, EvalAttempt,
     },
+    job::{create_durable_directory_all, sync_directory},
     project_codex_atif,
     vm::{
         SharedDirectory, VmAttempt, VmAttemptError, VmAttemptMemory, VmAttemptMemorySnapshot,
@@ -2658,18 +2659,15 @@ impl DifferentialComparison {
             trial,
             comparison_id,
         ));
-        fs::create_dir(&comparison_directory).wrap_err_with(|| {
-            format!(
-                "failed to create comparison directory {}",
-                comparison_directory.display()
-            )
-        })?;
+        create_durable_comparison_directory(&output, &comparison_directory)?;
         let progress_path = comparison_directory.join(PROGRESS_FILE);
         let (progress, progress_recorder) =
             DiffProgress::start(progress_path.clone(), started).await?;
-        progress.emit(
-            "runner",
-            "comparison.started",
+        let profile = DifferentialProfile::new(thinking, nanocodex_tool_mode, codex_tool_mode);
+        progress.emit_comparison_started(
+            &task,
+            profile,
+            trial,
             format!(
                 "{} · {MODEL} / {thinking} · nanocodex {} · stock {}",
                 task.name(),
@@ -4581,11 +4579,38 @@ fn append_unpaired_tail_summary(output: &mut String, comparison: &ApiEventLoopCo
 }
 
 fn prepare_output_parent(output: &Path) -> InternalResult<PathBuf> {
-    fs::create_dir_all(output)
-        .wrap_err_with(|| format!("failed to create output directory {}", output.display()))?;
-    output
-        .canonicalize()
-        .wrap_err_with(|| format!("failed to resolve output directory {}", output.display()))
+    create_durable_directory_all(output).wrap_err_with(|| {
+        format!(
+            "failed to durably create output directory {}",
+            output.display()
+        )
+    })
+}
+
+fn create_durable_comparison_directory(output: &Path, directory: &Path) -> InternalResult<()> {
+    create_durable_comparison_directory_with_sync(output, directory, sync_directory)
+}
+
+fn create_durable_comparison_directory_with_sync<F>(
+    output: &Path,
+    directory: &Path,
+    mut sync: F,
+) -> InternalResult<()>
+where
+    F: FnMut(&Path) -> io::Result<()>,
+{
+    fs::create_dir(directory).wrap_err_with(|| {
+        format!(
+            "failed to create comparison directory {}",
+            directory.display()
+        )
+    })?;
+    sync(output).wrap_err_with(|| {
+        format!(
+            "failed to durably publish comparison directory {}",
+            directory.display()
+        )
+    })
 }
 
 fn outcome_directory(outcome: &EvalAttemptOutcome) -> &Path {
@@ -4649,6 +4674,17 @@ fn file_sha256(path: &Path) -> InternalResult<String> {
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> InternalResult<()> {
+    write_json_atomic_with_sync(path, value, sync_directory)
+}
+
+fn write_json_atomic_with_sync<F>(
+    path: &Path,
+    value: &impl Serialize,
+    mut sync: F,
+) -> InternalResult<()>
+where
+    F: FnMut(&Path) -> io::Result<()>,
+{
     let parent = path
         .parent()
         .ok_or_else(|| diff_error!("comparison path has no parent: {}", path.display()))?;
@@ -4661,6 +4697,7 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> InternalResult<()> 
         .persist(path)
         .map_err(|error| error.error)
         .wrap_err_with(|| format!("failed to publish {}", path.display()))?;
+    sync(parent).wrap_err_with(|| format!("failed to durably publish {}", path.display()))?;
     Ok(())
 }
 
