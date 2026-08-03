@@ -23,8 +23,9 @@ Each `nanocodex` actor owns one conversation:
 - the AgentOS root filesystem is chunked into the same actor-owned SQLite
   storage and restored automatically across VM sleep/wake cycles;
 - `sandbox_exec`, `sandbox_read_file`, `sandbox_write_file`,
-  `sandbox_list_files`, and `sandbox_preview` expose bounded AgentOS operations
-  to Nanocodex without putting model credentials in the guest;
+  `sandbox_list_files`, `sandbox_start_process`, and `sandbox_preview` expose
+  bounded AgentOS operations to Nanocodex without putting model credentials in
+  the guest;
 - a completed turn is transactionally committed before its action returns or
   broadcasts `turnCompleted`;
 - duplicate turn IDs share one in-flight promise or replay the stored terminal
@@ -131,9 +132,10 @@ a deployment without embedding it in source by adding
 `?endpoint=https%3A%2F%2F...` to the page URL.
 
 The smoke also forces the real model to write, execute, and read through
-AgentOS and requires completed Nanocodex `tool.call`/`tool.result` event pairs,
-so it verifies the WASM tool loop and isolated VM rather than only a text
-response.
+AgentOS, starts a native Python HTTP server, creates a signed preview, and
+fetches that preview from outside Rivet. It requires completed Nanocodex
+`tool.call`/`tool.result` event pairs, so it verifies the WASM tool loop,
+isolated VM, and public proxy rather than only a text response.
 
 The stress driver reuses persistent actor connections and bounds fan-out to
 avoid benchmarking the gateway's per-route rate limiter. Tune
@@ -252,11 +254,15 @@ npm run smoke --prefix examples/rivet-actors
 npm run repl --prefix examples/rivet-actors
 ```
 
-Set `NANOCODEX_PUBLIC_URL` on the deployment to the browser-safe base endpoint
-when you want `sandbox_preview` to return an absolute URL; otherwise it returns
-the actor-relative `/fetch/<token>` path. Preview tokens survive actor sleep,
-while the server process itself must be restarted after wake. Workspace files
-survive automatically.
+Set `NANOCODEX_PUBLIC_URL` before running the subscription deployment helper to
+the client-safe Rivet endpoint from the namespace's **Connect** page (the
+`https://namespace:pk_...@api.rivet.dev` form). `sandbox_preview` converts that
+to an actor-specific gateway URL with `rvt-namespace` and `rvt-token` query
+parameters, which browsers and `fetch` can open. Without it, the tool returns
+the actor-relative `/fetch/<token>` path. This is Rivet AgentOS's equivalent of
+Vercel Sandbox's `domain(port)`: it creates a temporary signed proxy to that
+port. Preview tokens and workspace files survive actor sleep, while a server
+process must be restarted if the VM is woken without it.
 
 The browser bundle is static and can be published on any static host after
 `npm run build:web --prefix examples/rivet-actors`; paste the same public

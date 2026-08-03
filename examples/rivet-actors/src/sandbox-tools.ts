@@ -8,7 +8,7 @@ import type { ToolMap } from "nanocodex";
 const WORKSPACE = "/workspace";
 const MAX_COMMAND_CHARS = 32 * 1024;
 const MAX_FILE_BYTES = 1024 * 1024;
-const MAX_OUTPUT_CHARS = 128 * 1024;
+const MAX_OUTPUT_BYTES = 128 * 1024;
 const MAX_LIST_ENTRIES = 512;
 const MAX_TIMEOUT_MS = 120_000;
 
@@ -36,10 +36,30 @@ const agentOsActions = createAgentOsActions(
 );
 
 export type AgentOsActionContext = Parameters<typeof agentOsActions.exec>[0];
+type SandboxAgentOsActions = Pick<
+  typeof agentOsActions,
+  | "createPreviewUrl"
+  | "exec"
+  | "killProcess"
+  | "mkdir"
+  | "readFile"
+  | "readdirEntries"
+  | "spawn"
+  | "vmFetch"
+  | "writeFile"
+>;
 
 export function rivetSandboxTools(
   context: AgentOsActionContext,
   sessionId: string,
+): ToolMap {
+  void sessionId;
+  return createRivetSandboxTools(context);
+}
+
+export function createRivetSandboxTools(
+  context: AgentOsActionContext,
+  actions: SandboxAgentOsActions = agentOsActions,
 ): ToolMap {
   return {
     sandbox_exec: {
@@ -59,7 +79,7 @@ export function rivetSandboxTools(
         const command = requiredString(value.command, "command", MAX_COMMAND_CHARS);
         const cwd = workspacePath(optionalString(value.cwd, "cwd") ?? ".");
         const timeout = optionalInteger(value.timeout_ms, "timeout_ms", 1, MAX_TIMEOUT_MS) ?? 60_000;
-        const result = await agentOsActions.exec(context, command, {
+        const result = await actions.exec(context, command, {
           cwd,
           timeout,
           captureStdio: true,
@@ -81,9 +101,66 @@ export function rivetSandboxTools(
       parameters: pathParameters(),
       handler: async (input) => {
         const path = workspacePath(requiredString(objectInput(input).path, "path", 1024));
-        const content = await agentOsActions.readFile(context, path);
+        const content = await actions.readFile(context, path);
         if (content.byteLength > MAX_FILE_BYTES) throw new Error("file exceeds 1 MiB");
-        return { path, content: new TextDecoder().decode(content) };
+        let text: string;
+        try {
+          text = new TextDecoder("utf-8", { fatal: true }).decode(content);
+        } catch {
+          throw new Error("file is not valid UTF-8");
+        }
+        return { path, content: text };
+      },
+    },
+    sandbox_start_process: {
+      description: "Start a native executable in this actor's isolated Rivet AgentOS VM, optionally waiting for an HTTP port to become ready.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Executable to start, such as python3 or node." },
+          args: {
+            type: "array",
+            items: { type: "string" },
+            description: "Arguments passed directly to the executable, without a shell.",
+          },
+          cwd: { type: "string", description: "Workspace-relative working directory." },
+          ready_port: { type: "integer", minimum: 1024, maximum: 65_535 },
+          ready_timeout_ms: { type: "integer", minimum: 1, maximum: MAX_TIMEOUT_MS },
+        },
+        required: ["command"],
+        additionalProperties: false,
+      },
+      handler: async (input) => {
+        const value = objectInput(input);
+        const command = requiredString(value.command, "command", MAX_COMMAND_CHARS);
+        const args = optionalStringArray(value.args, "args", 128, 8_192) ?? [];
+        const cwd = workspacePath(optionalString(value.cwd, "cwd") ?? ".");
+        const readyPort = optionalInteger(value.ready_port, "ready_port", 1024, 65_535);
+        const readyTimeout = optionalInteger(
+          value.ready_timeout_ms,
+          "ready_timeout_ms",
+          1,
+          MAX_TIMEOUT_MS,
+        ) ?? 30_000;
+        const process = await actions.spawn(context, command, args, {
+          cwd,
+          output: { retainEvents: true },
+        });
+        try {
+          if (readyPort !== undefined) {
+            await waitForPort(actions, context, readyPort, readyTimeout);
+          }
+        } catch (error) {
+          await actions.killProcess(context, process.pid).catch(() => {});
+          throw error;
+        }
+        return {
+          process_id: process.pid,
+          command,
+          args,
+          status: "running",
+          ...(readyPort === undefined ? {} : { ready_port: readyPort }),
+        };
       },
     },
     sandbox_write_file: {
@@ -100,12 +177,12 @@ export function rivetSandboxTools(
       handler: async (input) => {
         const value = objectInput(input);
         const path = workspacePath(requiredString(value.path, "path", 1024));
-        const content = requiredString(value.content, "content", MAX_FILE_BYTES);
+        const content = requiredContent(value.content);
         const bytes = Buffer.byteLength(content, "utf8");
         if (bytes > MAX_FILE_BYTES) throw new Error("content exceeds 1 MiB");
         const parent = path.slice(0, path.lastIndexOf("/")) || WORKSPACE;
-        await agentOsActions.mkdir(context, parent, { recursive: true });
-        await agentOsActions.writeFile(context, path, content);
+        await actions.mkdir(context, parent, { recursive: true });
+        await actions.writeFile(context, path, content);
         return { path, bytes_written: bytes };
       },
     },
@@ -120,7 +197,7 @@ export function rivetSandboxTools(
       },
       handler: async (input) => {
         const path = workspacePath(optionalString(objectInput(input).path, "path") ?? ".");
-        const entries = await agentOsActions.readdirEntries(context, path);
+        const entries = await actions.readdirEntries(context, path);
         return {
           path,
           entries: entries.slice(0, MAX_LIST_ENTRIES).map((entry) => ({
@@ -146,18 +223,39 @@ export function rivetSandboxTools(
         const value = objectInput(input);
         const port = requiredInteger(value.port, "port", 1024, 65_535);
         const ttl = optionalInteger(value.ttl_seconds, "ttl_seconds", 60, 3_600) ?? 15 * 60;
-        const preview = await agentOsActions.createPreviewUrl(context, port, ttl);
-        const publicUrl = process.env.NANOCODEX_PUBLIC_URL?.replace(/\/$/, "");
+        const preview = await actions.createPreviewUrl(context, port, ttl);
+        const url = publicPreviewUrl(context, preview.path);
         return {
           port,
           path: preview.path,
-          url: publicUrl ? `${publicUrl}${preview.path}` : preview.path,
+          url,
           expires_at: new Date(preview.expiresAt).toISOString(),
           persistent: false,
         };
       },
     },
   };
+}
+
+function publicPreviewUrl(context: AgentOsActionContext, path: string): string {
+  const configured = process.env.NANOCODEX_PUBLIC_URL?.trim();
+  if (!configured) return path;
+  const url = new URL(configured);
+  const namespace = decodeURIComponent(url.username);
+  const token = decodeURIComponent(url.password);
+  url.username = "";
+  url.password = "";
+  if (namespace || token) {
+    if (!namespace || !token.startsWith("pk_")) {
+      throw new Error("NANOCODEX_PUBLIC_URL must contain a namespace and client-safe pk_ token");
+    }
+    url.pathname = `${url.pathname.replace(/\/$/, "")}/gateway/${encodeURIComponent(context.actorId)}/request${path}`;
+    url.searchParams.set("rvt-namespace", namespace);
+    url.searchParams.set("rvt-token", token);
+    return url.toString();
+  }
+  url.pathname = `${url.pathname.replace(/\/$/, "")}${path}`;
+  return url.toString();
 }
 
 export function workspacePath(raw: string): string {
@@ -182,9 +280,36 @@ function requiredString(value: unknown, name: string, maxChars: number): string 
   return value;
 }
 
+function requiredContent(value: unknown): string {
+  if (typeof value !== "string") throw new Error("content must be a string");
+  if (value.length > MAX_FILE_BYTES) throw new Error("content exceeds 1 MiB");
+  return value;
+}
+
 function optionalString(value: unknown, name: string): string | undefined {
   if (value === undefined) return undefined;
   return requiredString(value, name, 1024);
+}
+
+function optionalStringArray(
+  value: unknown,
+  name: string,
+  maxItems: number,
+  maxChars: number,
+): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > maxItems) {
+    throw new Error(`${name} must be an array with at most ${maxItems} strings`);
+  }
+  const parsed = value.map((item) => {
+    if (typeof item !== "string") throw new Error(`${name} must contain only strings`);
+    if (item.length > maxChars) throw new Error(`${name} contains an argument that is too long`);
+    return item;
+  });
+  if (parsed.reduce((total, item) => total + item.length, 0) > MAX_COMMAND_CHARS) {
+    throw new Error(`${name} is too long`);
+  }
+  return parsed;
 }
 
 function requiredInteger(value: unknown, name: string, minimum: number, maximum: number): number {
@@ -215,8 +340,37 @@ function pathParameters(): Record<string, unknown> {
   };
 }
 
+async function waitForPort(
+  actions: Pick<SandboxAgentOsActions, "vmFetch">,
+  context: AgentOsActionContext,
+  port: number,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      await actions.vmFetch(context, port, "http://127.0.0.1/");
+      return;
+    } catch {
+      if (Date.now() >= deadline) throw new Error(`port ${port} did not become ready`);
+      await new Promise((resolve) => setTimeout(resolve, Math.min(100, deadline - Date.now())));
+    }
+  }
+}
+
 function truncate(value: string): { text: string; truncated: boolean } {
-  return value.length <= MAX_OUTPUT_CHARS
-    ? { text: value, truncated: false }
-    : { text: value.slice(0, MAX_OUTPUT_CHARS), truncated: true };
+  const encoded = new TextEncoder().encode(value);
+  if (encoded.byteLength <= MAX_OUTPUT_BYTES) return { text: value, truncated: false };
+  let end = MAX_OUTPUT_BYTES;
+  while (end > 0) {
+    try {
+      return {
+        text: new TextDecoder("utf-8", { fatal: true }).decode(encoded.subarray(0, end)),
+        truncated: true,
+      };
+    } catch {
+      end -= 1;
+    }
+  }
+  return { text: "", truncated: true };
 }

@@ -25,6 +25,8 @@ const environment = [
   `CHATGPT_ACCOUNT_ID=${auth.accountId}`,
   `CHATGPT_FEDRAMP=${String(auth.fedramp)}`,
 ];
+const publicUrl = process.env.NANOCODEX_PUBLIC_URL?.trim();
+if (publicUrl) environment.push(`NANOCODEX_PUBLIC_URL=${publicUrl}`);
 const refreshToken = process.env.CHATGPT_REFRESH_TOKEN?.trim();
 if (refreshToken) environment.push(`CHATGPT_REFRESH_TOKEN=${refreshToken}`);
 

@@ -12,14 +12,29 @@ const events = session.connect();
 let eventCount = 0;
 const sandboxToolCalls = new Map<string, string>();
 const sandboxToolsCompleted = new Set<string>();
+let previewPath: string | undefined;
+let sandboxProcessId: number | undefined;
 events.on("agentEvent", (event) => {
   eventCount += 1;
+  if (process.env.NANOCODEX_SMOKE_TRACE === "1"
+    && (event.type === "tool.call" || event.type === "tool.result")) {
+    console.error(JSON.stringify({ type: event.type, payload: event.payload }));
+  }
   if (event.type === "tool.call" && typeof event.payload.tool === "string") {
     sandboxToolCalls.set(String(event.payload.call_id), event.payload.tool);
   }
   if (event.type === "tool.result" && event.payload.status === "completed") {
     const tool = sandboxToolCalls.get(String(event.payload.call_id));
-    if (tool) sandboxToolsCompleted.add(tool);
+    if (tool) {
+      sandboxToolsCompleted.add(tool);
+      const result = parseToolResult(event.payload.result);
+      if (tool === "sandbox_preview" && typeof result?.url === "string") {
+        previewPath = result.url;
+      }
+      if (tool === "sandbox_start_process" && typeof result?.process_id === "number") {
+        sandboxProcessId = result.process_id;
+      }
+    }
   }
 });
 await events.ready;
@@ -55,12 +70,25 @@ try {
   }
   const toolTurn = await session.turn({
     id: randomUUID(),
-    input: "Use sandbox_write_file to write SANDBOX_OK to probe.txt, use sandbox_exec to run cat on it, and verify it with sandbox_read_file. Then reply with exactly SANDBOX_OK.",
+    input: "Use sandbox_write_file to write exactly RIVET_SANDBOX_OK to index.html. Verify it with sandbox_exec and sandbox_read_file. Call sandbox_start_process with command `python3`, args [`-m`, `http.server`, `3000`, `--bind`, `0.0.0.0`, `--directory`, `/workspace`], and ready_port 3000. After it reports the port ready, call sandbox_preview for port 3000. Reply with only the preview URL.",
   });
-  const requiredTools = ["sandbox_write_file", "sandbox_exec", "sandbox_read_file"];
-  if (toolTurn.final_message.trim() !== "SANDBOX_OK"
-    || requiredTools.some((tool) => !sandboxToolsCompleted.has(tool))) {
+  const requiredTools = [
+    "sandbox_write_file",
+    "sandbox_exec",
+    "sandbox_read_file",
+    "sandbox_start_process",
+    "sandbox_preview",
+  ];
+  if (requiredTools.some((tool) => !sandboxToolsCompleted.has(tool)) || !previewPath) {
     throw new Error(`sandbox tool proof failed: ${toolTurn.final_message}`);
+  }
+  const previewUrl = previewPath.startsWith("http://") || previewPath.startsWith("https://")
+    ? previewPath
+    : appendGatewayPath(await session.getGatewayUrl(), previewPath);
+  const previewResponse = await fetch(previewUrl, { signal: AbortSignal.timeout(15_000) });
+  const previewBody = await previewResponse.text();
+  if (!previewResponse.ok || previewBody.trim() !== "RIVET_SANDBOX_OK") {
+    throw new Error(`preview fetch failed (${previewResponse.status}): ${previewBody.slice(0, 256)}`);
   }
   const status = await session.status();
   console.log(JSON.stringify({
@@ -69,11 +97,33 @@ try {
     completed_turns: status.completed_turns,
     elapsed_ms: Math.round(performance.now() - started),
     events: eventCount,
+    preview_url: previewUrl,
     tool_calls: requiredTools,
     restored: status.has_snapshot,
     status: "ok",
   }));
 } finally {
   await events.dispose();
+  if (sandboxProcessId !== undefined) {
+    await session.process.kill(sandboxProcessId).catch(() => {});
+  }
   await session.reset();
+}
+
+function parseToolResult(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== "string") return undefined;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function appendGatewayPath(gatewayUrl: string, path: string): string {
+  const url = new URL(gatewayUrl);
+  url.pathname = `${url.pathname.replace(/\/$/, "")}/request/${path.replace(/^\//, "")}`;
+  return url.toString();
 }
