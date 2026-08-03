@@ -181,8 +181,9 @@ function parseDirectoryCoordinate(directoryName, sweep) {
   const parts = directoryName.split("__");
   if (parts.length < 6) return null;
   const [shortName, thinking, nanocodexPart, codexPart, trialPart] = parts;
-  const task = sweep.tasks.find((candidate) => shortTaskName(candidate.name) === shortName);
-  if (!task) return null;
+  const tasks = sweep.tasks.filter((candidate) => shortTaskName(candidate.name) === shortName);
+  if (tasks.length !== 1) return null;
+  const [task] = tasks;
   const nanocodexToolMode = nanocodexPart.replace(/^nanocodex_/, "");
   const codexToolMode = codexPart.replace(/^codex_/, "");
   const trial = Number.parseInt(trialPart, 10);
@@ -190,6 +191,46 @@ function parseDirectoryCoordinate(directoryName, sweep) {
   return {
     taskName: task.name,
     taskDigest: task.contentDigest,
+    thinking,
+    nanocodexToolMode,
+    codexToolMode,
+    profile: profileKey(thinking, nanocodexToolMode, codexToolMode),
+    trial,
+  };
+}
+
+function parseProgressCoordinate(raw, sweep) {
+  const coordinate = asObject(raw);
+  const taskName = text(coordinate.task_name);
+  const taskDigest = text(coordinate.task_content_digest);
+  const thinking = text(coordinate.thinking);
+  const nanocodexToolMode = text(coordinate.nanocodex_tool_mode);
+  const codexToolMode = text(coordinate.codex_tool_mode);
+  const trial = number(coordinate.trial);
+  if (
+    !taskName ||
+    !taskDigest ||
+    !thinking ||
+    !nanocodexToolMode ||
+    !codexToolMode ||
+    !Number.isSafeInteger(trial) ||
+    trial < 1
+  ) {
+    return null;
+  }
+  const task = sweep.tasks.find(
+    (candidate) => candidate.name === taskName && candidate.contentDigest === taskDigest,
+  );
+  const profile = sweep.profiles.find(
+    (candidate) =>
+      candidate.thinking === thinking &&
+      candidate.nanocodexToolMode === nanocodexToolMode &&
+      candidate.codexToolMode === codexToolMode,
+  );
+  if (!task || !profile) return null;
+  return {
+    taskName,
+    taskDigest,
     thinking,
     nanocodexToolMode,
     codexToolMode,
@@ -206,30 +247,94 @@ function parseProgress(raw) {
     arm: text(raw.arm) ?? "runner",
     kind: text(raw.kind) ?? "unknown",
     summary: text(raw.summary),
+    coordinate: Object.keys(asObject(raw.coordinate)).length ? asObject(raw.coordinate) : null,
   };
 }
 
-async function readProgress(progressPath) {
-  let contents;
+async function readProgress(progressPath, previous) {
+  let input;
   try {
-    contents = await fs.readFile(progressPath, "utf8");
+    input = await fs.open(progressPath, "r");
   } catch (error) {
     if (error?.code === "ENOENT") return null;
     throw error;
   }
-  const latestByArm = {};
-  let latest = null;
-  for (const line of contents.split("\n")) {
-    if (!line) continue;
-    try {
-      const progress = parseProgress(JSON.parse(line));
-      if (!latest || progress.observedMs >= latest.observedMs) latest = progress;
-      if (["nanocodex", "codex"].includes(progress.arm)) latestByArm[progress.arm] = progress;
-    } catch {
-      // The writer may be in the middle of appending the final line.
+  try {
+    const stat = await input.stat();
+    const reusable =
+      previous &&
+      previous.dev === stat.dev &&
+      previous.ino === stat.ino &&
+      previous.offset <= stat.size;
+    const cache = reusable
+      ? previous
+      : {
+          dev: stat.dev,
+          ino: stat.ino,
+          offset: 0,
+          trailing: Buffer.alloc(0),
+          latest: null,
+          latestByArm: {},
+          coordinate: null,
+        };
+    const chunks = [cache.trailing];
+    let position = cache.offset;
+    while (position < stat.size) {
+      const buffer = Buffer.allocUnsafe(Math.min(1024 * 1024, stat.size - position));
+      const { bytesRead } = await input.read(buffer, 0, buffer.length, position);
+      if (!bytesRead) break;
+      chunks.push(buffer.subarray(0, bytesRead));
+      position += bytesRead;
     }
+    const pending = Buffer.concat(chunks);
+    let lineStart = 0;
+    for (let newline = pending.indexOf(0x0a); newline !== -1; newline = pending.indexOf(0x0a, lineStart)) {
+      const line = pending.subarray(lineStart, newline);
+      lineStart = newline + 1;
+      if (!line.length) continue;
+      try {
+        const progress = parseProgress(JSON.parse(line.toString("utf8")));
+        if (!cache.latest || progress.observedMs >= cache.latest.observedMs) cache.latest = progress;
+        if (["nanocodex", "codex"].includes(progress.arm)) {
+          cache.latestByArm[progress.arm] = progress;
+        }
+        if (progress.coordinate && !cache.coordinate) cache.coordinate = progress.coordinate;
+      } catch {
+        // Ignore one malformed complete record without discarding later evidence.
+      }
+    }
+    cache.trailing = pending.subarray(lineStart);
+    cache.offset = position;
+    cache.size = stat.size;
+    cache.mtimeMs = stat.mtimeMs;
+    return cache.latest
+      ? {
+          progress: {
+            latest: cache.latest,
+            latestByArm: cache.latestByArm,
+            coordinate: cache.coordinate,
+          },
+          cache,
+        }
+      : { progress: null, cache };
+  } finally {
+    await input.close();
   }
-  return latest ? { latest, latestByArm } : null;
+}
+
+async function progressFileUnchanged(progressPath, marker) {
+  try {
+    const stat = await fs.stat(progressPath);
+    return (
+      marker.dev === stat.dev &&
+      marker.ino === stat.ino &&
+      marker.size === stat.size &&
+      marker.mtimeMs === stat.mtimeMs
+    );
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 async function containsOverlay(directory) {
@@ -639,7 +744,8 @@ export class LiveEvalStore {
     this.staleAfterMs = staleAfterMs;
     this.reportCache = new Map();
     this.detailIndex = new Map();
-    this.tombstones = new Set();
+    this.progressCache = new Map();
+    this.tombstones = new Map();
     this.cpuSample = null;
     this.sequence = 0;
   }
@@ -745,6 +851,8 @@ export class LiveEvalStore {
     const nowMs = Date.now();
     const catalog = new Map();
     const evidence = new Map();
+    const seenDirectories = new Set();
+    const seenProgress = new Set();
 
     for (const sweep of this.sweeps) {
       for (const task of sweep.tasks) {
@@ -775,6 +883,7 @@ export class LiveEvalStore {
       for (const entry of await fs.readdir(sweep.root, { withFileTypes: true })) {
         if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
         const directory = path.join(sweep.root, entry.name);
+        seenDirectories.add(directory);
         const reportPath = path.join(directory, REPORT);
         let report = this.reportCache.get(reportPath);
         if (!report) {
@@ -787,24 +896,47 @@ export class LiveEvalStore {
           }
         }
         if (report) {
+          this.tombstones.delete(directory);
+          this.progressCache.delete(path.join(directory, PROGRESS));
           const key = coordinateKey(report.taskName, report.profile);
           evidence.get(key)?.reports.push(report);
           continue;
         }
-        if (this.tombstones.has(directory)) continue;
-        const coordinate = parseDirectoryCoordinate(entry.name, sweep);
-        if (!coordinate) continue;
-        const progress = await readProgress(path.join(directory, PROGRESS));
+        const progressPath = path.join(directory, PROGRESS);
+        seenProgress.add(progressPath);
+        const tombstone = this.tombstones.get(directory);
+        if (tombstone && (await progressFileUnchanged(progressPath, tombstone))) continue;
+        this.tombstones.delete(directory);
+        const read = await readProgress(progressPath, this.progressCache.get(progressPath));
+        if (!read) continue;
+        this.progressCache.set(progressPath, read.cache);
+        const progress = read.progress;
         if (!progress) continue;
+        const coordinate = progress.coordinate
+          ? parseProgressCoordinate(progress.coordinate, sweep)
+          : parseDirectoryCoordinate(entry.name, sweep);
+        if (!coordinate) continue;
         const ageMs = Math.max(0, nowMs - progress.latest.observedMs);
         const stale = ageMs > this.staleAfterMs;
         if (stale && !(await containsOverlay(directory))) {
-          this.tombstones.add(directory);
+          this.tombstones.set(directory, {
+            dev: read.cache.dev,
+            ino: read.cache.ino,
+            size: read.cache.size,
+            mtimeMs: read.cache.mtimeMs,
+          });
           continue;
         }
         const key = coordinateKey(coordinate.taskName, coordinate.profile);
         evidence.get(key)?.active.push({ ...coordinate, directory, progress, stale, ageMs });
       }
+    }
+
+    for (const progressPath of this.progressCache.keys()) {
+      if (!seenProgress.has(progressPath)) this.progressCache.delete(progressPath);
+    }
+    for (const directory of this.tombstones.keys()) {
+      if (!seenDirectories.has(directory)) this.tombstones.delete(directory);
     }
 
     const matrix = buildRows(catalog, evidence, nowMs);

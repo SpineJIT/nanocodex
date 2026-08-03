@@ -89,9 +89,12 @@ server does not provide arbitrary file or workspace access and does not serve
 raw prompts, reasoning, or tool transcripts. Host health is serialized only as
 normalized utilization percentages; exact CPU count, memory, swap, disk size,
 scheduler limits, host paths, network addresses, tailnet names, and credential
-shapes are excluded or redacted. Completed reports are cached in
-memory; only live progress files are reread, so watching the dashboard does not
-interfere with VM disk cleanup or shared image/runtime caches.
+shapes are excluded or redacted. Completed reports are cached in memory. Live
+progress files are followed from their last parsed byte, reportless tombstones
+are reconsidered when new evidence arrives, and structured progress coordinates
+keep tasks with the same short name distinct. Watching the dashboard therefore
+does not repeatedly parse full logs or interfere with VM disk cleanup and shared
+image/runtime caches.
 
 For tailnet-only access from the eval host, keep both processes bound to
 loopback and proxy the Vite port with Tailscale Serve. Inspect the host's

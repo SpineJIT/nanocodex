@@ -232,3 +232,100 @@ test("discovers split sweeps and folds replacement evidence into stable cells", 
     /logicalCpus|totalBytes|availableBytes|swapTotalBytes|diskTotalBytes|load1/,
   );
 });
+
+test("reconsiders a stale startup tombstone when append-only evidence resumes", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "nanocodex-live-evals-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const sweep = await makeSweep(temporary, "recovering");
+  const attempt = path.join(
+    sweep.root,
+    "recovering__high__nanocodex_code_mode__codex_code_mode__001__active",
+  );
+  await fs.mkdir(attempt);
+  const progressPath = path.join(attempt, "progress.jsonl");
+  await fs.writeFile(
+    progressPath,
+    `${JSON.stringify({
+      observed_at: new Date(Date.now() - 60_000).toISOString(),
+      elapsed_ms: 1_000,
+      arm: "runner",
+      kind: "comparison.started",
+    })}\n`,
+  );
+  const [discovered] = await discoverSweeps([sweep.root]);
+  const canonicalAttempt = path.join(discovered.root, path.basename(attempt));
+  const canonicalProgressPath = path.join(canonicalAttempt, "progress.jsonl");
+  const store = new LiveEvalStore([discovered], { staleAfterMs: 30_000 });
+
+  const stale = await store.snapshot();
+  assert.equal(stale.rows[0].cells[0].state, "queued");
+  assert.equal(store.tombstones.has(canonicalAttempt), true);
+  const cached = store.progressCache.get(canonicalProgressPath);
+
+  await fs.writeFile(path.join(attempt, "rootfs.upper.ext4"), "fixture");
+  await fs.appendFile(
+    progressPath,
+    `${JSON.stringify({
+      observed_at: new Date().toISOString(),
+      elapsed_ms: 61_000,
+      arm: "nanocodex",
+      kind: "attempt.started",
+    })}\n`,
+  );
+  const resumed = await store.snapshot();
+
+  assert.equal(resumed.rows[0].cells[0].state, "running");
+  assert.equal(store.tombstones.has(canonicalAttempt), false);
+  assert.equal(store.progressCache.get(canonicalProgressPath), cached);
+  assert.equal(
+    store.progressCache.get(canonicalProgressPath).offset,
+    (await fs.stat(progressPath)).size,
+  );
+});
+
+test("structured progress identity distinguishes tasks with the same short name", async (context) => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "nanocodex-live-evals-"));
+  context.after(() => fs.rm(temporary, { recursive: true, force: true }));
+  const root = path.join(temporary, "colliding");
+  await fs.mkdir(root);
+  await writeJson(path.join(root, "differential-sweep.json"), {
+    trials: 1,
+    tasks: [
+      { name: "suite-a/install", content_digest: "digest-a" },
+      { name: "suite-b/install", content_digest: "digest-b" },
+    ],
+    profiles: [profile],
+  });
+  const attempt = path.join(
+    root,
+    "install__high__nanocodex_code_mode__codex_code_mode__001__active",
+  );
+  await fs.mkdir(attempt);
+  await fs.writeFile(path.join(attempt, "rootfs.upper.ext4"), "fixture");
+  await fs.writeFile(
+    path.join(attempt, "progress.jsonl"),
+    `${JSON.stringify({
+      observed_at: new Date().toISOString(),
+      elapsed_ms: 5_000,
+      arm: "runner",
+      kind: "comparison.started",
+      coordinate: {
+        task_name: "suite-b/install",
+        task_content_digest: "digest-b",
+        thinking: "high",
+        nanocodex_tool_mode: "code_mode",
+        codex_tool_mode: "code_mode",
+        trial: 1,
+      },
+    })}\n`,
+  );
+
+  const snapshot = await new LiveEvalStore(await discoverSweeps([root])).snapshot();
+  const states = Object.fromEntries(
+    snapshot.rows.map((row) => [row.taskName, row.cells[0].state]),
+  );
+  assert.deepEqual(states, {
+    "suite-a/install": "queued",
+    "suite-b/install": "running",
+  });
+});
