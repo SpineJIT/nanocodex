@@ -29,8 +29,9 @@ use super::{
     VmToolClient,
     protocol::{
         CancelRequest, ControlResponse, CreateDirectoryRequest, ExecuteRequest, ExecuteResponse,
-        ReadFileRequest, ReadFileResponse, ReadyRequest, SessionRequest, SessionResponse,
-        ShutdownRequest, ToolRequest, WireToolContext, WireToolInput, WriteFileRequest,
+        MemoryRequest, MemoryResponse, ReadFileRequest, ReadFileResponse, ReadyRequest,
+        SessionRequest, SessionResponse, ShutdownRequest, TerminateToolProcessesRequest,
+        ToolRequest, WireToolContext, WireToolInput, WriteFileRequest,
     },
 };
 
@@ -43,6 +44,10 @@ const MAX_HOST_IN_FLIGHT_REQUESTS: usize = MAX_GUEST_IN_FLIGHT_REQUESTS - 1;
 const REQUEST_QUEUE_CAPACITY: usize = MAX_GUEST_IN_FLIGHT_REQUESTS;
 const MAX_TERMINAL_STDERR_BYTES: usize = 64 * 1024;
 const TERMINAL_STDERR_DRAIN_GRACE: Duration = Duration::from_millis(250);
+const MEMORY_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "linux")]
+const HOST_MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+const KIB_PER_MIB: u64 = 1024;
 
 /// One trusted host-control command executed inside the guest.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,6 +58,8 @@ pub struct VmCommand {
     environment: Vec<(String, String)>,
     timeout: Duration,
     max_output_bytes: usize,
+    stdout_mirror: Option<String>,
+    stderr_mirror: Option<String>,
 }
 
 impl VmCommand {
@@ -67,6 +74,8 @@ impl VmCommand {
             environment: Vec::new(),
             timeout: Duration::from_mins(1),
             max_output_bytes: DEFAULT_COMMAND_OUTPUT_BYTES,
+            stdout_mirror: None,
+            stderr_mirror: None,
         }
     }
 
@@ -104,6 +113,19 @@ impl VmCommand {
         self.max_output_bytes = max_output_bytes;
         self
     }
+
+    /// Mirrors output into harness-owned guest files while retaining the same
+    /// bounded terminal output.
+    ///
+    /// The files are truncated before the process starts and updated as bytes
+    /// arrive, so another session request can observe long-running command
+    /// progress without weakening terminal output or timeout semantics.
+    #[must_use]
+    pub fn mirror_output(mut self, stdout: impl Into<String>, stderr: impl Into<String>) -> Self {
+        self.stdout_mirror = Some(stdout.into());
+        self.stderr_mirror = Some(stderr.into());
+        self
+    }
 }
 
 /// Complete output from one trusted host-control command in the guest.
@@ -124,6 +146,48 @@ pub struct VmCommandPartialOutput {
     pub stdout: Vec<u8>,
     /// Standard error captured before the command stopped.
     pub stderr: Vec<u8>,
+}
+
+/// Peak host and guest memory observed over one VM session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VmMemoryObservation {
+    host_peak_rss_mib: Option<u64>,
+    guest_total_mib: Option<u64>,
+    guest_peak_used_mib: Option<u64>,
+    guest_oom_kills: u64,
+    terminal_oom: bool,
+}
+
+impl VmMemoryObservation {
+    /// Returns the VMM process's peak resident set on supported Linux hosts.
+    #[must_use]
+    pub const fn host_peak_rss_mib(self) -> Option<u64> {
+        self.host_peak_rss_mib
+    }
+
+    /// Returns the guest kernel's total usable memory.
+    #[must_use]
+    pub const fn guest_total_mib(self) -> Option<u64> {
+        self.guest_total_mib
+    }
+
+    /// Returns peak guest memory use derived from minimum `MemAvailable`.
+    #[must_use]
+    pub const fn guest_peak_used_mib(self) -> Option<u64> {
+        self.guest_peak_used_mib
+    }
+
+    /// Returns the guest kernel's observed OOM-kill count for this session.
+    #[must_use]
+    pub const fn guest_oom_kills(self) -> u64 {
+        self.guest_oom_kills
+    }
+
+    /// Returns whether a guest counter or terminal kernel diagnostic confirms OOM.
+    #[must_use]
+    pub const fn oom_detected(self) -> bool {
+        self.guest_oom_kills > 0 || self.terminal_oom
+    }
 }
 
 /// Failure to start, use, provision, or stop one retained VM tool session.
@@ -190,6 +254,10 @@ pub enum VmToolSessionError {
     #[error("the VMM did not exit within {0:?} after guest shutdown")]
     ShutdownTimeout(Duration),
 
+    /// Managed guest tool processes did not stop before the deadline.
+    #[error("managed guest tool processes did not stop within {0:?}")]
+    ToolProcessTerminationTimeout(Duration),
+
     /// The VMM returned an unsuccessful status after guest shutdown.
     #[error("the VMM exited unsuccessfully after guest shutdown: {0}")]
     VmmExit(ExitStatus),
@@ -240,6 +308,7 @@ pub struct VmToolSessionHandle {
 struct VmToolSessionInner {
     spawned_at: Instant,
     next_id: AtomicU64,
+    host_peak_rss_kib: AtomicU64,
     closing: AtomicBool,
     lifecycle: StdMutex<SessionLifecycle>,
     input: mpsc::Sender<OutboundRequest>,
@@ -479,6 +548,7 @@ impl VmToolSession {
             let inner = Arc::new(VmToolSessionInner {
                 spawned_at: Instant::now(),
                 next_id: AtomicU64::new(0),
+                host_peak_rss_kib: AtomicU64::new(0),
                 closing: AtomicBool::new(false),
                 lifecycle: StdMutex::new(SessionLifecycle::default()),
                 input: input_sender,
@@ -500,6 +570,12 @@ impl VmToolSession {
                 Arc::downgrade(&inner),
             ));
             runtime.spawn(capture_terminal_stderr(stderr, Arc::downgrade(&inner)));
+            if let Some(process_id) = lock_unpoisoned(&inner.child)
+                .as_ref()
+                .and_then(tokio::process::Child::id)
+            {
+                runtime.spawn(monitor_host_memory(process_id, Arc::downgrade(&inner)));
+            }
             Ok(Self {
                 handle: VmToolSessionHandle {
                     inner,
@@ -643,6 +719,65 @@ impl VmToolSession {
     /// exceeds its deadline, or the typed response is invalid.
     pub async fn command(&self, command: VmCommand) -> Result<VmCommandOutput, VmToolSessionError> {
         self.handle.command(command).await
+    }
+
+    /// Returns the best-effort peak memory observed for this VM session.
+    ///
+    /// Host RSS remains available when the guest protocol has already failed.
+    /// Missing telemetry is represented by absent fields rather than an error
+    /// so diagnostics never obscure the attempt's primary result.
+    pub async fn memory_observation(&self) -> VmMemoryObservation {
+        self.handle.memory_observation().await
+    }
+
+    /// Terminates subprocesses retained by the guest workspace-tool runtime.
+    ///
+    /// This is a non-destructive agent-lifecycle boundary: the VM, filesystem,
+    /// and host-control channel remain available. Processes that deliberately
+    /// detached from the workspace tool's managed process group are not
+    /// terminated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the guest cannot acknowledge cleanup before the
+    /// session's shutdown deadline or returns an invalid response.
+    pub async fn terminate_tool_processes(&self) -> Result<(), VmToolSessionError> {
+        let span = info_span!(
+            target: "nanocodex_vm",
+            "vm.session.terminate_tool_processes",
+            otel.kind = "internal",
+            otel.status_code = tracing::field::Empty,
+            vm.session.age_ns = tracing::field::Empty,
+            status = tracing::field::Empty,
+            error.message = tracing::field::Empty,
+            duration_ns = tracing::field::Empty,
+        );
+        let started_at = Instant::now();
+        let timeout = self.handle.inner.shutdown_timeout;
+        let result = async {
+            let response = tokio::time::timeout(
+                timeout,
+                self.handle.control_request(|id| {
+                    SessionRequest::TerminateToolProcesses(TerminateToolProcessesRequest { id })
+                }),
+            )
+            .await
+            .map_err(|_| VmToolSessionError::ToolProcessTerminationTimeout(timeout))??;
+            let SessionResponse::TerminateToolProcesses(response) = response else {
+                return Err(VmToolSessionError::Protocol(
+                    "expected a tool-process termination response",
+                ));
+            };
+            control_result(response)
+        }
+        .instrument(span.clone())
+        .await;
+        span.record(
+            "vm.session.age_ns",
+            elapsed_ns(self.handle.inner.spawned_at),
+        );
+        record_vm_result(&span, started_at, &result);
+        result
     }
 
     async fn terminate(&self) {
@@ -813,6 +948,61 @@ impl VmToolSessionHandle {
         span.record("vm.session.age_ns", elapsed_ns(self.inner.spawned_at));
         record_vm_result(&span, started_at, &result);
         result
+    }
+
+    /// Returns the best-effort peak memory observed for this VM session.
+    pub async fn memory_observation(&self) -> VmMemoryObservation {
+        let guest = self.memory_response().await.ok();
+        let host_peak_rss_kib = self.inner.host_peak_rss_kib.load(Ordering::Relaxed);
+        let terminal_oom =
+            terminal_oom_detected(&lock_unpoisoned(&self.inner.terminal).stderr_tail);
+
+        let (guest_total_mib, guest_peak_used_mib, guest_oom_kills) = guest.map_or(
+            (None, None, 0),
+            |MemoryResponse {
+                 total_kib,
+                 minimum_available_kib,
+                 oom_kills,
+                 ..
+             }| {
+                let peak_used_kib = total_kib.zip(minimum_available_kib).map(
+                    |(total_kib, minimum_available_kib)| {
+                        total_kib.saturating_sub(minimum_available_kib)
+                    },
+                );
+                (
+                    total_kib.map(kib_to_mib_ceil),
+                    peak_used_kib.map(kib_to_mib_ceil),
+                    oom_kills,
+                )
+            },
+        );
+        VmMemoryObservation {
+            host_peak_rss_mib: (host_peak_rss_kib != 0).then(|| kib_to_mib_ceil(host_peak_rss_kib)),
+            guest_total_mib,
+            guest_peak_used_mib,
+            guest_oom_kills,
+            terminal_oom,
+        }
+    }
+
+    async fn memory_response(&self) -> Result<MemoryResponse, VmToolSessionError> {
+        let response = tokio::time::timeout(
+            MEMORY_OBSERVATION_TIMEOUT,
+            self.control_request(|id| SessionRequest::Memory(MemoryRequest { id })),
+        )
+        .await
+        .map_err(|_| VmToolSessionError::GuestTimeout {
+            timeout: MEMORY_OBSERVATION_TIMEOUT,
+            output: VmCommandPartialOutput {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+        })??;
+        let SessionResponse::Memory(response) = response else {
+            return Err(VmToolSessionError::Protocol("expected a memory response"));
+        };
+        Ok(response)
     }
 
     async fn request(
@@ -1037,6 +1227,8 @@ impl VmToolSessionHandle {
                     environment: command.environment,
                     timeout_millis,
                     max_output_bytes,
+                    stdout_mirror: command.stdout_mirror,
+                    stderr_mirror: command.stderr_mirror,
                 })
             })
             .await?;
@@ -1398,6 +1590,58 @@ async fn capture_terminal_stderr(mut stderr: ChildStderr, inner: Weak<VmToolSess
     }
 }
 
+#[cfg(target_os = "linux")]
+async fn monitor_host_memory(process_id: u32, inner: Weak<VmToolSessionInner>) {
+    loop {
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        match tokio::fs::read_to_string(format!("/proc/{process_id}/status")).await {
+            Ok(status) => {
+                if let Some(rss_kib) = parse_linux_process_rss_kib(&status) {
+                    inner
+                        .host_peak_rss_kib
+                        .fetch_max(rss_kib, Ordering::Relaxed);
+                }
+            }
+            Err(_) if inner.closing.load(Ordering::Acquire) => return,
+            Err(_) => {}
+        }
+        tokio::time::sleep(HOST_MEMORY_SAMPLE_INTERVAL).await;
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn monitor_host_memory(_process_id: u32, _inner: Weak<VmToolSessionInner>) {}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_process_rss_kib(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            matches!(key, "VmRSS" | "VmHWM")
+                .then(|| value.split_whitespace().next()?.parse::<u64>().ok())
+                .flatten()
+        })
+        .max()
+}
+
+fn terminal_oom_detected(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    [
+        "out of memory: killed process",
+        "memory cgroup out of memory",
+        "oom-kill:",
+    ]
+    .iter()
+    .any(|diagnostic| stderr.contains(diagnostic))
+}
+
+const fn kib_to_mib_ceil(kib: u64) -> u64 {
+    kib.saturating_add(KIB_PER_MIB - 1) / KIB_PER_MIB
+}
+
 fn append_terminal_stderr(terminal: &mut TerminalDiagnostics, bytes: &[u8]) {
     if bytes.len() >= MAX_TERMINAL_STDERR_BYTES {
         terminal.stderr_tail.clear();
@@ -1547,8 +1791,10 @@ const fn set_request_id(request: &mut SessionRequest, id: u64) {
         SessionRequest::WriteFile(request) => request.id = id,
         SessionRequest::CreateDirectory(request) => request.id = id,
         SessionRequest::ReadFile(request) => request.id = id,
+        SessionRequest::Memory(request) => request.id = id,
         SessionRequest::Execute(request) => request.id = id,
         SessionRequest::Cancel(request) => request.id = id,
+        SessionRequest::TerminateToolProcesses(request) => request.id = id,
         SessionRequest::Shutdown(request) => request.id = id,
     }
 }
@@ -1669,10 +1915,22 @@ mod tracing_tests {
     };
 
     use super::{
-        VmCommand, VmCommandPartialOutput, VmToolSession, VmToolSessionError, lock_unpoisoned,
+        VmCommand, VmCommandPartialOutput, VmToolSession, VmToolSessionError, kib_to_mib_ceil,
+        lock_unpoisoned, parse_linux_process_rss_kib, terminal_oom_detected,
     };
 
     static TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn parses_peak_linux_vmm_rss_and_confirmed_oom_diagnostics() {
+        let status = "Name:\tvm-run\nVmHWM:\t77824 kB\nVmRSS:\t65536 kB\n";
+        assert_eq!(parse_linux_process_rss_kib(status), Some(77_824));
+        assert_eq!(kib_to_mib_ceil(77_824), 76);
+        assert!(terminal_oom_detected(
+            b"kernel: Out of memory: Killed process 42 (agent)"
+        ));
+        assert!(!terminal_oom_detected(b"guest command exited 137"));
+    }
 
     #[derive(Clone, Default)]
     struct TraceCapture {
@@ -1843,6 +2101,36 @@ mod tracing_tests {
         runtime.block_on(async {
             let session = VmToolSession::spawn(&mut command).unwrap();
             session.ready().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn managed_tool_process_termination_keeps_the_vm_session_open() {
+        let _test_guard = TRACE_TEST_LOCK.lock().unwrap();
+        let terminated = r#"{"kind":"terminate_tool_processes","payload":{"id":0,"error":null}}"#;
+        let ready = r#"{"kind":"ready","payload":{"id":1,"error":null}}"#;
+        let shutdown = r#"{"kind":"shutdown","payload":{"id":2,"error":null}}"#;
+        let script = format!(
+            "IFS= read -r terminate\n\
+             case \"$terminate\" in *'\"kind\":\"terminate_tool_processes\"'*) ;; *) exit 91 ;; esac\n\
+             printf '%s\\n' '{terminated}'\n\
+             IFS= read -r ready\n\
+             printf '%s\\n' '{ready}'\n\
+             IFS= read -r shutdown\n\
+             printf '%s\\n' '{shutdown}'"
+        );
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.arg("-c").arg(script);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let session = VmToolSession::spawn(&mut command).unwrap();
+            session.terminate_tool_processes().await.unwrap();
+            session.ready().await.unwrap();
+            session.shutdown().await.unwrap();
         });
     }
 
