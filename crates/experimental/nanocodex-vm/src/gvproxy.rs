@@ -1,7 +1,7 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
     io::{self, Read, Write},
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     os::unix::{net::UnixStream, process::CommandExt as _},
     path::{Path, PathBuf},
     process::{Child, Stdio},
@@ -11,6 +11,7 @@ use std::{
 
 use serde::Serialize;
 use thiserror::Error;
+use tracing::{error, warn};
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const API_TIMEOUT: Duration = Duration::from_secs(5);
@@ -75,9 +76,19 @@ pub struct Gvproxy {
     child: Child,
     network_socket: PathBuf,
     services_socket: PathBuf,
+    log: PathBuf,
+    started_at: Instant,
 }
 
 impl Gvproxy {
+    /// Guest-visible address that the default gvproxy network translates to
+    /// host loopback.
+    ///
+    /// [`Self::spawn`] deliberately starts the pinned gvproxy without a custom
+    /// configuration, whose `192.168.127.0/24` topology reserves the final
+    /// usable address for this host route.
+    pub const HOST_IPV4: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 254);
+
     /// Starts gvproxy and waits for both of its local sockets to become ready.
     ///
     /// # Errors
@@ -121,6 +132,7 @@ impl Gvproxy {
         remove_stale_socket(&network_socket)?;
         remove_stale_socket(&services_socket)?;
 
+        let log_path = log.to_path_buf();
         let log = fs::File::create(log)?;
         let mut command = std::process::Command::new(binary);
         command
@@ -162,6 +174,8 @@ impl Gvproxy {
             child,
             network_socket,
             services_socket,
+            log: log_path,
+            started_at,
         })
     }
 
@@ -221,9 +235,64 @@ enum ProcessGroup {
 
 impl Drop for Gvproxy {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let process_id = self.child.id();
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                let age_ms = elapsed_millis(self.started_at);
+                let message = format!(
+                    "nanocodex owner: gvproxy process {process_id} exited before owner cleanup \
+                     after {age_ms} ms: {status}"
+                );
+                if let Err(error) = append_owner_diagnostic(&self.log, &message) {
+                    warn!(
+                        process.id = process_id,
+                        error.message = %error,
+                        "failed to retain unexpected gvproxy exit in its log"
+                    );
+                }
+                error!(
+                    process.id = process_id,
+                    process.status = %status,
+                    process.age_ms = age_ms,
+                    "gvproxy exited before its owner"
+                );
+            }
+            Ok(None) => {
+                if let Err(error) = self.child.kill() {
+                    warn!(
+                        process.id = process_id,
+                        error.message = %error,
+                        "failed to terminate owned gvproxy process"
+                    );
+                }
+                if let Err(error) = self.child.wait() {
+                    warn!(
+                        process.id = process_id,
+                        error.message = %error,
+                        "failed to reap owned gvproxy process"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    process.id = process_id,
+                    error.message = %error,
+                    "failed to inspect owned gvproxy process before cleanup"
+                );
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
     }
+}
+
+fn append_owner_diagnostic(log: &Path, message: &str) -> io::Result<()> {
+    let mut log = OpenOptions::new().append(true).open(log)?;
+    writeln!(log, "{message}")
+}
+
+fn elapsed_millis(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[derive(Serialize)]
@@ -293,11 +362,17 @@ mod tests {
         fs,
         net::{Ipv4Addr, SocketAddrV4},
         os::unix::{fs::PermissionsExt as _, net::UnixListener},
+        process::Command,
     };
 
     use nix::unistd::getpgrp;
 
     use super::*;
+
+    #[test]
+    fn default_network_exposes_host_loopback_at_a_stable_address() {
+        assert_eq!(Gvproxy::HOST_IPV4, Ipv4Addr::new(192, 168, 127, 254));
+    }
 
     #[test]
     fn caller_selects_inherited_or_isolated_process_group() {
@@ -309,6 +384,32 @@ mod tests {
         assert_ne!(inherited.0, inherited.1);
         assert_eq!(isolated.0, isolated.1);
         assert_ne!(isolated.1, parent_group);
+    }
+
+    #[test]
+    fn unexpected_exit_is_retained_in_the_owned_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("gvproxy.log");
+        fs::write(&log, "gvproxy output\n").unwrap();
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 23"])
+            .spawn()
+            .unwrap();
+        let mut gvproxy = Gvproxy {
+            child,
+            network_socket: directory.path().join("network.sock"),
+            services_socket: directory.path().join("services.sock"),
+            log: log.clone(),
+            started_at: Instant::now(),
+        };
+        assert_eq!(gvproxy.child.wait().unwrap().code(), Some(23));
+
+        drop(gvproxy);
+
+        let retained = fs::read_to_string(log).unwrap();
+        assert!(retained.starts_with("gvproxy output\n"));
+        assert!(retained.contains("exited before owner cleanup"));
+        assert!(retained.contains("exit status: 23"));
     }
 
     fn recorded_process_group(
@@ -347,10 +448,15 @@ mod tests {
 
     #[test]
     fn refuses_non_loopback_forwards_before_contacting_gvproxy() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("gvproxy.log");
+        fs::write(&log, "").unwrap();
         let proxy = Gvproxy {
             child: std::process::Command::new("/usr/bin/true").spawn().unwrap(),
             network_socket: PathBuf::new(),
             services_socket: PathBuf::new(),
+            log,
+            started_at: Instant::now(),
         };
         let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9222));
         let remote = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 127, 2), 9222));

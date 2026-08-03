@@ -108,6 +108,7 @@ const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_mins(30);
 const DEFAULT_COPY_TIMEOUT: Duration = Duration::from_mins(10);
 const MAX_CONCURRENT_IMAGE_RESOLVES: usize = 8;
 const MAX_CONCURRENT_LAYER_DOWNLOADS: usize = 8;
+const MAX_VMM_BUILD_CACHE_IDENTITY_BYTES: usize = 4096;
 const BUILD_RUNTIME_ID: &str = "nanocodex-runtime";
 const BUILD_CONTEXT_ID: &str = "nanocodex-context";
 const BUILD_RUNTIME_DEVICE: &str = "/dev/vdb";
@@ -162,6 +163,7 @@ fi"#;
 pub struct VmImageBuilder {
     vmm: PathBuf,
     vmm_arguments: Vec<OsString>,
+    vmm_build_cache_identity: Option<String>,
     runtime_image: PathBuf,
     firmware_directory: Option<PathBuf>,
     cpus: u8,
@@ -188,6 +190,7 @@ impl VmImageBuilder {
         Self {
             vmm: vmm.into(),
             vmm_arguments: Vec::new(),
+            vmm_build_cache_identity: None,
             runtime_image: runtime_image.into(),
             firmware_directory: None,
             cpus: DEFAULT_BUILD_VM_CPUS,
@@ -237,6 +240,24 @@ impl VmImageBuilder {
     {
         self.vmm_arguments
             .extend(arguments.into_iter().map(Into::into));
+        self
+    }
+
+    /// Uses a caller-owned semantic identity for the Dockerfile build VMM.
+    ///
+    /// The default hashes the complete VMM executable, which is the safest
+    /// policy for arbitrary callers. An application whose VMM entry point is
+    /// embedded in a larger executable may use this override to keep unrelated
+    /// application changes from invalidating every built root disk.
+    ///
+    /// The identity must change whenever the configured VMM's execution
+    /// semantics can change a Dockerfile build result. VMM arguments, guest
+    /// runtime, firmware, resource policy, networking, resolver state, and
+    /// egress scope remain independent parts of the cache key.
+    /// [`Self::prepare`] rejects an empty identity or one larger than 4 KiB.
+    #[must_use]
+    pub fn vmm_build_cache_identity(mut self, identity: impl Into<String>) -> Self {
+        self.vmm_build_cache_identity = Some(identity.into());
         self
     }
 
@@ -304,6 +325,15 @@ impl VmImageBuilder {
     }
 
     async fn build_cache_inputs(&self) -> Result<BuildCacheInputs, ImageError> {
+        if self
+            .vmm_build_cache_identity
+            .as_ref()
+            .is_some_and(|identity| {
+                identity.is_empty() || identity.len() > MAX_VMM_BUILD_CACHE_IDENTITY_BYTES
+            })
+        {
+            return Err(ImageError::InvalidVmmBuildCacheIdentity);
+        }
         let network = match self.egress.network() {
             Network::Disabled => "disabled",
             Network::Internet => "internet",
@@ -317,7 +347,11 @@ impl VmImageBuilder {
             .to_owned();
         let (vmm_digest, runtime_digest, firmware_digest) =
             if let Some(directory) = &self.firmware_directory {
-                let firmware = directory.join(FIRMWARE_LIBRARY_FILENAME);
+                // Versioned libkrunfw installations expose the ABI filename as
+                // a symlink to the immutable versioned library. Hash the
+                // resolved regular file while retaining the configured
+                // directory for the dynamic loader.
+                let firmware = directory.join(FIRMWARE_LIBRARY_FILENAME).canonicalize()?;
                 let (vmm_digest, runtime_digest, firmware_digest) = tokio::try_join!(
                     cached_file_digest(&self.vmm, &self.vmm_digest),
                     cached_file_digest(&self.runtime_image, &self.runtime_digest),
@@ -331,8 +365,12 @@ impl VmImageBuilder {
                 )?;
                 (vmm_digest, runtime_digest, "system-firmware".to_owned())
             };
+        let vmm_identity = self
+            .vmm_build_cache_identity
+            .as_ref()
+            .map_or(vmm_digest, |identity| format!("caller-owned:{identity}"));
         Ok(BuildCacheInputs {
-            vmm_digest,
+            vmm_identity,
             runtime_digest,
             firmware_digest,
             resolver: match self.egress.network() {
@@ -520,6 +558,10 @@ pub enum ImageError {
         "Dockerfile build output cannot be cached because the egress lease has no build-cache scope"
     )]
     UnscopedBuildEgress,
+
+    /// A caller-owned VMM build-cache identity was empty or unreasonably large.
+    #[error("VMM build-cache identity must contain between 1 and 4096 bytes")]
+    InvalidVmmBuildCacheIdentity,
 
     /// The constrained Dockerfile parser rejected an instruction.
     #[error("unsupported Dockerfile instruction: {0}")]
@@ -793,7 +835,7 @@ impl Default for ImageRuntimeConfig {
 
 #[derive(Clone)]
 struct BuildCacheInputs {
-    vmm_digest: String,
+    vmm_identity: String,
     runtime_digest: String,
     firmware_digest: String,
     resolver: Option<String>,
@@ -2056,7 +2098,7 @@ fn build_cache_key(
         hasher.update(argument.as_os_str().as_bytes());
     }
     for value in [
-        &inputs.vmm_digest,
+        &inputs.vmm_identity,
         &inputs.runtime_digest,
         &inputs.firmware_digest,
         &inputs.network,
@@ -2473,7 +2515,7 @@ fn validated_prepared_disk_record(path: &Path) -> Result<String, ImageError> {
         )));
     }
     validate_root_disk(path)?;
-    Ok(record.shell)
+    prepared_shell(path).map(str::to_owned)
 }
 
 fn record_prepared_disk(path: &Path) -> Result<String, ImageError> {
@@ -2593,13 +2635,43 @@ fn sha256_file(path: &Path) -> io::Result<String> {
 
 fn prepared_shell(path: &Path) -> Result<&'static str, ImageError> {
     let mut reader = Reader::new(path)?;
-    if reader.exists("/bin/bash") {
+    let configured = reader
+        .read_file("/etc/passwd", 0, None)
+        .ok()
+        .and_then(|passwd| configured_root_shell(&passwd));
+    if let Some((shell, path)) = configured
+        && reader.exists(&path)
+    {
+        return Ok(shell);
+    }
+    if reader.exists("/bin/bash") || reader.exists("/usr/bin/bash") {
         Ok("bash")
     } else if reader.exists("/bin/sh") {
         Ok("sh")
     } else {
         Err(ImageError::MissingPreparedPath("/bin/sh"))
     }
+}
+
+fn configured_root_shell(passwd: &[u8]) -> Option<(&'static str, String)> {
+    passwd.split(|byte| *byte == b'\n').find_map(|entry| {
+        let mut fields = entry.split(|byte| *byte == b':');
+        fields.next()?;
+        fields.next()?;
+        if fields.next()? != b"0" {
+            return None;
+        }
+        fields.next()?;
+        fields.next()?;
+        fields.next()?;
+        let path = std::str::from_utf8(fields.next()?).ok()?;
+        let shell = match Path::new(path).file_name()?.to_str()? {
+            "bash" => "bash",
+            "sh" => "sh",
+            _ => return None,
+        };
+        Some((shell, path.to_owned()))
+    })
 }
 
 fn validate_ext4_disk(path: &Path) -> Result<(), ImageError> {
@@ -2650,9 +2722,10 @@ mod tests {
         ImageError, ImageRuntimeConfig, LayerRecord, ManifestSource, PulledImage, PulledLayer,
         Reader, ReferenceRecord, VmImageBuilder, append_normalized_context_entry, blob_path,
         build_cache_key, build_guest_bootstrap_script, cached_file_digest,
-        configure_firmware_library_path, disk_cache_key, docker_process_environment, output_tail,
-        prepare_copy_source_disk, prepare_flattened_disk, reference_cache_key,
-        resolver_configuration, valid_cached_blob, valid_cached_ext4_disk, write_cache_record,
+        configure_firmware_library_path, configured_root_shell, disk_cache_key,
+        docker_process_environment, output_tail, prepare_copy_source_disk, prepare_flattened_disk,
+        reference_cache_key, resolver_configuration, valid_cached_blob, valid_cached_ext4_disk,
+        write_cache_record,
     };
     use flate2::{Compression, write::GzEncoder};
     use tracing::{
@@ -2668,6 +2741,24 @@ mod tests {
     const FIXTURE_MANIFEST: &str =
         "sha256:56249d7a2f93306106f6d8bcdf6423afb73c1b747d874febcc778beee25cb8bb";
     static IMAGE_PREPARE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn configured_root_shell_uses_the_uid_zero_account() {
+        let passwd = b"service:x:1000:1000::/srv:/bin/bash\n\
+                       root:x:0:0:root:/root:/bin/sh\n";
+
+        assert_eq!(
+            configured_root_shell(passwd),
+            Some(("sh", "/bin/sh".to_owned()))
+        );
+    }
+
+    #[test]
+    fn configured_root_shell_ignores_unsupported_shells() {
+        let passwd = b"root:x:0:0:root:/root:/bin/ash\n";
+
+        assert_eq!(configured_root_shell(passwd), None);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -2907,6 +2998,7 @@ mod tests {
         let builder = VmImageBuilder::new("/opt/nanocodex-vmm", "/cache/runtime.ext4")
             .firmware_directory("/opt/libkrunfw")
             .vmm_args(["run", "--private-config"])
+            .vmm_build_cache_identity("vm-process-v3")
             .cpus(6)
             .memory_mib(8_192)
             .run_timeout(Duration::from_mins(15))
@@ -2920,11 +3012,78 @@ mod tests {
             Some(Path::new("/opt/libkrunfw"))
         );
         assert_eq!(builder.vmm_arguments, ["run", "--private-config"]);
+        assert_eq!(
+            builder.vmm_build_cache_identity.as_deref(),
+            Some("vm-process-v3")
+        );
         assert_eq!(builder.cpus, 6);
         assert_eq!(builder.memory_mib, 8_192);
         assert_eq!(builder.run_timeout, Duration::from_mins(15));
         assert_eq!(builder.copy_timeout, Duration::from_mins(2));
         assert_eq!(builder.egress.network(), &Network::Disabled);
+    }
+
+    #[test]
+    fn caller_owned_vmm_identity_survives_unrelated_executable_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let vmm = directory.path().join("vmm");
+        let runtime_image = directory.path().join("runtime.ext4");
+        fs::write(&vmm, b"first evaluator build").unwrap();
+        fs::write(&runtime_image, b"stable guest runtime").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let default_inputs = || {
+            let builder = VmImageBuilder::new(&vmm, &runtime_image).egress(EgressLease::disabled());
+            runtime.block_on(builder.build_cache_inputs()).unwrap()
+        };
+        let inputs = |identity| {
+            let builder = VmImageBuilder::new(&vmm, &runtime_image)
+                .vmm_build_cache_identity(identity)
+                .egress(EgressLease::disabled());
+            runtime.block_on(builder.build_cache_inputs()).unwrap()
+        };
+        let default_first = default_inputs();
+        let first = inputs("vm-process-v1");
+        fs::write(&vmm, b"second evaluator build").unwrap();
+        let default_second = default_inputs();
+        let second = inputs("vm-process-v1");
+        let bumped = inputs("vm-process-v2");
+
+        assert_ne!(default_first.vmm_identity, default_second.vmm_identity);
+        assert_eq!(first.vmm_identity, "caller-owned:vm-process-v1");
+        assert_eq!(first.vmm_identity, second.vmm_identity);
+        assert_ne!(first.vmm_identity, bumped.vmm_identity);
+        assert_eq!(first.runtime_digest, second.runtime_digest);
+        assert_eq!(first.firmware_digest, second.firmware_digest);
+    }
+
+    #[test]
+    fn caller_owned_vmm_identity_rejects_invalid_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let vmm = directory.path().join("vmm");
+        let runtime_image = directory.path().join("runtime.ext4");
+        fs::write(&vmm, b"vmm").unwrap();
+        fs::write(&runtime_image, b"runtime").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        for identity in [
+            String::new(),
+            "x".repeat(super::MAX_VMM_BUILD_CACHE_IDENTITY_BYTES + 1),
+        ] {
+            let builder = VmImageBuilder::new(&vmm, &runtime_image)
+                .vmm_build_cache_identity(identity)
+                .egress(EgressLease::disabled());
+            assert!(matches!(
+                runtime.block_on(builder.build_cache_inputs()),
+                Err(ImageError::InvalidVmmBuildCacheIdentity)
+            ));
+        }
     }
 
     #[test]
@@ -2989,6 +3148,38 @@ mod tests {
         assert_eq!(
             configured.as_deref(),
             Some(directory.path().canonicalize().unwrap().as_os_str())
+        );
+    }
+
+    #[test]
+    fn build_cache_hashes_a_versioned_firmware_symlink_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let vmm = directory.path().join("vmm");
+        let runtime_image = directory.path().join("runtime.ext4");
+        let versioned_firmware = directory.path().join("libkrunfw-versioned");
+        fs::write(&vmm, b"vmm").unwrap();
+        fs::write(&runtime_image, b"runtime").unwrap();
+        fs::write(&versioned_firmware, b"firmware").unwrap();
+        std::os::unix::fs::symlink(
+            versioned_firmware.file_name().unwrap(),
+            directory.path().join(FIRMWARE_LIBRARY_FILENAME),
+        )
+        .unwrap();
+        let builder = VmImageBuilder::new(&vmm, &runtime_image)
+            .firmware_directory(directory.path())
+            .egress(EgressLease::disabled());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let inputs = runtime
+            .block_on(builder.build_cache_inputs())
+            .expect("versioned firmware symlink should be a valid runtime input");
+
+        assert_eq!(
+            inputs.firmware_digest,
+            super::sha256_file(&versioned_firmware).unwrap()
         );
     }
 
@@ -3064,7 +3255,7 @@ ENV LEGACY value with spaces
         )]);
         let builder = VmImageBuilder::new("/vmm", "/runtime");
         let inputs = BuildCacheInputs {
-            vmm_digest: "vmm-a".to_owned(),
+            vmm_identity: "vmm-a".to_owned(),
             runtime_digest: "runtime-a".to_owned(),
             firmware_digest: "firmware-a".to_owned(),
             resolver: Some("nameserver 192.0.2.1\\n".to_owned()),
@@ -3086,7 +3277,7 @@ ENV LEGACY value with spaces
 
         for changed in [
             BuildCacheInputs {
-                vmm_digest: "vmm-b".to_owned(),
+                vmm_identity: "vmm-b".to_owned(),
                 ..inputs.clone()
             },
             BuildCacheInputs {
