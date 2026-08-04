@@ -25,6 +25,11 @@ The decision codes reuse the main ledger's policy:
   supporting deferred loading, including custom namespace members.
 - `P37` — complete caller/server namespace descriptions remain available;
   Nanocodex does not inherit Codex's temporary truncation.
+- `P38` — known encrypted function-argument markers remain lossless in typed
+  Responses history even though collaboration behavior stays out of scope.
+- `P39` — the model-visible `tool_search` source advertisement is bounded to
+  4 KiB without truncating UTF-8 or removing complete namespace descriptions
+  from returned definitions.
 - `E15` — relevant runtime, transport, TUI, MCP, or cleanup behavior needs a
   focused Nanocodex regression, profile, or consumer before adoption.
 - `D3` — the standalone sandbox-enabled V8 host, its packaging, and its
@@ -66,7 +71,7 @@ c550cb3e01 out-of-scope O15
 3a797496f1 out-of-scope O15
 9f4c20aadc evaluate E15
 166658a34a out-of-scope O15
-03edf16f0b out-of-scope O15
+03edf16f0b port P38
 101d6b8cb2 out-of-scope O15
 8707a35113 out-of-scope O15
 07490c7523 out-of-scope O15
@@ -81,7 +86,7 @@ b96ebfb312 out-of-scope O15
 d06c7ac055 evaluate E15
 fe01054a28 out-of-scope O15
 fbf666fa98 port P32
-ddf33ea802 out-of-scope O15
+ddf33ea802 port P39
 a4d2f31022 out-of-scope O15
 9a6668f674 out-of-scope O15
 e1895710ad out-of-scope O15
@@ -291,13 +296,19 @@ d75f94a94d out-of-scope O15
 - `P37`: MCP provider tests retain exact server descriptions in tool-search
   namespace output. The temporary Codex truncation in `ddf33ea802` is
   superseded by `fd1e4d7a6d` and is not adopted.
+- `P38`: `function_calls_preserve_encrypted_argument_markers` round-trips both
+  empty and populated `encrypted_function_args` fields through typed history.
+- `P39`: `search_definition_bounds_aggregate_source_descriptions` keeps the
+  source section within 4 KiB at a UTF-8 boundary while preserving configured
+  source names. Namespace wire tests additionally reject nested namespace and
+  `tool_search` children while retaining function/custom children.
 
 ## Classification totals
 
 | Classification | Count |
 | --- | ---: |
-| `port` | 16 |
+| `port` | 18 |
 | `evaluate` | 24 |
 | `defer` | 8 |
-| `out-of-scope` | 184 |
+| `out-of-scope` | 182 |
 | Total | 232 |

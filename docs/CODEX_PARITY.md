@@ -34,10 +34,10 @@ claims.
 
 | Classification | Count |
 | --- | ---: |
-| `port` | 50 |
+| `port` | 52 |
 | `evaluate` | 45 |
 | `defer` | 10 |
-| `out-of-scope` | 450 |
+| `out-of-scope` | 448 |
 | Total | 555 |
 
 ## First range: `35eaf3ff..8431dc59`

@@ -1,6 +1,6 @@
 //! Model-visible tool declarations and open JSON boundary values.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 /// Model-visible tool definition carried by Responses Lite input.
@@ -34,6 +34,10 @@ pub enum ToolDefinition {
         /// Guidance describing the namespace as a whole.
         description: Box<str>,
         /// Function declarations exposed under this namespace.
+        #[serde(
+            deserialize_with = "deserialize_namespace_tools",
+            serialize_with = "serialize_namespace_tools"
+        )]
         tools: Vec<Self>,
     },
     /// Free-form custom tool constrained by a grammar.
@@ -57,6 +61,39 @@ pub enum ToolDefinition {
         /// JSON Schema accepted as search arguments.
         parameters: JsonSchema,
     },
+}
+
+fn serialize_namespace_tools<S>(tools: &[ToolDefinition], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if let Some(invalid_kind) = tools.iter().find_map(invalid_namespace_child_kind) {
+        return Err(serde::ser::Error::custom(format!(
+            "Responses namespace cannot contain a {invalid_kind} definition"
+        )));
+    }
+    tools.serialize(serializer)
+}
+
+fn deserialize_namespace_tools<'de, D>(deserializer: D) -> Result<Vec<ToolDefinition>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let tools = Vec::<ToolDefinition>::deserialize(deserializer)?;
+    if let Some(invalid_kind) = tools.iter().find_map(invalid_namespace_child_kind) {
+        return Err(serde::de::Error::custom(format!(
+            "Responses namespace cannot contain a {invalid_kind} definition"
+        )));
+    }
+    Ok(tools)
+}
+
+const fn invalid_namespace_child_kind(tool: &ToolDefinition) -> Option<&'static str> {
+    match tool {
+        ToolDefinition::Function { .. } | ToolDefinition::Custom { .. } => None,
+        ToolDefinition::Namespace { .. } => Some("namespace"),
+        ToolDefinition::ToolSearch { .. } => Some("tool_search"),
+    }
 }
 
 impl ToolDefinition {
@@ -387,6 +424,29 @@ mod tests {
                 }]
             })
         );
+    }
+
+    #[test]
+    fn namespace_rejects_nested_namespace_and_tool_search_children() {
+        let nested = ToolDefinition::namespace(
+            "outer",
+            "Outer tools.",
+            [ToolDefinition::namespace("inner", "Inner tools.", [])],
+        );
+        assert!(serde_json::to_value(nested).is_err());
+
+        let invalid = json!({
+            "type": "namespace",
+            "name": "outer",
+            "description": "Outer tools.",
+            "tools": [{
+                "type": "tool_search",
+                "execution": "client",
+                "description": "Search tools.",
+                "parameters": {"type": "object"}
+            }]
+        });
+        assert!(serde_json::from_value::<ToolDefinition>(invalid).is_err());
     }
 
     #[test]

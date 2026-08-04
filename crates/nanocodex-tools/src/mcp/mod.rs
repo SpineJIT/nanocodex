@@ -29,6 +29,8 @@ use tracing::{Instrument, info_span};
 pub use config::{McpServer, McpToolExposure};
 pub use oauth::{McpOAuthCredentials, McpOAuthStore};
 
+const MAX_TOOL_SEARCH_SOURCE_DESCRIPTION_BYTES: usize = 4 * 1024;
+
 fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
         let follows_same_origin = attempt
@@ -752,17 +754,48 @@ fn validate_server(name: &str, server: &McpServer) -> Result<(), McpBuildError> 
 }
 
 fn search_description(servers: &[NamedServer]) -> String {
-    let sources = servers
+    let reserved_name_bytes = servers
         .iter()
-        .map(|server| match server.config.description.as_deref() {
-            Some(description) => format!("- {}: {}", server.name, description.trim()),
-            None => format!("- {}", server.name),
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .fold(servers.len().saturating_sub(1), |reserved, server| {
+            reserved.saturating_add(2).saturating_add(server.name.len())
+        });
+    let mut description_budget =
+        MAX_TOOL_SEARCH_SOURCE_DESCRIPTION_BYTES.saturating_sub(reserved_name_bytes);
+    let mut sources = String::new();
+    for server in servers {
+        let separator_bytes = usize::from(!sources.is_empty());
+        let required = separator_bytes
+            .saturating_add(2)
+            .saturating_add(server.name.len());
+        if required > MAX_TOOL_SEARCH_SOURCE_DESCRIPTION_BYTES.saturating_sub(sources.len()) {
+            continue;
+        }
+        if !sources.is_empty() {
+            sources.push('\n');
+        }
+        sources.push_str("- ");
+        sources.push_str(&server.name);
+        if let Some(description) = server.config.description.as_deref()
+            && description_budget >= 2
+        {
+            sources.push_str(": ");
+            description_budget -= 2;
+            let description = take_bytes_at_char_boundary(description.trim(), description_budget);
+            sources.push_str(description);
+            description_budget -= description.len();
+        }
+    }
     format!(
         "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nYou have access to tools from the following sources:\n{sources}\nSome of the tools may not have been provided to you upfront, and you should use this tool (`tool_search`) to search for the required tools. For MCP tool discovery, always use `tool_search` instead of `list_mcp_resources` or `list_mcp_resource_templates`."
     )
+}
+
+fn take_bytes_at_char_boundary(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 #[cfg(test)]
@@ -836,6 +869,30 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn search_definition_bounds_aggregate_source_descriptions() {
+        let mut builder = Mcp::builder();
+        for index in 0..64 {
+            builder = builder.server(
+                format!("source-{index:02}"),
+                McpServer::http("https://example.test/mcp").description("🦀".repeat(300)),
+            );
+        }
+        let mcp = builder.build().unwrap();
+        let description = mcp.search.definition().description().to_owned();
+        let (_, source_section) = description
+            .split_once("You have access to tools from the following sources:\n")
+            .unwrap();
+        let (sources, _) = source_section
+            .split_once("\nSome of the tools may not have been provided")
+            .unwrap();
+
+        assert!(sources.len() <= MAX_TOOL_SEARCH_SOURCE_DESCRIPTION_BYTES);
+        assert!(sources.starts_with("- source-00: 🦀"));
+        assert!(sources.contains("- source-63"));
+        assert!(std::str::from_utf8(sources.as_bytes()).is_ok());
     }
 
     #[tokio::test]

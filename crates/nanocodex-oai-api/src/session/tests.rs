@@ -195,6 +195,7 @@ impl Service<crate::ResponsesAttempt> for RecordingScripted {
                     name: "lookup".into(),
                     namespace: None,
                     arguments: r#"{"key":"region"}"#.into(),
+                    encrypted_function_args: None,
                     call_id: "call_1".into(),
                     caller: None,
                     status: None,
