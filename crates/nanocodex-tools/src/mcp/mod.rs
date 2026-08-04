@@ -4,6 +4,7 @@ mod catalog;
 mod client;
 mod config;
 mod oauth;
+mod pagination;
 mod resources;
 mod stdio;
 
@@ -25,7 +26,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{Instrument, info_span};
 
-pub use config::McpServer;
+pub use config::{McpServer, McpToolExposure};
 pub use oauth::{McpOAuthCredentials, McpOAuthStore};
 
 fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
@@ -306,6 +307,7 @@ impl McpHandle {
                             Arc::clone(&connected.client),
                             server.config.tool_timeout,
                             server.config.supports_parallel_tool_calls,
+                            server.config.tool_exposure,
                         )
                     })
                     .collect();
@@ -484,6 +486,7 @@ impl DynamicToolProvider for Mcp {
                                     Arc::clone(&connected.client),
                                     config.tool_timeout,
                                     config.supports_parallel_tool_calls,
+                                    config.tool_exposure,
                                 )
                             })
                             .collect::<Vec<_>>();
@@ -528,13 +531,15 @@ impl DynamicToolProvider for Mcp {
     }
 
     fn contains(&self, name: &str) -> bool {
-        self.state.entry(name).is_some()
+        self.state
+            .entry(name)
+            .is_some_and(|entry| entry.tool_exposure.is_callable())
     }
 
     fn supports_parallel_tool_calls(&self, name: &str) -> bool {
-        self.state
-            .entry(name)
-            .is_some_and(|entry| entry.supports_parallel_tool_calls)
+        self.state.entry(name).is_some_and(|entry| {
+            entry.tool_exposure.is_callable() && entry.supports_parallel_tool_calls
+        })
     }
 
     async fn execute(
@@ -544,6 +549,9 @@ impl DynamicToolProvider for Mcp {
         _context: ToolContext<'_>,
     ) -> Option<ToolOutput> {
         let entry = self.state.ready_entry(name).await?;
+        if !entry.tool_exposure.is_callable() {
+            return None;
+        }
         let Value::Object(arguments) = input else {
             return Some(ToolOutput::error(format!(
                 "MCP tool {name} requires an object argument"
@@ -1031,6 +1039,42 @@ mod tests {
             execution.output,
             ToolOutputBody::Text(output) if output.contains("fixture:hello")
         ));
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_exposure_selects_deferred_and_code_mode_surfaces_per_server() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mcp-stdio-server.mjs");
+        let server = || McpServer::stdio("node").arg(fixture.to_string_lossy());
+        let mcp = Mcp::builder()
+            .server(
+                "deferred",
+                server().tool_exposure(McpToolExposure::DeferredOnly),
+            )
+            .server(
+                "nested",
+                server().tool_exposure(McpToolExposure::CodeModeOnly),
+            )
+            .server("hidden", server().tool_exposure(McpToolExposure::Hidden))
+            .build()
+            .unwrap();
+        mcp.start();
+
+        let search = mcp.state.search("echo", None).await.unwrap();
+        let loadable = search.loadable_tools().unwrap();
+        assert_eq!(loadable.as_array().unwrap().len(), 1);
+        assert_eq!(loadable[0]["name"], "mcp__deferred__");
+
+        assert_eq!(
+            mcp.available_definitions()
+                .iter()
+                .map(ToolDefinition::name)
+                .collect::<Vec<_>>(),
+            ["mcp__nested__echo"]
+        );
+        assert!(mcp.contains("mcp__deferred__echo"));
+        assert!(mcp.contains("mcp__nested__echo"));
+        assert!(!mcp.contains("mcp__hidden__echo"));
     }
 
     #[cfg(unix)]

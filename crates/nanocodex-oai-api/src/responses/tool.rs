@@ -15,6 +15,9 @@ pub enum ToolDefinition {
         description: Box<str>,
         /// Whether the provider should enforce the parameter schema strictly.
         strict: bool,
+        /// Whether this definition is returned for deferred provider loading.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
         /// JSON Schema accepted as function arguments.
         parameters: JsonSchema,
         #[serde(skip)]
@@ -39,6 +42,9 @@ pub enum ToolDefinition {
         name: Box<str>,
         /// Concrete guidance for when and how to use the tool.
         description: Box<str>,
+        /// Whether this definition is returned for deferred provider loading.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
         /// Free-form input grammar.
         format: CustomToolFormat,
     },
@@ -86,6 +92,7 @@ impl ToolDefinition {
             name: name.into(),
             description: description.into(),
             strict: false,
+            defer_loading: None,
             parameters: parameters.into(),
             output_schema: None,
         }
@@ -101,6 +108,7 @@ impl ToolDefinition {
         Self::Custom {
             name: name.into(),
             description: description.into(),
+            defer_loading: None,
             format,
         }
     }
@@ -170,6 +178,33 @@ impl ToolDefinition {
             *current = Some(output_schema.into());
         }
         self
+    }
+
+    /// Marks a function or custom definition for provider-native deferred loading.
+    #[must_use]
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "ToolDefinition owns drop types that const evaluation rejects"
+    )]
+    pub fn with_deferred_loading(mut self) -> Self {
+        match &mut self {
+            Self::Function { defer_loading, .. } | Self::Custom { defer_loading, .. } => {
+                *defer_loading = Some(true);
+            }
+            Self::Namespace { .. } | Self::ToolSearch { .. } => {}
+        }
+        self
+    }
+
+    /// Returns whether this function or custom definition requests deferred loading.
+    #[must_use]
+    pub const fn is_deferred(&self) -> bool {
+        match self {
+            Self::Function { defer_loading, .. } | Self::Custom { defer_loading, .. } => {
+                matches!(defer_loading, Some(true))
+            }
+            Self::Namespace { .. } | Self::ToolSearch { .. } => false,
+        }
     }
 
     /// Returns the model-visible tool name.
@@ -281,7 +316,38 @@ impl From<Value> for JsonValue {
 mod tests {
     use serde_json::json;
 
-    use super::{JsonSchema, ToolDefinition};
+    use super::{CustomToolFormat, JsonSchema, ToolDefinition};
+
+    #[test]
+    fn function_and_custom_tools_opt_into_deferred_loading_without_changing_eager_shapes() {
+        let function = ToolDefinition::function(
+            "lookup",
+            "Look up a value.",
+            json!({ "type": "object", "properties": {} }),
+        );
+        assert!(!function.is_deferred());
+        assert!(
+            serde_json::to_value(&function).unwrap()["defer_loading"].is_null(),
+            "eager definitions must preserve their existing wire shape"
+        );
+
+        let custom = ToolDefinition::custom(
+            "patch",
+            "Apply a patch.",
+            CustomToolFormat::grammar("lark", "start: \"patch\""),
+        )
+        .with_deferred_loading();
+        assert!(custom.is_deferred());
+        assert_eq!(
+            serde_json::to_value(&custom).unwrap()["defer_loading"],
+            true
+        );
+        let namespace = ToolDefinition::namespace("editing", "Deferred editing tools.", [custom]);
+        assert_eq!(
+            serde_json::to_value(namespace).unwrap()["tools"][0]["type"],
+            "custom"
+        );
+    }
 
     #[test]
     fn namespace_serializes_function_children_without_client_output_metadata() {

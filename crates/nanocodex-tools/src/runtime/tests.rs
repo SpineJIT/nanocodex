@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use nanocodex_oai_api::{auth::OpenAiAuth, tools::ToolDefinition};
+use nanocodex_oai_api::{auth::OpenAiAuth, responses::JsonSchema, tools::ToolDefinition};
 use serde::Deserialize;
 use serde_json::{Value, json, value::to_raw_value};
 
@@ -31,6 +31,8 @@ struct Search {
     activated: Arc<AtomicBool>,
 }
 
+struct NativeSearch;
+
 struct DeferredProvider {
     activated: Arc<AtomicBool>,
     started: AtomicBool,
@@ -46,6 +48,11 @@ struct StartTrackingProvider {
 }
 
 struct CollisionTool;
+
+struct NamedTool {
+    name: &'static str,
+    output: &'static str,
+}
 
 struct DeclaredProvider {
     name: &'static str,
@@ -76,6 +83,21 @@ impl Tool for Double {
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
         let input = input.decode_json::<DoubleInput>()?;
         Ok(ToolOutput::text((input.value * 2).to_string()))
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for NamedTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            self.name,
+            format!("Returns {}.", self.output),
+            json!({ "type": "object", "properties": {} }),
+        )
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        Ok(ToolOutput::text(self.output))
     }
 }
 
@@ -222,6 +244,26 @@ impl Tool for Search {
             json!({ "name": "deferred_echo" }),
             true,
         ))
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for NativeSearch {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::tool_search(
+            "client",
+            "Searches deferred tools.",
+            JsonSchema::from(json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"],
+                "additionalProperties": false
+            })),
+        )
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        Ok(ToolOutput::from_json(json!([]), true))
     }
 }
 
@@ -532,6 +574,154 @@ fn exposure_controls_direct_visibility_without_removing_code_mode_access() {
         "normal Code Mode augments each direct spec with its exec declaration"
     );
     assert_eq!(code_mode_contract, code_mode_only_contract);
+}
+
+#[test]
+fn per_tool_exposure_selects_direct_and_code_mode_surfaces_independently() {
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(NamedTool {
+            name: "nested_only",
+            output: "nested",
+        })
+        .tool_with_exposure(
+            NamedTool {
+                name: "direct_only",
+                output: "direct",
+            },
+            ToolExposure::DirectOnly,
+        )
+        .tool_with_exposure(
+            NamedTool {
+                name: "hidden",
+                output: "hidden",
+            },
+            ToolExposure::Hidden,
+        )
+        .build()
+        .unwrap();
+    let runtime = ToolRuntime::new_with_tools(".", None, None, &tools);
+
+    assert_eq!(
+        runtime
+            .model_specs("test-session")
+            .iter()
+            .map(ToolDefinition::name)
+            .collect::<Vec<_>>(),
+        ["exec", "wait", "direct_only"]
+    );
+    assert_eq!(
+        runtime.model_contract("test-session").1,
+        [("nested_only".to_owned(), "nested_only".to_owned())]
+    );
+    assert!(
+        runtime.contains("hidden"),
+        "hidden tools remain dispatchable"
+    );
+}
+
+#[tokio::test]
+async fn first_registered_normalized_code_mode_name_wins_consistently() {
+    let tools = Tools::builder()
+        .without_defaults()
+        .exposure(ToolExposure::DirectAndCodeMode)
+        .tool(NamedTool {
+            name: "normalized-alias",
+            output: "first",
+        })
+        .tool(NamedTool {
+            name: "normalized_alias",
+            output: "second",
+        })
+        .build()
+        .unwrap();
+    let runtime = ToolRuntime::new_with_tools(".", None, None, &tools);
+
+    assert_eq!(
+        runtime.model_contract("test-session").1,
+        [("normalized_alias".to_owned(), "normalized-alias".to_owned())]
+    );
+    let execution = runtime
+        .execute_code(
+            "text(await tools.normalized_alias({}));",
+            ToolContext::new(
+                "test-model",
+                "test-session",
+                "test-call",
+                &[],
+                DEFAULT_TOOL_OUTPUT_TOKENS,
+            ),
+        )
+        .await;
+    assert!(execution.success);
+    assert_eq!(execution.nested_calls[0].name, "normalized-alias");
+}
+
+#[test]
+fn registered_tools_cannot_replace_host_owned_routing_tools() {
+    for name in ["exec", "wait", "tool_search"] {
+        let result = Tools::builder()
+            .without_defaults()
+            .tool(NamedTool {
+                name,
+                output: "replacement",
+            })
+            .build();
+        assert!(matches!(
+            result,
+            Err(super::ToolsBuildError::ReservedName(candidate)) if candidate.as_ref() == name
+        ));
+    }
+}
+
+#[test]
+fn canonical_native_tool_search_remains_configurable() {
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(NativeSearch)
+        .build()
+        .unwrap();
+
+    assert!(matches!(
+        tools.registered[0].handler.definition(),
+        ToolDefinition::ToolSearch { .. }
+    ));
+}
+
+#[tokio::test]
+async fn extending_a_runtime_keeps_the_first_exact_tool_registration() {
+    let first = Tools::builder()
+        .without_defaults()
+        .tool(NamedTool {
+            name: "same_name",
+            output: "first",
+        })
+        .build()
+        .unwrap();
+    let second = Tools::builder()
+        .without_defaults()
+        .tool(NamedTool {
+            name: "same_name",
+            output: "second",
+        })
+        .build()
+        .unwrap();
+    let runtime = ToolRuntime::new_with_tools(".", None, None, &first).with_tools(&second);
+    let output = runtime
+        .execute_tool(
+            "same_name",
+            ToolInput::Function(to_raw_value(&json!({})).unwrap()),
+            ToolContext::new(
+                "test-model",
+                "test-session",
+                "test-call",
+                &[],
+                DEFAULT_TOOL_OUTPUT_TOKENS,
+            ),
+        )
+        .await;
+
+    assert_eq!(output.code_mode_value(), json!("first"));
 }
 
 #[test]

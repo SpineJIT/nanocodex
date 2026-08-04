@@ -9,6 +9,7 @@ use serde_json::{Map, Value, json};
 use crate::{Tool, ToolContext, ToolInput, ToolOutput, ToolResult};
 
 use super::catalog::ProviderState;
+use super::pagination::collect_paginated;
 
 const LIST_RESOURCES_DESCRIPTION: &str = "Lists resources provided by MCP servers. Resources allow servers to share data that provides context to language models, such as files, database schemas, or application-specific information. Prefer resources over web search when possible.";
 const LIST_RESOURCE_TEMPLATES_DESCRIPTION: &str = "Lists resource templates provided by MCP servers. Parameterized resource templates allow servers to share data that takes parameters and provides context to language models, such as files, database schemas, or application-specific information. Prefer resource templates over web search when possible.";
@@ -193,27 +194,20 @@ async fn list_resources(state: &ProviderState, input: ListInput) -> Result<Value
     }
     let mut resources = Vec::new();
     for (server, client) in state.clients().await {
-        let mut cursor = None;
-        loop {
-            let params = cursor
-                .clone()
-                .map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor)));
-            let result = match client.list_resources(params).await {
-                Ok(result) => result,
-                Err(error) => {
-                    tracing::warn!(%error, %server, "failed to list MCP resources");
-                    break;
-                }
-            };
-            resources.extend(with_server(result.resources, &server)?);
-            let Some(next_cursor) = result.next_cursor else {
-                break;
-            };
-            if cursor.as_ref() == Some(&next_cursor) {
-                tracing::warn!(%server, "MCP resources/list returned a duplicate cursor");
-                break;
+        let pages = collect_paginated("resources/list", None, |params| {
+            let client = Arc::clone(&client);
+            async move {
+                let result = client
+                    .list_resources(params)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok((result.resources, result.next_cursor))
             }
-            cursor = Some(next_cursor);
+        })
+        .await;
+        match pages {
+            Ok(items) => resources.extend(with_server(items, &server)?),
+            Err(error) => tracing::warn!(%error, %server, "failed to list MCP resources"),
         }
     }
     Ok(json!({ "resources": resources }))
@@ -242,27 +236,22 @@ async fn list_resource_templates(state: &ProviderState, input: ListInput) -> Res
     }
     let mut templates = Vec::new();
     for (server, client) in state.clients().await {
-        let mut cursor = None;
-        loop {
-            let params = cursor
-                .clone()
-                .map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor)));
-            let result = match client.list_resource_templates(params).await {
-                Ok(result) => result,
-                Err(error) => {
-                    tracing::warn!(%error, %server, "failed to list MCP resource templates");
-                    break;
-                }
-            };
-            templates.extend(with_server(result.resource_templates, &server)?);
-            let Some(next_cursor) = result.next_cursor else {
-                break;
-            };
-            if cursor.as_ref() == Some(&next_cursor) {
-                tracing::warn!(%server, "MCP resources/templates/list returned a duplicate cursor");
-                break;
+        let pages = collect_paginated("resources/templates/list", None, |params| {
+            let client = Arc::clone(&client);
+            async move {
+                let result = client
+                    .list_resource_templates(params)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok((result.resource_templates, result.next_cursor))
             }
-            cursor = Some(next_cursor);
+        })
+        .await;
+        match pages {
+            Ok(items) => templates.extend(with_server(items, &server)?),
+            Err(error) => {
+                tracing::warn!(%error, %server, "failed to list MCP resource templates");
+            }
         }
     }
     Ok(json!({ "resourceTemplates": templates }))

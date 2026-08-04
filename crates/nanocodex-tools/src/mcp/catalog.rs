@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::watch;
 
-use super::client::Client;
+use super::{client::Client, config::McpToolExposure};
 
 const DEFAULT_SEARCH_LIMIT: usize = 8;
 const MAX_SEARCH_LIMIT: usize = 32;
@@ -29,6 +29,7 @@ pub(crate) struct ToolEntry {
     namespace_description: String,
     pub definition: ToolDefinition,
     pub supports_parallel_tool_calls: bool,
+    pub tool_exposure: McpToolExposure,
     pub search_text: String,
     pub client: Client,
     pub timeout: Duration,
@@ -190,7 +191,11 @@ impl ProviderState {
                 "prewarming MCP tool search index"
             );
             catalog.search_index = Some(Arc::new(SearchIndex::new(
-                catalog.entries.values().cloned(),
+                catalog
+                    .entries
+                    .values()
+                    .filter(|entry| entry.tool_exposure.is_deferred())
+                    .cloned(),
             )));
         } else {
             catalog.search_index = None;
@@ -238,7 +243,11 @@ impl ProviderState {
                 "building MCP tool search index"
             );
             catalog.search_index = Some(Arc::new(SearchIndex::new(
-                catalog.entries.values().cloned(),
+                catalog
+                    .entries
+                    .values()
+                    .filter(|entry| entry.tool_exposure.is_deferred())
+                    .cloned(),
             )));
         }
         let index = catalog
@@ -275,6 +284,7 @@ impl ProviderState {
         catalog
             .entries
             .values()
+            .filter(|entry| entry.tool_exposure.is_available_in_code_mode())
             .map(|entry| entry.definition.clone())
             .collect()
     }
@@ -404,6 +414,7 @@ impl ToolEntry {
         client: Client,
         timeout: Duration,
         server_supports_parallel_tool_calls: bool,
+        tool_exposure: McpToolExposure,
     ) -> Self {
         let remote_name = tool.name.to_string();
         let canonical_name = canonical_tool_name(server_name, &remote_name);
@@ -461,6 +472,7 @@ impl ToolEntry {
             namespace_description,
             definition,
             supports_parallel_tool_calls,
+            tool_exposure,
             search_text,
             client,
             timeout,

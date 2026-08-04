@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- [tools] Add bounded MCP pagination, collision-safe Code Mode registration,
+  per-tool and per-server exposure policy, and deferred custom-tool wire shapes.
+- [parity] Classify Codex through `7ada37a1` and defer the standalone V8 host.
 - [model] Support selecting `gpt-5.6-luna` when creating Rust, CLI, Python,
   JavaScript, and Harbor agent threads.
 - [vm] Add persistent VM-backed workspace tools, immutable root-image

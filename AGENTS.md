@@ -43,7 +43,7 @@
 - Codex is evidence, not an API requirement. Copy relevant invariants and
   operational behavior while keeping Nanocodex's smaller public surface.
 - The reviewed upstream checkpoint is
-  `openai/codex@35eaf3ffb0bf2001486c68c47a3d946b34d16634`. A parity review must
+  `openai/codex@7ada37a15e1f6aa84f83b4b9410f9d29e66fefe4`. A parity review must
   inspect every later commit, classify it as port/evaluate/defer/out-of-scope,
   and cite adopted behavior before advancing the checkpoint.
 
