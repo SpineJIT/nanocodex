@@ -114,8 +114,12 @@ application parses `CODEX_THREAD_ID` and derives a stable
 explicit override for hosts without that Codex identity. The application
 applies `retain` or `delete` cleanup only after the turn finishes. Commands
 travel to the guest over SSH stdin and receive both a local deadline and a
-combined output bound. The tool registry disables host workspace tools, so
-shell work cannot silently fall back to the machine running Nanocodex.
+combined output bound. On Unix, successive operations reuse a private
+per-sandbox OpenSSH control master; structured results expose whether the
+connection was reused and its master PID. Caller cleanup explicitly closes
+every master, with a 60-second idle fallback after abrupt host termination. The
+tool registry disables host workspace tools, so shell work cannot silently fall
+back to the machine running Nanocodex.
 
 Run it with a Codex-compatible ChatGPT `auth.json` or an OpenAI API key:
 
