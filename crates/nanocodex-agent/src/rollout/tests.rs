@@ -161,6 +161,10 @@ fn prompt_previews_are_single_line_and_bounded() {
         160
     );
     assert_eq!(load::prompt_preview(" \n\t "), None);
+    assert_eq!(
+        load::prompt_preview("safe\u{1b}]52;c;payload\u{7} text"),
+        Some("safe]52;c;payload text".to_owned())
+    );
 }
 
 fn set_modified(path: &Path, seconds: u64) {

@@ -285,6 +285,9 @@ pub(super) fn prompt_preview(prompt: &str) -> Option<String> {
             pending_space = !preview.is_empty();
             continue;
         }
+        if character.is_control() {
+            continue;
+        }
         if pending_space && chars < MAX_CHARS {
             preview.push(' ');
             chars += 1;

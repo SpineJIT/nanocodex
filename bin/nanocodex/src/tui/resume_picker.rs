@@ -1,4 +1,4 @@
-use std::{io, time::SystemTime};
+use std::{borrow::Cow, io, time::SystemTime};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use nanocodex::agent::rollout::RolloutSessionInfo;
@@ -155,13 +155,14 @@ fn session_item(
     } else {
         Style::default()
     };
-    let workspace = session.workspace().unwrap_or("(workspace unavailable)");
+    let workspace =
+        sanitized_terminal_text(session.workspace().unwrap_or("(workspace unavailable)"));
     let location = if session.is_archived() {
         "archived"
     } else {
         "active"
     };
-    let preview = session.preview().unwrap_or("(prompt unavailable)");
+    let preview = sanitized_terminal_text(session.preview().unwrap_or("(prompt unavailable)"));
     ListItem::new(vec![
         Line::styled(
             format!(
@@ -179,6 +180,19 @@ fn session_item(
             },
         ),
     ])
+}
+
+fn sanitized_terminal_text(value: &str) -> Cow<'_, str> {
+    if value.chars().any(char::is_control) {
+        Cow::Owned(
+            value
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(value)
+    }
 }
 
 fn format_age(modified_at: SystemTime, now: SystemTime) -> String {
@@ -252,5 +266,17 @@ mod tests {
         assert_eq!(format_age(now - Duration::from_secs(60), now), "1m ago");
         assert_eq!(format_age(now - Duration::from_secs(3_600), now), "1h ago");
         assert_eq!(format_age(now - Duration::from_secs(86_400), now), "1d ago");
+    }
+
+    #[test]
+    fn terminal_text_strips_control_sequences_without_allocating_normal_text() {
+        assert!(matches!(
+            sanitized_terminal_text("normal text"),
+            Cow::Borrowed("normal text")
+        ));
+        assert_eq!(
+            sanitized_terminal_text("/tmp/\u{1b}]52;c;payload\u{7}\nworkspace"),
+            "/tmp/]52;c;payloadworkspace"
+        );
     }
 }
