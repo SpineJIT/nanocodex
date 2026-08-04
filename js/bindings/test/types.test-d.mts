@@ -13,7 +13,7 @@ declare const apiKey: string;
 async function check() {
   const agent = await Agent.create({
     apiKey,
-    model: "gpt-5.6-luna",
+    model: "gpt-5.6-terra",
     thinking: "high",
     fastMode: false,
     workspace: "/workspace",

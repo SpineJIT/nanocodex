@@ -379,10 +379,11 @@ WebSocket, while the host owns device-attestation generation.
 
 ### Responses Lite parallel-tool scheduling
 
-For `gpt-5.6-sol` and `gpt-5.6-luna`, Nanocodex matches Codex's Responses Lite
-request contract by sending `parallel_tool_calls: false`. The client still
-accepts multi-call responses and schedules them through Codex's read/write admission gate:
-explicitly safe calls may overlap, while an unsafe call excludes every sibling.
+For `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`, Nanocodex matches
+Codex's Responses Lite request contract by sending `parallel_tool_calls: false`.
+The client still accepts multi-call responses and schedules them through
+Codex's read/write admission gate: explicitly safe calls may overlap, while an
+unsafe call excludes every sibling.
 
 The safe built-ins match Codex: `exec_command`, `write_stdin`, `view_image`,
 provider-native `tool_search`, and web search. MCP tools opt in through

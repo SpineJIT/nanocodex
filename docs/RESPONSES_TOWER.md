@@ -5,10 +5,13 @@ Status: implemented.
 ## Ownership and public composition
 
 `OpenAi::new(auth)` creates the standard client recipe with `gpt-5.6-sol`.
-`OpenAi::builder(auth)` exposes the closed Sol/Luna model choice plus transport,
-storage, history, reasoning, and Tower policy. `Nanocodex::builder(openai)`
-then adds agent instructions, tools, workspace, session identity, and lifecycle
-policy while keeping driver mechanics private.
+`OpenAi::builder(auth)` exposes the closed Sol/Terra/Luna model choice plus
+transport, storage, history, reasoning, wire namespace, and Tower policy. The
+optional wire namespace applies only to API-key HTTPS OpenAI routing gateways;
+it changes no provider or model semantics and never expands the typed model
+family. `Nanocodex::builder(openai)` then adds agent instructions, tools,
+workspace, session identity, and lifecycle policy while keeping driver
+mechanics private.
 
 `build()` requires an active Tokio runtime, spawns one stateful driver, and
 returns `(Nanocodex, AgentEvents)`. The driver owns mutable conversation,
@@ -20,7 +23,7 @@ history, code-mode runtime, shell sessions, and prompt-cache identity across
 follow-on turns. A WebSocket policy also reuses its connection. The caller does
 not replay earlier results.
 
-The selected Sol or Luna model is fixed when the thread is created. Upstream
+The selected Sol, Terra, or Luna model is fixed when the thread is created. Upstream
 Codex permits model changes on later turns at commit
 [`acd540f1`](https://github.com/openai/codex/commit/acd540f1581bf30f963fccbcce43ac494102242c):
 

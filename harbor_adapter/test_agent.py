@@ -294,16 +294,16 @@ class CliToolInstallContractTests(unittest.TestCase):
 
 
 class ModelContractTests(unittest.TestCase):
-    def test_supported_models_are_exactly_sol_and_luna(self) -> None:
+    def test_supported_models_are_exactly_the_gpt_5_6_family(self) -> None:
         self.assertEqual(
             SUPPORTED_MODELS,
-            {"gpt-5.6-sol", "gpt-5.6-luna"},
+            {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"},
         )
         self.assertEqual(DEFAULT_MODEL, "gpt-5.6-sol")
         self.assertEqual(NanocodexAgent._api_model_name(None), DEFAULT_MODEL)
         self.assertEqual(
-            NanocodexAgent._api_model_name("openai/gpt-5.6-luna"),
-            "gpt-5.6-luna",
+            NanocodexAgent._api_model_name("openai/gpt-5.6-terra"),
+            "gpt-5.6-terra",
         )
 
     def test_run_arguments_forward_the_selected_model(self) -> None:
@@ -336,12 +336,15 @@ class ModelContractTests(unittest.TestCase):
         fast_mode = arguments.index("--fast-mode")
         self.assertEqual(arguments[fast_mode : fast_mode + 2], ["--fast-mode", "false"])
 
-    def test_constructor_rejects_models_outside_the_supported_pair(self) -> None:
+    def test_constructor_rejects_models_outside_the_supported_family(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(ValueError, "supports only gpt-5.6-luna, gpt-5.6-sol"):
+            with self.assertRaisesRegex(
+                ValueError,
+                "supports only gpt-5.6-luna, gpt-5.6-sol, gpt-5.6-terra",
+            ):
                 NanocodexAgent(
                     logs_dir=Path(directory),
-                    model_name="openai/gpt-5.6-terra",
+                    model_name="openai/gpt-5.5",
                     extra_env={"OPENAI_API_KEY": "test-key"},
                 )
 
