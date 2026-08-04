@@ -109,6 +109,10 @@ impl ExeDevSandbox {
             timeout: config.command_timeout,
             output_limit: config.output_limit,
             known_hosts: tempfile::NamedTempFile::new()?.into_temp_path(),
+            #[cfg(unix)]
+            control_directory: tempfile::Builder::new()
+                .prefix("ncx-ssh-")
+                .tempdir_in("/tmp")?,
         };
         Ok(Self::with_transport(config.name, Arc::new(transport)))
     }
@@ -145,30 +149,47 @@ impl ExeDevSandbox {
         &self,
         policy: SandboxCleanup,
     ) -> Result<Option<SandboxOperation>, SandboxError> {
-        if policy == SandboxCleanup::Retain {
-            return Ok(None);
+        let mut operation = if policy == SandboxCleanup::Delete {
+            let mut state = self.inner.state.lock().await;
+            if state.created {
+                let output = self
+                    .inner
+                    .transport
+                    .lobby(vec![
+                        "rm".to_owned(),
+                        self.inner.name.clone(),
+                        "--json".to_owned(),
+                    ])
+                    .await?;
+                let success = output.success();
+                if success {
+                    state.created = false;
+                }
+                Some(SandboxOperation::from_process(
+                    self.info(state.created),
+                    output,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let closed = self.close_connections().await?;
+        if let Some(operation) = &mut operation {
+            operation.control_masters_closed = closed;
         }
-        let mut state = self.inner.state.lock().await;
-        if !state.created {
-            return Ok(None);
-        }
-        let output = self
+        Ok(operation)
+    }
+
+    async fn close_connections(&self) -> Result<usize, SandboxError> {
+        let guest = self
             .inner
             .transport
-            .lobby(vec![
-                "rm".to_owned(),
-                self.inner.name.clone(),
-                "--json".to_owned(),
-            ])
-            .await?;
-        let success = output.success();
-        if success {
-            state.created = false;
-        }
-        Ok(Some(SandboxOperation::from_process(
-            self.info(state.created),
-            output,
-        )))
+            .close(&format!("{}.exe.xyz", self.inner.name))
+            .await;
+        let lobby = self.inner.transport.close("exe.dev").await;
+        Ok(usize::from(guest?) + usize::from(lobby?))
     }
 
     fn info(&self, created: bool) -> SandboxIdentity {
@@ -190,6 +211,9 @@ impl ExeDevSandbox {
                 stderr: String::new(),
                 timed_out: false,
                 output_limit_exceeded: false,
+                connection_reused: false,
+                control_master_pid: None,
+                control_masters_closed: 0,
                 wall_time_seconds: 0.0,
             });
         }
@@ -261,6 +285,12 @@ pub struct SandboxOperation {
     pub timed_out: bool,
     /// Whether combined output crossed the configured bound.
     pub output_limit_exceeded: bool,
+    /// Whether this operation reused an already-active SSH control master.
+    pub connection_reused: bool,
+    /// Active OpenSSH control-master PID observed after the operation.
+    pub control_master_pid: Option<u32>,
+    /// Number of control masters explicitly closed after caller cleanup.
+    pub control_masters_closed: usize,
     /// Local wall-clock duration.
     pub wall_time_seconds: f64,
 }
@@ -274,6 +304,9 @@ impl SandboxOperation {
             stderr: output.stderr,
             timed_out: output.timed_out,
             output_limit_exceeded: output.output_limit_exceeded,
+            connection_reused: output.connection_reused,
+            control_master_pid: output.control_master_pid,
+            control_masters_closed: 0,
             wall_time_seconds: output.wall_time_seconds,
         }
     }
@@ -408,6 +441,7 @@ fn validate_vm_name(name: &str) -> Result<(), SandboxError> {
 trait SandboxTransport: Send + Sync {
     async fn lobby(&self, arguments: Vec<String>) -> std::io::Result<ProcessOutput>;
     async fn guest(&self, destination: &str, script: String) -> std::io::Result<ProcessOutput>;
+    async fn close(&self, destination: &str) -> std::io::Result<bool>;
 }
 
 struct SshTransport {
@@ -415,6 +449,8 @@ struct SshTransport {
     timeout: Duration,
     output_limit: usize,
     known_hosts: tempfile::TempPath,
+    #[cfg(unix)]
+    control_directory: tempfile::TempDir,
 }
 
 #[async_trait]
@@ -439,6 +475,10 @@ impl SandboxTransport for SshTransport {
         )
         .await
     }
+
+    async fn close(&self, destination: &str) -> std::io::Result<bool> {
+        self.close_master(destination).await
+    }
 }
 
 impl SshTransport {
@@ -449,6 +489,7 @@ impl SshTransport {
         input: Option<Vec<u8>>,
         accept_new_host: bool,
     ) -> std::io::Result<ProcessOutput> {
+        let existing_master = self.control_master(destination).await?;
         let mut command = Command::new(&self.binary);
         command
             .arg("-o")
@@ -457,6 +498,7 @@ impl SshTransport {
             .arg("ConnectTimeout=10")
             .arg("-o")
             .arg("ConnectionAttempts=6");
+        self.configure_multiplexing(&mut command);
         if accept_new_host {
             command
                 .arg("-o")
@@ -477,8 +519,115 @@ impl SshTransport {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
-        bounded_output(command, input, self.timeout, self.output_limit).await
+        let mut output = bounded_output(command, input, self.timeout, self.output_limit).await?;
+        let active_master = self.control_master(destination).await?;
+        output.connection_reused = existing_master.is_some();
+        output.control_master_pid = active_master.and_then(|master| master.pid);
+        Ok(output)
     }
+
+    #[cfg(unix)]
+    fn configure_multiplexing(&self, command: &mut Command) {
+        command
+            .arg("-o")
+            .arg("ControlMaster=auto")
+            .arg("-o")
+            .arg("ControlPersist=60")
+            .arg("-o")
+            .arg(format!("ControlPath={}", self.control_path().display()));
+    }
+
+    #[cfg(not(unix))]
+    fn configure_multiplexing(&self, _command: &mut Command) {}
+
+    #[cfg(unix)]
+    fn control_path(&self) -> PathBuf {
+        self.control_directory.path().join("%C")
+    }
+
+    #[cfg(unix)]
+    async fn control_master(&self, destination: &str) -> std::io::Result<Option<ControlMaster>> {
+        let mut command = Command::new(&self.binary);
+        command
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg(format!("ControlPath={}", self.control_path().display()))
+            .arg("-O")
+            .arg("check")
+            .arg(destination)
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(3), command.output())
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "SSH control check timed out")
+            })??;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let message = String::from_utf8_lossy(&output.stderr);
+        Ok(Some(ControlMaster {
+            pid: parse_control_master_pid(&message),
+        }))
+    }
+
+    #[cfg(not(unix))]
+    async fn control_master(&self, _destination: &str) -> std::io::Result<Option<ControlMaster>> {
+        Ok(None)
+    }
+
+    #[cfg(unix)]
+    async fn close_master(&self, destination: &str) -> std::io::Result<bool> {
+        if self.control_master(destination).await?.is_none() {
+            return Ok(false);
+        }
+        let mut command = Command::new(&self.binary);
+        command
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg(format!("ControlPath={}", self.control_path().display()))
+            .arg("-O")
+            .arg("exit")
+            .arg(destination)
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(3), command.output())
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "SSH control shutdown timed out",
+                )
+            })??;
+        if output.status.success() {
+            Ok(true)
+        } else {
+            Err(std::io::Error::other(format!(
+                "failed to close SSH control master for {destination}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
+    #[cfg(not(unix))]
+    async fn close_master(&self, _destination: &str) -> std::io::Result<bool> {
+        Ok(false)
+    }
+}
+
+struct ControlMaster {
+    pid: Option<u32>,
+}
+
+fn parse_control_master_pid(message: &str) -> Option<u32> {
+    let suffix = message.split_once("pid=")?.1;
+    let digits = suffix
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    digits.parse().ok()
 }
 
 struct ProcessOutput {
@@ -487,6 +636,8 @@ struct ProcessOutput {
     stderr: String,
     timed_out: bool,
     output_limit_exceeded: bool,
+    connection_reused: bool,
+    control_master_pid: Option<u32>,
     wall_time_seconds: f64,
 }
 
@@ -571,6 +722,8 @@ async fn bounded_output(
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         timed_out: matches!(outcome, WaitOutcome::TimedOut),
         output_limit_exceeded,
+        connection_reused: false,
+        control_master_pid: None,
         wall_time_seconds: started.elapsed().as_secs_f64(),
     })
 }
@@ -676,6 +829,8 @@ mod tests {
                 stderr: String::new(),
                 timed_out: false,
                 output_limit_exceeded: false,
+                connection_reused: false,
+                control_master_pid: None,
                 wall_time_seconds: 0.01,
             }
         }
@@ -709,6 +864,14 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .ok_or_else(|| std::io::Error::other("missing fake output"))
+        }
+
+        async fn close(&self, destination: &str) -> std::io::Result<bool> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("close {destination}"));
+            Ok(true)
         }
     }
 
@@ -791,10 +954,28 @@ mod tests {
             .unwrap();
 
         assert!(deleted.success());
-        assert_eq!(
-            transport.calls.lock().unwrap().last().unwrap(),
-            "lobby rm nanocodex-test --json"
+        let calls = transport.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "lobby rm nanocodex-test --json")
         );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "close nanocodex-test.exe.xyz")
+        );
+        assert!(calls.iter().any(|call| call == "close exe.dev"));
+        assert_eq!(deleted.control_masters_closed, 2);
+    }
+
+    #[test]
+    fn parses_openssh_control_master_pid() {
+        assert_eq!(
+            parse_control_master_pid("Master running (pid=4217)\r\n"),
+            Some(4217)
+        );
+        assert_eq!(parse_control_master_pid("Control socket absent"), None);
     }
 
     #[cfg(unix)]

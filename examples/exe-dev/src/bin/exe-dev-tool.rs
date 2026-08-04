@@ -34,7 +34,11 @@ async fn main() -> Result<()> {
 
     match cleanup_result {
         Ok(Some(operation)) if operation.exit_code == Some(0) => {
-            eprintln!("deleted caller-owned sandbox {}", sandbox.name());
+            eprintln!(
+                "deleted caller-owned sandbox {}; closed {} SSH control masters",
+                sandbox.name(),
+                operation.control_masters_closed
+            );
         }
         Ok(Some(operation)) => {
             bail!(
