@@ -77,7 +77,6 @@ Relevant global options:
 --provider.tempo.api-base-url <https-url>  # default https://openai.mpp.tempo.xyz/v1
 --provider.tempo.wallet-store <path>       # default ~/.tempo/wallet/store.json
 --provider.tempo.swap-slippage-bps <bps>   # default 100
---provider.tempo.egress-max-charge <units> # default 100000 NanoUSD atomic units
 --provider.tempo.api-key <key>             # optional gated deployment key
 ```
 
@@ -106,9 +105,8 @@ environment or MCP transports.
 
 The egress proxy buffers a request body up to 16 MiB so it can replay the exact
 request after a valid 402 challenge. It rejects redirects, protocol upgrades,
-unsupported payment methods, malformed challenges, and charges above
-`--provider.tempo.egress-max-charge`. The wallet and signing key never leave
-the Nanocodex process.
+unsupported payment methods, and malformed challenges. The wallet and signing
+key never leave the Nanocodex process.
 
 MPP tracing records full request, response, challenge, and credential content.
 Operators must protect those traces like wallet and conversation data.
@@ -122,7 +120,7 @@ cap, and fans curl subprocesses out from one `Promise.all` cell:
 
 ```sh
 nanocodex run --provider.tempo \
-  "Use one Code Mode cell. Fetch https://mpp.dev/api/services, select eight safe HTTP service smoke requests whose advertised charges fit the configured cap, then use Promise.all over exec_command calls that each run curl -fsS. Verify every exit code and report the endpoint/status matrix."
+  "Use one Code Mode cell. Fetch https://mpp.dev/api/services, select eight safe HTTP service smoke requests with low advertised charges, then use Promise.all over exec_command calls that each run curl -fsS. Verify every exit code and report the endpoint/status matrix."
 ```
 
 Run the same model turn with every workspace command inside the retained VM:
@@ -131,7 +129,7 @@ Run the same model turn with every workspace command inside the retained VM:
 nanocodex run --provider.tempo \
   --vm .nanocodex/vm/session-rootfs.ext4 \
   --vm-guest-runtime target/aarch64-unknown-linux-musl/debug/nanocodex-vm-guest \
-  "Use one Code Mode cell. Fetch https://mpp.dev/api/services, select eight safe HTTP service smoke requests whose advertised charges fit the configured cap, then use Promise.all over exec_command calls that each run curl -fsS. Verify every exit code and report the endpoint/status matrix."
+  "Use one Code Mode cell. Fetch https://mpp.dev/api/services, select eight safe HTTP service smoke requests with low advertised charges, then use Promise.all over exec_command calls that each run curl -fsS. Verify every exit code and report the endpoint/status matrix."
 ```
 
 Host mode applies the proxy route only to tool subprocesses. VM mode projects
