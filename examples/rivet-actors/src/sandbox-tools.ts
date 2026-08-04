@@ -4,6 +4,7 @@ import {
   type AgentOsOptions,
 } from "@rivet-dev/agentos";
 import type { ToolMap } from "nanocodex";
+import type { RawAccess } from "rivetkit/db";
 
 const WORKSPACE = "/workspace";
 const MAX_COMMAND_CHARS = 32 * 1024;
@@ -11,10 +12,16 @@ const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_OUTPUT_BYTES = 128 * 1024;
 const MAX_LIST_ENTRIES = 512;
 const MAX_TIMEOUT_MS = 120_000;
+export const MAX_PREVIEW_TTL_SECONDS = 15 * 60;
+const PREVIEW_PROCESS_LIMIT_MS = (MAX_PREVIEW_TTL_SECONDS + 60) * 1_000;
 
 export const agentOsRuntimeOptions = {
   defaultSoftware: true,
   limits: {
+    jsRuntime: {
+      cpuTimeLimitMs: PREVIEW_PROCESS_LIMIT_MS,
+      wallClockLimitMs: PREVIEW_PROCESS_LIMIT_MS,
+    },
     resources: {
       maxFilesystemBytes: 512 * 1024 * 1024,
       maxProcesses: 64,
@@ -25,7 +32,7 @@ export const agentOsRuntimeOptions = {
 
 export const agentOsPreviewOptions = {
   defaultExpiresInSeconds: 15 * 60,
-  maxExpiresInSeconds: 60 * 60,
+  maxExpiresInSeconds: MAX_PREVIEW_TTL_SECONDS,
   maxActiveTokens: 32,
 } satisfies NonNullable<AgentOsActorExtras["preview"]>;
 
@@ -44,10 +51,82 @@ type SandboxAgentOsActions = Pick<
   | "mkdir"
   | "readFile"
   | "readdirEntries"
-  | "spawn"
   | "vmFetch"
   | "writeFile"
 >;
+type SpawnedProcess = { pid: number };
+type SelfActorClient = {
+  nanocodex: {
+    getForId(actorId: string): {
+      process: {
+        spawn(
+          command: string,
+          args: string[],
+          options: { cwd: string; output: { retainEvents: true } },
+        ): Promise<SpawnedProcess>;
+      };
+    };
+  };
+};
+type AgentOsVmStart = NonNullable<AgentOsActorExtras["onVmStart"]>;
+type AgentOsVmStartContext = Parameters<AgentOsVmStart>[0];
+type AgentOsVm = Parameters<AgentOsVmStart>[1];
+type PreviewServerRow = {
+  port: number;
+  command: string;
+  args_json: string;
+  cwd: string;
+};
+
+export async function migrateRivetSandboxDatabase(database: RawAccess): Promise<void> {
+  await database.execute(`
+    CREATE TABLE IF NOT EXISTS nanocodex_preview_servers (
+      port INTEGER PRIMARY KEY,
+      command TEXT NOT NULL,
+      args_json TEXT NOT NULL,
+      cwd TEXT NOT NULL,
+      expires_at_ms INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+}
+
+export async function restoreRivetPreviewServers(
+  context: AgentOsVmStartContext,
+  vm: AgentOsVm,
+): Promise<void> {
+  const now = Date.now();
+  await context.db.execute(
+    "DELETE FROM nanocodex_preview_servers WHERE expires_at_ms <= ?",
+    now,
+  );
+  const rows = await context.db.execute<PreviewServerRow>(
+    `SELECT port, command, args_json, cwd
+     FROM nanocodex_preview_servers
+     WHERE expires_at_ms > ?
+     ORDER BY port`,
+    now,
+  );
+  for (const row of rows) {
+    try {
+      const args = parseStoredArgs(row.args_json);
+      await vm.process.spawn(row.command, args, {
+        cwd: row.cwd,
+        output: { retainEvents: true },
+      });
+      await waitForVmPort(vm, row.port, 30_000);
+    } catch (error) {
+      context.log.error({
+        msg: "failed to restore Rivet sandbox preview server",
+        port: row.port,
+        error,
+      });
+      await context.db.execute(
+        "DELETE FROM nanocodex_preview_servers WHERE port = ?",
+        row.port,
+      );
+    }
+  }
+}
 
 export function rivetSandboxTools(
   context: AgentOsActionContext,
@@ -117,7 +196,7 @@ export function createRivetSandboxTools(
       parameters: {
         type: "object",
         properties: {
-          command: { type: "string", description: "Executable to start, such as python3 or node." },
+          command: { type: "string", description: "Executable to start, such as node." },
           args: {
             type: "array",
             items: { type: "string" },
@@ -142,13 +221,31 @@ export function createRivetSandboxTools(
           1,
           MAX_TIMEOUT_MS,
         ) ?? 30_000;
-        const process = await actions.spawn(context, command, args, {
+        // Invoke AgentOS's generated process action through the actor handle.
+        // A process started directly inside the long Nanocodex turn is scoped to
+        // that action and is reaped when the turn context closes.
+        const self = (context.client() as SelfActorClient).nanocodex.getForId(context.actorId);
+        const process = await self.process.spawn(command, args, {
           cwd,
           output: { retainEvents: true },
         });
         try {
           if (readyPort !== undefined) {
             await waitForPort(actions, context, readyPort, readyTimeout);
+            await context.db.execute(
+              `INSERT INTO nanocodex_preview_servers
+                 (port, command, args_json, cwd, expires_at_ms)
+               VALUES (?, ?, ?, ?, 0)
+               ON CONFLICT(port) DO UPDATE SET
+                 command = excluded.command,
+                 args_json = excluded.args_json,
+                 cwd = excluded.cwd,
+                 expires_at_ms = 0`,
+              readyPort,
+              command,
+              JSON.stringify(args),
+              cwd,
+            );
           }
         } catch (error) {
           await actions.killProcess(context, process.pid).catch(() => {});
@@ -214,7 +311,7 @@ export function createRivetSandboxTools(
         type: "object",
         properties: {
           port: { type: "integer", minimum: 1024, maximum: 65_535 },
-          ttl_seconds: { type: "integer", minimum: 60, maximum: 3_600 },
+          ttl_seconds: { type: "integer", minimum: 60, maximum: MAX_PREVIEW_TTL_SECONDS },
         },
         required: ["port"],
         additionalProperties: false,
@@ -222,8 +319,32 @@ export function createRivetSandboxTools(
       handler: async (input) => {
         const value = objectInput(input);
         const port = requiredInteger(value.port, "port", 1024, 65_535);
-        const ttl = optionalInteger(value.ttl_seconds, "ttl_seconds", 60, 3_600) ?? 15 * 60;
+        const ttl = optionalInteger(
+          value.ttl_seconds,
+          "ttl_seconds",
+          60,
+          MAX_PREVIEW_TTL_SECONDS,
+        ) ?? MAX_PREVIEW_TTL_SECONDS;
+        try {
+          await actions.vmFetch(context, port, "http://127.0.0.1/");
+        } catch {
+          throw new Error(`port ${port} is not reachable; start a listening server before creating a preview`);
+        }
+        const registered = await context.db.execute<{ port: number }>(
+          "SELECT port FROM nanocodex_preview_servers WHERE port = ?",
+          port,
+        );
+        if (!registered[0]) {
+          throw new Error(
+            `port ${port} is not durable; start it with sandbox_start_process and ready_port ${port}`,
+          );
+        }
         const preview = await actions.createPreviewUrl(context, port, ttl);
+        await context.db.execute(
+          "UPDATE nanocodex_preview_servers SET expires_at_ms = ? WHERE port = ?",
+          preview.expiresAt,
+          port,
+        );
         const url = publicPreviewUrl(context, preview.path);
         return {
           port,
@@ -354,6 +475,32 @@ async function waitForPort(
       await new Promise((resolve) => setTimeout(resolve, Math.min(100, deadline - Date.now())));
     }
   }
+}
+
+async function waitForVmPort(vm: AgentOsVm, port: number, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      await vm.network.httpRequest({
+        port,
+        path: "/",
+        method: "GET",
+        headers: {},
+      });
+      return;
+    } catch {
+      if (Date.now() >= deadline) throw new Error(`port ${port} did not become ready`);
+      await new Promise((resolve) => setTimeout(resolve, Math.min(100, deadline - Date.now())));
+    }
+  }
+}
+
+function parseStoredArgs(encoded: string): string[] {
+  const value: unknown = JSON.parse(encoded);
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+    throw new Error("stored preview server arguments are invalid");
+  }
+  return value;
 }
 
 function truncate(value: string): { text: string; truncated: boolean } {

@@ -105,6 +105,11 @@ tabs or devices connected with the same actor key stay synchronized. A newly
 connected client also reconstructs any active prompt from `status()` before
 joining its remaining event stream.
 
+For the hosted preview demo, use AgentOS's Node runtime for listening servers.
+Its `python3` command is Pyodide-backed and does not provide a bindable server
+socket. `sandbox_preview` probes the requested port before minting a signed URL,
+so a failed or exited server cannot produce a dead preview capability.
+
 The REPL is intentionally disposable. It stores only the Rivet endpoint,
 actor key, and an unfinished turn ID/input in `.nanocodex/rivet-repl.json`.
 The file is mode `0600` because it may contain unfinished prompt text.
@@ -264,8 +269,10 @@ to an actor-specific gateway URL with `rvt-namespace` and `rvt-token` query
 parameters, which browsers and `fetch` can open. Without it, the tool returns
 the actor-relative `/fetch/<token>` path. This is Rivet AgentOS's equivalent of
 Vercel Sandbox's `domain(port)`: it creates a temporary signed proxy to that
-port. Preview tokens and workspace files survive actor sleep, while a server
-process must be restarted if the VM is woken without it.
+port. This example bounds preview tokens to 15 minutes and keeps the actor's
+server launch specification in actor SQLite. The VM can sleep normally; its
+`onVmStart` hook restarts unexpired preview servers before AgentOS proxies the
+waking request. Workspace files and preview tokens survive the same cycle.
 
 The browser bundle is static and can be published on any static host after
 `npm run build:web --prefix examples/rivet-actors`; paste the same public

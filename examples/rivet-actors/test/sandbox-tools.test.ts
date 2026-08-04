@@ -1,17 +1,43 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import {
+  agentOsRuntimeOptions,
   createRivetSandboxTools,
+  restoreRivetPreviewServers,
   workspacePath,
 } from "../src/sandbox-tools.js";
 
 const MIB = 1024 * 1024;
 const OUTPUT_LIMIT = 128 * 1024;
-const context = { actorId: "actor-123" } as Parameters<typeof createRivetSandboxTools>[0];
+const databaseExecute = vi.fn(async (sql: string, ...bindings: unknown[]) => (
+  sql.startsWith("SELECT port FROM nanocodex_preview_servers WHERE port")
+    ? [{ port: bindings[0] }]
+    : []
+));
+const durableSpawn = vi.fn(async () => ({ pid: 41, state: "running", startedAtMs: 1 }));
+const context = {
+  actorId: "actor-123",
+  db: { execute: databaseExecute },
+  client: () => ({
+    nanocodex: {
+      getForId: () => ({ process: { spawn: durableSpawn } }),
+    },
+  }),
+} as unknown as Parameters<typeof createRivetSandboxTools>[0];
 
-afterEach(() => vi.unstubAllEnvs());
+afterEach(() => {
+  vi.clearAllMocks();
+  vi.unstubAllEnvs();
+});
 
 describe("Rivet AgentOS workspace paths", () => {
+  test("keeps JavaScript listeners alive beyond the signed preview lifetime", () => {
+    expect(agentOsRuntimeOptions.limits.jsRuntime).toEqual({
+      cpuTimeLimitMs: 960_000,
+      wallClockLimitMs: 960_000,
+    });
+  });
+
   test("canonicalizes paths under the workspace", () => {
     expect(workspacePath(".")).toBe("/workspace");
     expect(workspacePath("././")).toBe("/workspace");
@@ -115,24 +141,30 @@ describe("Rivet AgentOS tools", () => {
     const tools = createRivetSandboxTools(context, actions.value);
 
     await expect(invoke(tools, "sandbox_start_process", {
-      command: "python3",
-      args: ["-m", "http.server", "3000", "--directory", "."],
+      command: "node",
+      args: ["/workspace/server.mjs"],
       ready_port: 3000,
       ready_timeout_ms: 12_345,
     })).resolves.toEqual({
       process_id: 41,
-      command: "python3",
-      args: ["-m", "http.server", "3000", "--directory", "."],
+      command: "node",
+      args: ["/workspace/server.mjs"],
       status: "running",
       ready_port: 3000,
     });
-    expect(actions.spawn).toHaveBeenCalledWith(
-      context,
-      "python3",
-      ["-m", "http.server", "3000", "--directory", "."],
+    expect(durableSpawn).toHaveBeenCalledWith(
+      "node",
+      ["/workspace/server.mjs"],
       { cwd: "/workspace", output: { retainEvents: true } },
     );
     expect(actions.vmFetch).toHaveBeenCalledWith(context, 3000, "http://127.0.0.1/");
+    expect(databaseExecute).toHaveBeenCalledWith(
+      expect.stringContaining("INSERT INTO nanocodex_preview_servers"),
+      3000,
+      "node",
+      '["/workspace/server.mjs"]',
+      "/workspace",
+    );
   });
 
   test("kills a process whose readiness probe times out", async () => {
@@ -169,6 +201,36 @@ describe("Rivet AgentOS tools", () => {
       persistent: false,
     });
     expect(actions.createPreviewUrl).toHaveBeenCalledWith(context, 3000, 600);
+    expect(actions.vmFetch).toHaveBeenCalledWith(context, 3000, "http://127.0.0.1/");
+    expect(databaseExecute).toHaveBeenCalledWith(
+      "UPDATE nanocodex_preview_servers SET expires_at_ms = ? WHERE port = ?",
+      Date.parse("2030-01-01T00:00:00.000Z"),
+      3000,
+    );
+  });
+
+  test("refuses to sign a preview for an unreachable port", async () => {
+    const actions = makeActions({
+      vmFetch: vi.fn(async () => { throw new Error("connection refused"); }),
+    });
+
+    await expect(invoke(
+      createRivetSandboxTools(context, actions.value),
+      "sandbox_preview",
+      { port: 3000 },
+    )).rejects.toThrow("port 3000 is not reachable");
+    expect(actions.createPreviewUrl).not.toHaveBeenCalled();
+  });
+
+  test("bounds preview lifetime to the actor's keep-alive window", async () => {
+    const actions = makeActions();
+
+    await expect(invoke(
+      createRivetSandboxTools(context, actions.value),
+      "sandbox_preview",
+      { port: 3000, ttl_seconds: 901 },
+    )).rejects.toThrow("ttl_seconds must be an integer between 60 and 900");
+    expect(actions.createPreviewUrl).not.toHaveBeenCalled();
   });
 
   test("refuses to put a secret Rivet token in a preview URL", async () => {
@@ -186,6 +248,43 @@ describe("Rivet AgentOS tools", () => {
   });
 });
 
+describe("Rivet AgentOS preview recovery", () => {
+  test("restarts an unexpired preview listener when its VM wakes", async () => {
+    const execute = vi.fn(async (sql: string) => (
+      sql.includes("SELECT port, command")
+        ? [{
+            port: 3000,
+            command: "node",
+            args_json: '["/workspace/server.mjs"]',
+            cwd: "/workspace",
+          }]
+        : []
+    ));
+    const wakeContext = {
+      db: { execute },
+      log: { error: vi.fn() },
+    } as unknown as Parameters<typeof restoreRivetPreviewServers>[0];
+    const vm = {
+      process: { spawn: vi.fn(async () => ({ pid: 42 })) },
+      network: { httpRequest: vi.fn(async () => ({ status: 200 })) },
+    } as unknown as Parameters<typeof restoreRivetPreviewServers>[1];
+
+    await restoreRivetPreviewServers(wakeContext, vm);
+
+    expect(vm.process.spawn).toHaveBeenCalledWith(
+      "node",
+      ["/workspace/server.mjs"],
+      { cwd: "/workspace", output: { retainEvents: true } },
+    );
+    expect(vm.network.httpRequest).toHaveBeenCalledWith({
+      port: 3000,
+      path: "/",
+      method: "GET",
+      headers: {},
+    });
+  });
+});
+
 function makeActions(overrides: Record<string, unknown> = {}) {
   const actions = {
     createPreviewUrl: vi.fn(async () => ({
@@ -199,7 +298,6 @@ function makeActions(overrides: Record<string, unknown> = {}) {
     mkdir: vi.fn(async () => undefined),
     readFile: vi.fn(async () => new TextEncoder().encode("hello")),
     readdirEntries: vi.fn(async () => []),
-    spawn: vi.fn(async () => ({ pid: 41, state: "running", startedAtMs: 1 })),
     vmFetch: vi.fn(async () => ({
       status: 200,
       statusText: "OK",

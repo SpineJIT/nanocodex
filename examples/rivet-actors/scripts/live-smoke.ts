@@ -70,7 +70,7 @@ try {
   }
   const toolTurn = await awaitDurableTurn({
     id: randomUUID(),
-    input: "Use sandbox_write_file to write exactly RIVET_SANDBOX_OK to index.html. Verify it with sandbox_exec and sandbox_read_file. Call sandbox_start_process with command `python3`, args [`-m`, `http.server`, `3000`, `--bind`, `0.0.0.0`, `--directory`, `/workspace`], and ready_port 3000. After it reports the port ready, call sandbox_preview for port 3000. Reply with only the preview URL.",
+    input: "Use sandbox_write_file to write exactly RIVET_SANDBOX_OK to index.html and to write server.mjs containing a Node HTTP server that reads /workspace/index.html and listens on 0.0.0.0:3000. Verify index.html with sandbox_exec and sandbox_read_file. Call sandbox_start_process with command `node`, args [`/workspace/server.mjs`], and ready_port 3000. After it reports the port ready, call sandbox_preview for port 3000. Reply with only the preview URL.",
   });
   const requiredTools = [
     "sandbox_write_file",

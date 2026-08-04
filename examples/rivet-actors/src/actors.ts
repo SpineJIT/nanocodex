@@ -26,6 +26,8 @@ import {
   type AgentOsActionContext,
   agentOsPreviewOptions,
   agentOsRuntimeOptions,
+  migrateRivetSandboxDatabase,
+  restoreRivetPreviewServers,
   rivetSandboxTools,
 } from "./sandbox-tools.js";
 
@@ -144,6 +146,7 @@ export const nanocodex = agentOS({
     turns: new Map(),
   }),
   onWake: async (c: SessionContext) => migrateSessionDatabase(c.db),
+  onVmStart: restoreRivetPreviewServers,
   events: {
     agentEvent: event<AgentEvent>(),
     turnAccepted: event<TurnAccepted>(),
@@ -418,6 +421,7 @@ async function createAgent(context: SessionContext): Promise<DefaultAgent> {
 }
 
 async function migrateSessionDatabase(database: RawAccess): Promise<void> {
+  await migrateRivetSandboxDatabase(database);
   await database.execute(`
     CREATE TABLE IF NOT EXISTS session_state (
       singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
