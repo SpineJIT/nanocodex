@@ -21,6 +21,8 @@ All language consumers live at this repository boundary:
 - Vercel Workflows: `vercel-workflows/` runs Nanocodex as a durable Workflow
   actor with a persistent Vercel Sandbox, replayable state, and synchronized
   native WebSocket clients.
+- exe.dev: `exe-dev/` proves both a private retained session inside a persistent
+  VM and an external Nanocodex session using an exe.dev VM as a caller-owned tool.
 
 From the repository root:
 

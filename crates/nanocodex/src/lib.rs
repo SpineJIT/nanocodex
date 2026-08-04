@@ -21,9 +21,10 @@ pub mod agent {
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     pub use nanocodex_agent::rollout;
     pub use nanocodex_agent::{
-        AgentEvents, AgentHandle, AgentSessionContext, CostStatus, EstimatedUsdCost, Nanocodex,
-        NanocodexBuilder, NanocodexError, PromptRoute, Result, ServiceTier, Turn, TurnControl,
-        TurnResult, TurnUsage, UsdAmount, events, input, session, usage,
+        AgentEvents, AgentHandle, AgentSessionContext, CostStatus, EstimatedUsdCost,
+        ExecutionEnvironment, Nanocodex, NanocodexBuilder, NanocodexError, PromptRoute, Result,
+        ServiceTier, Turn, TurnControl, TurnResult, TurnUsage, UsdAmount, events, input, session,
+        usage,
     };
 }
 

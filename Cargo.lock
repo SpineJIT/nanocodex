@@ -5191,6 +5191,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanocodex-exe-dev"
+version = "0.3.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "eyre",
+ "futures-util",
+ "http-body-util",
+ "nanocodex",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "uuid",
+]
+
+[[package]]
 name = "nanocodex-oai-api"
 version = "0.3.0"
 dependencies = [
