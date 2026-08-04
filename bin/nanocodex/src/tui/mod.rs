@@ -5,6 +5,7 @@ mod diff;
 mod external_editor;
 mod markdown;
 mod notification;
+mod resume_picker;
 mod scheduler;
 mod selection;
 mod telemetry;
@@ -53,6 +54,8 @@ use self::{
     transcript::TranscriptItem,
 };
 use crate::config::AgentArgs;
+
+pub(crate) use resume_picker::select_resume_session;
 
 const BTW_BOUNDARY: &str = r"You are answering an ephemeral BTW side question.
 Treat inherited conversation history only as reference context. Do not resume or complete an

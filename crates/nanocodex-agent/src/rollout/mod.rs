@@ -5,7 +5,7 @@ mod wire;
 #[cfg(test)]
 mod tests;
 
-pub use load::{DurableSession, RolloutTranscriptItem};
+pub use load::{DurableSession, RolloutSessionInfo, RolloutTranscriptItem};
 pub use store::RolloutInfo;
 pub(crate) use store::{RolloutOrigin, RolloutRecorder, RolloutTurn};
 
@@ -67,6 +67,19 @@ impl RolloutConfig {
     /// exist, or its rollout is malformed or incompatible.
     pub fn load_session(&self, thread_id: &str) -> io::Result<DurableSession> {
         DurableSession::load(&self.codex_home, thread_id)
+    }
+
+    /// Lists resumable Codex and Nanocodex sessions beneath this Codex home.
+    ///
+    /// Active and archived uncompressed JSONL rollouts are returned newest
+    /// first. Files without recognizable session metadata are ignored so a
+    /// stale or partially written unrelated file cannot prevent discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a session directory exists but cannot be read.
+    pub fn list_sessions(&self) -> io::Result<Vec<RolloutSessionInfo>> {
+        load::list_sessions(&self.codex_home)
     }
 
     pub(crate) fn resumed(mut self, rollout_path: PathBuf) -> Self {

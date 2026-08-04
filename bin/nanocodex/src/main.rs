@@ -38,7 +38,7 @@ mod vm;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
-use eyre::{Result, WrapErr};
+use eyre::{Result, WrapErr, eyre};
 use nanocodex::agent::rollout::RolloutConfig;
 
 use config::AgentArgs;
@@ -107,9 +107,9 @@ struct RunCommand {
 
 #[derive(Args)]
 struct ResumeCommand {
-    /// Codex thread UUID to resume.
+    /// Codex thread UUID to resume. Omit it to select from discovered sessions.
     #[arg(value_parser = NonEmptyStringValueParser::new())]
-    thread_id: String,
+    thread_id: Option<String>,
 
     #[command(flatten)]
     agent: AgentArgs,
@@ -154,9 +154,31 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Some(Command::Resume(command)) => {
             let codex_home = config::default_codex_home()?;
-            let session = RolloutConfig::new(&codex_home)
-                .load_session(&command.thread_id)
-                .wrap_err_with(|| format!("failed to load Codex thread {}", command.thread_id))?;
+            let rollouts = RolloutConfig::new(&codex_home);
+            let thread_id = match command.thread_id {
+                Some(thread_id) => thread_id,
+                None => {
+                    let sessions = rollouts.list_sessions().wrap_err_with(|| {
+                        format!(
+                            "failed to discover Codex threads under {}",
+                            codex_home.display()
+                        )
+                    })?;
+                    if sessions.is_empty() {
+                        return Err(eyre!(
+                            "no resumable Codex threads found under {}",
+                            codex_home.display()
+                        ));
+                    }
+                    let Some(thread_id) = tui::select_resume_session(&sessions)? else {
+                        return Ok(());
+                    };
+                    thread_id
+                }
+            };
+            let session = rollouts
+                .load_session(&thread_id)
+                .wrap_err_with(|| format!("failed to load Codex thread {thread_id}"))?;
             let workspace = PathBuf::from(session.workspace());
             let _observability = command.observability.install(true, &workspace)?;
             tui::run(command.agent, command.vm, command.prompt, Some(session)).await
@@ -362,8 +384,22 @@ mod tests {
         let Some(Command::Resume(command)) = cli.command else {
             panic!("resume command was not parsed");
         };
-        assert_eq!(command.thread_id, "019c0d31-c308-7d91-bff4-5dca82d15ac6");
+        assert_eq!(
+            command.thread_id.as_deref(),
+            Some("019c0d31-c308-7d91-bff4-5dca82d15ac6")
+        );
         assert_eq!(command.prompt.as_deref(), Some("continue"));
         assert!(!command.agent.uses_tempo());
+    }
+
+    #[test]
+    fn resume_without_a_thread_id_opens_discovery_path() {
+        let cli = Cli::try_parse_from(["nanocodex", "resume", "--provider.openai"])
+            .expect("resume should accept an omitted thread UUID");
+
+        let Some(Command::Resume(command)) = cli.command else {
+            panic!("resume command was not parsed");
+        };
+        assert!(command.thread_id.is_none());
     }
 }
