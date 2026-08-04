@@ -1,5 +1,7 @@
 //! A deliberately small native Nanocodex consumer for one private exe.dev VM.
 
+pub mod sandbox;
+
 use std::{
     convert::Infallible,
     env,

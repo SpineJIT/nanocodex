@@ -4,6 +4,10 @@ This example runs one native, retained Nanocodex session beside a project in an
 exe.dev VM. It is a concrete application consumer, not a generic app-server
 protocol in the stable Nanocodex crates.
 
+It also includes the inverse experiment: `exe-dev-tool` leaves Nanocodex and
+its model credentials on the host while exposing one exact exe.dev VM through
+narrow caller-defined tools.
+
 The service:
 
 - owns one ordered prompt queue and one native Nanocodex driver;
@@ -92,12 +96,49 @@ Environment=NANOCODEX_EXE_API_BASE=
 Environment=NANOCODEX_EXE_TRANSPORT=websocket
 ```
 
+## exe.dev as an external sandbox tool
+
+`exe-dev-tool` demonstrates the inverse ownership boundary:
+
+```text
+host Nanocodex session
+  -> sandbox_create
+  -> sandbox_exec
+  -> sandbox_info
+       -> one caller-named private exe.dev VM
+```
+
+The model cannot choose a VM name or delete a VM. By default the embedding
+application parses `CODEX_THREAD_ID` and derives a stable
+`nanocodex-<uuid-without-hyphens>` VM name. `NANOCODEX_EXE_SANDBOX` is an
+explicit override for hosts without that Codex identity. The application
+applies `retain` or `delete` cleanup only after the turn finishes. Commands
+travel to the guest over SSH stdin and receive both a local deadline and a
+combined output bound. The tool registry disables host workspace tools, so
+shell work cannot silently fall back to the machine running Nanocodex.
+
+Run it with a Codex-compatible ChatGPT `auth.json` or an OpenAI API key:
+
+```sh
+NANOCODEX_AUTH_FILE="$HOME/.codex/auth.json" \
+NANOCODEX_EXE_CLEANUP=delete \
+cargo run -p nanocodex-exe-dev --bin exe-dev-tool -- \
+  'Create the sandbox, run uname -srm, write and verify ~/proof.txt, then report the result.'
+```
+
+The host must already be authenticated for non-interactive `ssh exe.dev` and
+guest SSH. Set `NANOCODEX_EXE_SANDBOX` when running outside a Codex environment;
+`NANOCODEX_EXE_SSH` may select a different SSH executable. Cleanup defaults to
+`retain`; use `delete` only when the named VM belongs exclusively to this run.
+
 ## Local validation
 
 ```sh
 cargo test -p nanocodex-exe-dev
 cargo clippy -p nanocodex-exe-dev --all-targets -- -D warnings
 OPENAI_API_KEY=sk-... cargo run -p nanocodex-exe-dev
+NANOCODEX_EXE_SANDBOX=nanocodex-tool-local cargo run \
+  -p nanocodex-exe-dev --bin exe-dev-tool
 ```
 
 Configuration is intentionally narrow:

@@ -5,7 +5,7 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --locked --release -p nanocodex-exe-dev && \
+    cargo build --locked --release -p nanocodex-exe-dev --bin nanocodex-exe-dev && \
     cp /src/target/release/nanocodex-exe-dev /tmp/nanocodex-exe-dev
 
 FROM scratch AS artifact

@@ -12,16 +12,22 @@ description = "Private native Nanocodex session consumer for exe.dev VMs"
 
 [dependencies]
 axum.workspace = true
+chrono.workspace = true
 eyre.workspace = true
 futures-util.workspace = true
 nanocodex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
-tempfile.workspace = true
 tower.workspace = true
 
 [lints]
