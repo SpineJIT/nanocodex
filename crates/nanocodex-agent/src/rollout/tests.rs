@@ -1,4 +1,7 @@
-use std::io::{BufRead, BufReader, Read};
+use std::{
+    io::{BufRead, BufReader, Read},
+    time::Duration,
+};
 
 use nanocodex_oai_api::responses::{ContentItem, MessageRole};
 use serde_json::Value;
@@ -36,6 +39,144 @@ fn child_rollout_policy_does_not_inherit_a_resume_path() {
 
     assert_eq!(child.codex_home(), Path::new("/codex"));
     assert!(child.resume_path.is_none());
+}
+
+#[test]
+fn discovers_active_and_archived_rollouts_newest_first() {
+    let home = tempdir().expect("temporary Codex home");
+    let active_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    let archived_id = "019c0d31-c308-7d91-bff4-5dca82d15ac5";
+    let ignored_id = "019c0d31-c308-7d91-bff4-5dca82d15ac4";
+    let active = write_discoverable_rollout(home.path(), "sessions/2026/08/04", active_id);
+    let archived =
+        write_discoverable_rollout(home.path(), "archived_sessions/2026/08/03", archived_id);
+    let ignored_directory = home.path().join("sessions/2026/08/02");
+    std::fs::create_dir_all(&ignored_directory).expect("create ignored rollout directory");
+    std::fs::write(
+        ignored_directory.join(format!("rollout-2026-08-02T12-00-00-{ignored_id}.jsonl")),
+        "not json\n",
+    )
+    .expect("write malformed rollout");
+    std::fs::write(
+        ignored_directory.join(format!(
+            "rollout-2026-08-02T12-00-00-{ignored_id}.jsonl.zst"
+        )),
+        "compressed",
+    )
+    .expect("write unsupported compressed rollout");
+
+    set_modified(&archived, 10);
+    set_modified(&active, 20);
+    let sessions = RolloutConfig::new(home.path())
+        .list_sessions()
+        .expect("discover rollouts");
+
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0].thread_id(), active_id);
+    assert_eq!(sessions[0].workspace(), home.path().to_str());
+    assert_eq!(sessions[0].preview(), Some("resume me"));
+    assert!(!sessions[0].is_archived());
+    assert_eq!(sessions[1].thread_id(), archived_id);
+    assert!(sessions[1].is_archived());
+}
+
+#[test]
+fn discovery_prefers_an_active_copy_of_a_duplicate_thread() {
+    let home = tempdir().expect("temporary Codex home");
+    let thread_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    let active = write_discoverable_rollout(home.path(), "sessions/2026/08/04", thread_id);
+    let archived =
+        write_discoverable_rollout(home.path(), "archived_sessions/2026/08/05", thread_id);
+    set_modified(&active, 10);
+    set_modified(&archived, 20);
+
+    let sessions = RolloutConfig::new(home.path())
+        .list_sessions()
+        .expect("discover deduplicated rollouts");
+
+    assert_eq!(sessions.len(), 1);
+    assert!(!sessions[0].is_archived());
+}
+
+fn write_discoverable_rollout(home: &Path, relative: &str, thread_id: &str) -> PathBuf {
+    let directory = home.join(relative);
+    std::fs::create_dir_all(&directory).expect("create rollout directory");
+    let path = directory.join(format!("rollout-2026-08-04T12-00-00-{thread_id}.jsonl"));
+    let mut file = File::create(&path).expect("create discoverable rollout");
+    write_line(
+        &mut file,
+        &serde_json::json!({
+            "timestamp": "2026-08-04T12:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "cwd": home,
+                "history_mode": "legacy",
+                "context_window": {"window_id": "window-1"}
+            }
+        }),
+    )
+    .expect("write session metadata");
+    write_line(
+        &mut file,
+        &serde_json::json!({
+            "timestamp": "2026-08-04T12:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "resume\n  me"
+            }
+        }),
+    )
+    .expect("write user preview");
+    write_line(
+        &mut file,
+        &serde_json::json!({
+            "timestamp": "2026-08-04T12:00:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "resume me"}]
+            }
+        }),
+    )
+    .expect("write committed history");
+    file.flush().expect("flush discoverable rollout");
+    path
+}
+
+#[test]
+fn prompt_previews_are_single_line_and_bounded() {
+    assert_eq!(
+        load::prompt_preview("  first\n\tsecond  "),
+        Some("first second".to_owned())
+    );
+    let long = "x".repeat(200);
+    assert_eq!(
+        load::prompt_preview(&long)
+            .expect("non-empty preview")
+            .chars()
+            .count(),
+        160
+    );
+    assert_eq!(load::prompt_preview(" \n\t "), None);
+    assert_eq!(
+        load::prompt_preview("safe\u{1b}]52;c;payload\u{7} text"),
+        Some("safe]52;c;payload text".to_owned())
+    );
+}
+
+fn set_modified(path: &Path, seconds: u64) {
+    File::options()
+        .write(true)
+        .open(path)
+        .expect("open rollout to set modification time")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+        )
+        .expect("set rollout modification time");
 }
 
 fn recorder(home: &Path) -> RolloutRecorder {

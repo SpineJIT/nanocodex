@@ -1,4 +1,47 @@
 use super::*;
+use std::{collections::HashMap, time::SystemTime};
+
+/// Lightweight metadata for one resumable Codex-compatible rollout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RolloutSessionInfo {
+    thread_id: String,
+    workspace: Option<String>,
+    preview: Option<String>,
+    modified_at: SystemTime,
+    archived: bool,
+}
+
+impl RolloutSessionInfo {
+    /// Returns the stable thread UUID accepted by [`RolloutConfig::load_session`].
+    #[must_use]
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    /// Returns the workspace recorded in the rollout metadata, when available.
+    #[must_use]
+    pub fn workspace(&self) -> Option<&str> {
+        self.workspace.as_deref()
+    }
+
+    /// Returns a bounded single-line preview of the first user prompt.
+    #[must_use]
+    pub fn preview(&self) -> Option<&str> {
+        self.preview.as_deref()
+    }
+
+    /// Returns the rollout file's last modification time.
+    #[must_use]
+    pub const fn modified_at(&self) -> SystemTime {
+        self.modified_at
+    }
+
+    /// Returns whether the rollout was found below `archived_sessions`.
+    #[must_use]
+    pub const fn is_archived(&self) -> bool {
+        self.archived
+    }
+}
 
 /// A completed model boundary materialized from a Codex-compatible rollout.
 ///
@@ -114,6 +157,167 @@ pub enum RolloutTranscriptItem {
         /// Serialized tool arguments sent by the model.
         arguments: String,
     },
+}
+
+pub(super) fn list_sessions(codex_home: &Path) -> io::Result<Vec<RolloutSessionInfo>> {
+    let mut sessions = HashMap::<String, RolloutSessionInfo>::new();
+    for (root, archived) in [
+        (codex_home.join("sessions"), false),
+        (codex_home.join("archived_sessions"), true),
+    ] {
+        let mut directories = vec![root];
+        while let Some(directory) = directories.pop() {
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    directories.push(entry.path());
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let Some(thread_id) = rollout_thread_id(&entry.file_name()) else {
+                    continue;
+                };
+                let Some(candidate) = rollout_session_info(&entry.path(), thread_id, archived)
+                else {
+                    continue;
+                };
+                match sessions.entry(candidate.thread_id.clone()) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(candidate);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry)
+                        if prefer_session(&candidate, entry.get()) =>
+                    {
+                        entry.insert(candidate);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                }
+            }
+        }
+    }
+    let mut sessions = sessions.into_values().collect::<Vec<_>>();
+    sort_sessions(&mut sessions);
+    Ok(sessions)
+}
+
+fn rollout_thread_id(file_name: &std::ffi::OsStr) -> Option<String> {
+    let stem = file_name.to_str()?.strip_suffix(".jsonl")?;
+    let start = stem.len().checked_sub(36)?;
+    let suffix = stem.get(start..)?;
+    (start > 0 && stem.as_bytes().get(start - 1) == Some(&b'-'))
+        .then(|| uuid::Uuid::parse_str(suffix).ok())
+        .flatten()
+        .map(|id| id.to_string())
+}
+
+fn rollout_session_info(
+    path: &Path,
+    thread_id: String,
+    archived: bool,
+) -> Option<RolloutSessionInfo> {
+    let expected_id = uuid::Uuid::parse_str(&thread_id).ok()?;
+    let modified_at = path.metadata().ok()?.modified().ok()?;
+    let mut workspace = None;
+    let mut preview = None;
+    for line in BufReader::new(File::open(path).ok()?).lines() {
+        let Ok(line) = line else {
+            return None;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("session_meta") if workspace.is_none() => {
+                let payload = value.get("payload")?;
+                validate_legacy_history_mode(payload).ok()?;
+                let stored_id = payload
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| uuid::Uuid::parse_str(id).ok())?;
+                if stored_id != expected_id {
+                    return None;
+                }
+                workspace = payload
+                    .get("cwd")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+            }
+            Some("event_msg") if preview.is_none() => {
+                let payload = value.get("payload")?;
+                if payload.get("type").and_then(serde_json::Value::as_str) == Some("user_message") {
+                    preview = payload
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(prompt_preview);
+                }
+            }
+            Some("response_item" | "compacted") if workspace.is_some() => {
+                return Some(RolloutSessionInfo {
+                    thread_id,
+                    workspace,
+                    preview,
+                    modified_at,
+                    archived,
+                });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+pub(super) fn prompt_preview(prompt: &str) -> Option<String> {
+    const MAX_CHARS: usize = 160;
+
+    let mut preview = String::new();
+    let mut chars = 0;
+    let mut pending_space = false;
+    for character in prompt.chars() {
+        if character.is_whitespace() {
+            pending_space = !preview.is_empty();
+            continue;
+        }
+        if character.is_control() {
+            continue;
+        }
+        if pending_space && chars < MAX_CHARS {
+            preview.push(' ');
+            chars += 1;
+        }
+        pending_space = false;
+        if chars == MAX_CHARS {
+            break;
+        }
+        preview.push(character);
+        chars += 1;
+    }
+    (!preview.is_empty()).then_some(preview)
+}
+
+fn prefer_session(candidate: &RolloutSessionInfo, current: &RolloutSessionInfo) -> bool {
+    match (candidate.archived, current.archived) {
+        (false, true) => true,
+        (true, false) => false,
+        _ => candidate.modified_at > current.modified_at,
+    }
+}
+
+fn sort_sessions(sessions: &mut [RolloutSessionInfo]) {
+    sessions.sort_by(|left, right| {
+        right
+            .modified_at
+            .cmp(&left.modified_at)
+            .then_with(|| left.archived.cmp(&right.archived))
+            .then_with(|| left.thread_id.cmp(&right.thread_id))
+    });
 }
 
 fn find_rollout_path(codex_home: &Path, thread_id: &str) -> io::Result<Option<PathBuf>> {
