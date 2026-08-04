@@ -30,7 +30,7 @@ const request = {
 try {
   const started = await first.start(request);
   if (started.replayed) throw new Error("fresh synchronized turn was unexpectedly replayed");
-  const result = await first.prompt(request);
+  const result = await first.turn(request);
   if (result.final_message !== "RIVET_SYNC_OK") {
     throw new Error(`unexpected synchronized result: ${result.final_message}`);
   }

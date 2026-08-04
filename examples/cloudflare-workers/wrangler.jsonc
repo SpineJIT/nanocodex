@@ -3,6 +3,7 @@
   "name": "nanocodex-durable-agent",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-29",
+  "compatibility_flags": ["nodejs_compat"],
   "rules": [
     {
       "type": "CompiledWasm",
@@ -27,6 +28,10 @@
       {
         "name": "NANOCODEX_AUTH",
         "class_name": "NanocodexSubscriptionAuth"
+      },
+      {
+        "name": "Sandbox",
+        "class_name": "Sandbox"
       }
     ]
   },
@@ -34,10 +39,28 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["NanocodexSession", "NanocodexSubscriptionAuth"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["Sandbox"]
+    }
+  ],
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "./Dockerfile",
+      "max_instances": 10
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "NANOCODEX_WORKSPACES",
+      "bucket_name": "nanocodex-sandbox-workspaces"
     }
   ],
   "vars": {
     "AGENT_IDLE_TIMEOUT_MS": "30000",
-    "NANOCODEX_AUTH_MODE": "chatgpt"
+    "NANOCODEX_AUTH_MODE": "chatgpt",
+    "SANDBOX_TRANSPORT": "rpc"
   }
 }

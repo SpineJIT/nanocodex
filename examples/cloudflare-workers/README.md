@@ -10,7 +10,11 @@ client WebSocket ──> Worker router ──> one NanocodexSession object per s
                                          ├─ Rust/WASM Nanocodex driver
                                          ├─ persistent model WebSocket
                                          ├─ hibernatable client sockets
-                                         └─ SQLite snapshot + terminal turns
+                                         ├─ SQLite snapshot + terminal turns
+                                         └─ Cloudflare Sandbox DO + container
+                                              └─ /workspace mounted to per-session R2 prefix
+
+preview capability ──> Worker router ──> session Sandbox container port
 
 ChatGPT subscription ───────────────> one NanocodexSubscriptionAuth object
                                          └─ SQLite token rotation + 401 recovery
@@ -32,6 +36,16 @@ resumes complete client-owned typed history from SQLite. See Cloudflare's
 and [WebSocket hibernation](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
 documentation for the underlying behavior.
 
+The caller-defined `sandbox_exec`, `sandbox_start_process`, `sandbox_read_file`,
+`sandbox_write_file`, `sandbox_list_files`, and `sandbox_preview` tools run
+untrusted work in a separate Cloudflare Sandbox container. The Sandbox uses the
+current RPC transport, scopes its R2 mount to the Nanocodex session ID, and
+proxies opaque capability-scoped preview URLs through the existing Worker
+hostname. The authenticated preview token reveals neither the session capability
+nor server credentials, and avoids requiring wildcard DNS or a separate Quick
+Tunnel process. Nanocodex remains the only model and tool-loop owner; the
+Sandbox SDK supplies execution isolation and storage.
+
 ## Run locally
 
 From the repository root, build the optimized WASM package and install the
@@ -41,6 +55,11 @@ example:
 just build-wasm
 npm ci --prefix examples/cloudflare-workers
 ```
+
+Docker must be running because Wrangler builds the Sandbox container. Local
+R2 bindings are emulated by Wrangler; set `NANOCODEX_SANDBOX_LOCAL=true` in a
+local `.dev.vars` file when you want the mounted workspace synchronized through
+the local R2 binding path.
 
 Sign in once with Codex, then start the subscription-backed Worker:
 
@@ -80,6 +99,7 @@ Start workerd in one terminal and run the live probes in another:
 
 ```sh
 npm run repl --prefix examples/cloudflare-workers
+npm run smoke:sandbox --prefix examples/cloudflare-workers
 npm run smoke --prefix examples/cloudflare-workers
 npm run multiclient --prefix examples/cloudflare-workers
 npm run stress --prefix examples/cloudflare-workers
@@ -102,10 +122,18 @@ inference. If the Worker process itself dies before a turn commits, reopening
 the REPL resubmits the same turn from the last committed snapshot; a partial
 provider response cannot be resumed.
 
-The smoke performs real model turns, verifies duplicate suppression, detaches
-its client, waits for idle teardown, reconnects to the durable snapshot, proves
-that a follow-on remembers history, and requires a completed `runtimeInfo` tool
-call/result pair.
+`smoke:sandbox` bypasses the model and directly attacks the same bounded tool
+handlers used by the agent. It checks write/exec/read/list behavior, non-zero
+exits, output and timeout limits, path traversal and oversized-write rejection,
+a managed port-8000 process and preview, and R2 persistence across container
+destruction. Its fixed `POST`/`DELETE /admin/sandbox-smoke` flow requires the
+admin bearer token; the external probe fetches the preview like a browser, then
+the finish request destroys the disposable container and verifies the remount.
+
+The model smoke performs real model turns, verifies duplicate suppression,
+detaches its client, waits for idle teardown, reconnects to the durable snapshot,
+proves that a follow-on remembers history, and requires completed write, exec,
+and read tool call/result pairs.
 `multiclient` attaches at least two clients before prompting and requires every
 client to receive the same accepted turn, assistant-delta stream, event count,
 and terminal result without reconnecting.
@@ -132,12 +160,24 @@ Node-based consumers may continue to use Code Mode when their host permits it.
 ```sh
 npm run check --prefix examples/cloudflare-workers
 cd examples/cloudflare-workers
+npx wrangler r2 bucket create nanocodex-sandbox-workspaces
 npx wrangler secret put CHATGPT_ACCESS_TOKEN
 npx wrangler secret put CHATGPT_REFRESH_TOKEN
 npx wrangler secret put CHATGPT_ACCOUNT_ID
 npx wrangler secret put NANOCODEX_ADMIN_TOKEN
 npx wrangler deploy
+NANOCODEX_WORKER_URL=https://nanocodex-durable-agent.<subdomain>.workers.dev \
+NANOCODEX_ADMIN_TOKEN=<admin-token> npm run smoke:sandbox
 ```
+
+Create the R2 bucket once per Cloudflare account. Each actor receives only its
+`/sessions/<session-id>/` prefix inside the mounted `/workspace`; model
+credentials remain in the Worker and are not injected into the container.
+After deployment, ask the agent to create a small server on port 8080 in the
+background and call `sandbox_preview` to get a public URL on the same Worker
+origin. HTTP and WebSocket preview traffic is forwarded to that exact per-session
+container and port. The opaque URL is a bearer capability for the preview only;
+rotating `NANOCODEX_ADMIN_TOKEN` invalidates outstanding preview URLs.
 
 At the time this example was validated, the ChatGPT edge rejected direct
 Cloudflare Worker egress with HTTP 403. That is an upstream egress-policy

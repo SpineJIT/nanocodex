@@ -27,6 +27,7 @@
     "typecheck": "tsc --noEmit && tsc -p web/tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@rivet-dev/agentos": "0.2.15",
     "nanocodex": "file:../../js/bindings",
     "rivetkit": "2.3.10",
     "ws": "8.21.1"
@@ -41,6 +42,7 @@
   },
   "overrides": {
     "esbuild": "0.28.1",
+    "rivetkit": "2.3.10",
     "ws": "8.21.1"
   }
 }

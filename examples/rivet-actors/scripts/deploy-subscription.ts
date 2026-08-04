@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { createCodexAuthFileProvider } from "../src/codex-auth-file.js";
 
-const cloudToken = requiredSecret("RIVET_CLOUD_TOKEN");
+const cloudToken = process.env.RIVET_CLOUD_TOKEN?.trim();
 const codexHome = process.env.CODEX_HOME ?? join(homedir(), ".codex");
 const authFile = resolve(process.env.NANOCODEX_CODEX_AUTH_FILE ?? join(codexHome, "auth.json"));
 const auth = await createCodexAuthFileProvider(authFile).snapshot();
@@ -25,6 +25,8 @@ const environment = [
   `CHATGPT_ACCOUNT_ID=${auth.accountId}`,
   `CHATGPT_FEDRAMP=${String(auth.fedramp)}`,
 ];
+const publicUrl = process.env.NANOCODEX_PUBLIC_URL?.trim();
+if (publicUrl) environment.push(`NANOCODEX_PUBLIC_URL=${publicUrl}`);
 const refreshToken = process.env.CHATGPT_REFRESH_TOKEN?.trim();
 if (refreshToken) environment.push(`CHATGPT_REFRESH_TOKEN=${refreshToken}`);
 
@@ -35,8 +37,7 @@ process.stderr.write(
 const child = spawn("npx", [
   "@rivetkit/cli@2.3.10",
   "deploy",
-  "--token",
-  cloudToken,
+  ...(cloudToken ? ["--token", cloudToken] : []),
   "--dockerfile",
   "examples/rivet-actors/Dockerfile",
   "--build-context",

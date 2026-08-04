@@ -42,6 +42,7 @@ const defaultEndpoint = requestedEndpoint || (location.hostname === "127.0.0.1" 
 let state = loadState() ?? freshState(defaultEndpoint);
 if (requestedEndpoint) state.endpoint = requestedEndpoint;
 let client: NanocodexClient | undefined;
+let session: Session | undefined;
 let connection: Connection | undefined;
 let generation = 0;
 let eventCount = 0;
@@ -72,14 +73,14 @@ ui.form.addEventListener("submit", (event) => {
   event.preventDefault();
   const input = ui.input.value.trim();
   if (!input) return setActivity("prompt is empty", true);
-  if (!connection) return setActivity("connect to the actor first", true);
+  if (!session) return setActivity("connect to the actor first", true);
   if (state.pending) return setActivity("one durable turn is already pending", true);
   const pending = { id: crypto.randomUUID(), input };
   state.pending = pending;
   observeTurn(pending.id, pending.input);
   ui.input.value = "";
   saveState();
-  void runPending(connection, generation);
+  void runPending(session, generation);
 });
 
 async function connect(): Promise<void> {
@@ -97,6 +98,7 @@ async function connect(): Promise<void> {
   try {
     client = makeClient(state.endpoint);
     const handle = client.nanocodex.getOrCreate([state.actorKey]);
+    session = handle;
     const nextConnection = handle.connect();
     connection = nextConnection;
     nextConnection.on("turnAccepted", (accepted) => {
@@ -129,13 +131,13 @@ async function connect(): Promise<void> {
       if (activeGeneration === generation) setStatus(status, status === "connected" ? "ok" : "warn");
     });
     await nextConnection.ready;
-    const [actorId, sessionStatus] = await Promise.all([handle.resolve(), nextConnection.status()]);
+    const [actorId, sessionStatus] = await Promise.all([handle.resolve(), handle.status()]);
     if (activeGeneration !== generation) return;
     ui.actor.textContent = actorId;
     for (const turn of sessionStatus.active_turn_details) observeTurn(turn.id, turn.input);
     setStatus(sessionStatus.active_turns.length > 0 ? "running" : "ready", "ok");
     setActivity(sessionStatus.completed_turns + " committed turns");
-    if (state.pending) void runPending(nextConnection, activeGeneration);
+    if (state.pending) void runPending(handle, activeGeneration);
   } catch (error) {
     if (activeGeneration === generation) {
       setStatus("failed", "bad");
@@ -144,7 +146,7 @@ async function connect(): Promise<void> {
   }
 }
 
-async function runPending(active: Connection, activeGeneration: number): Promise<void> {
+async function runPending(active: Session, activeGeneration: number): Promise<void> {
   const pending = state.pending;
   if (!pending) return;
   try {
@@ -153,17 +155,39 @@ async function runPending(active: Connection, activeGeneration: number): Promise
     observeTurn(accepted.id, accepted.input);
     setStatus(accepted.replayed ? "resuming" : "running", "ok");
     setActivity((accepted.replayed ? "rejoined " : "started ") + shortId(pending.id) + "; detach any time");
-    const completed = await active.prompt(pending);
+    const completed = await awaitDurableTurn(active, pending, activeGeneration);
     if (activeGeneration === generation) completeTurn(completed.id, completed.final_message);
   } catch (error) {
     if (activeGeneration === generation) failTurn(pending.id, errorMessage(error));
   }
 }
 
+async function awaitDurableTurn(
+  active: Session,
+  pending: PendingTurn,
+  activeGeneration: number,
+) {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await active.turn(pending);
+    } catch (error) {
+      lastError = error;
+      if (activeGeneration !== generation || state.pending?.id !== pending.id) throw error;
+      const status = await active.status();
+      if (!status.active_turns.includes(pending.id)) throw error;
+      setStatus("reconnecting", "warn");
+      setActivity("connection interrupted; rejoining " + shortId(pending.id));
+    }
+  }
+  throw lastError;
+}
+
 async function detach(showMessage = true): Promise<void> {
   generation += 1;
   const oldConnection = connection;
   const oldClient = client;
+  session = undefined;
   connection = undefined;
   client = undefined;
   await Promise.allSettled([oldConnection?.dispose(), oldClient?.dispose()]);
@@ -290,8 +314,8 @@ function syncStoredState(encoded: string | null): void {
   if (changedActor) {
     ui.actor.textContent = "not resolved";
     void connect();
-  } else if (previousPendingId !== state.pending?.id && connection) {
-    void runPending(connection, generation);
+  } else if (previousPendingId !== state.pending?.id && session) {
+    void runPending(session, generation);
   }
 }
 

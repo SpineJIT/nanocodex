@@ -25,7 +25,7 @@ const sessions = handles.map((handle, index) => {
 try {
   await Promise.all(sessions.map(({ connection }) => connection.ready));
   const seeded = await Promise.allSettled(sessions.map(async ({ connection, request }) => {
-    const result = await connection.prompt(request);
+    const result = await connection.turn(request);
     if (result.final_message !== request.input.slice("Reply with exactly ".length)) {
       throw new Error(`unexpected seed result: ${result.final_message}`);
     }
@@ -41,7 +41,7 @@ try {
     const settled = await Promise.allSettled(sessions.flatMap(({ connection, request }) =>
       Array.from(
         { length: batchSize },
-        () => connection.prompt(request),
+        () => connection.turn(request),
       )));
     const failure = settled.find((result) => result.status === "rejected");
     if (failure) throw failure.reason;

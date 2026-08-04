@@ -16,6 +16,7 @@ import {
   openApiKeyWebSocket,
   openSubscriptionWebSocket,
 } from "./model-websocket";
+import { vercelSandboxTools } from "./sandbox-tools";
 
 const CHATGPT_WEBSOCKET_URL = "wss://chatgpt.com/backend-api/codex/responses";
 const CHATGPT_API_BASE_URL = "https://chatgpt.com/backend-api/codex";
@@ -128,21 +129,27 @@ export async function runNanocodexTurn(
     const mode = modelAuthMode();
     const common = {
       apiBaseUrl: mode === "chatgpt" ? CHATGPT_API_BASE_URL : undefined,
-      instructions: "You are Nanocodex running as a durable Vercel Workflow actor.",
+      instructions: "You are Nanocodex running as a durable Vercel Workflow actor. Use the sandbox_* tools for code, files, and previews; their /workspace is an isolated persistent Vercel Sandbox for this session.",
       module: await wasmBytes,
       resume: snapshot,
       sessionId,
       toolMode: "direct" as const,
       tools: {
+        ...vercelSandboxTools(sessionId),
         runtimeInfo: {
           description: "Return information about the current agent runtime.",
           parameters: { type: "object", additionalProperties: false },
-          handler: () => ({ runtime: "vercel-workflow", session_id: sessionId }),
+          handler: () => ({
+            runtime: "vercel-workflow",
+            sandbox: "vercel-persistent-firecracker",
+            session_id: sessionId,
+            workspace: "/workspace",
+          }),
         },
       },
       websocketUrl: process.env.OPENAI_WEBSOCKET_URL
         ?? (mode === "chatgpt" ? CHATGPT_WEBSOCKET_URL : undefined),
-      workspace: "/tmp/nanocodex",
+      workspace: "/workspace",
     };
 
     agent = mode === "chatgpt"

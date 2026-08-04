@@ -85,19 +85,22 @@ try {
   socket.send(JSON.stringify({
     type: "prompt",
     id: toolId,
-    input: "You must call runtimeInfo exactly once. Then reply with only the runtime value returned by that tool.",
+    input: "Use sandbox_write_file to write SANDBOX_OK to probe.txt, use sandbox_exec to run cat on it, and verify it with sandbox_read_file. Then reply with exactly SANDBOX_OK.",
   }));
   const toolTurn = await terminal(inbox, toolId, terminalTimeoutMs);
   progress("tool-turn-completed");
-  if (!String(toolTurn.final_message).includes("cloudflare-durable-object")) {
-    throw new Error(`runtimeInfo tool returned an unexpected answer: ${toolTurn.final_message}`);
+  if (String(toolTurn.final_message).trim() !== "SANDBOX_OK") {
+    throw new Error(`sandbox tools returned an unexpected answer: ${toolTurn.final_message}`);
   }
-  const toolCall = agentEvents.find((event) =>
-    event.type === "tool.call" && event.payload?.tool === "runtimeInfo");
-  const toolResult = agentEvents.find((event) =>
-    event.type === "tool.result" && event.payload?.call_id === toolCall?.payload?.call_id);
-  if (!toolCall || !toolResult || toolResult.payload?.status !== "completed") {
-    throw new Error("runtimeInfo did not produce a completed tool.call/tool.result event pair");
+  const requiredTools = ["sandbox_write_file", "sandbox_exec", "sandbox_read_file"];
+  for (const tool of requiredTools) {
+    const toolCall = agentEvents.find((event) =>
+      event.type === "tool.call" && event.payload?.tool === tool);
+    const toolResult = agentEvents.find((event) =>
+      event.type === "tool.result" && event.payload?.call_id === toolCall?.payload?.call_id);
+    if (!toolCall || !toolResult || toolResult.payload?.status !== "completed") {
+      throw new Error(`${tool} did not produce a completed tool.call/tool.result event pair`);
+    }
   }
 
   const finalState = await state();
@@ -112,7 +115,7 @@ try {
     idle_shutdown_ms: Math.round(idleShutdownMs),
     restored_turn_ms: Math.round(restoreMs),
     agent_events: agentEvents.length,
-    tool_call: toolCall.payload.tool,
+    tool_calls: requiredTools,
     completed_turns: finalState.completed_turns,
     idle_state: idleState.agent_loaded ? "loaded" : "unloaded",
     ...(authStatus === undefined ? {} : { auth_revision: authStatus.revision }),

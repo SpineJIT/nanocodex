@@ -81,7 +81,7 @@ async function completePending(pending: PendingTurn, resumed: boolean): Promise<
   process.stderr.write(
     `${resumed ? "Resuming" : "Started"} ${pending.id}${accepted.replayed ? " (already running)" : ""}. Ctrl-C detaches.\n`,
   );
-  const completed = await session.prompt(pending);
+  const completed = await session.turn(pending);
   if (state.pending?.id === pending.id) {
     delete state.pending;
     await saveState();

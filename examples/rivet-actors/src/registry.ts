@@ -1,12 +1,12 @@
-import { setup } from "rivetkit";
+import { setup } from "@rivet-dev/agentos";
 
 import { nanocodexAuth } from "./auth.js";
 import { nanocodex } from "./actors.js";
 
 export const registry = setup({
-  // Leave room for the JSON/RPC envelope so the actor's 1 MiB prompt limit is
-  // the authoritative boundary instead of RivetKit's 64 KiB transport default.
-  maxIncomingMessageSize: 2 * 1024 * 1024,
+  // AgentOS's setup enables the direct actor SQLite runtime socket and raises
+  // transport limits for filesystem operations. Nanocodex still enforces its
+  // own 1 MiB prompt boundary before accepting model work.
   // The embedding server owns its HTTP listener and process lifecycle, so it
   // coordinates both listeners and the child engine under one signal handler.
   shutdown: {
