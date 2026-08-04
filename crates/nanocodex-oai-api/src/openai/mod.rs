@@ -128,6 +128,21 @@ impl<F> OpenAiBuilder<F> {
         self
     }
 
+    /// Prepends a namespace to supported model identifiers on the wire.
+    ///
+    /// For example, an OpenAI routing gateway may expose Sol as
+    /// `openai/gpt-5.6-sol` while Nanocodex continues to retain `Model::Sol`
+    /// for model-specific behavior, pricing, compaction, and snapshots. This
+    /// changes only the wire identifier for the closed [`Model`] enum; it is
+    /// not an alternate provider or arbitrary-model surface. [`Self::build`]
+    /// rejects malformed prefixes and use outside API-key HTTPS transport.
+    #[must_use]
+    pub fn model_id_prefix(mut self, prefix: impl Into<String>) -> Self {
+        let prefix = prefix.into();
+        self.config.model_id_prefix = Some(Arc::from(prefix.trim()));
+        self
+    }
+
     /// Selects the initial Responses transport policy for new sessions.
     ///
     /// [`ResponsesTransport::WebSocket`] prefers a persistent socket. The
@@ -509,6 +524,30 @@ fn validate(config: &ModelConfig) -> Result<(), OpenAiError> {
             detail: "the OpenAI API base URL must not be empty",
         });
     }
+    if let Some(prefix) = config.model_id_prefix.as_deref() {
+        if prefix.is_empty()
+            || prefix.starts_with('/')
+            || prefix.ends_with('/')
+            || prefix.split('/').any(str::is_empty)
+            || prefix
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err(OpenAiError::InvalidConfiguration {
+                detail: "the model ID prefix must contain non-empty path segments without whitespace",
+            });
+        }
+        if config.auth.mode() != OpenAiAuthMode::ApiKey {
+            return Err(OpenAiError::InvalidConfiguration {
+                detail: "model ID prefixes require API-key authentication",
+            });
+        }
+        if !matches!(config.responses_transport, ResponsesTransport::Https) {
+            return Err(OpenAiError::InvalidConfiguration {
+                detail: "model ID prefixes require the HTTPS Responses transport",
+            });
+        }
+    }
     if config.auth.mode() == OpenAiAuthMode::ChatGpt && config.store_responses {
         return Err(OpenAiError::InvalidConfiguration {
             detail: "ChatGPT subscription authentication does not support store: true",
@@ -602,6 +641,42 @@ mod tests {
             client.config.responses_history,
             ResponsesHistory::Incremental
         );
+    }
+
+    #[test]
+    fn model_id_prefix_is_normalized_and_scoped_to_api_key_https() {
+        let client = OpenAi::builder("test-key")
+            .transport(ResponsesTransport::Https)
+            .model_id_prefix(" openai ")
+            .build()
+            .unwrap();
+
+        assert_eq!(client.config.model_id_prefix.as_deref(), Some("openai"));
+
+        let websocket_error = OpenAi::builder("test-key")
+            .model_id_prefix("openai")
+            .build()
+            .err()
+            .expect("WebSocket prefix should be rejected");
+        assert!(
+            websocket_error
+                .to_string()
+                .contains("require the HTTPS Responses transport")
+        );
+
+        for prefix in [" ", "/openai", "openai/", "openai//routing", "open ai"] {
+            let malformed_error = OpenAi::builder("test-key")
+                .transport(ResponsesTransport::Https)
+                .model_id_prefix(prefix)
+                .build()
+                .err()
+                .expect("malformed prefix should be rejected");
+            assert!(
+                malformed_error
+                    .to_string()
+                    .contains("non-empty path segments")
+            );
+        }
     }
 
     #[tokio::test]

@@ -111,9 +111,16 @@ pub(crate) struct AgentArgs {
     #[command(flatten)]
     model_policy: ModelArgs,
 
-    /// GPT-5.6 coding model: gpt-5.6-sol or gpt-5.6-luna.
+    /// GPT-5.6 coding model: gpt-5.6-sol, gpt-5.6-terra, or gpt-5.6-luna.
     #[arg(long, env = "OPENAI_MODEL", default_value_t)]
     model: Model,
+
+    /// Optional namespace prepended to the model identifier on the wire.
+    ///
+    /// OpenAI routing gateways may use `openai`, producing identifiers such as
+    /// `openai/gpt-5.6-sol` without changing Nanocodex's closed model policy.
+    #[arg(long, env = "NANOCODEX_MODEL_ID_PREFIX")]
+    model_id_prefix: Option<String>,
 
     /// Reasoning execution mode: standard or pro.
     #[arg(long, env = "OPENAI_REASONING_MODE", default_value_t)]
@@ -267,6 +274,9 @@ impl AgentArgs {
         let mut openai = OpenAi::builder(auth)
             .transport(responses_transport)
             .websocket_url(direct_websocket_url);
+        if let Some(prefix) = self.model_id_prefix.as_deref() {
+            openai = openai.model_id_prefix(prefix);
+        }
         if mpp_enabled {
             openai = openai.max_attempts(NonZeroU32::MIN);
         }

@@ -30,7 +30,7 @@ from harbor.utils.trajectory_utils import format_trajectory_json
 
 PROTOCOL_VERSION = 1
 DEFAULT_MODEL = "gpt-5.6-sol"
-SUPPORTED_MODELS = {DEFAULT_MODEL, "gpt-5.6-luna"}
+SUPPORTED_MODELS = {DEFAULT_MODEL, "gpt-5.6-terra", "gpt-5.6-luna"}
 TERMINAL_EVENTS = {"run.completed", "run.failed"}
 RUN_METRIC_FIELDS = (
     "connection_attempts",

@@ -1,6 +1,6 @@
 export type Thinking = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 export type ReasoningMode = "standard" | "pro";
-export type Model = "gpt-5.6-sol" | "gpt-5.6-luna";
+export type Model = "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna";
 
 export type PromptItem =
   | { type: "text"; text: string }

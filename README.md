@@ -102,10 +102,17 @@ history, WebSocket, tools, shell sessions, and prompt-cache identity.
 `agent.clone()` is a cheap handle to that same session; the independently
 returned `AgentEvents` stream is the session-wide event firehose.
 
-Nanocodex supports `gpt-5.6-sol` (the default) and `gpt-5.6-luna`. Select the
-model with `.model(Model::Luna)` when creating an agent. The model is fixed for
-that thread: switching later would invalidate the provider checkpoint and
-require an inefficient replay of the complete retained context.
+Nanocodex supports `gpt-5.6-sol` (the default), `gpt-5.6-terra`, and
+`gpt-5.6-luna`. Select a model with `.model(Model::Terra)` or
+`.model(Model::Luna)` when creating an agent. The model is fixed for that
+thread: switching later would invalidate the provider checkpoint and require
+an inefficient replay of the complete retained context.
+
+API-key HTTPS OpenAI routing gateways that namespace model identifiers can set
+`NANOCODEX_MODEL_ID_PREFIX`. For example, a prefix of `openai` sends
+`openai/gpt-5.6-sol` on the wire while preserving Sol's typed behavior,
+pricing, compaction, and snapshot identity inside Nanocodex. This does not add
+an alternate provider or arbitrary-model surface.
 
 ## Voice: devices or Unix pipes
 

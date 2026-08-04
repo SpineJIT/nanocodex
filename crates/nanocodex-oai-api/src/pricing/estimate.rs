@@ -17,6 +17,18 @@ const SOL_PRIORITY: TokenRates = TokenRates {
     cache_write_input: 12_500,
     output: 60_000,
 };
+const TERRA_STANDARD: TokenRates = TokenRates {
+    input: 2_000,
+    cached_input: 200,
+    cache_write_input: 2_500,
+    output: 12_000,
+};
+const TERRA_PRIORITY: TokenRates = TokenRates {
+    input: 4_000,
+    cached_input: 400,
+    cache_write_input: 5_000,
+    output: 24_000,
+};
 const LUNA_STANDARD: TokenRates = TokenRates {
     input: 200,
     cached_input: 20,
@@ -43,6 +55,8 @@ impl TokenRates {
         match (model, service_tier) {
             (Model::Sol, ServiceTier::Standard) => SOL_STANDARD,
             (Model::Sol, ServiceTier::Priority) => SOL_PRIORITY,
+            (Model::Terra, ServiceTier::Standard) => TERRA_STANDARD,
+            (Model::Terra, ServiceTier::Priority) => TERRA_PRIORITY,
             (Model::Luna, ServiceTier::Standard) => LUNA_STANDARD,
             (Model::Luna, ServiceTier::Priority) => LUNA_PRIORITY,
         }
@@ -164,7 +178,7 @@ pub fn estimate(usage: &Usage, service_tier: ServiceTier) -> EstimatedUsdCost {
 /// Estimates one provider operation using the selected model's built-in rates.
 ///
 /// This is the model-aware form of [`estimate`]. Managed sessions use it so
-/// both supported GPT-5.6 models receive an estimate from reported usage.
+/// every supported GPT-5.6 model receives an estimate from reported usage.
 #[must_use]
 pub fn estimate_for_model(
     usage: &Usage,
@@ -302,6 +316,29 @@ mod tests {
         assert_eq!(standard.output().decimal(), "1.2");
         assert_eq!(standard.amount().decimal(), "1.369");
         assert_eq!(priority.amount().decimal(), "2.738");
+    }
+
+    #[test]
+    fn terra_rates_cover_standard_and_priority_usage() {
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            input_tokens_details: Some(InputTokenDetails {
+                cached_tokens: 200_000,
+                cache_write_tokens: 100_000,
+            }),
+            output_tokens: 1_000_000,
+            ..Usage::default()
+        };
+
+        let standard = estimate_for_model(&usage, Model::Terra, ServiceTier::Standard);
+        let priority = estimate_for_model(&usage, Model::Terra, ServiceTier::Priority);
+
+        assert_eq!(standard.input().decimal(), "1.4");
+        assert_eq!(standard.cached_input().decimal(), "0.04");
+        assert_eq!(standard.cache_write_input().decimal(), "0.25");
+        assert_eq!(standard.output().decimal(), "12");
+        assert_eq!(standard.amount().decimal(), "13.69");
+        assert_eq!(priority.amount().decimal(), "27.38");
     }
 
     #[test]

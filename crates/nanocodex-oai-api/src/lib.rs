@@ -153,6 +153,8 @@ pub enum Model {
     /// GPT-5.6 Sol.
     #[default]
     Sol,
+    /// GPT-5.6 Terra.
+    Terra,
     /// GPT-5.6 Luna.
     Luna,
 }
@@ -163,6 +165,7 @@ impl Model {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Sol => "gpt-5.6-sol",
+            Self::Terra => "gpt-5.6-terra",
             Self::Luna => "gpt-5.6-luna",
         }
     }
@@ -180,15 +183,16 @@ impl FromStr for Model {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "gpt-5.6-sol" | "sol" => Ok(Self::Sol),
+            "gpt-5.6-terra" | "terra" => Ok(Self::Terra),
             "gpt-5.6-luna" | "luna" => Ok(Self::Luna),
             _ => Err(format!(
-                "invalid model {value:?}; expected gpt-5.6-sol or gpt-5.6-luna"
+                "invalid model {value:?}; expected gpt-5.6-sol, gpt-5.6-terra, or gpt-5.6-luna"
             )),
         }
     }
 }
 
-/// Context-window size used by both supported Responses Lite model contracts.
+/// Prompt-token budget used by automatic compaction to avoid long-context pricing.
 pub const CONTEXT_WINDOW_TOKENS: u64 = 272_000;
 
 /// User input for one agent turn.
@@ -510,6 +514,8 @@ mod tests {
     fn model_parses_short_and_api_names() {
         assert_eq!("sol".parse(), Ok(Model::Sol));
         assert_eq!("gpt-5.6-sol".parse(), Ok(Model::Sol));
+        assert_eq!("terra".parse(), Ok(Model::Terra));
+        assert_eq!("gpt-5.6-terra".parse(), Ok(Model::Terra));
         assert_eq!("luna".parse(), Ok(Model::Luna));
         assert_eq!("gpt-5.6-luna".parse(), Ok(Model::Luna));
         assert_eq!(Model::default().as_str(), "gpt-5.6-sol");
