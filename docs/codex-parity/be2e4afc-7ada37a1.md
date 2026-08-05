@@ -282,17 +282,17 @@ d75f94a94d out-of-scope O15
 - `P32`: `runtime_construction_starts_providers_and_preserves_eager_prewarm`,
   `direct_model_calls_reach_activated_dynamic_tools`, MCP concurrent startup,
   and reload tests cover nonblocking provider startup and late reusable state.
-- `P33`: `mcp::pagination` rejects repeated/oversized catalogs and preserves
-  page order; resource integration tests exhaust valid multi-page results.
+- `P33`: `mcp::pagination` rejects repeated/oversized catalogs; resource
+  integration tests exhaust valid multi-page results in order.
 - `P34`: `registered_tools_cannot_replace_host_owned_routing_tools` and
   `first_registered_normalized_code_mode_name_wins_consistently` cover host
   reservation and first-winner prompt, metadata, and dispatch behavior.
 - `P35`: `per_tool_exposure_selects_direct_and_code_mode_surfaces_independently`
   and `mcp_tool_exposure_selects_deferred_and_code_mode_surfaces_per_server`
   cover each supported surface while hidden handlers remain registered.
-- `P36`: `function_and_custom_tools_opt_into_deferred_loading_without_changing_eager_shapes`
-  covers eager compatibility, deferred custom tools, and custom namespace
-  members.
+- `P36`: existing namespace serialization coverage plus
+  `custom_tools_opt_into_deferred_loading_and_namespace_membership` cover eager
+  compatibility, deferred custom tools, and custom namespace members.
 - `P37`: MCP provider tests retain exact server descriptions in tool-search
   namespace output. The temporary Codex truncation in `ddf33ea802` is
   superseded by `fd1e4d7a6d` and is not adopted.

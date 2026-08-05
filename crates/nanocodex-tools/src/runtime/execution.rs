@@ -6,8 +6,7 @@ use super::*;
 /// normally owned privately by the higher-level agent driver.
 pub struct ToolRuntime {
     pub(super) registry: Arc<ToolRegistry>,
-    exposure: ToolExposure,
-    base_exposure_configured: bool,
+    exposure: Option<ToolExposure>,
     deferred_tools_guidance_enabled: bool,
     code_mode: code_mode::CodeModeRuntime,
     sessions: Arc<ShellSessions>,
@@ -111,8 +110,7 @@ impl ToolRuntime {
         }
         Self {
             registry: Arc::new(ToolRegistry::from_ordered(handlers)),
-            exposure: ToolExposure::default(),
-            base_exposure_configured: false,
+            exposure: None,
             deferred_tools_guidance_enabled: false,
             code_mode: code_mode::CodeModeRuntime::new_with_turn(
                 code_mode_workspace,
@@ -134,10 +132,10 @@ impl ToolRuntime {
     pub fn with_tools(mut self, tools: &Tools) -> Self {
         tools.start_providers();
         let registry = Arc::make_mut(&mut self.registry);
-        if !self.base_exposure_configured {
-            self.exposure = tools.exposure();
-            registry.set_all_exposures(tools.exposure());
-            self.base_exposure_configured = true;
+        if self.exposure.is_none() {
+            let exposure = tools.exposure();
+            self.exposure = Some(exposure);
+            registry.set_all_exposures(exposure);
         }
         self.deferred_tools_guidance_enabled |= tools.deferred_tools_guidance_enabled;
         registry.extend(tools.registered.iter().map(|tool| {
@@ -210,7 +208,7 @@ impl ToolRuntime {
             code_mode::exec_spec(
                 &nested,
                 self.deferred_tools_guidance_enabled,
-                self.exposure == ToolExposure::CodeModeOnly,
+                self.exposure.unwrap_or_default() == ToolExposure::CodeModeOnly,
             ),
             code_mode::wait_spec(),
         ];

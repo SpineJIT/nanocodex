@@ -15,7 +15,7 @@ pub(crate) struct ToolRegistry {
 impl ToolRegistry {
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.get(name).is_some()
-            || (!host_owned_dynamic_name(name)
+            || (!host_owned_name(name)
                 && self
                     .providers
                     .iter()
@@ -76,7 +76,7 @@ impl ToolRegistry {
                     ));
                 }
             };
-            let Some(provider) = (!host_owned_dynamic_name(name))
+            let Some(provider) = (!host_owned_name(name))
                 .then(|| {
                     self.providers
                         .iter()
@@ -332,7 +332,7 @@ impl ToolRegistry {
             )
             .filter(|definition| {
                 !matches!(definition, ToolDefinition::ToolSearch { .. })
-                    && !host_owned_dynamic_name(definition.name())
+                    && !host_owned_name(definition.name())
             });
         first_normalized_definitions(definitions)
     }
@@ -363,10 +363,6 @@ fn first_normalized_definitions(
             }
         })
         .collect()
-}
-
-fn host_owned_dynamic_name(name: &str) -> bool {
-    matches!(name, "exec" | "wait")
 }
 
 fn definition_metadata(name: &str, definition: &ToolDefinition) -> Value {

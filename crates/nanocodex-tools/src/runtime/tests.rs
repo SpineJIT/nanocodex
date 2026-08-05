@@ -672,20 +672,14 @@ fn registered_tools_cannot_replace_host_owned_routing_tools() {
             Err(super::ToolsBuildError::ReservedName(candidate)) if candidate.as_ref() == name
         ));
     }
-}
 
-#[test]
-fn canonical_native_tool_search_remains_configurable() {
-    let tools = Tools::builder()
-        .without_defaults()
-        .tool(NativeSearch)
-        .build()
-        .unwrap();
-
-    assert!(matches!(
-        tools.registered[0].handler.definition(),
-        ToolDefinition::ToolSearch { .. }
-    ));
+    assert!(
+        Tools::builder()
+            .without_defaults()
+            .tool(NativeSearch)
+            .build()
+            .is_ok()
+    );
 }
 
 #[tokio::test]

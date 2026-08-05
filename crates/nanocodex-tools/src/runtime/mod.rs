@@ -45,3 +45,7 @@ use crate::{
 use crate::{image_generation, web_search};
 
 const CODEX_THREAD_ID_ENV_VAR: &str = "CODEX_THREAD_ID";
+
+fn host_owned_name(name: &str) -> bool {
+    matches!(name, "exec" | "wait")
+}

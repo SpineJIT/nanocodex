@@ -1,6 +1,6 @@
 //! Model-visible tool declarations and open JSON boundary values.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
 /// Model-visible tool definition carried by Responses Lite input.
@@ -33,11 +33,8 @@ pub enum ToolDefinition {
         name: Box<str>,
         /// Guidance describing the namespace as a whole.
         description: Box<str>,
-        /// Function declarations exposed under this namespace.
-        #[serde(
-            deserialize_with = "deserialize_namespace_tools",
-            serialize_with = "serialize_namespace_tools"
-        )]
+        /// Function or custom declarations exposed under this namespace.
+        #[serde(serialize_with = "serialize_namespace_tools")]
         tools: Vec<Self>,
     },
     /// Free-form custom tool constrained by a grammar.
@@ -67,33 +64,17 @@ fn serialize_namespace_tools<S>(tools: &[ToolDefinition], serializer: S) -> Resu
 where
     S: Serializer,
 {
-    if let Some(invalid_kind) = tools.iter().find_map(invalid_namespace_child_kind) {
-        return Err(serde::ser::Error::custom(format!(
-            "Responses namespace cannot contain a {invalid_kind} definition"
-        )));
+    if tools.iter().any(|tool| {
+        !matches!(
+            tool,
+            ToolDefinition::Function { .. } | ToolDefinition::Custom { .. }
+        )
+    }) {
+        return Err(serde::ser::Error::custom(
+            "Responses namespaces may contain only function or custom definitions",
+        ));
     }
     tools.serialize(serializer)
-}
-
-fn deserialize_namespace_tools<'de, D>(deserializer: D) -> Result<Vec<ToolDefinition>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let tools = Vec::<ToolDefinition>::deserialize(deserializer)?;
-    if let Some(invalid_kind) = tools.iter().find_map(invalid_namespace_child_kind) {
-        return Err(serde::de::Error::custom(format!(
-            "Responses namespace cannot contain a {invalid_kind} definition"
-        )));
-    }
-    Ok(tools)
-}
-
-const fn invalid_namespace_child_kind(tool: &ToolDefinition) -> Option<&'static str> {
-    match tool {
-        ToolDefinition::Function { .. } | ToolDefinition::Custom { .. } => None,
-        ToolDefinition::Namespace { .. } => Some("namespace"),
-        ToolDefinition::ToolSearch { .. } => Some("tool_search"),
-    }
 }
 
 impl ToolDefinition {
@@ -233,17 +214,6 @@ impl ToolDefinition {
         self
     }
 
-    /// Returns whether this function or custom definition requests deferred loading.
-    #[must_use]
-    pub const fn is_deferred(&self) -> bool {
-        match self {
-            Self::Function { defer_loading, .. } | Self::Custom { defer_loading, .. } => {
-                matches!(defer_loading, Some(true))
-            }
-            Self::Namespace { .. } | Self::ToolSearch { .. } => false,
-        }
-    }
-
     /// Returns the model-visible tool name.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -356,25 +326,13 @@ mod tests {
     use super::{CustomToolFormat, JsonSchema, ToolDefinition};
 
     #[test]
-    fn function_and_custom_tools_opt_into_deferred_loading_without_changing_eager_shapes() {
-        let function = ToolDefinition::function(
-            "lookup",
-            "Look up a value.",
-            json!({ "type": "object", "properties": {} }),
-        );
-        assert!(!function.is_deferred());
-        assert!(
-            serde_json::to_value(&function).unwrap()["defer_loading"].is_null(),
-            "eager definitions must preserve their existing wire shape"
-        );
-
+    fn custom_tools_opt_into_deferred_loading_and_namespace_membership() {
         let custom = ToolDefinition::custom(
             "patch",
             "Apply a patch.",
             CustomToolFormat::grammar("lark", "start: \"patch\""),
         )
         .with_deferred_loading();
-        assert!(custom.is_deferred());
         assert_eq!(
             serde_json::to_value(&custom).unwrap()["defer_loading"],
             true
@@ -387,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn namespace_serializes_function_children_without_client_output_metadata() {
+    fn namespace_serializes_supported_children_and_rejects_nested_namespaces() {
         let definition = ToolDefinition::namespace(
             "image_gen",
             "Tools in the image_gen namespace.",
@@ -424,29 +382,12 @@ mod tests {
                 }]
             })
         );
-    }
-
-    #[test]
-    fn namespace_rejects_nested_namespace_and_tool_search_children() {
         let nested = ToolDefinition::namespace(
             "outer",
             "Outer tools.",
             [ToolDefinition::namespace("inner", "Inner tools.", [])],
         );
         assert!(serde_json::to_value(nested).is_err());
-
-        let invalid = json!({
-            "type": "namespace",
-            "name": "outer",
-            "description": "Outer tools.",
-            "tools": [{
-                "type": "tool_search",
-                "execution": "client",
-                "description": "Search tools.",
-                "parameters": {"type": "object"}
-            }]
-        });
-        assert!(serde_json::from_value::<ToolDefinition>(invalid).is_err());
     }
 
     #[test]

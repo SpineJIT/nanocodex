@@ -459,10 +459,6 @@ impl ToolsBuilder {
     }
 }
 
-fn host_owned_name(name: &str) -> bool {
-    matches!(name, "exec" | "wait")
-}
-
 fn built_in_name(tools: &Tools, name: &str) -> bool {
     (tools.workspace
         && matches!(

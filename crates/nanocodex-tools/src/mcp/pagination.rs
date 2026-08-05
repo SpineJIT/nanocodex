@@ -9,7 +9,6 @@ const DEFAULT_MCP_PAGINATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) async fn collect_paginated<T, F, Fut>(
     method: &str,
-    overall_timeout: Option<Duration>,
     mut fetch: F,
 ) -> Result<Vec<T>, String>
 where
@@ -52,7 +51,7 @@ where
         ))
     };
 
-    let timeout = overall_timeout.unwrap_or(DEFAULT_MCP_PAGINATION_TIMEOUT);
+    let timeout = DEFAULT_MCP_PAGINATION_TIMEOUT;
     tokio::time::timeout(timeout, collect)
         .await
         .map_err(|_| format!("{method} pagination timed out after {timeout:?}"))?
@@ -60,45 +59,25 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use super::*;
 
     #[tokio::test]
-    async fn rejects_repeated_cursors() {
-        let error = collect_paginated("tools/list", None, |_| async {
+    async fn rejects_unbounded_pagination() {
+        let repeated_cursor = collect_paginated("tools/list", |_| async {
             Ok((vec![1_u8], Some("same".to_owned())))
         })
         .await
         .unwrap_err();
+        assert_eq!(
+            repeated_cursor,
+            "tools/list returned a repeated pagination cursor"
+        );
 
-        assert_eq!(error, "tools/list returned a repeated pagination cursor");
-    }
-
-    #[tokio::test]
-    async fn preserves_page_order() {
-        let pages = Arc::new(Mutex::new(vec![
-            (vec![3_u8], None),
-            (vec![1_u8, 2], Some("next".to_owned())),
-        ]));
-        let collected = collect_paginated("tools/list", None, |_| {
-            let pages = Arc::clone(&pages);
-            async move { Ok(pages.lock().unwrap().pop().unwrap()) }
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(collected, [1, 2, 3]);
-    }
-
-    #[tokio::test]
-    async fn rejects_oversized_catalogs() {
-        let error = collect_paginated("tools/list", None, |_| async {
+        let oversized_catalog = collect_paginated("tools/list", |_| async {
             Ok((vec![(); MAX_MCP_CATALOG_ITEMS + 1], None))
         })
         .await
         .unwrap_err();
-
-        assert!(error.contains("catalog limit"));
+        assert!(oversized_catalog.contains("catalog limit"));
     }
 }

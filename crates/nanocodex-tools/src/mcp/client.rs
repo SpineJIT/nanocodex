@@ -77,7 +77,7 @@ impl ClientInner {
 
     async fn list_all_tools(&self, parent: &Span) -> Result<Vec<Tool>, String> {
         let service = Arc::clone(&self.service);
-        let tools = collect_paginated("tools/list", None, move |params| {
+        let tools = collect_paginated("tools/list", move |params| {
             let service = Arc::clone(&service);
             async move {
                 let result = service

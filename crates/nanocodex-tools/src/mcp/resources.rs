@@ -194,7 +194,7 @@ async fn list_resources(state: &ProviderState, input: ListInput) -> Result<Value
     }
     let mut resources = Vec::new();
     for (server, client) in state.clients().await {
-        let pages = collect_paginated("resources/list", None, |params| {
+        let pages = collect_paginated("resources/list", |params| {
             let client = Arc::clone(&client);
             async move {
                 let result = client
@@ -236,7 +236,7 @@ async fn list_resource_templates(state: &ProviderState, input: ListInput) -> Res
     }
     let mut templates = Vec::new();
     for (server, client) in state.clients().await {
-        let pages = collect_paginated("resources/templates/list", None, |params| {
+        let pages = collect_paginated("resources/templates/list", |params| {
             let client = Arc::clone(&client);
             async move {
                 let result = client
