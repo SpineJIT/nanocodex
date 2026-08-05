@@ -1,25 +1,21 @@
 # Codex parity ledger
 
-This ledger records the review of all 323 commits in the exclusive local
+This ledger records the review of all 555 commits in the exclusive local
 checkout range
 
 ```text
 openai/codex@35eaf3ffb0bf2001486c68c47a3d946b34d16634
-    ..openai/codex@be2e4afcd7392339d6adbaf0d31b26316bcaa2ab
+    ..openai/codex@7ada37a15e1f6aa84f83b4b9410f9d29e66fefe4
 ```
 
 The review used the clean local Codex checkout at the range head. The command
-`git rev-list --count <range>` returns `323`. The first 37 commits remain
+`git rev-list --count <range>` returns `555`. The first 37 commits remain
 expanded below; the following 279 are classified individually in
 [`codex-parity/8431dc59-3418498f.md`](codex-parity/8431dc59-3418498f.md), and
 the final seven are classified in
-[`codex-parity/3418498f-be2e4afc.md`](codex-parity/3418498f-be2e4afc.md).
-
-This is the latest reviewed checkpoint, not a claim about every commit
-currently present in the local upstream checkout. Local `origin/main` is
-`bb1af235ea2822d7a40f75ef52e4d6a2cde84da2`, ten commits after this ledger.
-Those commits remain unclassified and the checkpoint must not advance until
-they receive the same port/evaluate/defer/out-of-scope review.
+[`codex-parity/3418498f-be2e4afc.md`](codex-parity/3418498f-be2e4afc.md). The
+latest 232 are classified in
+[`codex-parity/be2e4afc-7ada37a1.md`](codex-parity/be2e4afc-7ada37a1.md).
 
 The classifications mean:
 
@@ -38,11 +34,11 @@ claims.
 
 | Classification | Count |
 | --- | ---: |
-| `port` | 34 |
-| `evaluate` | 21 |
-| `defer` | 2 |
-| `out-of-scope` | 266 |
-| Total | 323 |
+| `port` | 52 |
+| `evaluate` | 45 |
+| `defer` | 10 |
+| `out-of-scope` | 448 |
+| Total | 555 |
 
 ## First range: `35eaf3ff..8431dc59`
 

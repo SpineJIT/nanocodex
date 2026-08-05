@@ -148,6 +148,8 @@ pub enum ResponseItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         namespace: Option<Box<str>>,
         arguments: Box<str>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_function_args: Option<Vec<Box<str>>>,
         call_id: Box<str>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<ToolCaller>,
@@ -447,6 +449,29 @@ mod tests {
             serde_json::to_value(&item).unwrap(),
             serde_json::from_str::<Value>(unknown).unwrap()
         );
+    }
+
+    #[test]
+    fn function_calls_preserve_encrypted_argument_markers() {
+        for value in [
+            serde_json::json!({
+                "type": "function_call",
+                "name": "send_message",
+                "arguments": "{}",
+                "encrypted_function_args": [],
+                "call_id": "call-empty"
+            }),
+            serde_json::json!({
+                "type": "function_call",
+                "name": "send_message",
+                "arguments": "{}",
+                "encrypted_function_args": ["opaque"],
+                "call_id": "call-opaque"
+            }),
+        ] {
+            let item: ResponseItem = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(item).unwrap(), value);
+        }
     }
 
     #[test]

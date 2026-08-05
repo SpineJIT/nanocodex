@@ -17,6 +17,7 @@ use tracing::{Instrument, Span, info_span};
 
 use super::config::{McpServer, McpTransport, SecretSource};
 use super::oauth::{McpOAuthStore, OAuthMetadataCache, OAuthRuntime, transport_from_credentials};
+use super::pagination::collect_paginated;
 use super::stdio::McpStdioTransport;
 
 const MCP_USER_AGENT: &str = concat!("nanocodex-mcp-client/", env!("CARGO_PKG_VERSION"));
@@ -74,11 +75,19 @@ impl ClientInner {
         result
     }
 
-    async fn list_all_tools(
-        &self,
-        parent: &Span,
-    ) -> Result<Vec<Tool>, rmcp::service::ServiceError> {
-        let tools = self.service.list_all_tools().await;
+    async fn list_all_tools(&self, parent: &Span) -> Result<Vec<Tool>, String> {
+        let service = Arc::clone(&self.service);
+        let tools = collect_paginated("tools/list", move |params| {
+            let service = Arc::clone(&service);
+            async move {
+                let result = service
+                    .list_tools(params)
+                    .await
+                    .map_err(|error| error_chain(&error))?;
+                Ok((result.tools, result.next_cursor))
+            }
+        })
+        .await;
         if let Some(oauth) = &self.oauth
             && let Err(error) = oauth.persist_if_changed(parent).await
         {
@@ -475,7 +484,7 @@ async fn finish_startup(
                 .into_iter()
                 .filter(|tool| server.includes_tool(tool.name.as_ref()))
                 .collect::<Vec<_>>()),
-            Ok(Err(error)) => Err(format!("MCP tools/list failed: {}", error_chain(&error))),
+            Ok(Err(error)) => Err(format!("MCP tools/list failed: {error}")),
             Err(_) => Err(startup_timeout(server, "tools/list")),
         };
     span.record("status", if tools.is_ok() { "completed" } else { "failed" });

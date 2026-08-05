@@ -3,6 +3,34 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_mins(5);
 
+/// Model-facing surfaces on which one MCP server's tools are available.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum McpToolExposure {
+    /// Discover tools through `tool_search` and call them from Code Mode.
+    #[default]
+    DeferredAndCodeMode,
+    /// Discover tools through `tool_search`, but omit them from Code Mode.
+    DeferredOnly,
+    /// Expose tools only inside Code Mode, without provider-native discovery.
+    CodeModeOnly,
+    /// Keep the server connected without exposing or dispatching its tools.
+    Hidden,
+}
+
+impl McpToolExposure {
+    pub(crate) const fn is_deferred(self) -> bool {
+        matches!(self, Self::DeferredAndCodeMode | Self::DeferredOnly)
+    }
+
+    pub(crate) const fn is_available_in_code_mode(self) -> bool {
+        matches!(self, Self::DeferredAndCodeMode | Self::CodeModeOnly)
+    }
+
+    pub(crate) const fn is_callable(self) -> bool {
+        !matches!(self, Self::Hidden)
+    }
+}
+
 /// One MCP server transport and its lifecycle limits.
 #[derive(Clone)]
 pub struct McpServer {
@@ -11,6 +39,7 @@ pub struct McpServer {
     pub(crate) startup_timeout: Duration,
     pub(crate) tool_timeout: Duration,
     pub(crate) supports_parallel_tool_calls: bool,
+    pub(crate) tool_exposure: McpToolExposure,
     pub(crate) enabled_tools: Option<Vec<String>>,
     pub(crate) disabled_tools: Vec<String>,
     pub(crate) unsupported_option: Option<&'static str>,
@@ -52,6 +81,7 @@ impl McpServer {
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             supports_parallel_tool_calls: false,
+            tool_exposure: McpToolExposure::default(),
             enabled_tools: None,
             disabled_tools: Vec::new(),
             unsupported_option: None,
@@ -71,6 +101,7 @@ impl McpServer {
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             supports_parallel_tool_calls: false,
+            tool_exposure: McpToolExposure::default(),
             enabled_tools: None,
             disabled_tools: Vec::new(),
             unsupported_option: None,
@@ -105,6 +136,13 @@ impl McpServer {
     #[must_use]
     pub const fn supports_parallel_tool_calls(mut self, supports: bool) -> Self {
         self.supports_parallel_tool_calls = supports;
+        self
+    }
+
+    /// Selects whether this server's tools are deferred, nested in Code Mode, both, or hidden.
+    #[must_use]
+    pub const fn tool_exposure(mut self, exposure: McpToolExposure) -> Self {
+        self.tool_exposure = exposure;
         self
     }
 

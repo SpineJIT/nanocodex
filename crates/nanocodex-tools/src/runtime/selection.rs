@@ -9,6 +9,26 @@ pub enum ToolExposure {
     /// Expose `exec` and `wait` before ordinary direct tools, while retaining
     /// the same handlers for calls composed through Code Mode.
     DirectAndCodeMode,
+    /// Expose a tool directly without making it callable from Code Mode.
+    DirectOnly,
+    /// Keep a tool registered for dispatch without exposing it to the model.
+    Hidden,
+}
+
+impl ToolExposure {
+    pub(super) const fn is_direct(self) -> bool {
+        matches!(self, Self::DirectAndCodeMode | Self::DirectOnly)
+    }
+
+    pub(super) const fn is_available_in_code_mode(self) -> bool {
+        matches!(self, Self::CodeModeOnly | Self::DirectAndCodeMode)
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct RegisteredTool {
+    pub(super) handler: Arc<dyn Tool>,
+    pub(super) exposure: Option<ToolExposure>,
 }
 
 /// A lazily populated family of Code Mode tools.
@@ -75,7 +95,7 @@ pub struct Tools {
     pub(super) default_shell: Option<Arc<str>>,
     process_environment: Arc<Vec<(OsString, OsString)>>,
     remote_http_client: Option<reqwest::Client>,
-    pub(super) registered: Vec<Arc<dyn Tool>>,
+    pub(super) registered: Vec<RegisteredTool>,
     pub(super) provider_direct: Vec<Arc<dyn Tool>>,
     pub(super) providers: Vec<Arc<dyn DynamicToolProvider>>,
     pub(super) deferred_tools_guidance_enabled: bool,
@@ -121,7 +141,7 @@ impl fmt::Debug for Tools {
                 &self
                     .registered
                     .iter()
-                    .map(|tool| tool.definition().name().to_owned())
+                    .map(|tool| tool.handler.definition().name().to_owned())
                     .collect::<Vec<_>>(),
             )
             .field(
@@ -236,6 +256,10 @@ pub enum ToolsBuildError {
     /// A custom tool collides with an enabled built-in tool.
     #[error("tool name `{0}` conflicts with an enabled built-in tool")]
     BuiltInName(Box<str>),
+
+    /// A custom tool collides with a host-owned routing tool.
+    #[error("tool name `{0}` is reserved by the Code Mode host")]
+    ReservedName(Box<str>),
 }
 
 impl ToolsBuilder {
@@ -322,7 +346,24 @@ impl ToolsBuilder {
     /// Adds a function or freeform tool to the runtime.
     #[must_use]
     pub fn tool<T: Tool + 'static>(mut self, tool: T) -> Self {
-        self.tools.registered.push(Arc::new(tool));
+        self.tools.registered.push(RegisteredTool {
+            handler: Arc::new(tool),
+            exposure: None,
+        });
+        self
+    }
+
+    /// Adds a function or freeform tool with an explicit model-facing exposure.
+    #[must_use]
+    pub fn tool_with_exposure<T: Tool + 'static>(
+        mut self,
+        tool: T,
+        exposure: ToolExposure,
+    ) -> Self {
+        self.tools.registered.push(RegisteredTool {
+            handler: Arc::new(tool),
+            exposure: Some(exposure),
+        });
         self
     }
 
@@ -364,16 +405,33 @@ impl ToolsBuilder {
                 .len()
                 .saturating_add(self.tools.provider_direct.len()),
         );
-        for tool in self
-            .tools
-            .registered
-            .iter()
-            .chain(&self.tools.provider_direct)
-        {
+        for tool in &self.tools.registered {
+            let definition = tool.handler.definition();
+            let name = definition.name();
+            if name.is_empty() {
+                return Err(ToolsBuildError::EmptyName);
+            }
+            if host_owned_name(name)
+                || (name == "tool_search"
+                    && !matches!(definition, ToolDefinition::ToolSearch { .. }))
+            {
+                return Err(ToolsBuildError::ReservedName(name.into()));
+            }
+            if built_in_name(&self.tools, name) {
+                return Err(ToolsBuildError::BuiltInName(name.into()));
+            }
+            if !names.insert(name.to_owned()) {
+                return Err(ToolsBuildError::DuplicateName(name.into()));
+            }
+        }
+        for tool in &self.tools.provider_direct {
             let definition = tool.definition();
             let name = definition.name();
             if name.is_empty() {
                 return Err(ToolsBuildError::EmptyName);
+            }
+            if host_owned_name(name) {
+                return Err(ToolsBuildError::ReservedName(name.into()));
             }
             if built_in_name(&self.tools, name) {
                 return Err(ToolsBuildError::BuiltInName(name.into()));

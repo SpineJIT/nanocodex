@@ -7,6 +7,7 @@ use super::*;
 pub(crate) struct ToolRegistry {
     ordered: Vec<Arc<dyn Tool>>,
     definitions: Vec<ToolDefinition>,
+    exposures: Vec<ToolExposure>,
     by_name: HashMap<Box<str>, usize>,
     pub(super) providers: Vec<Arc<dyn DynamicToolProvider>>,
 }
@@ -14,10 +15,11 @@ pub(crate) struct ToolRegistry {
 impl ToolRegistry {
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.get(name).is_some()
-            || self
-                .providers
-                .iter()
-                .any(|provider| provider.contains(name))
+            || (!host_owned_name(name)
+                && self
+                    .providers
+                    .iter()
+                    .any(|provider| provider.contains(name)))
     }
 
     pub(crate) fn supports_parallel_tool_calls(&self, name: &str) -> bool {
@@ -74,10 +76,13 @@ impl ToolRegistry {
                     ));
                 }
             };
-            let Some(provider) = self
-                .providers
-                .iter()
-                .find(|provider| provider.contains(name))
+            let Some(provider) = (!host_owned_name(name))
+                .then(|| {
+                    self.providers
+                        .iter()
+                        .find(|provider| provider.contains(name))
+                })
+                .flatten()
             else {
                 return ToolOutput::error(format!("unsupported tool call: {name}"));
             };
@@ -169,11 +174,12 @@ impl ToolRegistry {
         context: ToolContext<'_>,
     ) -> ToolOutput {
         let Some((handler, definition)) = self.get(name) else {
-            let Some(provider) = self
-                .providers
-                .iter()
-                .find(|provider| provider.contains(name))
-            else {
+            let Some(provider) = self.providers.iter().find(|provider| {
+                provider
+                    .available_definitions()
+                    .iter()
+                    .any(|definition| definition.name() == name)
+            }) else {
                 return ToolOutput::error(format!("unsupported nested tool call: {name}"));
             };
             if let Some(execution) = provider.execute(name, input, context).await {
@@ -219,20 +225,10 @@ impl ToolRegistry {
     }
 
     pub(crate) fn nested_tool_metadata(&self) -> Vec<Value> {
-        let mut metadata = self
-            .entries()
-            .filter(|(_, definition)| !matches!(definition, ToolDefinition::ToolSearch { .. }))
-            .map(|(_, definition)| definition_metadata(definition.name(), definition))
-            .collect::<Vec<_>>();
-        for definition in self
-            .providers
-            .iter()
-            .flat_map(|provider| provider.available_definitions())
-            .filter(|definition| !matches!(definition, ToolDefinition::ToolSearch { .. }))
-        {
-            metadata.push(definition_metadata(definition.name(), &definition));
-        }
-        metadata
+        self.code_mode_definitions()
+            .into_iter()
+            .map(|definition| definition_metadata(definition.name(), &definition))
+            .collect()
     }
     pub(super) fn from_ordered(ordered: Vec<Arc<dyn Tool>>) -> Self {
         let definitions = ordered
@@ -245,6 +241,7 @@ impl ToolRegistry {
             .map(|(index, definition)| (definition.name().into(), index))
             .collect();
         Self {
+            exposures: vec![ToolExposure::CodeModeOnly; definitions.len()],
             ordered,
             definitions,
             by_name,
@@ -252,12 +249,27 @@ impl ToolRegistry {
         }
     }
 
-    pub(super) fn extend(&mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) {
-        for tool in tools {
-            let index = self.ordered.len();
+    pub(super) fn set_all_exposures(&mut self, exposure: ToolExposure) {
+        self.exposures.fill(exposure);
+    }
+
+    pub(super) fn extend(
+        &mut self,
+        tools: impl IntoIterator<Item = (Arc<dyn Tool>, ToolExposure)>,
+    ) {
+        for (tool, exposure) in tools {
             let definition = tool.definition();
+            if self.by_name.contains_key(definition.name()) {
+                tracing::warn!(
+                    tool_name = definition.name(),
+                    "skipping duplicate tool that is already registered"
+                );
+                continue;
+            }
+            let index = self.ordered.len();
             self.by_name.insert(definition.name().into(), index);
             self.definitions.push(definition);
+            self.exposures.push(exposure);
             self.ordered.push(tool);
         }
     }
@@ -271,35 +283,86 @@ impl ToolRegistry {
         &self.definitions
     }
 
-    pub(crate) fn code_mode_tool_names(&self) -> Vec<(String, String)> {
-        let mut names = std::collections::BTreeMap::new();
-        for definition in self
-            .definitions
+    pub(crate) fn direct_definitions(&self) -> impl Iterator<Item = &ToolDefinition> {
+        self.definitions
             .iter()
-            .filter(|definition| !matches!(definition, ToolDefinition::ToolSearch { .. }))
-        {
-            names.insert(
-                code_mode::description::normalize_identifier(definition.name()),
-                definition.name().to_owned(),
-            );
-        }
-        for definition in self
-            .providers
-            .iter()
-            .flat_map(|provider| provider.available_definitions())
-            .filter(|definition| !matches!(definition, ToolDefinition::ToolSearch { .. }))
-        {
-            names.insert(
-                code_mode::description::normalize_identifier(definition.name()),
-                definition.name().to_owned(),
-            );
-        }
-        names.into_iter().collect()
+            .zip(&self.exposures)
+            .filter_map(|(definition, exposure)| exposure.is_direct().then_some(definition))
     }
 
+    pub(crate) fn code_mode_tool_names(&self) -> Vec<(String, String)> {
+        let mut names = self
+            .code_mode_definitions()
+            .into_iter()
+            .map(|definition| {
+                (
+                    code_mode::description::normalize_identifier(definition.name()),
+                    definition.name().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    pub(crate) fn registered_code_mode_definitions(&self) -> Vec<ToolDefinition> {
+        first_normalized_definitions(
+            self.definitions
+                .iter()
+                .zip(&self.exposures)
+                .filter(|(definition, exposure)| {
+                    exposure.is_available_in_code_mode()
+                        && !matches!(definition, ToolDefinition::ToolSearch { .. })
+                })
+                .map(|(definition, _)| definition.clone()),
+        )
+    }
+
+    pub(crate) fn code_mode_definitions(&self) -> Vec<ToolDefinition> {
+        let definitions = self
+            .definitions
+            .iter()
+            .zip(&self.exposures)
+            .filter(|(_, exposure)| exposure.is_available_in_code_mode())
+            .map(|(definition, _)| definition.clone())
+            .chain(
+                self.providers
+                    .iter()
+                    .flat_map(|provider| provider.available_definitions()),
+            )
+            .filter(|definition| {
+                !matches!(definition, ToolDefinition::ToolSearch { .. })
+                    && !host_owned_name(definition.name())
+            });
+        first_normalized_definitions(definitions)
+    }
+
+    #[cfg(test)]
     pub(super) fn entries(&self) -> impl Iterator<Item = (&Arc<dyn Tool>, &ToolDefinition)> {
         self.ordered.iter().zip(&self.definitions)
     }
+}
+
+fn first_normalized_definitions(
+    definitions: impl IntoIterator<Item = ToolDefinition>,
+) -> Vec<ToolDefinition> {
+    let mut seen = HashSet::new();
+    definitions
+        .into_iter()
+        .filter(|definition| {
+            let normalized = code_mode::description::normalize_identifier(definition.name());
+            if seen.insert(normalized.clone()) {
+                true
+            } else {
+                tracing::warn!(
+                    tool_name = definition.name(),
+                    code_mode_name = normalized,
+                    "skipping tool with a duplicate normalized Code Mode name"
+                );
+                false
+            }
+        })
+        .collect()
 }
 
 fn definition_metadata(name: &str, definition: &ToolDefinition) -> Value {

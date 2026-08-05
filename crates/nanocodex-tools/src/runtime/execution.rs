@@ -6,7 +6,7 @@ use super::*;
 /// normally owned privately by the higher-level agent driver.
 pub struct ToolRuntime {
     pub(super) registry: Arc<ToolRegistry>,
-    exposure: ToolExposure,
+    exposure: Option<ToolExposure>,
     deferred_tools_guidance_enabled: bool,
     code_mode: code_mode::CodeModeRuntime,
     sessions: Arc<ShellSessions>,
@@ -110,7 +110,7 @@ impl ToolRuntime {
         }
         Self {
             registry: Arc::new(ToolRegistry::from_ordered(handlers)),
-            exposure: ToolExposure::default(),
+            exposure: None,
             deferred_tools_guidance_enabled: false,
             code_mode: code_mode::CodeModeRuntime::new_with_turn(
                 code_mode_workspace,
@@ -131,11 +131,26 @@ impl ToolRuntime {
     #[must_use]
     pub fn with_tools(mut self, tools: &Tools) -> Self {
         tools.start_providers();
-        self.exposure = tools.exposure();
-        self.deferred_tools_guidance_enabled = tools.deferred_tools_guidance_enabled;
         let registry = Arc::make_mut(&mut self.registry);
-        registry.extend(tools.registered.iter().cloned());
-        registry.extend(tools.provider_direct.iter().cloned());
+        if self.exposure.is_none() {
+            let exposure = tools.exposure();
+            self.exposure = Some(exposure);
+            registry.set_all_exposures(exposure);
+        }
+        self.deferred_tools_guidance_enabled |= tools.deferred_tools_guidance_enabled;
+        registry.extend(tools.registered.iter().map(|tool| {
+            (
+                Arc::clone(&tool.handler),
+                tool.exposure.unwrap_or_else(|| tools.exposure()),
+            )
+        }));
+        registry.extend(
+            tools
+                .provider_direct
+                .iter()
+                .cloned()
+                .map(|tool| (tool, tools.exposure())),
+        );
         registry.providers.extend(tools.providers.iter().cloned());
         if let Some(working_directory) = &tools.working_directory {
             self.working_directory = Arc::clone(working_directory);
@@ -175,33 +190,25 @@ impl ToolRuntime {
     /// session.
     #[must_use]
     pub fn model_specs(&self, _session_id: &str) -> Vec<ToolDefinition> {
-        let mut nested = self
+        let mut nested = self.registry.registered_code_mode_definitions();
+        let mut direct = self
             .registry
-            .definitions()
-            .iter()
+            .direct_definitions()
             .filter(|definition| !matches!(definition, ToolDefinition::ToolSearch { .. }))
             .cloned()
             .collect::<Vec<_>>();
-        let mut direct = self
-            .registry
-            .definitions()
+        let code_mode_names = nested
             .iter()
-            .filter(|definition| {
-                self.exposure == ToolExposure::DirectAndCodeMode
-                    && !matches!(definition, ToolDefinition::ToolSearch { .. })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if self.exposure == ToolExposure::DirectAndCodeMode {
-            direct = group_direct_code_mode_definitions(direct);
-            crate::code_mode_order::sort_direct_definitions(&mut direct);
-        }
+            .map(|definition| definition.name().to_owned())
+            .collect::<HashSet<_>>();
+        direct = group_direct_code_mode_definitions(direct, &code_mode_names);
+        crate::code_mode_order::sort_direct_definitions(&mut direct);
         crate::code_mode_order::sort_definitions(&mut nested);
         let mut native = vec![
             code_mode::exec_spec(
                 &nested,
                 self.deferred_tools_guidance_enabled,
-                self.exposure == ToolExposure::CodeModeOnly,
+                self.exposure.unwrap_or_default() == ToolExposure::CodeModeOnly,
             ),
             code_mode::wait_spec(),
         ];
@@ -327,11 +334,18 @@ impl ToolRuntime {
     }
 }
 
-fn group_direct_code_mode_definitions(definitions: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+fn group_direct_code_mode_definitions(
+    definitions: Vec<ToolDefinition>,
+    code_mode_names: &HashSet<String>,
+) -> Vec<ToolDefinition> {
     let mut grouped = Vec::<ToolDefinition>::new();
     for definition in definitions {
         let canonical_name = definition.name().to_owned();
-        let mut definition = code_mode::description::augment_definition_for_code_mode(definition);
+        let mut definition = if code_mode_names.contains(&canonical_name) {
+            code_mode::description::augment_definition_for_code_mode(definition)
+        } else {
+            definition
+        };
         let Some((namespace, name)) = canonical_name.rsplit_once("__") else {
             grouped.push(definition);
             continue;

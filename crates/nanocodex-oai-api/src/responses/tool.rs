@@ -1,6 +1,6 @@
 //! Model-visible tool declarations and open JSON boundary values.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
 /// Model-visible tool definition carried by Responses Lite input.
@@ -15,6 +15,9 @@ pub enum ToolDefinition {
         description: Box<str>,
         /// Whether the provider should enforce the parameter schema strictly.
         strict: bool,
+        /// Whether this definition is returned for deferred provider loading.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
         /// JSON Schema accepted as function arguments.
         parameters: JsonSchema,
         #[serde(skip)]
@@ -30,7 +33,8 @@ pub enum ToolDefinition {
         name: Box<str>,
         /// Guidance describing the namespace as a whole.
         description: Box<str>,
-        /// Function declarations exposed under this namespace.
+        /// Function or custom declarations exposed under this namespace.
+        #[serde(serialize_with = "serialize_namespace_tools")]
         tools: Vec<Self>,
     },
     /// Free-form custom tool constrained by a grammar.
@@ -39,6 +43,9 @@ pub enum ToolDefinition {
         name: Box<str>,
         /// Concrete guidance for when and how to use the tool.
         description: Box<str>,
+        /// Whether this definition is returned for deferred provider loading.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
         /// Free-form input grammar.
         format: CustomToolFormat,
     },
@@ -51,6 +58,23 @@ pub enum ToolDefinition {
         /// JSON Schema accepted as search arguments.
         parameters: JsonSchema,
     },
+}
+
+fn serialize_namespace_tools<S>(tools: &[ToolDefinition], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if tools.iter().any(|tool| {
+        !matches!(
+            tool,
+            ToolDefinition::Function { .. } | ToolDefinition::Custom { .. }
+        )
+    }) {
+        return Err(serde::ser::Error::custom(
+            "Responses namespaces may contain only function or custom definitions",
+        ));
+    }
+    tools.serialize(serializer)
 }
 
 impl ToolDefinition {
@@ -86,6 +110,7 @@ impl ToolDefinition {
             name: name.into(),
             description: description.into(),
             strict: false,
+            defer_loading: None,
             parameters: parameters.into(),
             output_schema: None,
         }
@@ -101,6 +126,7 @@ impl ToolDefinition {
         Self::Custom {
             name: name.into(),
             description: description.into(),
+            defer_loading: None,
             format,
         }
     }
@@ -168,6 +194,22 @@ impl ToolDefinition {
         } = &mut self
         {
             *current = Some(output_schema.into());
+        }
+        self
+    }
+
+    /// Marks a function or custom definition for provider-native deferred loading.
+    #[must_use]
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "ToolDefinition owns drop types that const evaluation rejects"
+    )]
+    pub fn with_deferred_loading(mut self) -> Self {
+        match &mut self {
+            Self::Function { defer_loading, .. } | Self::Custom { defer_loading, .. } => {
+                *defer_loading = Some(true);
+            }
+            Self::Namespace { .. } | Self::ToolSearch { .. } => {}
         }
         self
     }
@@ -281,10 +323,29 @@ impl From<Value> for JsonValue {
 mod tests {
     use serde_json::json;
 
-    use super::{JsonSchema, ToolDefinition};
+    use super::{CustomToolFormat, JsonSchema, ToolDefinition};
 
     #[test]
-    fn namespace_serializes_function_children_without_client_output_metadata() {
+    fn custom_tools_opt_into_deferred_loading_and_namespace_membership() {
+        let custom = ToolDefinition::custom(
+            "patch",
+            "Apply a patch.",
+            CustomToolFormat::grammar("lark", "start: \"patch\""),
+        )
+        .with_deferred_loading();
+        assert_eq!(
+            serde_json::to_value(&custom).unwrap()["defer_loading"],
+            true
+        );
+        let namespace = ToolDefinition::namespace("editing", "Deferred editing tools.", [custom]);
+        assert_eq!(
+            serde_json::to_value(namespace).unwrap()["tools"][0]["type"],
+            "custom"
+        );
+    }
+
+    #[test]
+    fn namespace_serializes_supported_children_and_rejects_nested_namespaces() {
         let definition = ToolDefinition::namespace(
             "image_gen",
             "Tools in the image_gen namespace.",
@@ -321,6 +382,12 @@ mod tests {
                 }]
             })
         );
+        let nested = ToolDefinition::namespace(
+            "outer",
+            "Outer tools.",
+            [ToolDefinition::namespace("inner", "Inner tools.", [])],
+        );
+        assert!(serde_json::to_value(nested).is_err());
     }
 
     #[test]
