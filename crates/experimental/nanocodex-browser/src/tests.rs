@@ -331,7 +331,7 @@ async fn code_mode_description_exposes_browser_action_schema() -> Result<()> {
 }
 
 #[tokio::test]
-async fn deferred_browser_is_discoverable_without_model_schema_bytes() -> Result<()> {
+async fn deferred_browser_is_advertised_without_action_schema_bytes() -> Result<()> {
     let baseline_tools = Tools::builder().without_defaults().build()?;
     let baseline =
         ToolRuntime::new_with_tools(".", None, None, &baseline_tools).model_specs("test-session");
@@ -343,28 +343,30 @@ async fn deferred_browser_is_discoverable_without_model_schema_bytes() -> Result
     let runtime = ToolRuntime::new_with_tools(".", None, None, &tools);
     let specs = runtime.model_specs("test-session");
 
-    assert_eq!(
-        serde_json::to_vec(&specs)?,
-        serde_json::to_vec(&baseline)?,
-        "deferred browser registration must not change the model-facing tool prefix"
-    );
+    let baseline = serde_json::to_vec(&baseline)?;
+    let serialized = serde_json::to_vec(&specs)?;
+    let model_contract = String::from_utf8(serialized.clone())?;
+    assert!(model_contract.contains("tools.browser"));
+    assert!(model_contract.contains("host-managed browser session"));
+    assert!(!model_contract.contains("detect_gate"));
+    assert!(serialized.len() - baseline.len() < 512);
     assert!(runtime.contains("browser"));
 
     let execution = runtime
         .execute_code(
             r#"
-const browser = ALL_TOOLS.find((tool) => tool.name === "browser");
-if (!browser) throw new Error("browser metadata missing");
-if (typeof browser.description !== "string") {
+const metadata = ALL_TOOLS.find((tool) => tool.name === "browser");
+if (!metadata) throw new Error("browser metadata missing");
+if (typeof metadata.description !== "string") {
   throw new Error("browser description missing");
 }
-const opened = await tools[browser.name]({
+const opened = await tools.browser({
   action: "open",
   url: "https://example.com"
 });
 text({
-  name: browser.name,
-  hasDescription: browser.description.length > 0,
+  name: metadata.name,
+  hasDescription: metadata.description.length > 0,
   opened
 });
 "#,

@@ -3797,6 +3797,13 @@ impl DynamicToolProvider for BrowserTool {
         vec![browser_tool_definition()]
     }
 
+    fn code_mode_tool_summaries(&self) -> Vec<(String, String)> {
+        vec![(
+            "browser".to_owned(),
+            "Control the host-managed browser session one typed action at a time.".to_owned(),
+        )]
+    }
+
     fn contains(&self, name: &str) -> bool {
         name == "browser"
     }

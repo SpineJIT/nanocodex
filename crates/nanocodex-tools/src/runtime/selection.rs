@@ -55,6 +55,16 @@ pub trait DynamicToolProvider: Send + Sync {
     /// Returns deferred tools currently callable from new Code Mode cells.
     fn available_definitions(&self) -> Vec<ToolDefinition>;
 
+    /// Returns compact, stable guidance for provider tools that should be
+    /// discoverable before the model starts its first Code Mode cell.
+    ///
+    /// The complete definitions remain runtime-only and available through
+    /// `ALL_TOOLS`; summaries keep large dynamic schemas out of the model
+    /// request prefix.
+    fn code_mode_tool_summaries(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     /// Returns whether this provider currently exposes `name`.
     fn contains(&self, name: &str) -> bool {
         self.available_definitions()

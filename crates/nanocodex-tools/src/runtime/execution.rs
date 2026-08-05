@@ -191,6 +191,7 @@ impl ToolRuntime {
     #[must_use]
     pub fn model_specs(&self, _session_id: &str) -> Vec<ToolDefinition> {
         let mut nested = self.registry.registered_code_mode_definitions();
+        let provider_summaries = self.registry.code_mode_tool_summaries();
         let mut direct = self
             .registry
             .direct_definitions()
@@ -207,6 +208,7 @@ impl ToolRuntime {
         let mut native = vec![
             code_mode::exec_spec(
                 &nested,
+                &provider_summaries,
                 self.deferred_tools_guidance_enabled,
                 self.exposure.unwrap_or_default() == ToolExposure::CodeModeOnly,
             ),

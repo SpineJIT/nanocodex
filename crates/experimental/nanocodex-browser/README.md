@@ -107,13 +107,17 @@ or an explicitly managed CDP endpoint.
 - Harness-owned cookies/storage, virtual passkeys, allowlisted source-browser handoff,
   upload roots, browser egress policy, remote CDP, and libkrun VM composition.
 
-The Nanocodex CLI can copy a standard desktop browser profile's complete cookie
-database into either supported session-private browser. A bare cookie flag
-auto-detects a source; `brave`, `chrome`, `chromium`, `edge`, `firefox`, and
-`safari` select it explicitly:
+The Nanocodex CLI exposes a private Chromium session and copies a standard
+desktop browser profile's complete cookie database into it by default. `all`
+auto-detects the source; `brave`, `chrome`, `chromium`, `edge`, `firefox`, and
+`safari` select it explicitly. Pass `none` to either option to disable that
+default:
 
 ```console
-nanocodex --browser --cookies
+nanocodex
+nanocodex --browser=none --cookies=none
+nanocodex --cookies=none
+nanocodex --browser=brave --cookies=all
 nanocodex --browser --cookies=chrome
 nanocodex --browser=brave --cookies=edge
 nanocodex --browser --cookies=firefox
@@ -123,11 +127,12 @@ nanocodex --browser --cookies=safari
 Chromium-family sources use their own executable as a short-lived decryption
 broker. Firefox is copied with SQLite's online backup API. Safari's bounded
 binary-cookie decoder may require granting the Nanocodex process macOS access
-to Safari's sandboxed profile. Source profiles are never mutated.
-
-The source profile is never mutated, and cookie values remain outside the
-model-callable browser schema. This mode deliberately gives the agent
-authenticated access to every site represented in the selected profile.
+to Safari's sandboxed profile. Source profiles are never mutated, and cookie
+values remain outside the model-callable browser schema. The `exec` contract
+advertises `tools.browser` with a compact summary; its complete action guidance
+remains runtime-only in `ALL_TOOLS`. The default cookie mode deliberately gives
+the agent authenticated access to every site represented in the selected
+profile.
 
 ## Current boundaries
 

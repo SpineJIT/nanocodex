@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- [cli] Enable the private browser and complete desktop-profile cookie import
+  by default, with compact up-front `tools.browser` discovery in Code Mode.
 - [tools] Add bounded MCP pagination, collision-safe Code Mode registration,
   per-tool and per-server exposure policy, and deferred custom-tool wire shapes.
 - [parity] Classify Codex through `7ada37a1` and defer the standalone V8 host.

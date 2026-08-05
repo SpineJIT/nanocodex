@@ -318,6 +318,26 @@ impl ToolRegistry {
         )
     }
 
+    pub(crate) fn code_mode_tool_summaries(&self) -> Vec<(String, String)> {
+        let mut seen = self
+            .registered_code_mode_definitions()
+            .into_iter()
+            .map(|definition| code_mode::description::normalize_identifier(definition.name()))
+            .collect::<HashSet<_>>();
+        let mut summaries = self
+            .providers
+            .iter()
+            .flat_map(|provider| provider.code_mode_tool_summaries())
+            .filter_map(|(name, description)| {
+                let normalized = code_mode::description::normalize_identifier(&name);
+                (!host_owned_name(&name) && seen.insert(normalized.clone()))
+                    .then_some((normalized, description))
+            })
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| left.0.cmp(&right.0));
+        summaries
+    }
+
     pub(crate) fn code_mode_definitions(&self) -> Vec<ToolDefinition> {
         let definitions = self
             .definitions

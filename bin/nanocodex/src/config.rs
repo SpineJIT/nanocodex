@@ -210,6 +210,11 @@ impl AgentArgs {
         self.browser.is_enabled()
     }
 
+    #[cfg(test)]
+    pub(crate) const fn copies_all_browser_cookies(&self) -> bool {
+        self.browser.copies_all_cookies()
+    }
+
     pub(crate) fn thinking(&self) -> Thinking {
         self.model_policy.thinking.unwrap_or_default()
     }

@@ -55,11 +55,14 @@ async fn run_agent(browser: BrowserTool) -> Result<Value> {
             .as_array()
             .and_then(|tools| tools.iter().find(|tool| tool["name"] == "exec"))
             .ok_or_else(|| eyre!("warmup did not expose Code Mode"))?;
+        let description = exec["description"]
+            .as_str()
+            .ok_or_else(|| eyre!("Code Mode description was not text"))?;
+        assert!(description.contains("tools.browser"));
+        assert!(description.contains("host-managed browser session"));
         assert!(
-            exec["description"]
-                .as_str()
-                .is_some_and(|description| !description.contains("tools.browser")),
-            "warmup unexpectedly included the browser schema: {exec}"
+            !description.contains("detect_gate"),
+            "warmup unexpectedly included the browser action schema: {exec}"
         );
         send_completed(&mut socket, "resp-warmup", &[], None).await?;
 

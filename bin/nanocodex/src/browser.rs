@@ -12,18 +12,22 @@ enum BrowserKind {
     #[value(alias = "true")]
     Chromium,
     Brave,
+    #[value(alias = "false", alias = "off")]
+    None,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum CookieSourceKind {
-    #[value(alias = "true")]
-    Auto,
+    #[value(alias = "auto", alias = "true")]
+    All,
     Brave,
     Chrome,
     Chromium,
     Edge,
     Firefox,
     Safari,
+    #[value(alias = "false", alias = "off")]
+    None,
 }
 
 enum CookieSource {
@@ -31,46 +35,53 @@ enum CookieSource {
     State(BrowserStorageState),
 }
 
-/// Opt-in local browser configuration for normal agent sessions.
-#[derive(Args, Default)]
+/// Local browser configuration for normal agent sessions.
+#[derive(Args)]
 pub(crate) struct BrowserArgs {
-    /// Expose one private browser session to Code Mode as `tools.browser`.
+    /// Select the private browser exposed to Code Mode as `tools.browser`.
     ///
     /// Pass `brave` to use the standard Brave installation. A bare `--browser`
-    /// preserves the private Chromium default.
+    /// preserves the private Chromium default; pass `none` to disable it.
     #[arg(
         long,
         env = "NANOCODEX_BROWSER",
         value_enum,
         num_args = 0..=1,
+        default_value = "chromium",
         default_missing_value = "chromium",
         require_equals = true
     )]
     browser: Option<BrowserKind>,
 
-    /// Copy cookies from a standard desktop browser profile.
+    /// Copy cookies from a standard desktop browser profile into the private session.
     ///
-    /// Pass a browser name to select the source profile. A bare flag or `true`
-    /// automatically selects an installed profile.
+    /// The default `all` copies every cookie from an automatically selected
+    /// installed profile. Pass a browser name to select its profile or `none`
+    /// to start with an empty cookie jar.
     #[arg(
         long,
         env = "NANOCODEX_BROWSER_COOKIES",
         value_enum,
         num_args = 0..=1,
-        default_missing_value = "auto",
-        require_equals = true,
-        requires = "browser"
+        default_value = "all",
+        default_missing_value = "all",
+        require_equals = true
     )]
     cookies: Option<CookieSourceKind>,
 
     /// Chrome or Chromium executable used by the browser tool.
-    #[arg(
-        long,
-        env = "NANOCODEX_BROWSER_EXECUTABLE",
-        value_name = "PATH",
-        requires = "browser"
-    )]
+    #[arg(long, env = "NANOCODEX_BROWSER_EXECUTABLE", value_name = "PATH")]
     browser_executable: Option<PathBuf>,
+}
+
+impl Default for BrowserArgs {
+    fn default() -> Self {
+        Self {
+            browser: Some(BrowserKind::Chromium),
+            cookies: Some(CookieSourceKind::All),
+            browser_executable: None,
+        }
+    }
 }
 
 pub(crate) struct ConfiguredBrowser {
@@ -80,13 +91,30 @@ pub(crate) struct ConfiguredBrowser {
 impl BrowserArgs {
     #[cfg(test)]
     pub(crate) const fn is_enabled(&self) -> bool {
-        self.browser.is_some()
+        !matches!(self.browser, None | Some(BrowserKind::None))
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn copies_all_cookies(&self) -> bool {
+        matches!(self.cookies, Some(CookieSourceKind::All))
     }
 
     pub(crate) fn configure(&self, workspace: &Path) -> Result<Option<ConfiguredBrowser>> {
         let Some(kind) = self.browser else {
             return Ok(None);
         };
+        if kind == BrowserKind::None {
+            if self
+                .cookies
+                .is_some_and(|source| source != CookieSourceKind::All)
+            {
+                return Err(eyre!("--cookies requires an enabled browser"));
+            }
+            if self.browser_executable.is_some() {
+                return Err(eyre!("--browser-executable requires an enabled browser"));
+            }
+            return Ok(None);
+        }
         let mut builder = Browser::builder().file_root(workspace);
         match kind {
             BrowserKind::Chromium => {
@@ -104,8 +132,12 @@ impl BrowserArgs {
                     .wrap_err("failed to locate the standard Brave profile")?;
                 builder = builder.executable(brave.executable().to_path_buf());
             }
+            BrowserKind::None => unreachable!("disabled browsers return before configuration"),
         }
-        if let Some(source) = self.cookies {
+        if let Some(source) = self
+            .cookies
+            .filter(|source| *source != CookieSourceKind::None)
+        {
             builder = match cookie_source(source, kind)? {
                 CookieSource::Chromium(source) => builder.cookie_source(source.copy_all_cookies()),
                 CookieSource::State(state) => builder.storage_state(state),
@@ -135,12 +167,12 @@ fn cookie_source(source: CookieSourceKind, target: BrowserKind) -> Result<Cookie
         _ => {}
     }
     let explicit = match source {
-        CookieSourceKind::Auto => None,
+        CookieSourceKind::All => None,
         CookieSourceKind::Brave => Some(BrowserProfileKind::Brave),
         CookieSourceKind::Chrome => Some(BrowserProfileKind::Chrome),
         CookieSourceKind::Chromium => Some(BrowserProfileKind::Chromium),
         CookieSourceKind::Edge => Some(BrowserProfileKind::Edge),
-        CookieSourceKind::Firefox | CookieSourceKind::Safari => None,
+        CookieSourceKind::Firefox | CookieSourceKind::Safari | CookieSourceKind::None => None,
     };
     if let Some(source) = explicit {
         return BraveSession::standard_for(source)
@@ -161,6 +193,7 @@ fn cookie_source(source: CookieSourceKind, target: BrowserKind) -> Result<Cookie
             BrowserProfileKind::Brave,
             BrowserProfileKind::Edge,
         ],
+        BrowserKind::None => unreachable!("disabled browsers have no cookie source"),
     };
     preferences
         .into_iter()
@@ -220,13 +253,41 @@ mod tests {
         let definitions = runtime.model_specs("browser-tui-test");
         let serialized = serde_json::to_string(&definitions).unwrap();
 
-        assert_eq!(
-            serde_json::to_vec(&definitions).unwrap(),
-            serde_json::to_vec(&baseline).unwrap(),
-            "enabling browser must not add any model-input schema bytes"
-        );
-        assert!(!serialized.contains("browser"));
+        let baseline_bytes = serde_json::to_vec(&baseline).unwrap();
+        let definition_bytes = serde_json::to_vec(&definitions).unwrap();
+        assert_ne!(definition_bytes, baseline_bytes);
+        assert!(serialized.contains("tools.browser"));
+        assert!(serialized.contains("host-managed browser session"));
+        assert!(!serialized.contains("detect_gate"));
+        assert!(definition_bytes.len() - baseline_bytes.len() < 512);
         assert!(runtime.contains("browser"));
         browser.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn disabled_browser_rejects_nondefault_browser_configuration() {
+        let workspace = tempfile::tempdir().unwrap();
+        let cookies = BrowserArgs {
+            browser: Some(super::BrowserKind::None),
+            cookies: Some(super::CookieSourceKind::Chrome),
+            browser_executable: None,
+        }
+        .configure(workspace.path())
+        .err()
+        .unwrap();
+        assert_eq!(cookies.to_string(), "--cookies requires an enabled browser");
+
+        let executable = BrowserArgs {
+            browser: Some(super::BrowserKind::None),
+            cookies: Some(super::CookieSourceKind::All),
+            browser_executable: Some("/tmp/chromium".into()),
+        }
+        .configure(workspace.path())
+        .err()
+        .unwrap();
+        assert_eq!(
+            executable.to_string(),
+            "--browser-executable requires an enabled browser"
+        );
     }
 }
