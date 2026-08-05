@@ -171,6 +171,8 @@ fn subagent_stress_command(
     let mut command = Command::new(env!("CARGO_BIN_EXE_nanocodex"));
     command
         .arg("run")
+        .arg("--browser=none")
+        .arg("--cookies=none")
         .arg("--api-key")
         .arg(API_KEY_SENTINEL)
         .arg("--websocket-url")
@@ -284,6 +286,8 @@ fn stress_command(
     let mut command = Command::new(env!("CARGO_BIN_EXE_nanocodex"));
     command
         .arg("run")
+        .arg("--browser=none")
+        .arg("--cookies=none")
         .arg("--api-key")
         .arg(API_KEY_SENTINEL)
         .arg("--websocket-url")

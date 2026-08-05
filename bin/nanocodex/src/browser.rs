@@ -109,10 +109,9 @@ impl BrowserArgs {
             return Ok(None);
         };
         if kind == BrowserKind::None {
-            if self
-                .cookies
-                .is_some_and(|source| source != CookieSourceKind::All)
-            {
+            if self.cookies.is_some_and(|source| {
+                !matches!(source, CookieSourceKind::All | CookieSourceKind::None)
+            }) {
                 return Err(eyre!("--cookies requires an enabled browser"));
             }
             if self.browser_executable.is_some() {
@@ -272,6 +271,15 @@ mod tests {
     #[test]
     fn disabled_browser_rejects_nondefault_browser_configuration() {
         let workspace = tempfile::tempdir().unwrap();
+        let disabled = BrowserArgs {
+            browser: Some(super::BrowserKind::None),
+            cookies: Some(super::CookieSourceKind::None),
+            browser_executable: None,
+        }
+        .configure(workspace.path())
+        .unwrap();
+        assert!(disabled.is_none());
+
         let cookies = BrowserArgs {
             browser: Some(super::BrowserKind::None),
             cookies: Some(super::CookieSourceKind::Chrome),

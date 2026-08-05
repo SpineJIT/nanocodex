@@ -17,6 +17,8 @@ async fn interrupt_after_completion_still_flushes_one_terminal_event() -> Result
         .current_dir(&workspace)
         .env_remove("OPENAI_API_KEY")
         .arg("run")
+        .arg("--browser=none")
+        .arg("--cookies=none")
         .arg("--api-key")
         .arg("test-key")
         .arg("--websocket-url")
