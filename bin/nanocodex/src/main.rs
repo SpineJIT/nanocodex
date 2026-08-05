@@ -273,20 +273,25 @@ mod tests {
     }
 
     #[test]
-    fn browser_tool_and_all_cookies_are_enabled_by_default() {
+    fn brave_browser_tool_and_all_cookies_are_enabled_by_default() {
         let tui = Cli::try_parse_from(["nanocodex"]).unwrap();
         assert!(tui.agent.browser_enabled());
         assert!(tui.agent.copies_all_browser_cookies());
+        assert!(tui.agent.uses_brave_browser());
 
         let tui = Cli::try_parse_from(["nanocodex", "--browser"]).unwrap();
         assert!(tui.agent.browser_enabled());
+        assert!(tui.agent.uses_brave_browser());
 
         let brave =
             Cli::try_parse_from(["nanocodex", "--browser=brave", "--cookies=true"]).unwrap();
         assert!(brave.agent.browser_enabled());
+        assert!(brave.agent.uses_brave_browser());
 
-        let chromium = Cli::try_parse_from(["nanocodex", "--browser", "--cookies=true"]).unwrap();
+        let chromium =
+            Cli::try_parse_from(["nanocodex", "--browser=chromium", "--cookies=true"]).unwrap();
         assert!(chromium.agent.browser_enabled());
+        assert!(!chromium.agent.uses_brave_browser());
 
         let all_cookies = Cli::try_parse_from(["nanocodex", "--cookies=all"]).unwrap();
         assert!(all_cookies.agent.browser_enabled());

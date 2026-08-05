@@ -9,8 +9,8 @@ use nanocodex_browser::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum BrowserKind {
-    #[value(alias = "true")]
     Chromium,
+    #[value(alias = "true")]
     Brave,
     #[value(alias = "false", alias = "off")]
     None,
@@ -40,15 +40,15 @@ enum CookieSource {
 pub(crate) struct BrowserArgs {
     /// Select the private browser exposed to Code Mode as `tools.browser`.
     ///
-    /// Pass `brave` to use the standard Brave installation. A bare `--browser`
-    /// preserves the private Chromium default; pass `none` to disable it.
+    /// Brave is the default. Pass `chromium` to use private Chromium or `none`
+    /// to disable browser tools.
     #[arg(
         long,
         env = "NANOCODEX_BROWSER",
         value_enum,
         num_args = 0..=1,
-        default_value = "chromium",
-        default_missing_value = "chromium",
+        default_value = "brave",
+        default_missing_value = "brave",
         require_equals = true
     )]
     browser: Option<BrowserKind>,
@@ -77,7 +77,7 @@ pub(crate) struct BrowserArgs {
 impl Default for BrowserArgs {
     fn default() -> Self {
         Self {
-            browser: Some(BrowserKind::Chromium),
+            browser: Some(BrowserKind::Brave),
             cookies: Some(CookieSourceKind::All),
             browser_executable: None,
         }
@@ -97,6 +97,11 @@ impl BrowserArgs {
     #[cfg(test)]
     pub(crate) const fn copies_all_cookies(&self) -> bool {
         matches!(self.cookies, Some(CookieSourceKind::All))
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn uses_brave(&self) -> bool {
+        matches!(self.browser, Some(BrowserKind::Brave))
     }
 
     pub(crate) fn configure(&self, workspace: &Path) -> Result<Option<ConfiguredBrowser>> {

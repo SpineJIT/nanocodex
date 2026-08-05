@@ -215,6 +215,11 @@ impl AgentArgs {
         self.browser.copies_all_cookies()
     }
 
+    #[cfg(test)]
+    pub(crate) const fn uses_brave_browser(&self) -> bool {
+        self.browser.uses_brave()
+    }
+
     pub(crate) fn thinking(&self) -> Thinking {
         self.model_policy.thinking.unwrap_or_default()
     }

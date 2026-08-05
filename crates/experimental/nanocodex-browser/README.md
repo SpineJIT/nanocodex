@@ -107,8 +107,8 @@ or an explicitly managed CDP endpoint.
 - Harness-owned cookies/storage, virtual passkeys, allowlisted source-browser handoff,
   upload roots, browser egress policy, remote CDP, and libkrun VM composition.
 
-The Nanocodex CLI exposes a private Chromium session and copies a standard
-desktop browser profile's complete cookie database into it by default. `all`
+The Nanocodex CLI exposes a private Brave session and copies a standard desktop
+browser profile's complete cookie database into it by default. `all`
 auto-detects the source; `brave`, `chrome`, `chromium`, `edge`, `firefox`, and
 `safari` select it explicitly. Pass `none` to either option to disable that
 default:
@@ -117,7 +117,7 @@ default:
 nanocodex
 nanocodex --browser=none --cookies=none
 nanocodex --cookies=none
-nanocodex --browser=brave --cookies=all
+nanocodex --browser=chromium --cookies=all
 nanocodex --browser --cookies=chrome
 nanocodex --browser=brave --cookies=edge
 nanocodex --browser --cookies=firefox
