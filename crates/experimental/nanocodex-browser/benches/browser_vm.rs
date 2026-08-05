@@ -118,6 +118,7 @@ fn benchmark_live_vm(criterion: &mut Criterion) {
                 .execute(BrowserAction::Screenshot {
                     full_page: false,
                     annotate: false,
+                    target: None,
                 })
                 .await
                 .expect("warm screenshot");

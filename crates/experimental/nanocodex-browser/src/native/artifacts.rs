@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chromiumoxide::{Page, page::ScreenshotParams};
+use chromiumoxide::{Page, cdp::browser_protocol::page::Viewport, page::ScreenshotParams};
 use image::{DynamicImage, ImageBuffer, Rgba};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -62,9 +62,14 @@ pub(super) async fn capture(
     output_dir: &Path,
     artifact_id: String,
     full_page: bool,
+    clip: Option<Viewport>,
 ) -> Result<BrowserImageArtifact, BrowserError> {
     let path = output_dir.join(format!("{artifact_id}.png"));
-    let params = ScreenshotParams::builder().full_page(full_page).build();
+    let mut params = ScreenshotParams::builder().full_page(full_page);
+    if let Some(clip) = clip {
+        params = params.clip(clip).capture_beyond_viewport(true);
+    }
+    let params = params.build();
     let bytes = page.screenshot(params).await?;
     let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     if byte_count > MAX_IMAGE_ARTIFACT_BYTES {

@@ -77,6 +77,7 @@ async fn headed_browser_vm_runs_typed_actions_and_reaps() {
         .execute(BrowserAction::Screenshot {
             full_page: false,
             annotate: false,
+            target: None,
         })
         .await
         .expect("capture screenshot");

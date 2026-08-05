@@ -70,6 +70,7 @@ impl SessionTraceState {
                 &self.directory,
                 format!("action-{sequence:06}"),
                 false,
+                None,
             )
             .await
             {

@@ -353,6 +353,38 @@ text(ALL_TOOLS.map((tool) => ({
 }
 
 #[tokio::test]
+async fn tool_schema_exposes_cloned_schemas_without_expanding_all_tools() -> Result<()> {
+    let workspace = temporary_workspace("tool-schema")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+const schema = toolSchema("update_plan");
+const missing = toolSchema("missing_tool");
+schema.inputSchema.mutated = true;
+const fresh = toolSchema("update_plan");
+text({
+  hasInputSchema: schema.inputSchema?.type === "object",
+  hasOutputSchema: schema.outputSchema !== undefined,
+  mutationLeaked: fresh.inputSchema.mutated === true,
+  missing: missing === undefined,
+});
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert_eq!(
+        emitted_text(&execution)?,
+        r#"{"hasInputSchema":true,"hasOutputSchema":true,"mutationLeaked":false,"missing":true}"#
+    );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn function_tools_receive_an_empty_object_when_called_without_arguments() -> Result<()> {
     let workspace = temporary_workspace("empty-function-arguments")?;
     let tools = test_tools(&workspace);

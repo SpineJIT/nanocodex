@@ -33,7 +33,7 @@ use chromiumoxide::{
                 EventDownloadWillBegin, PermissionDescriptor, PermissionSetting,
                 SetDownloadBehaviorBehavior, SetDownloadBehaviorParams, SetPermissionParams,
             },
-            dom::SetFileInputFilesParams,
+            dom::{GetBoxModelParams, SetFileInputFilesParams},
             dom_snapshot::{
                 ArrayOfStrings, CaptureSnapshotParams, CaptureSnapshotReturns, DocumentSnapshot,
                 LayoutTreeSnapshot, RareBooleanData, RareIntegerData, RareStringData, Rectangle,
@@ -59,7 +59,7 @@ use chromiumoxide::{
             page::{
                 AddScriptToEvaluateOnNewDocumentParams, EventJavascriptDialogOpening,
                 GetNavigationHistoryParams, HandleJavaScriptDialogParams,
-                NavigateToHistoryEntryParams,
+                NavigateToHistoryEntryParams, Viewport,
             },
             target::{GetTargetsParams, SetAutoAttachParams, TargetId},
             web_authn::{
@@ -70,7 +70,7 @@ use chromiumoxide::{
         },
         js_protocol::runtime::{
             EvaluateParams, EventConsoleApiCalled, EventExceptionThrown, ExecutionContextId,
-            RemoteObject, StackTrace,
+            ReleaseObjectParams, RemoteObject, StackTrace,
         },
     },
     error::CdpError,
@@ -2783,7 +2783,11 @@ return element.checked;"#
             set_file_input_files(&session.page, &target, paths).await?;
             Ok(action_result(sequence, BrowserActionName::UploadFiles))
         }
-        BrowserAction::SetViewport { width, height } => {
+        BrowserAction::SetViewport {
+            width,
+            height,
+            device_scale_factor,
+        } => {
             if width == 0
                 || height == 0
                 || width > MAX_VIEWPORT_DIMENSION
@@ -2795,12 +2799,18 @@ return element.checked;"#
                     maximum: MAX_VIEWPORT_DIMENSION,
                 });
             }
+            let device_scale_factor = device_scale_factor.unwrap_or(1.0);
+            if !device_scale_factor.is_finite() || device_scale_factor <= 0.0 {
+                return Err(BrowserError::InvalidDeviceScaleFactor {
+                    device_scale_factor,
+                });
+            }
             session
                 .page
                 .execute(SetDeviceMetricsOverrideParams::new(
                     i64::from(width),
                     i64::from(height),
-                    1.0,
+                    device_scale_factor,
                     false,
                 ))
                 .await?;
@@ -2860,6 +2870,7 @@ return element.checked;"#
         BrowserAction::Screenshot {
             full_page,
             annotate,
+            target,
         } => {
             if session.visual_artifacts.len() >= MAX_VISUAL_ARTIFACTS {
                 return Err(BrowserError::VisualArtifactLimit {
@@ -2869,11 +2880,17 @@ return element.checked;"#
             if annotate {
                 install_annotations(session).await?;
             }
+            let clip = capture_clip(session, target.as_ref(), full_page).await;
+            if clip.is_err() && annotate {
+                let _ = evaluate_value(&session.page, REMOVE_ANNOTATIONS_SCRIPT).await;
+            }
+            let clip = clip?;
             let screenshot = artifacts::capture(
                 &session.page,
                 &session.output_dir,
                 format!("screenshot-{sequence}"),
                 full_page,
+                clip,
             )
             .await;
             if annotate {
@@ -2917,17 +2934,19 @@ return element.checked;"#
                 pdf,
             })
         }
-        BrowserAction::VisualBaseline { full_page } => {
+        BrowserAction::VisualBaseline { full_page, target } => {
             if session.visual_artifacts.len() >= MAX_VISUAL_ARTIFACTS {
                 return Err(BrowserError::VisualArtifactLimit {
                     maximum: MAX_VISUAL_ARTIFACTS,
                 });
             }
+            let clip = capture_clip(session, target.as_ref(), full_page).await?;
             let image = artifacts::capture(
                 &session.page,
                 &session.output_dir,
                 format!("visual-{sequence}"),
                 full_page,
+                clip,
             )
             .await?;
             session
@@ -2943,6 +2962,7 @@ return element.checked;"#
             baseline_id,
             threshold,
             full_page,
+            target,
         } => {
             let baseline = session
                 .visual_artifacts
@@ -2956,11 +2976,13 @@ return element.checked;"#
                     maximum: MAX_VISUAL_ARTIFACTS,
                 });
             }
+            let clip = capture_clip(session, target.as_ref(), full_page).await?;
             let current = artifacts::capture(
                 &session.page,
                 &session.output_dir,
                 format!("visual-{sequence}"),
                 full_page,
+                clip,
             )
             .await?;
             let diff = artifacts::compare(&baseline, &current, &session.output_dir, threshold)?;
@@ -5361,6 +5383,100 @@ if (!element) throw new Error("selector did not match an element");
     ))
 }
 
+async fn capture_clip(
+    session: &Session,
+    target: Option<&BrowserTarget>,
+    full_page: bool,
+) -> Result<Option<Viewport>, BrowserError> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    if full_page {
+        return Err(BrowserError::TargetWithFullPage);
+    }
+
+    let target = session.target(target).await?;
+    interaction::wait_until_actionable(
+        &session.page,
+        &target,
+        interaction::Actionability::Attached,
+    )
+    .await?;
+    evaluate_typed_in_context::<bool>(
+        &session.page,
+        element_script(
+            &target.query,
+            r#"element.scrollIntoView({ block: "center", inline: "center" });
+return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))));"#,
+        )?,
+        target.context_id,
+    )
+    .await?;
+
+    let mut params = EvaluateParams::new(element_script(&target.query, "return element;")?);
+    params.context_id = target.context_id;
+    params.return_by_value = Some(false);
+    params.await_promise = Some(true);
+    let result = session.page.evaluate_expression(params).await?;
+    let object_id =
+        result
+            .object()
+            .object_id
+            .clone()
+            .ok_or_else(|| BrowserError::Actionability {
+                selector: target.query.display(),
+                reason: "resolved element did not produce a remote object".to_owned(),
+            })?;
+    let model = session
+        .page
+        .execute(
+            GetBoxModelParams::builder()
+                .object_id(object_id.clone())
+                .build(),
+        )
+        .await;
+    let _ = session
+        .page
+        .execute(ReleaseObjectParams::new(object_id))
+        .await;
+    let border = model?.result.model.border;
+    let coordinates = border.inner();
+    if coordinates.len() != 8 || coordinates.iter().any(|coordinate| !coordinate.is_finite()) {
+        return Err(BrowserError::Actionability {
+            selector: target.query.display(),
+            reason: "element has an invalid rendered border box".to_owned(),
+        });
+    }
+    let mut points = coordinates.chunks_exact(2);
+    let first = points.next().ok_or_else(|| BrowserError::Actionability {
+        selector: target.query.display(),
+        reason: "element has no rendered border box".to_owned(),
+    })?;
+    let (mut left, mut right, mut top, mut bottom) = (first[0], first[0], first[1], first[1]);
+    for point in points {
+        left = left.min(point[0]);
+        right = right.max(point[0]);
+        top = top.min(point[1]);
+        bottom = bottom.max(point[1]);
+    }
+    let width = right - left;
+    let height = bottom - top;
+    if width <= 0.0 || height <= 0.0 {
+        return Err(BrowserError::Actionability {
+            selector: target.query.display(),
+            reason: "element has an empty rendered border box".to_owned(),
+        });
+    }
+    let layout = session.page.layout_metrics().await?;
+    Ok(Some(Viewport {
+        x: left + layout.css_layout_viewport.page_x as f64,
+        y: top + layout.css_layout_viewport.page_y as f64,
+        width,
+        height,
+        scale: 1.0,
+    }))
+}
+
 async fn set_file_input_files(
     page: &Page,
     target: &ElementTarget,
@@ -5953,6 +6069,12 @@ pub enum BrowserError {
         height: u32,
         maximum: u32,
     },
+    #[error(
+        "browser device scale factor must be finite and greater than zero, received {device_scale_factor}"
+    )]
+    InvalidDeviceScaleFactor { device_scale_factor: f64 },
+    #[error("browser element capture cannot be combined with a full-page screenshot")]
+    TargetWithFullPage,
     #[error("browser session could not be initialized")]
     SessionUnavailable,
     #[error("browser session is closed")]

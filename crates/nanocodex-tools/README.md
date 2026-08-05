@@ -146,7 +146,9 @@ let tools = Tools::builder().provider(mcp).build()?;
 Handshakes and discovery start with the owning runtime. Both exposure policies
 keep the provider-native `tool_search` visible while omitting deferred MCP
 schemas from the initial request. Code Mode lists those deferred tools as
-compact name/description entries in `ALL_TOOLS`. Search results contain
+compact name/description entries in `ALL_TOOLS`; `toolSchema(name)` returns a
+cloned input/output JSON Schema on demand when generated code needs the exact
+payload contract. Search results contain
 loadable MCP namespaces for direct model calls and also activate matching Code
 Mode definitions, keeping large catalogs out of the initial tool list.
 `McpServer::tool_exposure` independently selects `DeferredOnly`,

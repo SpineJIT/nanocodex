@@ -283,6 +283,8 @@ async fn code_mode_description_exposes_browser_action_schema() -> Result<()> {
     assert!(description.contains(r#"action: "get_html""#));
     assert!(description.contains(r#"action: "get_styles""#));
     assert!(description.contains(r#"action: "screenshot""#));
+    assert!(description.contains("device_scale_factor?: number"));
+    assert!(description.contains("target?:"));
     assert!(description.contains(r#"action: "pdf""#));
     assert!(description.contains(r#"action: "session_trace_start""#));
     assert!(description.contains(r#"action: "mouse_move""#));
@@ -360,13 +362,28 @@ if (!metadata) throw new Error("browser metadata missing");
 if (typeof metadata.description !== "string") {
   throw new Error("browser description missing");
 }
-const opened = await tools.browser({
+const schema = toolSchema(metadata.name)?.inputSchema;
+const variants = schema?.oneOf ?? [];
+const screenshot = variants.find((variant) =>
+  variant.properties?.action?.enum?.[0] === "screenshot"
+);
+const viewport = variants.find((variant) =>
+  variant.properties?.action?.enum?.[0] === "set_viewport"
+);
+if (!screenshot?.properties?.target) {
+  throw new Error("targeted screenshot schema missing");
+}
+if (!viewport?.properties?.device_scale_factor) {
+  throw new Error("device scale factor schema missing");
+}
+const opened = await tools[metadata.name]({
   action: "open",
   url: "https://example.com"
 });
 text({
   name: metadata.name,
   hasDescription: metadata.description.length > 0,
+  hasPixelCalibrationSchema: true,
   opened
 });
 "#,
@@ -374,13 +391,100 @@ text({
         )
         .await;
 
-    assert!(execution.success);
+    assert!(execution.success, "{:#?}", execution.output);
     assert_eq!(execution.nested_calls.len(), 1);
     let output: Value = serde_json::from_str(execution_text(&execution.output)?)?;
     assert_eq!(output["name"], "browser");
     assert_eq!(output["hasDescription"], true);
+    assert_eq!(output["hasPixelCalibrationSchema"], true);
     assert_eq!(output["opened"]["action"], "open");
     assert_eq!(recording.actions()?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local Chrome or Chromium installation"]
+async fn targeted_screenshots_honor_device_pixel_ratio() -> Result<()> {
+    let browser = Browser::new()?;
+    browser
+        .execute(BrowserAction::SetViewport {
+            width: 320,
+            height: 240,
+            device_scale_factor: Some(2.0),
+        })
+        .await?;
+    browser
+        .execute(BrowserAction::Open {
+            url: r#"data:text/html,<body style='margin:0'><div id='target' style='width:120px;height:80px;background:red'></div><iframe style='border:0;width:100px;height:100px' srcdoc="<body style='margin:0'><div id='frame-target' style='width:60px;height:40px;background:green'></div>"></iframe>"#.to_owned(),
+        })
+        .await?;
+    let target = BrowserTarget::css("#target");
+    let screenshot = browser
+        .execute(BrowserAction::Screenshot {
+            full_page: false,
+            annotate: false,
+            target: Some(target.clone()),
+        })
+        .await?;
+    let BrowserActionResult::Screenshot {
+        image: Some(image), ..
+    } = screenshot
+    else {
+        return Err(eyre!("expected targeted screenshot"));
+    };
+    assert_eq!((image.width, image.height), (240, 160));
+    let frame_screenshot = browser
+        .execute(BrowserAction::Screenshot {
+            full_page: false,
+            annotate: false,
+            target: Some(BrowserTarget::css("#frame-target")),
+        })
+        .await?;
+    assert!(matches!(
+        frame_screenshot,
+        BrowserActionResult::Screenshot { image: Some(image), .. }
+            if (image.width, image.height) == (120, 80)
+    ));
+
+    let baseline = browser
+        .execute(BrowserAction::VisualBaseline {
+            full_page: false,
+            target: Some(target.clone()),
+        })
+        .await?;
+    let BrowserActionResult::VisualBaseline { image, .. } = baseline else {
+        return Err(eyre!("expected targeted visual baseline"));
+    };
+    browser
+        .execute(BrowserAction::Evaluate {
+            expression: "document.querySelector('#target').style.background = 'blue'; true"
+                .to_owned(),
+        })
+        .await?;
+    let diff = browser
+        .execute(BrowserAction::VisualDiff {
+            baseline_id: image.artifact_id,
+            threshold: Some(0),
+            full_page: false,
+            target: Some(target.clone()),
+        })
+        .await?;
+    assert!(matches!(
+        diff,
+        BrowserActionResult::VisualDiff { diff, .. }
+            if diff.dimensions_match && diff.changed_pixel_ratio > 0.99
+    ));
+    assert!(matches!(
+        browser
+            .execute(BrowserAction::Screenshot {
+                full_page: true,
+                annotate: false,
+                target: Some(target),
+            })
+            .await,
+        Err(BrowserError::TargetWithFullPage)
+    ));
+    browser.close().await?;
     Ok(())
 }
 
@@ -684,7 +788,10 @@ return true;
     );
 
     let baseline = browser
-        .execute(BrowserAction::VisualBaseline { full_page: false })
+        .execute(BrowserAction::VisualBaseline {
+            full_page: false,
+            target: None,
+        })
         .await?;
     let BrowserActionResult::VisualBaseline { image, .. } = baseline else {
         return Err(eyre!("expected visual baseline"));
@@ -699,6 +806,7 @@ return true;
             baseline_id: image.artifact_id,
             threshold: Some(8),
             full_page: false,
+            target: None,
         })
         .await?;
     let BrowserActionResult::VisualDiff { diff, .. } = diff else {

@@ -31,11 +31,13 @@ println!("{}", result.final_message());
 # }
 ```
 
-The model reaches the tool as `await tools.browser(...)` inside Code Mode. Its
-full contract is discoverable at runtime through `ALL_TOOLS`, but provider
-registration keeps that contract out of the model-facing tool prefix. A
-runnable version lives at `examples/browser_agent.rs`. Callers that deliberately
-want the eager schema can register the same value with `.tool(browser)`.
+The model reaches the tool as `await tools.browser(...)` inside Code Mode.
+`ALL_TOOLS` discovers the deferred tool without expanding its schema; callers
+can inspect the exact input and output contracts on demand with
+`toolSchema("browser")`. Provider registration therefore keeps the full contract
+out of the model-facing tool prefix. A runnable version lives at
+`examples/browser_agent.rs`. Callers that deliberately want the eager schema
+can register the same value with `.tool(browser)`.
 
 For isolation, one non-cloneable VM owner keeps the disposable browser alive
 and gives the agent a tool handle:
@@ -96,14 +98,47 @@ The browser starts lazily on its first local action. Use `Browser::builder()`
 for deterministic browser context, egress policy, storage state, diagnostics,
 or an explicitly managed CDP endpoint.
 
+Pixel-calibrated captures set both CSS viewport dimensions and device pixel
+ratio, then reuse one semantic or CSS target across screenshots and visual
+comparison:
+
+```no_run
+use nanocodex_browser::{Browser, BrowserAction, BrowserActionResult, BrowserTarget};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let browser = Browser::new()?;
+browser
+    .execute(BrowserAction::SetViewport {
+        width: 1440,
+        height: 1200,
+        device_scale_factor: Some(2.0),
+    })
+    .await?;
+let capture = browser
+    .execute(BrowserAction::Screenshot {
+        full_page: false,
+        annotate: false,
+        target: Some(BrowserTarget::css("#mixer")),
+    })
+    .await?;
+let BrowserActionResult::Screenshot { image: Some(image), .. } = capture else {
+    return Err("browser did not return an image".into());
+};
+println!("{}x{} device pixels", image.width, image.height);
+browser.close().await?;
+# Ok(())
+# }
+```
+
 ## Capabilities
 
 - Chromium navigation and interaction through semantic references, CSS, roles,
   text, labels, frames, tabs, and open shadow roots.
 - Bounded snapshots, DOM/layout/style inspection, console and source-mapped
   errors, network bodies, WebSocket messages, HAR, and React diagnostics.
-- Screenshots, PDF, visual/session/performance traces, video, CPU profiles,
-  coverage, heap inspection, accessibility/axe, Lighthouse, and CrUX actions.
+- Viewport- and element-targeted screenshots, pixel-level visual diffs,
+  PDF, visual/session/performance traces, video, CPU profiles, coverage, heap
+  inspection, accessibility/axe, Lighthouse, and CrUX actions.
 - Harness-owned cookies/storage, virtual passkeys, allowlisted source-browser handoff,
   upload roots, browser egress policy, remote CDP, and libkrun VM composition.
 

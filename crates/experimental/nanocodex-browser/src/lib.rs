@@ -84,10 +84,14 @@ pub use features::{
 pub use native::{BrowserBuildError, BrowserError};
 pub use session::{BraveSession, BraveSessionError, BrowserProfileKind};
 
-const TOOL_DESCRIPTION: &str = r"Control one server-managed browser session.
+const TOOL_DESCRIPTION: &str = r#"Control one server-managed browser session.
 
 Call this tool from Code Mode as `await tools.browser({ action: ..., ... })`.
 Each call performs exactly one browser action against the session's active page.
+Before guessing an action's fields, inspect the exact deferred input contract with
+`toolSchema("browser").inputSchema` and filter its `oneOf` variants by the
+single-value `properties.action.enum` discriminator. Keep the inspection inside Code Mode
+and emit only the relevant variant.
 Compose the complete browser investigation in one Code Mode cell whenever
 possible. Do not return to the model after every browser action. Browser actions
 are deliberately ordered within one session; use normal JavaScript loops and
@@ -135,6 +139,10 @@ boundary they also contain `modelImage`; call `image(result.image.modelImage)`
 for a screenshot or baseline, `image(result.diff.modelImage)` for a visual
 diff, or `image(anomaly.modelImage)` for a visual-trace anomaly. Do not include
 the base64-bearing `modelImage` object in subsequent `text(...)` output.
+For pixel calibration, first use `set_viewport` with an explicit
+`device_scale_factor`, then pass the same element `target` to `screenshot`,
+`visual_baseline`, and `visual_diff`. Targeted captures crop to the element's
+rendered border box and cannot be combined with `full_page`.
 Use `visual_baseline` plus `visual_diff` for deterministic before/after
 comparison. Use `visual_trace_start` and `visual_trace_stop` around an
 interaction to detect flashes, blank intermediate frames, and large visual
@@ -190,10 +198,10 @@ A snapshot returns compact accessibility-tree text plus stable `eN` references,
 following a familiar browser-agent convention.
 Use `evaluate` only when the normal snapshot and interaction actions are
 insufficient. The browser is owned by the host: do not launch a browser, connect
-to a debugging port, or manage browser processes yourself.";
+to a debugging port, or manage browser processes yourself."#;
 
 /// One action against the active page of a browser session.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserAction {
     /// Navigate the active page to a URL.
@@ -352,8 +360,13 @@ pub enum BrowserAction {
         /// Paths relative to the browser's configured file root.
         paths: Vec<std::path::PathBuf>,
     },
-    /// Set the active page's viewport in CSS pixels.
-    SetViewport { width: u32, height: u32 },
+    /// Set the active page's viewport in CSS pixels and its output pixel density.
+    SetViewport {
+        width: u32,
+        height: u32,
+        /// Device pixels per CSS pixel. Defaults to 1.0.
+        device_scale_factor: Option<f64>,
+    },
     /// Navigate to the preceding history entry when one exists.
     GoBack,
     /// Navigate to the following history entry when one exists.
@@ -389,6 +402,8 @@ pub enum BrowserAction {
         /// Overlay numbered labels for interactive elements.
         #[serde(default)]
         annotate: bool,
+        /// Crop to one rendered element's border box.
+        target: Option<BrowserTarget>,
     },
     /// Print the active page to a private file-backed PDF artifact.
     Pdf {
@@ -408,6 +423,8 @@ pub enum BrowserAction {
         /// Capture the complete scrollable page.
         #[serde(default)]
         full_page: bool,
+        /// Crop to one rendered element's border box.
+        target: Option<BrowserTarget>,
     },
     /// Compare the current page against a retained visual baseline.
     VisualDiff {
@@ -418,6 +435,8 @@ pub enum BrowserAction {
         /// Capture the complete scrollable page.
         #[serde(default)]
         full_page: bool,
+        /// Crop to one rendered element's border box.
+        target: Option<BrowserTarget>,
     },
     /// Begin a bounded rendered-frame trace for flash and instability detection.
     VisualTraceStart {
@@ -2477,7 +2496,7 @@ async fn persist_trace_artifact(
 }
 
 /// One action retained by [`BrowserRecording`].
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordedBrowserAction {
     pub sequence: u64,
