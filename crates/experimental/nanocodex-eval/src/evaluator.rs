@@ -348,7 +348,7 @@ impl Evaluator {
                 run: run.clone(),
             })
             .await;
-        run.finish(&result, usize::from(result.is_ok()), 0);
+        run.finish(&result);
         result
     }
 
@@ -2008,9 +2008,9 @@ impl RunEmitter {
         let _ = state.sender.send(event);
     }
 
-    fn finish<T>(&self, result: &Result<T, EvalError>, attempts: usize, skipped: usize) {
+    fn finish<T>(&self, result: &Result<T, EvalError>) {
         let kind = match result {
-            Ok(_) => EvalEventKind::RunCompleted { attempts, skipped },
+            Ok(_) => EvalEventKind::RunCompleted,
             Err(error) => EvalEventKind::RunFailed {
                 error: error.to_string(),
             },

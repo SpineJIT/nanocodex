@@ -68,13 +68,8 @@ pub enum EvalEventKind {
     Completed(Box<EvalResult>),
     /// The attempt failed without a score.
     Failed(Box<EvalFailure>),
-    /// Every attempt admitted by this invocation reached a terminal outcome.
-    RunCompleted {
-        /// Number of terminal attempts returned by this invocation.
-        attempts: usize,
-        /// Number of already-durable sweep attempts skipped during resume.
-        skipped: usize,
-    },
+    /// The invocation returned its terminal outcome.
+    RunCompleted,
     /// The invocation ended before it could return complete terminal outcomes.
     RunFailed {
         /// Complete formatted operational error.

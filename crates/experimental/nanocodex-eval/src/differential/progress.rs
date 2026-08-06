@@ -267,7 +267,7 @@ impl DiffProgress {
             | EvalEventKind::Agent(_)
             | EvalEventKind::Completed(_)
             | EvalEventKind::Failed(_)
-            | EvalEventKind::RunCompleted { .. }
+            | EvalEventKind::RunCompleted
             | EvalEventKind::RunFailed { .. } => {}
         }
     }
