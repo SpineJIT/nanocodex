@@ -196,7 +196,7 @@ impl Run {
         loop {
             match evaluation.claim(&selector, LEASE_DURATION)? {
                 EvaluationClaim::Prepare(claim) => {
-                    let result = prepare_resources(claim.task(), &self.vm).await;
+                    let result = prepare_resources(claim.task(), claim.harnesses(), &self.vm).await;
                     match result {
                         Ok(resources) => {
                             claim.complete()?;
@@ -212,7 +212,9 @@ impl Run {
                     let result = async {
                         let resources = match prepared.take() {
                             Some(resources) => resources,
-                            None => prepare_resources(claim.task(), &self.vm).await?,
+                            None => {
+                                prepare_resources(claim.task(), claim.harnesses(), &self.vm).await?
+                            }
                         };
                         execute_coordinate(
                             claim.task().clone(),
@@ -291,7 +293,7 @@ async fn run_remote(
         match coordinator.claim(&selection).await? {
             RemoteClaim::Prepare(lease) => {
                 let heartbeat = remote_heartbeat(coordinator.clone(), lease.clone());
-                let result = prepare_resources(selection.task(), vm).await;
+                let result = prepare_resources(selection.task(), selection.harnesses(), vm).await;
                 match result {
                     Ok(resources) => {
                         let finish = coordinator.prepared(&lease).await;
@@ -316,7 +318,9 @@ async fn run_remote(
                 let result = async {
                     let resources = match prepared.take() {
                         Some(resources) => resources,
-                        None => prepare_resources(selection.task(), vm).await?,
+                        None => {
+                            prepare_resources(selection.task(), selection.harnesses(), vm).await?
+                        }
                     };
                     execute_coordinate(
                         selection.task().clone(),
@@ -435,11 +439,15 @@ enum ExecutionResult {
     Retryable { error: String, evidence: PathBuf },
 }
 
-async fn prepare_resources(task: &Task, vm: &VmPreparationArgs) -> Result<VmResources> {
+async fn prepare_resources(
+    task: &Task,
+    harnesses: &[ResolvedHarness],
+    vm: &VmPreparationArgs,
+) -> Result<VmResources> {
     let current_executable = std::env::current_exe()?;
     let runtime_image =
         run::prepare_vm_guest_runtime_from(vm.vm_guest_runtime.as_deref(), &vm.vm_cache).await?;
-    let resources = VmResources::builder(&current_executable, runtime_image)
+    let mut builder = VmResources::builder(&current_executable, runtime_image)
         .task(task.clone())
         .cache_directory(&vm.vm_cache)
         .cache_policy(if vm.vm_refresh {
@@ -447,9 +455,11 @@ async fn prepare_resources(task: &Task, vm: &VmPreparationArgs) -> Result<VmReso
         } else {
             CachePolicy::Reuse
         })
-        .image_preparation_concurrency(1)
-        .prepare()
-        .await?;
+        .image_preparation_concurrency(1);
+    for harness in harnesses {
+        builder = builder.guest_executable(&harness.command, &harness.guest_command);
+    }
+    let resources = builder.prepare().await?;
     // The durable preparation lease covers the complete immutable task
     // environment, not merely the lazy recipe used to build it.
     resources.backend().await?;
@@ -499,6 +509,7 @@ async fn execute_coordinate(
                 nanocodex,
                 task.clone(),
                 &configured.command,
+                &configured.guest_command,
                 harness_auth,
                 resources,
             )

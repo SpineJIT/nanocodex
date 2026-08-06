@@ -47,6 +47,7 @@ pub struct EvaluationSelection {
     treatment: EvaluationTreatment,
     web_search: bool,
     harness: Option<ResolvedHarness>,
+    harnesses: Vec<ResolvedHarness>,
 }
 
 /// The next durable action for one profile family.
@@ -68,6 +69,7 @@ pub struct PreparationClaim {
     workset: Workset,
     lease: PreparationLease,
     task: Task,
+    harnesses: Vec<ResolvedHarness>,
     heartbeat: JoinHandle<()>,
 }
 
@@ -80,6 +82,7 @@ pub struct CoordinateClaim {
     treatment: EvaluationTreatment,
     web_search: bool,
     harness: Option<ResolvedHarness>,
+    harnesses: Vec<ResolvedHarness>,
     output_directory: PathBuf,
     heartbeat: JoinHandle<()>,
 }
@@ -320,6 +323,7 @@ impl Evaluation {
                     workset: self.workset.clone(),
                     lease,
                     task,
+                    harnesses: self.profile.harnesses.values().cloned().collect(),
                     heartbeat,
                 }))
             }
@@ -340,6 +344,7 @@ impl Evaluation {
                     treatment: family.into(),
                     web_search: self.profile.web_search,
                     harness: self.profile.harness(&family.harness).cloned(),
+                    harnesses: self.profile.harnesses.values().cloned().collect(),
                     output_directory,
                     heartbeat,
                 }))
@@ -369,6 +374,7 @@ impl EvaluationSelection {
             .clone();
         let task = profile.task(&family.task).map_err(error)?.task.clone();
         let harness = profile.harness(&family.harness).cloned();
+        let harnesses = profile.harnesses.values().cloned().collect();
         Ok(Self {
             profile: profile.name,
             profile_digest: profile.digest,
@@ -377,6 +383,7 @@ impl EvaluationSelection {
             treatment: (&family).into(),
             web_search: profile.web_search,
             harness,
+            harnesses,
         })
     }
 
@@ -421,6 +428,12 @@ impl EvaluationSelection {
     pub const fn harness(&self) -> Option<&ResolvedHarness> {
         self.harness.as_ref()
     }
+
+    /// External harnesses installed during this task's durable preparation.
+    #[must_use]
+    pub fn harnesses(&self) -> &[ResolvedHarness] {
+        &self.harnesses
+    }
 }
 
 impl EvaluationSelector {
@@ -462,6 +475,12 @@ impl PreparationClaim {
     #[must_use]
     pub const fn task(&self) -> &Task {
         &self.task
+    }
+
+    /// External harnesses installed into the immutable task image.
+    #[must_use]
+    pub fn harnesses(&self) -> &[ResolvedHarness] {
+        &self.harnesses
     }
 
     /// Accepts successful preparation if this claim still owns the lease.
@@ -510,6 +529,12 @@ impl CoordinateClaim {
     #[must_use]
     pub const fn harness(&self) -> Option<&ResolvedHarness> {
         self.harness.as_ref()
+    }
+
+    /// External harnesses installed into the immutable task image.
+    #[must_use]
+    pub fn harnesses(&self) -> &[ResolvedHarness] {
+        &self.harnesses
     }
 
     /// Unique retained-artifact directory for this profile trial.

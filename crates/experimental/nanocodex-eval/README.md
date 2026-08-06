@@ -90,6 +90,7 @@ harnesses are ordinary independent coordinates:
 ```toml
 [harness.codex]
 command = "harness/codex"
+guest_command = "/usr/local/bin/codex"
 version = "0.145.0"
 arguments = [
   "exec", "--json", "--ephemeral",

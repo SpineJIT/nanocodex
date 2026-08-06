@@ -3,33 +3,6 @@ use super::*;
 pub(super) struct HarnessVmResources {
     environment: VmEnvironment,
     backend: VmBackend,
-    ca_bundle: Option<HarnessCaBundle>,
-}
-
-pub(super) struct HarnessRelease {
-    pub(super) root: PathBuf,
-    ca_bundle: Option<HarnessCaBundle>,
-}
-
-pub(super) fn prepare_harness_release(
-    output_parent: &Path,
-    harness_binary: &Path,
-) -> InternalResult<HarnessRelease> {
-    let releases = output_parent.join(".harness-releases");
-    fs::create_dir_all(&releases)?;
-    let temporary = tempfile::tempdir_in(&releases)?;
-    let staged_command = temporary.path().join("command");
-    reflink_or_sparse_copy(harness_binary, &staged_command)?;
-    fs::set_permissions(&staged_command, fs::Permissions::from_mode(0o755))?;
-    let mut header = [0_u8; 20];
-    fs::File::open(&staged_command)?.read_exact(&mut header)?;
-    validate_vm_guest_elf(&header, &staged_command)?;
-    let ca_bundle = resolve_harness_ca_source()?
-        .as_ref()
-        .map(|source| stage_harness_ca_bundle(source, temporary.path()))
-        .transpose()?;
-    let root = temporary.keep();
-    Ok(HarnessRelease { root, ca_bundle })
 }
 
 pub(super) async fn prepare_harness_vm_resources(
@@ -37,7 +10,6 @@ pub(super) async fn prepare_harness_vm_resources(
     vm: &VmResources,
     guest_memory_mb: u64,
     web_search: bool,
-    release: &HarnessRelease,
 ) -> InternalResult<HarnessVmResources> {
     let environment = vm.environment(task).await?;
     let backend = vm
@@ -45,11 +17,7 @@ pub(super) async fn prepare_harness_vm_resources(
             VmBackend::builder()
                 .retain_passed_rootfs(false)
                 .retain_failed_rootfs(false)
-                .web_search(web_search)
-                .shared_directory(SharedDirectory::read_only(
-                    HARNESS_SHARE_TAG,
-                    release.root.clone(),
-                )),
+                .web_search(web_search),
             task,
             guest_memory_mb,
         )
@@ -57,7 +25,6 @@ pub(super) async fn prepare_harness_vm_resources(
     Ok(HarnessVmResources {
         environment,
         backend,
-        ca_bundle: release.ca_bundle,
     })
 }
 
@@ -71,6 +38,7 @@ impl HarnessVmResources {
         runtime: VmAttempt,
         attempt: EvalAttempt<'_>,
         command: HarnessExec,
+        guest_command: String,
         auth: HarnessAuth,
         guest: HarnessGuestConfig,
     ) -> InternalResult<AttemptAgent, VmAttemptError> {
@@ -79,8 +47,8 @@ impl HarnessVmResources {
             session,
             attempt,
             &self.environment,
+            guest_command,
             auth,
-            self.ca_bundle,
             guest,
         )?;
         let api_base_url = runner.api_base_url().to_owned();
@@ -92,82 +60,6 @@ impl HarnessVmResources {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct HarnessCaBundle {
-    pub(super) guest_environment: &'static str,
-}
-
-pub(super) struct HarnessCaSource {
-    pub(super) path: PathBuf,
-    pub(super) source_environment: &'static str,
-    pub(super) guest_environment: &'static str,
-}
-
-pub(super) fn resolve_harness_ca_source() -> InternalResult<Option<HarnessCaSource>, io::Error> {
-    for (source_environment, guest_environment) in [
-        (
-            HARNESS_SSL_CERT_FILE_ENVIRONMENT,
-            HARNESS_SSL_CERT_FILE_ENVIRONMENT,
-        ),
-        (
-            HARNESS_NIX_SSL_CERT_FILE_ENVIRONMENT,
-            HARNESS_SSL_CERT_FILE_ENVIRONMENT,
-        ),
-    ] {
-        let Some(path) = std::env::var_os(source_environment).filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        return Ok(Some(HarnessCaSource {
-            path: fs::canonicalize(PathBuf::from(path))?,
-            source_environment,
-            guest_environment,
-        }));
-    }
-    for path in [
-        Path::new("/etc/ssl/certs/ca-certificates.crt"),
-        Path::new("/etc/ssl/cert.pem"),
-    ] {
-        if path.is_file() {
-            return Ok(Some(HarnessCaSource {
-                path: fs::canonicalize(path)?,
-                source_environment: "host_system",
-                guest_environment: HARNESS_SSL_CERT_FILE_ENVIRONMENT,
-            }));
-        }
-    }
-    Ok(None)
-}
-
-pub(super) fn stage_harness_ca_bundle(
-    source: &HarnessCaSource,
-    share_root: &Path,
-) -> InternalResult<HarnessCaBundle, io::Error> {
-    let staged = share_root.join(HARNESS_CA_BUNDLE_FILENAME);
-    reflink_or_sparse_copy(&source.path, &staged)?;
-    if staged.metadata()?.len() == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "harness CA bundle selected by {} is empty: {}",
-                source.source_environment,
-                source.path.display()
-            ),
-        ));
-    }
-    fs::set_permissions(&staged, fs::Permissions::from_mode(0o444))?;
-    info!(
-        target: "nanocodex_eval",
-        source_environment = source.source_environment,
-        source_path = %source.path.display(),
-        staged_path = %staged.display(),
-        "staged the host CA bundle for the pinned guest harness"
-    );
-    Ok(HarnessCaBundle {
-        guest_environment: source.guest_environment,
-    })
-}
-
 pub(super) enum GuestAuth {
     ApiKey(Arc<str>),
     AuthFile(Vec<u8>),
@@ -175,6 +67,7 @@ pub(super) enum GuestAuth {
 
 pub(super) struct VmHarnessRunner {
     session: VmToolSessionHandle,
+    guest_command: String,
     workspace: String,
     environment: Vec<(String, String)>,
     auth_file: Option<Vec<u8>>,
@@ -191,8 +84,8 @@ impl VmHarnessRunner {
         session: VmToolSessionHandle,
         attempt: EvalAttempt<'_>,
         environment: &VmEnvironment,
+        guest_command: String,
         auth: HarnessAuth,
-        ca_bundle: Option<HarnessCaBundle>,
         guest: HarnessGuestConfig,
     ) -> InternalResult<Self, VmAttemptError> {
         if !Path::new(&guest.home).is_absolute() || !Path::new(&guest.auth_file).is_absolute() {
@@ -238,12 +131,6 @@ impl VmHarnessRunner {
             "NANOCODEX_HARNESS_API_BASE_URL".to_owned(),
             capture_base_url.clone(),
         );
-        if let Some(ca_bundle) = ca_bundle {
-            command_environment.insert(
-                ca_bundle.guest_environment.to_owned(),
-                HARNESS_CA_BUNDLE_FILE.to_owned(),
-            );
-        }
         let auth_file = match auth {
             GuestAuth::ApiKey(api_key) => {
                 command_environment.insert(guest.api_key_environment.clone(), api_key.to_string());
@@ -259,6 +146,7 @@ impl VmHarnessRunner {
             .unwrap_or_else(|| HARNESS_CAPTURE_PROXY_API_UPSTREAM.to_owned());
         Ok(Self {
             session,
+            guest_command,
             workspace: environment.workspace().to_owned(),
             environment: command_environment.into_iter().collect(),
             auth_file,
@@ -277,31 +165,6 @@ impl VmHarnessRunner {
 
     async fn prepare(&self) -> InternalResult<(), VmAttemptError> {
         self.session.ready().await?;
-        self.session
-            .create_directory(HARNESS_SHARE_MOUNT, 0o755, None)
-            .await?;
-        let mount = self
-            .session
-            .command(
-                VmCommand::new("/bin/mount")
-                    .arg("-t")
-                    .arg("virtiofs")
-                    .arg("-o")
-                    .arg("ro")
-                    .arg(HARNESS_SHARE_TAG)
-                    .arg(HARNESS_SHARE_MOUNT)
-                    .environment(self.environment.clone())
-                    .timeout(HARNESS_SETUP_TIMEOUT),
-            )
-            .await?;
-        if mount.exit_code != 0 {
-            return Err(io::Error::other(format!(
-                "failed to mount the pinned harness in the guest (exit {}): {}",
-                mount.exit_code,
-                String::from_utf8_lossy(&mount.stderr).trim()
-            ))
-            .into());
-        }
         self.session
             .create_directory(&self.harness_home, 0o700, None)
             .await?;
@@ -383,7 +246,7 @@ impl HarnessCommandRunner for VmHarnessRunner {
     > {
         Box::pin(async move {
             let capture_proxy = self.start_capture_proxy().await?;
-            let mut command = VmCommand::new(HARNESS_GUEST_BINARY)
+            let mut command = VmCommand::new(&self.guest_command)
                 .current_directory(&self.workspace)
                 .environment(self.environment.clone())
                 .timeout(timeout)

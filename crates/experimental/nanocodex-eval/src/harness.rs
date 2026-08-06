@@ -10,7 +10,6 @@ use std::{
     future::Future,
     io::{self, Read},
     net::{Ipv4Addr, TcpListener},
-    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
@@ -20,7 +19,6 @@ use std::{
 use nanocodex_agent::{NanocodexBuilder, Thinking};
 use nanocodex_oai_api::Model;
 use nanocodex_vm::host::Gvproxy;
-use tracing::info;
 
 use crate::{
     EvalAttemptOutcome, Evaluator, HarnessCommandOutput, HarnessCommandRunner,
@@ -29,8 +27,8 @@ use crate::{
     evaluator::{AttemptAgent, EvalAttempt},
     harness_exec::project_harness_atif,
     vm::{
-        SharedDirectory, VmAttempt, VmAttemptError, VmBackend, VmCommand, VmEnvironment,
-        VmResources, VmToolSessionError, VmToolSessionHandle, reflink_or_sparse_copy,
+        VmAttempt, VmAttemptError, VmBackend, VmCommand, VmEnvironment, VmResources,
+        VmToolSessionError, VmToolSessionHandle,
     },
 };
 
@@ -43,21 +41,13 @@ macro_rules! harness_error {
     };
 }
 
-const HARNESS_SHARE_TAG: &str = "nanocodex-harness";
-const HARNESS_SHARE_MOUNT: &str = "/run/nanocodex-harness";
-const HARNESS_GUEST_BINARY: &str = "/run/nanocodex-harness/command";
 const HARNESS_CAPTURE_PROXY_API_UPSTREAM: &str = "https://api.openai.com/v1";
 const HARNESS_CAPTURE_PROXY_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const HARNESS_API_EXCHANGES_FILENAME: &str = "api-exchanges.jsonl";
 const DEFAULT_HARNESS_HOME: &str = "/run/nanocodex-harness-home";
 const DEFAULT_HARNESS_AUTH_FILE: &str = "/run/nanocodex-harness-home/auth.json";
 const DEFAULT_HARNESS_API_KEY_ENVIRONMENT: &str = "OPENAI_API_KEY";
-const HARNESS_CA_BUNDLE_FILENAME: &str = "ca-certificates.pem";
-const HARNESS_CA_BUNDLE_FILE: &str = "/run/nanocodex-harness/ca-certificates.pem";
-const HARNESS_SSL_CERT_FILE_ENVIRONMENT: &str = "SSL_CERT_FILE";
-const HARNESS_NIX_SSL_CERT_FILE_ENVIRONMENT: &str = "NIX_SSL_CERT_FILE";
 const HARNESS_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
-const HARNESS_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(target_arch = "aarch64")]
 const VM_GUEST_TARGET: &str = "aarch64-unknown-linux-musl";
 #[cfg(target_arch = "x86_64")]
@@ -114,6 +104,7 @@ pub struct Harness {
     nanocodex: NanocodexBuilder,
     task: Task,
     command: PathBuf,
+    guest_command: String,
     auth: HarnessAuth,
     resources: VmResources,
     model: Model,
@@ -138,6 +129,7 @@ impl Harness {
         nanocodex: NanocodexBuilder,
         task: Task,
         command: impl Into<PathBuf>,
+        guest_command: impl Into<String>,
         auth: HarnessAuth,
         resources: VmResources,
     ) -> Self {
@@ -145,6 +137,7 @@ impl Harness {
             nanocodex,
             task,
             command: command.into(),
+            guest_command: guest_command.into(),
             auth,
             resources,
             model: Model::default(),
@@ -252,36 +245,36 @@ impl Harness {
         if self.guest_memory_mb == 0 {
             return Err(HarnessError::message("guest memory must be non-zero"));
         }
+        if !Path::new(&self.guest_command).is_absolute() {
+            return Err(HarnessError::message(format!(
+                "guest command must be an absolute path: {}",
+                self.guest_command
+            )));
+        }
         fs::create_dir_all(&self.output).map_err(HarnessError::from_error)?;
-        let output = self.output.clone();
-        let command = self.command.clone();
-        let release =
-            tokio::task::spawn_blocking(move || prepare_harness_release(&output, &command))
-                .await
-                .map_err(HarnessError::from_error)?
-                .map_err(HarnessError::from_box)?;
+        let mut header = [0_u8; 20];
+        fs::File::open(&self.command)
+            .and_then(|mut file| file.read_exact(&mut header))
+            .map_err(HarnessError::from_error)?;
+        validate_vm_guest_elf(&header, &self.command).map_err(HarnessError::from_box)?;
         let resources = prepare_harness_vm_resources(
             &self.task,
             &self.resources,
             self.guest_memory_mb,
             self.web_search,
-            &release,
         )
         .await
         .map_err(HarnessError::from_box)?;
-        let command = HarnessExec::new(
-            release.root.join("command"),
-            self.model.as_str(),
-            self.thinking.as_str(),
-        )
-        .map_err(HarnessError::from_error)?
-        .web_search(self.web_search)
-        .arguments(self.arguments);
+        let command = HarnessExec::new(&self.command, self.model.as_str(), self.thinking.as_str())
+            .map_err(HarnessError::from_error)?
+            .web_search(self.web_search)
+            .arguments(self.arguments);
         let backend = resources.backend();
         let resources = Arc::new(resources);
         let auth = self.auth;
         let version = self.version;
         let name = self.name;
+        let guest_command = self.guest_command;
         let guest = HarnessGuestConfig {
             environment: self.environment,
             home: self.home,
@@ -296,6 +289,7 @@ impl Harness {
                     runtime,
                     attempt,
                     command.clone(),
+                    guest_command.clone(),
                     auth.clone(),
                     guest.clone(),
                 )

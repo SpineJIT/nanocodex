@@ -13,10 +13,10 @@ use std::{
     fs,
     future::Future,
     io,
-    io::Read as _,
+    io::{Read as _, Write as _},
     num::ParseFloatError,
     os::unix::fs::PermissionsExt as _,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     pin::Pin,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
@@ -165,6 +165,12 @@ const ZONEINFO_PREFIXES: [&str; 4] = [
 
 type PreparedEnvironmentCell = Arc<AsyncOnceCell<Result<VmEnvironment, Arc<str>>>>;
 
+#[derive(Clone, Debug)]
+struct VmGuestExecutable {
+    source: PathBuf,
+    guest_path: String,
+}
+
 fn effective_guest_memory_mb(declared_memory_mb: u64, max_guest_memory_mb: Option<u64>) -> u64 {
     max_guest_memory_mb
         .map_or(declared_memory_mb, |limit| declared_memory_mb.min(limit))
@@ -200,6 +206,7 @@ pub struct VmResourcesBuilder {
     image_network_retries: usize,
     image_preparation_concurrency: usize,
     gvproxy: Option<PathBuf>,
+    guest_executables: Vec<VmGuestExecutable>,
 }
 
 #[derive(Clone)]
@@ -210,6 +217,7 @@ enum VmEnvironmentSource {
         policy: CachePolicy,
         builder: VmImageBuilder,
         network_retries: usize,
+        guest_executables: Arc<[VmGuestExecutable]>,
     },
 }
 
@@ -241,6 +249,7 @@ impl VmResources {
             image_network_retries: DEFAULT_IMAGE_NETWORK_RETRIES,
             image_preparation_concurrency: DEFAULT_IMAGE_PREPARATION_CONCURRENCY,
             gvproxy: None,
+            guest_executables: Vec::new(),
         }
     }
 
@@ -448,6 +457,20 @@ impl VmResourcesBuilder {
         self
     }
 
+    /// Installs one host executable into every immutable prepared task image.
+    #[must_use]
+    pub fn guest_executable(
+        mut self,
+        source: impl Into<PathBuf>,
+        guest_path: impl Into<String>,
+    ) -> Self {
+        self.guest_executables.push(VmGuestExecutable {
+            source: source.into(),
+            guest_path: guest_path.into(),
+        });
+        self
+    }
+
     /// Discovers shared VM resources and installs lazy task-image recipes.
     ///
     /// Task images materialize through bounded single-flight cells when first
@@ -472,7 +495,22 @@ impl VmResourcesBuilder {
         if let Some(task) = self.tasks.iter().find(|task| task.requires_compose()) {
             return Err(VmResourcesError::Compose(task.name().to_owned()));
         }
+        for executable in &self.guest_executables {
+            if !executable.source.is_file() {
+                return Err(VmResourcesError::InvalidGuestExecutable(
+                    executable.source.clone(),
+                ));
+            }
+            if !valid_guest_executable_path(&executable.guest_path) {
+                return Err(VmResourcesError::InvalidGuestExecutablePath(
+                    executable.guest_path.clone(),
+                ));
+            }
+        }
         let environment_source = if let Some(rootfs) = self.rootfs {
+            if !self.guest_executables.is_empty() {
+                return Err(VmResourcesError::GuestExecutablesWithRootfs);
+            }
             if !rootfs.exists() {
                 return Err(VmResourcesError::InvalidRootfs(rootfs));
             }
@@ -491,6 +529,7 @@ impl VmResourcesBuilder {
                 policy: self.cache_policy,
                 builder: image_builder(&self.vmm, &self.runtime_image),
                 network_retries: self.image_network_retries,
+                guest_executables: self.guest_executables.into(),
             }
         };
         let environments = self
@@ -567,6 +606,18 @@ pub enum VmResourcesError {
     #[error("gvproxy override does not name a file: {0}")]
     InvalidGvproxy(PathBuf),
 
+    /// A prepared guest executable was missing.
+    #[error("guest executable does not name a file: {0}")]
+    InvalidGuestExecutable(PathBuf),
+
+    /// A prepared guest executable destination was not absolute.
+    #[error("guest executable destination must be absolute: {0}")]
+    InvalidGuestExecutablePath(String),
+
+    /// An already prepared rootfs cannot be extended immutably.
+    #[error("guest executables cannot be installed into an explicit rootfs override")]
+    GuestExecutablesWithRootfs,
+
     /// The pinned network helper is unavailable for this host.
     #[error("gvproxy is not published for {os}/{architecture}")]
     UnsupportedPlatform {
@@ -634,7 +685,7 @@ async fn prepare_vm_environment(
     task: &Task,
     source: &VmEnvironmentSource,
 ) -> Result<VmEnvironment, VmResourcesError> {
-    let (cache, policy, builder, network_retries) = match source {
+    let (cache, policy, builder, network_retries, guest_executables) = match source {
         VmEnvironmentSource::Rootfs(environment) => {
             task.validate_package()?;
             return Ok(environment.clone());
@@ -644,14 +695,23 @@ async fn prepare_vm_environment(
             policy,
             builder,
             network_retries,
-        } => (cache, policy, builder, network_retries),
+            guest_executables,
+        } => (cache, policy, builder, network_retries, guest_executables),
     };
     task.validate_package()?;
     let prepared = prepare_image_with_network_retries(
         task.name(),
         "task",
         *network_retries,
-        || prepare_task_image(builder, task, cache, *policy),
+        || {
+            prepare_task_image_with_guest_executables(
+                builder,
+                task,
+                cache,
+                *policy,
+                guest_executables,
+            )
+        },
         tokio::time::sleep,
     )
     .await?;
@@ -929,17 +989,61 @@ pub async fn prepare_task_image(
     cache: &Path,
     policy: CachePolicy,
 ) -> Result<PreparedRootDisk, ImageError> {
+    prepare_task_image_with_guest_executables(builder, task, cache, policy, &[]).await
+}
+
+async fn prepare_task_image_with_guest_executables(
+    builder: &VmImageBuilder,
+    task: &Task,
+    cache: &Path,
+    policy: CachePolicy,
+    guest_executables: &[VmGuestExecutable],
+) -> Result<PreparedRootDisk, ImageError> {
     let context = tempfile::tempdir()?;
     task.materialize_environment(context.path())
         .map_err(io::Error::other)?;
+    let installed_bytes = materialize_guest_executables(context.path(), guest_executables)?;
+    let image_bytes = task
+        .resources()
+        .storage_mb
+        .saturating_mul(BYTES_PER_MIB)
+        .saturating_add(installed_bytes);
     builder
-        .prepare(
-            context.path(),
-            task.resources().storage_mb.saturating_mul(BYTES_PER_MIB),
-            cache,
-            policy,
-        )
+        .prepare(context.path(), image_bytes, cache, policy)
         .await
+}
+
+fn materialize_guest_executables(
+    context: &Path,
+    executables: &[VmGuestExecutable],
+) -> Result<u64, io::Error> {
+    if executables.is_empty() {
+        return Ok(0);
+    }
+    let directory = context.join(".nanocodex/guest-executables");
+    fs::create_dir_all(&directory)?;
+    let dockerfile_path = context.join("Dockerfile");
+    let mut dockerfile = fs::OpenOptions::new().append(true).open(&dockerfile_path)?;
+    let mut installed_bytes = 0_u64;
+    for (index, executable) in executables.iter().enumerate() {
+        let name = index.to_string();
+        let staged = directory.join(&name);
+        reflink_or_sparse_copy(&executable.source, &staged)?;
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))?;
+        installed_bytes = installed_bytes.saturating_add(staged.metadata()?.len());
+        let source = format!(".nanocodex/guest-executables/{name}");
+        writeln!(dockerfile, "\nCOPY {source} {}", executable.guest_path)?;
+    }
+    dockerfile.sync_all()?;
+    Ok(installed_bytes)
+}
+
+fn valid_guest_executable_path(path: &str) -> bool {
+    Path::new(path).is_absolute()
+        && !path.chars().any(char::is_whitespace)
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
 }
 
 /// Builds a task's separate verifier environment into a reusable ext4 root disk.

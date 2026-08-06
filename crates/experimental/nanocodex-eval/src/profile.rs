@@ -30,6 +30,8 @@ pub struct EvaluationManifest {
 #[serde(deny_unknown_fields)]
 pub struct Harness {
     command: PathBuf,
+    /// Absolute executable path installed in every prepared task image.
+    guest_command: String,
     /// Semantic harness release shared by architecture-specific executables.
     ///
     /// When omitted, legacy manifests continue to pin the exact command bytes.
@@ -112,6 +114,8 @@ pub struct ResolvedHarness {
     pub name: String,
     /// Architecture-local executable.
     pub command: PathBuf,
+    /// Executable path inside the prepared task image.
+    pub guest_command: String,
     /// Guest argument template.
     pub arguments: Vec<String>,
     /// Guest environment additions.
@@ -214,6 +218,14 @@ pub enum ProfileError {
     /// A semantic harness version was present but empty.
     #[error("evaluation harness `{0}` has an empty version")]
     EmptyHarnessVersion(String),
+    /// A harness guest command was not an absolute path.
+    #[error("evaluation harness `{harness}` guest_command must be a clean absolute path: {path}")]
+    InvalidHarnessGuestCommand {
+        /// Invalid harness name.
+        harness: String,
+        /// Rejected guest path.
+        path: String,
+    },
     /// A resolved path could not be canonicalized.
     #[error("failed to resolve {path}: {source}")]
     ResolvePath {
@@ -337,6 +349,22 @@ impl EvaluationManifest {
                         profile: name.clone(),
                         harness: harness_name.clone(),
                     })?;
+            if !Path::new(&harness.guest_command).is_absolute()
+                || harness.guest_command.chars().any(char::is_whitespace)
+                || !Path::new(&harness.guest_command)
+                    .components()
+                    .all(|component| {
+                        matches!(
+                            component,
+                            std::path::Component::RootDir | std::path::Component::Normal(_)
+                        )
+                    })
+            {
+                return Err(ProfileError::InvalidHarnessGuestCommand {
+                    harness: harness_name.clone(),
+                    path: harness.guest_command.clone(),
+                });
+            }
             let command = resolve_path(root, &harness.command)?;
             let command_identity = match harness.version.as_deref() {
                 Some(version) if version.trim().is_empty() => {
@@ -354,6 +382,7 @@ impl EvaluationManifest {
                 ResolvedHarness {
                     name: harness_name.clone(),
                     command,
+                    guest_command: harness.guest_command.clone(),
                     arguments: harness.arguments.clone(),
                     environment: harness.environment.clone(),
                     home: harness.home.clone(),
@@ -788,6 +817,7 @@ trials = 1
             &config,
             r#"[harness.codex]
 command = "codex"
+guest_command = "/usr/local/bin/codex"
 arguments = ["{prompt}"]
 
 [profiles.release]
@@ -828,6 +858,7 @@ harness = ["nanocodex", "codex"]
                 directory.path().join("nanocodex.toml"),
                 r#"[harness.codex]
 command = "codex"
+guest_command = "/usr/local/bin/codex"
 version = "0.145.0"
 arguments = ["{prompt}"]
 
