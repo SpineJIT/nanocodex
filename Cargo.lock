@@ -5135,16 +5135,13 @@ name = "nanocodex-eval"
 version = "0.3.0"
 dependencies = [
  "arcbox-ext4",
- "async-trait",
  "axum",
  "base64",
  "chrono",
- "criterion",
  "filetime",
  "fs2",
  "futures-util",
  "hex",
- "ignore",
  "jiff",
  "nanocodex-agent",
  "nanocodex-oai-api",
@@ -5162,8 +5159,6 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "toml",
  "tracing",
- "tracing-subscriber",
- "url",
  "uuid",
 ]
 

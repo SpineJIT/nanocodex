@@ -1,12 +1,10 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt::{self, Display, Formatter, Write as _},
     fs::{self, File},
-    future::Future,
     io::{self, BufRead, BufReader, Read, Write},
     net::{Ipv4Addr, TcpListener},
-    num::NonZeroUsize,
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     pin::Pin,
@@ -15,8 +13,6 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use fs2::FileExt as _;
-use futures_util::{StreamExt as _, stream::FuturesUnordered};
 use nanocodex_agent::{NanocodexBuilder, Thinking, events::AgentEventKind};
 use nanocodex_oai_api::MODEL;
 use nanocodex_vm::host::Gvproxy;
@@ -40,9 +36,7 @@ use crate::{
     EvalAttemptOutcome, EvalEventKind, EvalEventStream, EvalExceptionKind, EvalOutcome, EvalStatus,
     Evaluator, EvaluatorBuilder, MeasurementCompleteness, ResponsesCaptureProxy,
     ResponsesCaptureProxyConfig, ResponsesModelCatalogOverride, Task, UsageTotals,
-    evaluator::{
-        AdmissionAttempt, AdmissionController, AdmissionPermit, AttemptAgent, EvalAttempt,
-    },
+    evaluator::{AttemptAgent, EvalAttempt},
     job::{create_durable_directory_all, sync_directory},
     project_codex_atif,
     vm::{
@@ -118,15 +112,11 @@ where
 const DEFAULT_OUTPUT_DIRECTORY: &str = ".nanocodex/eval-diff";
 const COMPARISON_FILE: &str = "comparison.json";
 const COMPARISON_SCHEMA_VERSION: u32 = 16;
-const SWEEP_MANIFEST_FILE: &str = "differential-sweep.json";
-const SWEEP_LOCK_FILE: &str = ".differential-sweep.lock";
-const SWEEP_MANIFEST_SCHEMA_VERSION: u32 = 3;
 const PROGRESS_FILE: &str = "progress.jsonl";
 const PROGRESS_SCHEMA_VERSION: u32 = 1;
 const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const PROGRESS_HEARTBEAT_SUMMARY_CHARS: usize = 64;
 const PROGRESS_SUMMARY_CHARS: usize = 180;
-const DIFFERENTIAL_UPPER_DISK_SUFFIX: &str = ".upper.ext4";
 const TRAJECTORY_FILE: &str = "agent/trajectory.json";
 const API_EXCHANGES_FILE: &str = "agent/api-exchanges.jsonl";
 const API_COMPARISON_FILE: &str = "api-comparison.json";
@@ -155,7 +145,6 @@ const DIFF_CODEX_LIVE_STDERR_FILE: &str = "/run/nanoeval-codex-home/codex-live-s
 const DIFF_CODEX_PROGRESS_POLL: Duration = Duration::from_millis(500);
 const DIFF_CODEX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const DIFF_CODEX_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
-const DIFFERENTIAL_ARMS_PER_PAIR: usize = 2;
 const DEFAULT_DIFFERENTIAL_GUEST_MEMORY_MB: u64 = 512;
 const MINIMUM_DIFFERENTIAL_GUEST_MEMORY_MB: u64 = 128;
 const MEMORY_RECOMMENDATION_PERCENT: u64 = 120;
@@ -220,25 +209,18 @@ struct DifferentialEvaluatorInner {
     nanocodex_tool_mode: NanocodexToolMode,
     codex_tool_mode: CodexToolMode,
     nanocodex_build: ExecutableIdentity,
-    admission: Arc<AdmissionController>,
-    max_concurrency: usize,
-    max_memory_mb: Option<u64>,
-    max_infrastructure_replacements: usize,
     memory: Mutex<DifferentialMemoryPlanner>,
 }
 
-/// One semantic treatment in a centrally scheduled differential sweep.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DifferentialProfile {
+struct DifferentialProfile {
     thinking: Thinking,
     nanocodex_tool_mode: NanocodexToolMode,
     codex_tool_mode: CodexToolMode,
 }
 
 impl DifferentialProfile {
-    /// Creates one reasoning-effort and paired tool-exposure treatment.
-    #[must_use]
-    pub const fn new(
+    const fn new(
         thinking: Thinking,
         nanocodex_tool_mode: NanocodexToolMode,
         codex_tool_mode: CodexToolMode,
@@ -248,24 +230,6 @@ impl DifferentialProfile {
             nanocodex_tool_mode,
             codex_tool_mode,
         }
-    }
-
-    /// Returns the reasoning effort shared by both arms.
-    #[must_use]
-    pub const fn thinking(self) -> Thinking {
-        self.thinking
-    }
-
-    /// Returns Nanocodex's model-visible tool exposure.
-    #[must_use]
-    pub const fn nanocodex_tool_mode(self) -> NanocodexToolMode {
-        self.nanocodex_tool_mode
-    }
-
-    /// Returns stock Codex's model-visible tool exposure.
-    #[must_use]
-    pub const fn codex_tool_mode(self) -> CodexToolMode {
-        self.codex_tool_mode
     }
 
     fn name(self) -> String {
@@ -279,41 +243,10 @@ impl DifferentialProfile {
 }
 
 #[derive(Clone)]
-struct ScheduledComparison {
-    task_index: usize,
-    profile_index: usize,
-    task: Task,
-    trial: usize,
-    profile: DifferentialProfile,
-    infrastructure_replacement_for: Option<usize>,
-    memory_attempt: usize,
-    minimum_guest_memory_mb: Option<u64>,
-    memory_retry_for: Option<PathBuf>,
-    queued_at: DateTime<Utc>,
-}
-
-struct InfrastructureReplacementState {
-    task: Task,
-    profile: DifferentialProfile,
-    next_trial: usize,
-    remaining: usize,
-    target_valid: usize,
-    valid: usize,
-    outstanding: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DifferentialMemoryPlan {
     guest_memory_mb: u64,
     nanocodex_admission_memory_mb: u64,
     codex_admission_memory_mb: u64,
-}
-
-impl DifferentialMemoryPlan {
-    const fn pair_admission_memory_mb(self) -> u64 {
-        self.nanocodex_admission_memory_mb
-            .saturating_add(self.codex_admission_memory_mb)
-    }
 }
 
 struct DifferentialMemoryPlanner {
@@ -543,7 +476,6 @@ struct DifferentialComparison {
     nanocodex_build: ExecutableIdentity,
     schedule: DifferentialSchedule,
     memory_plan: DifferentialMemoryPlan,
-    admission: AdmissionPermit,
 }
 
 /// Deliberate policy and required components for [`DifferentialEvaluator`].
@@ -557,9 +489,6 @@ pub struct DifferentialEvaluatorBuilder {
     nanocodex_tool_mode: NanocodexToolMode,
     codex_tool_mode: CodexToolMode,
     nanocodex_build: Option<ExecutableIdentity>,
-    max_concurrency: usize,
-    max_memory_mb: Option<u64>,
-    max_infrastructure_replacements: usize,
     initial_guest_memory_mb: u64,
     memory_profile_path: Option<PathBuf>,
 }
@@ -670,14 +599,6 @@ pub enum DifferentialBuildError {
     #[error("a differential evaluation requires Nanocodex executable identity")]
     MissingNanocodexIdentity,
 
-    /// The configured pair concurrency was zero.
-    #[error("differential pair concurrency must be greater than zero")]
-    InvalidConcurrency,
-
-    /// The configured measured host-memory target was zero.
-    #[error("differential host-memory target must be greater than zero")]
-    InvalidMemory,
-
     /// The configured initial per-arm guest memory was zero.
     #[error("differential initial guest memory must be greater than zero")]
     InvalidInitialGuestMemory,
@@ -750,154 +671,17 @@ pub struct DifferentialReport {
     artifacts: ComparisonArtifacts,
 }
 
-/// Durable result of one centrally scheduled differential sweep.
 #[derive(Serialize)]
-pub struct DifferentialSweepResults {
-    reports: Vec<DifferentialReport>,
-    summaries: Vec<DifferentialReportSummary>,
-    skipped: usize,
-}
-
-/// Small stable index entry for either a newly completed or resumed pair.
-#[derive(Clone, Serialize)]
-pub struct DifferentialReportSummary {
-    task_name: String,
-    task_root: PathBuf,
-    task_content_digest: String,
-    trial: usize,
-    thinking: String,
-    nanocodex_tool_mode: NanocodexToolMode,
-    codex_tool_mode: CodexToolMode,
-    classification: DifferentialClassification,
-    infrastructure_failure: bool,
-    operational_error: bool,
-    oom_detected: bool,
-    memory_attempt: usize,
-    configured_guest_memory_mb: u64,
-    declared_guest_memory_mb: u64,
-    infrastructure_replacement_for: Option<usize>,
-    comparison_path: PathBuf,
-}
-
-#[derive(Deserialize, Eq, PartialEq, Serialize)]
-struct DifferentialSweepManifest {
-    schema_version: u32,
-    comparison_schema_version: u32,
-    model: String,
-    web_search: bool,
-    trials: usize,
-    tasks: Vec<DifferentialSweepTask>,
-    profiles: Vec<DifferentialSweepProfile>,
-    nanocodex_sha256: String,
-    codex_sha256: String,
-}
-
-#[derive(Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-struct DifferentialSweepTask {
-    name: String,
-    root: PathBuf,
-    content_digest: String,
-}
-
-#[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-struct DifferentialSweepProfile {
-    thinking: String,
-    nanocodex_tool_mode: String,
-    codex_tool_mode: String,
-}
-
-struct DifferentialSweepGuard {
-    _lock: File,
-}
-
-#[derive(Deserialize)]
-struct RetainedDifferentialReport {
-    schema_version: u32,
-    task: RetainedTaskIdentity,
-    trial: usize,
-    model: String,
-    thinking: String,
-    policy: RetainedComparisonPolicy,
-    schedule: DifferentialSchedule,
-    classification: DifferentialClassification,
-    nanocodex_build: RetainedExecutableIdentity,
-    codex_build: RetainedExecutableIdentity,
-    nanocodex: RetainedArmReport,
-    codex: RetainedArmReport,
-    artifacts: RetainedComparisonArtifacts,
-}
-
-#[derive(Deserialize)]
-struct RetainedTaskIdentity {
-    name: String,
-    root: PathBuf,
-    content_digest: String,
-}
-
-#[derive(Deserialize)]
-struct RetainedComparisonPolicy {
-    web_search: bool,
-    #[serde(default)]
-    nanocodex_tool_mode: NanocodexToolMode,
-    codex_tool_mode: CodexToolMode,
-}
-
-#[derive(Deserialize)]
-struct RetainedExecutableIdentity {
-    sha256: String,
-}
-
-#[derive(Deserialize)]
-struct RetainedArmReport {
-    operational_error: Option<String>,
-    event_error: Option<String>,
-    trajectory_error: Option<String>,
-    api_capture_error: Option<String>,
-    memory: Option<ArmMemoryReport>,
-    outcome: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-struct RetainedComparisonArtifacts {
-    comparison: PathBuf,
-    progress_error: Option<String>,
-    api_comparison_error: Option<String>,
-    profile_validation_error: Option<String>,
-}
-
-#[derive(Deserialize, Serialize)]
 struct DifferentialSchedule {
-    queued_at: DateTime<Utc>,
-    admitted_at: DateTime<Utc>,
-    queue_duration_ms: u64,
     declared_pair_memory_mb: u64,
-    requested_pair_memory_mb: u64,
-    admitted_pair_memory_mb: u64,
     configured_guest_memory_mb: u64,
     nanocodex_admission_memory_mb: u64,
     codex_admission_memory_mb: u64,
     memory_attempt: usize,
-    memory_retry_for: Option<PathBuf>,
-    max_concurrency: usize,
-    max_memory_mb: Option<u64>,
-    max_infrastructure_replacements: usize,
-    infrastructure_replacement_for: Option<usize>,
 }
 
 const fn differential_pair_memory_mb(arm_memory_mb: u64) -> u64 {
     arm_memory_mb.saturating_mul(2)
-}
-
-fn releasable_differential_arm_memory_mb(
-    arm_memory_mb: u64,
-    pair_memory_mb: u64,
-    max_memory_mb: Option<u64>,
-) -> u64 {
-    if max_memory_mb.is_some_and(|limit| pair_memory_mb <= limit) {
-        arm_memory_mb
-    } else {
-        0
-    }
 }
 
 fn differential_comparison_name(
@@ -912,51 +696,6 @@ fn differential_comparison_name(
         profile.name(),
         id.simple()
     )
-}
-
-fn release_differential_arm_memory(
-    admission: &mut AdmissionPermit,
-    arm_memory_mb: u64,
-    arm: &'static str,
-) {
-    let (released_slots, released_mb) = admission.release(1, arm_memory_mb);
-    if released_slots > 0 || released_mb > 0 {
-        info!(
-            comparison_arm = arm,
-            scheduler.concurrency.released = released_slots,
-            scheduler.memory.released_mb = released_mb,
-            "released completed differential arm capacity"
-        );
-    }
-}
-
-async fn join_differential_arms<N, C>(
-    mut admission: AdmissionPermit,
-    nanocodex_memory_mb: u64,
-    codex_memory_mb: u64,
-    nanocodex: N,
-    codex: C,
-) -> (N::Output, C::Output)
-where
-    N: Future,
-    C: Future,
-{
-    tokio::pin!(nanocodex);
-    tokio::pin!(codex);
-    tokio::select! {
-        nanocodex_result = &mut nanocodex => {
-            release_differential_arm_memory(&mut admission, nanocodex_memory_mb, "nanocodex");
-            let codex_result = codex.await;
-            release_differential_arm_memory(&mut admission, codex_memory_mb, "codex");
-            (nanocodex_result, codex_result)
-        }
-        codex_result = &mut codex => {
-            release_differential_arm_memory(&mut admission, codex_memory_mb, "codex");
-            let nanocodex_result = nanocodex.await;
-            release_differential_arm_memory(&mut admission, nanocodex_memory_mb, "nanocodex");
-            (nanocodex_result, codex_result)
-        }
-    }
 }
 
 /// Result of rebuilding derived trajectory and API comparisons from retained evidence.
@@ -1514,392 +1253,6 @@ use progress::*;
 mod codex_vm;
 use codex_vm::*;
 
-fn differential_sweep_manifest(
-    inner: &DifferentialEvaluatorInner,
-    tasks: &[Task],
-    profiles: &[DifferentialProfile],
-    trials: usize,
-) -> DifferentialSweepManifest {
-    let mut tasks = tasks
-        .iter()
-        .map(|task| DifferentialSweepTask {
-            name: task.name().to_owned(),
-            root: task.root().to_path_buf(),
-            content_digest: task.content_digest().to_owned(),
-        })
-        .collect::<Vec<_>>();
-    tasks.sort_unstable();
-    let profiles = differential_sweep_profiles(profiles);
-    DifferentialSweepManifest {
-        schema_version: SWEEP_MANIFEST_SCHEMA_VERSION,
-        comparison_schema_version: COMPARISON_SCHEMA_VERSION,
-        model: MODEL.to_owned(),
-        web_search: inner.web_search,
-        trials,
-        tasks,
-        profiles,
-        nanocodex_sha256: inner.nanocodex_build.sha256.clone(),
-        codex_sha256: inner.codex_sha256.clone(),
-    }
-}
-
-fn differential_sweep_profiles(profiles: &[DifferentialProfile]) -> Vec<DifferentialSweepProfile> {
-    profiles
-        .iter()
-        .map(|profile| DifferentialSweepProfile {
-            thinking: profile.thinking.as_str().to_owned(),
-            nanocodex_tool_mode: profile.nanocodex_tool_mode.as_str().to_owned(),
-            codex_tool_mode: profile.codex_tool_mode.as_str().to_owned(),
-        })
-        .collect()
-}
-
-fn prepare_differential_sweep(
-    inner: &DifferentialEvaluatorInner,
-    tasks: &[Task],
-    profiles: &[DifferentialProfile],
-    trials: usize,
-) -> InternalResult<(DifferentialSweepGuard, Vec<DifferentialReportSummary>)> {
-    let lock_path = inner.output.join(SWEEP_LOCK_FILE);
-    let lock = File::options()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .wrap_err_with(|| format!("failed to open sweep lock {}", lock_path.display()))?;
-    lock.try_lock_exclusive().map_err(|error| {
-        diff_error!(
-            "another differential runner owns {}: {error}",
-            lock_path.display()
-        )
-    })?;
-    let guard = DifferentialSweepGuard { _lock: lock };
-    let expected = differential_sweep_manifest(inner, tasks, profiles, trials);
-    let manifest_path = inner.output.join(SWEEP_MANIFEST_FILE);
-    if manifest_path.is_file() {
-        let bytes = fs::read(&manifest_path).wrap_err_with(|| {
-            format!(
-                "failed to read differential sweep manifest {}",
-                manifest_path.display()
-            )
-        })?;
-        let retained: DifferentialSweepManifest =
-            serde_json::from_slice(&bytes).wrap_err_with(|| {
-                format!(
-                    "failed to decode differential sweep manifest {}",
-                    manifest_path.display()
-                )
-            })?;
-        if retained != expected {
-            return Err(diff_error!(
-                "differential sweep manifest {} does not match the requested tasks, profiles, \
-                 trials, model, or executable builds; choose a new --output directory",
-                manifest_path.display()
-            ));
-        }
-    } else {
-        write_json_atomic(&manifest_path, &expected).map_err(|source| {
-            Box::new(ContextError {
-                context: format!(
-                    "failed to retain differential sweep manifest {}",
-                    manifest_path.display()
-                ),
-                source,
-            }) as BoxError
-        })?;
-    }
-    let removed_upper_disks = cleanup_incomplete_differential_upper_disks(&inner.output)?;
-    if removed_upper_disks > 0 {
-        info!(
-            removed_upper_disks,
-            output = %inner.output.display(),
-            "removed writable VM disks left by interrupted differential comparisons"
-        );
-    }
-    let summaries = scan_differential_reports(inner, &expected)?;
-    Ok((guard, summaries))
-}
-
-fn cleanup_incomplete_differential_upper_disks(output: &Path) -> InternalResult<usize> {
-    let mut removed = 0;
-    for entry in fs::read_dir(output).wrap_err_with(|| {
-        format!(
-            "failed to scan differential sweep output {} for interrupted comparisons",
-            output.display()
-        )
-    })? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let comparison_directory = entry.path();
-        if comparison_directory.join(COMPARISON_FILE).is_file()
-            || !comparison_directory.join(PROGRESS_FILE).is_file()
-        {
-            continue;
-        }
-
-        let mut directories = vec![comparison_directory];
-        while let Some(directory) = directories.pop() {
-            for child in fs::read_dir(&directory).wrap_err_with(|| {
-                format!(
-                    "failed to scan interrupted comparison directory {}",
-                    directory.display()
-                )
-            })? {
-                let child = child?;
-                let file_type = child.file_type()?;
-                if file_type.is_dir() {
-                    directories.push(child.path());
-                } else if file_type.is_file()
-                    && child
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| name.ends_with(DIFFERENTIAL_UPPER_DISK_SUFFIX))
-                {
-                    let path = child.path();
-                    fs::remove_file(&path).wrap_err_with(|| {
-                        format!(
-                            "failed to remove writable VM disk left by interrupted comparison {}",
-                            path.display()
-                        )
-                    })?;
-                    removed += 1;
-                }
-            }
-        }
-    }
-    Ok(removed)
-}
-
-fn scan_differential_reports(
-    inner: &DifferentialEvaluatorInner,
-    manifest: &DifferentialSweepManifest,
-) -> InternalResult<Vec<DifferentialReportSummary>> {
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(&inner.output).wrap_err_with(|| {
-        format!(
-            "failed to scan differential sweep output {}",
-            inner.output.display()
-        )
-    })? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            let path = entry.path().join(COMPARISON_FILE);
-            if path.is_file() {
-                paths.push(path);
-            }
-        }
-    }
-    paths.sort_unstable();
-    paths
-        .into_iter()
-        .map(|path| retained_differential_summary(&path, manifest))
-        .collect()
-}
-
-fn retained_differential_summary(
-    path: &Path,
-    manifest: &DifferentialSweepManifest,
-) -> InternalResult<DifferentialReportSummary> {
-    let bytes = fs::read(path)
-        .wrap_err_with(|| format!("failed to read retained comparison {}", path.display()))?;
-    let report: RetainedDifferentialReport = serde_json::from_slice(&bytes)
-        .wrap_err_with(|| format!("failed to decode retained comparison {}", path.display()))?;
-    if report.schema_version != manifest.comparison_schema_version {
-        return Err(diff_error!(
-            "retained comparison {} uses schema {}; expected {}",
-            path.display(),
-            report.schema_version,
-            manifest.comparison_schema_version
-        ));
-    }
-    let task_matches = manifest.tasks.iter().any(|task| {
-        task.name == report.task.name
-            && task.root == report.task.root
-            && task.content_digest == report.task.content_digest
-    });
-    let profile_matches = manifest.profiles.iter().any(|profile| {
-        profile.thinking == report.thinking
-            && profile.nanocodex_tool_mode == report.policy.nanocodex_tool_mode.as_str()
-            && profile.codex_tool_mode == report.policy.codex_tool_mode.as_str()
-    });
-    if !task_matches
-        || !profile_matches
-        || report.model != manifest.model
-        || report.policy.web_search != manifest.web_search
-        || report.nanocodex_build.sha256 != manifest.nanocodex_sha256
-        || report.codex_build.sha256 != manifest.codex_sha256
-    {
-        return Err(diff_error!(
-            "retained comparison {} does not belong to its differential sweep manifest",
-            path.display()
-        ));
-    }
-    if report.artifacts.comparison != path {
-        return Err(diff_error!(
-            "retained comparison {} records a different comparison path {}",
-            path.display(),
-            report.artifacts.comparison.display()
-        ));
-    }
-    let oom_detected = [&report.nanocodex, &report.codex]
-        .into_iter()
-        .any(|arm| arm.memory.is_some_and(|memory| memory.oom_detected));
-    let infrastructure_failure = oom_detected
-        || [&report.nanocodex, &report.codex]
-            .into_iter()
-            .any(retained_arm_has_infrastructure_failure);
-    let operational_error = report.artifacts.progress_error.is_some()
-        || report.artifacts.api_comparison_error.is_some()
-        || report.artifacts.profile_validation_error.is_some()
-        || [&report.nanocodex, &report.codex]
-            .into_iter()
-            .any(retained_arm_has_operational_error);
-    Ok(DifferentialReportSummary {
-        task_name: report.task.name,
-        task_root: report.task.root,
-        task_content_digest: report.task.content_digest,
-        trial: report.trial,
-        thinking: report.thinking,
-        nanocodex_tool_mode: report.policy.nanocodex_tool_mode,
-        codex_tool_mode: report.policy.codex_tool_mode,
-        classification: report.classification,
-        infrastructure_failure,
-        operational_error,
-        oom_detected,
-        memory_attempt: report.schedule.memory_attempt,
-        configured_guest_memory_mb: report.schedule.configured_guest_memory_mb,
-        declared_guest_memory_mb: report.schedule.declared_pair_memory_mb / 2,
-        infrastructure_replacement_for: report.schedule.infrastructure_replacement_for,
-        comparison_path: path.to_path_buf(),
-    })
-}
-
-fn retained_arm_has_infrastructure_failure(arm: &RetainedArmReport) -> bool {
-    arm.outcome
-        .as_ref()
-        .and_then(|outcome| outcome.pointer("/attempt/outcome"))
-        .and_then(serde_json::Value::as_str)
-        == Some("infrastructure_error")
-}
-
-const fn retained_arm_has_operational_error(arm: &RetainedArmReport) -> bool {
-    arm.operational_error.is_some()
-        || arm.event_error.is_some()
-        || arm.trajectory_error.is_some()
-        || arm.api_capture_error.is_some()
-}
-
-fn resume_differential_schedule(
-    pending: &mut VecDeque<ScheduledComparison>,
-    replacements: &mut [InfrastructureReplacementState],
-    summaries: &[DifferentialReportSummary],
-    requested_trials: usize,
-    max_infrastructure_replacements: usize,
-    profile_count: usize,
-) -> usize {
-    let mut retained_pending = VecDeque::with_capacity(pending.len());
-    let mut skipped = 0_usize;
-    while let Some(scheduled) = pending.pop_front() {
-        let matching_trial = summaries
-            .iter()
-            .filter(|summary| {
-                summary.matches(&scheduled.task, scheduled.profile)
-                    && summary.trial == scheduled.trial
-            })
-            .collect::<Vec<_>>();
-        if matching_trial.iter().any(|summary| summary.is_valid()) {
-            skipped = skipped.saturating_add(1);
-            continue;
-        }
-        let latest = matching_trial.iter().copied().max_by(|left, right| {
-            (left.memory_attempt, &left.comparison_path)
-                .cmp(&(right.memory_attempt, &right.comparison_path))
-        });
-        match latest {
-            None => retained_pending.push_back(scheduled),
-            Some(summary)
-                if summary.oom_detected
-                    && summary.configured_guest_memory_mb < summary.declared_guest_memory_mb =>
-            {
-                let mut scheduled = scheduled;
-                scheduled.memory_attempt = summary.memory_attempt.saturating_add(1);
-                scheduled.minimum_guest_memory_mb = Some(
-                    summary
-                        .configured_guest_memory_mb
-                        .saturating_mul(2)
-                        .min(summary.declared_guest_memory_mb),
-                );
-                scheduled.memory_retry_for = Some(summary.comparison_path.clone());
-                retained_pending.push_back(scheduled);
-            }
-            Some(_) => {}
-        }
-    }
-    *pending = retained_pending;
-
-    for (replacement_index, replacement) in replacements.iter_mut().enumerate() {
-        let task_index = replacement_index / profile_count;
-        let profile_index = replacement_index % profile_count;
-        let matching = summaries
-            .iter()
-            .filter(|summary| summary.matches(&replacement.task, replacement.profile))
-            .collect::<Vec<_>>();
-        let mut max_trial = requested_trials;
-        let mut replacement_trials = BTreeSet::new();
-        let mut linked_failures = BTreeSet::new();
-        let mut valid_trials = BTreeSet::new();
-        let mut latest_by_trial = BTreeMap::<usize, &DifferentialReportSummary>::new();
-        for &summary in &matching {
-            max_trial = max_trial.max(summary.trial);
-            if summary.is_valid() {
-                valid_trials.insert(summary.trial);
-            }
-            if let Some(parent) = summary.infrastructure_replacement_for {
-                replacement_trials.insert(summary.trial);
-                linked_failures.insert(parent);
-            }
-            let latest = latest_by_trial.entry(summary.trial).or_insert(summary);
-            if (summary.memory_attempt, &summary.comparison_path)
-                > (latest.memory_attempt, &latest.comparison_path)
-            {
-                *latest = summary;
-            }
-        }
-        replacement.next_trial = max_trial.saturating_add(1);
-        replacement.remaining =
-            max_infrastructure_replacements.saturating_sub(replacement_trials.len());
-
-        let queued = pending
-            .iter()
-            .filter(|scheduled| {
-                scheduled.task_index == task_index && scheduled.profile_index == profile_index
-            })
-            .count();
-        replacement.target_valid = requested_trials;
-        replacement.valid = valid_trials.len().min(requested_trials);
-        replacement.outstanding = queued;
-        for failed_trial in latest_by_trial
-            .values()
-            .filter(|summary| {
-                (summary.infrastructure_failure || summary.operational_error)
-                    && !summary.oom_detected
-                    && !linked_failures.contains(&summary.trial)
-            })
-            .map(|summary| summary.trial)
-            .collect::<Vec<_>>()
-        {
-            let Some(scheduled) = replacement.next(task_index, profile_index, failed_trial) else {
-                break;
-            };
-            pending.push_back(scheduled);
-        }
-    }
-    skipped
-}
-
 impl DifferentialEvaluator {
     /// Starts a reusable matched differential-evaluation recipe.
     #[must_use]
@@ -1914,9 +1267,6 @@ impl DifferentialEvaluator {
             nanocodex_tool_mode: NanocodexToolMode::CodeModeOnly,
             codex_tool_mode: CodexToolMode::CodeModeOnly,
             nanocodex_build: None,
-            max_concurrency: 1,
-            max_memory_mb: None,
-            max_infrastructure_replacements: 0,
             initial_guest_memory_mb: DEFAULT_DIFFERENTIAL_GUEST_MEMORY_MB,
             memory_profile_path: None,
         }
@@ -1927,692 +1277,67 @@ impl DifferentialEvaluator {
     /// # Errors
     ///
     /// Returns an error when the comparison cannot be prepared or retained.
+    /// Runs one independent matched pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the comparison cannot be prepared or retained.
     pub async fn task(&self, task: Task) -> DifferentialResult<DifferentialReport> {
-        self.run_task(
-            task,
-            1,
-            DifferentialProfile::new(
-                self.inner.thinking,
-                self.inner.nanocodex_tool_mode,
-                self.inner.codex_tool_mode,
-            ),
-            None,
-        )
-        .await
-    }
-
-    async fn run_task(
-        &self,
-        task: Task,
-        trial: usize,
-        profile: DifferentialProfile,
-        infrastructure_replacement_for: Option<usize>,
-    ) -> DifferentialResult<DifferentialReport> {
-        let scheduled = ScheduledComparison {
-            task_index: 0,
-            profile_index: 0,
-            task,
-            trial,
-            profile,
-            infrastructure_replacement_for,
-            memory_attempt: 1,
-            minimum_guest_memory_mb: None,
-            memory_retry_for: None,
-            queued_at: Utc::now(),
-        };
-        let memory_plan = self.memory_plan(&scheduled.task, None);
-        let requested_memory_mb = memory_plan.pair_admission_memory_mb();
-        let admission = self
-            .inner
-            .admission
-            .acquire_many(DIFFERENTIAL_ARMS_PER_PAIR, requested_memory_mb)
-            .await
-            .ok_or_else(|| {
-                DifferentialError::new(diff_error!("differential evaluator is draining"))
-            })?;
-        self.run_admitted_task(scheduled, memory_plan, admission)
-            .await
-    }
-
-    async fn run_admitted_task(
-        &self,
-        scheduled: ScheduledComparison,
-        memory_plan: DifferentialMemoryPlan,
-        admission: AdmissionPermit,
-    ) -> DifferentialResult<DifferentialReport> {
-        let ScheduledComparison {
-            task,
-            trial,
-            profile,
-            infrastructure_replacement_for,
-            memory_attempt,
-            memory_retry_for,
-            queued_at,
-            ..
-        } = scheduled;
-        let admitted_at = Utc::now();
-        let declared_memory_mb = differential_pair_memory_mb(task.resources().memory_mb);
-        let requested_memory_mb = memory_plan.pair_admission_memory_mb();
-        let admitted_memory_mb = self
-            .inner
-            .max_memory_mb
-            .map_or(requested_memory_mb, |limit| requested_memory_mb.min(limit));
-        let inner = &self.inner;
+        let profile = DifferentialProfile::new(
+            self.inner.thinking,
+            self.inner.nanocodex_tool_mode,
+            self.inner.codex_tool_mode,
+        );
+        let memory_plan = self.memory_plan(&task);
         let result = DifferentialComparison {
-            task,
-            trial,
-            nanocodex: inner.nanocodex.clone(),
-            codex_sha256: inner.codex_sha256.clone(),
-            codex_release: Arc::clone(&inner.codex_release),
-            codex_auth: inner.codex_auth.clone(),
-            vm: Arc::clone(&inner.vm),
-            output: inner.output.clone(),
-            thinking: profile.thinking,
-            web_search: inner.web_search,
-            nanocodex_tool_mode: profile.nanocodex_tool_mode,
-            codex_tool_mode: profile.codex_tool_mode,
-            nanocodex_build: inner.nanocodex_build.clone(),
+            trial: 1,
             schedule: DifferentialSchedule {
-                queued_at,
-                admitted_at,
-                queue_duration_ms: admitted_at
-                    .signed_duration_since(queued_at)
-                    .num_milliseconds()
-                    .max(0)
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-                declared_pair_memory_mb: declared_memory_mb,
-                requested_pair_memory_mb: requested_memory_mb,
-                admitted_pair_memory_mb: admitted_memory_mb,
+                declared_pair_memory_mb: differential_pair_memory_mb(task.resources().memory_mb),
                 configured_guest_memory_mb: memory_plan.guest_memory_mb,
                 nanocodex_admission_memory_mb: memory_plan.nanocodex_admission_memory_mb,
                 codex_admission_memory_mb: memory_plan.codex_admission_memory_mb,
-                memory_attempt,
-                memory_retry_for,
-                max_concurrency: inner.max_concurrency,
-                max_memory_mb: inner.max_memory_mb,
-                max_infrastructure_replacements: inner.max_infrastructure_replacements,
-                infrastructure_replacement_for,
+                memory_attempt: 1,
             },
+            task,
+            nanocodex: self.inner.nanocodex.clone(),
+            codex_sha256: self.inner.codex_sha256.clone(),
+            codex_release: Arc::clone(&self.inner.codex_release),
+            codex_auth: self.inner.codex_auth.clone(),
+            vm: Arc::clone(&self.inner.vm),
+            output: self.inner.output.clone(),
+            thinking: profile.thinking,
+            web_search: self.inner.web_search,
+            nanocodex_tool_mode: profile.nanocodex_tool_mode,
+            codex_tool_mode: profile.codex_tool_mode,
+            nanocodex_build: self.inner.nanocodex_build.clone(),
             memory_plan,
-            admission,
         }
         .run()
         .await;
-        if let Ok(report) = &result {
-            let mut memory = self
+        if let Ok(report) = &result
+            && let Err(error) = self
                 .inner
                 .memory
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Err(error) = memory.observe(report) {
-                warn!(
-                    task = report.task_name(),
-                    error = %error,
-                    "failed to persist differential memory observation"
-                );
-            }
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observe(report)
+        {
+            warn!(
+                task = report.task_name(),
+                error = %error,
+                "failed to persist differential memory observation"
+            );
         }
         result
     }
 
-    fn memory_plan(
-        &self,
-        task: &Task,
-        minimum_guest_memory_mb: Option<u64>,
-    ) -> DifferentialMemoryPlan {
+    fn memory_plan(&self, task: &Task) -> DifferentialMemoryPlan {
         self.inner
             .memory
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .plan(task, minimum_guest_memory_mb)
+            .plan(task, None)
     }
-
-    /// Runs `count` independent matched pairs for one task.
-    ///
-    /// Configured invalid-pair replacements are retained after the requested
-    /// trial coordinates, so the returned collection can contain more than
-    /// `count` reports.
-    ///
-    /// Results preserve trial order even when pairs complete out of order.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error after all admitted pairs finish when any comparison
-    /// cannot be prepared or retained.
-    pub async fn task_n(
-        &self,
-        task: Task,
-        count: NonZeroUsize,
-    ) -> DifferentialResult<DifferentialSweepResults> {
-        self.run_tasks(
-            vec![task],
-            count,
-            vec![DifferentialProfile::new(
-                self.inner.thinking,
-                self.inner.nanocodex_tool_mode,
-                self.inner.codex_tool_mode,
-            )],
-        )
-        .await
-    }
-
-    /// Runs one independent matched pair for every task.
-    ///
-    /// Configured invalid-pair replacements can add retained reports.
-    ///
-    /// Results preserve input order even when pairs complete out of order.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error after all admitted pairs finish when any comparison
-    /// cannot be prepared or retained.
-    pub async fn tasks(&self, tasks: Vec<Task>) -> DifferentialResult<DifferentialSweepResults> {
-        self.run_tasks(
-            tasks,
-            NonZeroUsize::MIN,
-            vec![DifferentialProfile::new(
-                self.inner.thinking,
-                self.inner.nanocodex_tool_mode,
-                self.inner.codex_tool_mode,
-            )],
-        )
-        .await
-    }
-
-    async fn run_tasks(
-        &self,
-        tasks: Vec<Task>,
-        count: NonZeroUsize,
-        profiles: Vec<DifferentialProfile>,
-    ) -> DifferentialResult<DifferentialSweepResults> {
-        if tasks.is_empty() {
-            return Err(DifferentialError::new(diff_error!(
-                "differential matrix requires at least one task"
-            )));
-        }
-        validate_differential_profiles(&profiles)?;
-        let count = count.get();
-        let (_guard, mut summaries) =
-            prepare_differential_sweep(&self.inner, &tasks, &profiles, count)
-                .map_err(DifferentialError::new)?;
-        let profile_count = profiles.len();
-        let (mut replacements, mut pending) = initial_differential_schedule(
-            tasks,
-            count,
-            &profiles,
-            self.inner.max_infrastructure_replacements,
-        );
-        let skipped = resume_differential_schedule(
-            &mut pending,
-            &mut replacements,
-            &summaries,
-            count,
-            self.inner.max_infrastructure_replacements,
-            profile_count,
-        );
-        let mut waiting_by_task = BTreeMap::<usize, VecDeque<ScheduledComparison>>::new();
-        while let Some(scheduled) = pending.pop_front() {
-            waiting_by_task
-                .entry(scheduled.task_index)
-                .or_default()
-                .push_back(scheduled);
-        }
-        let mut preparations = FuturesUnordered::new();
-        for (task_index, scheduled) in &waiting_by_task {
-            let task_index = *task_index;
-            let task = scheduled
-                .front()
-                .map(|scheduled| scheduled.task.clone())
-                .ok_or_else(|| {
-                    DifferentialError::new(diff_error!(
-                        "differential scheduler created an empty task preparation queue"
-                    ))
-                })?;
-            let vm = Arc::clone(&self.inner.vm);
-            preparations.push(async move {
-                let result = vm.environment(&task).await;
-                (task_index, task, result)
-            });
-        }
-        let mut in_flight = FuturesUnordered::new();
-        let mut active_tasks = BTreeSet::new();
-        let mut results = Vec::new();
-        let mut preparation_errors = Vec::new();
-        let mut draining = false;
-        while !pending.is_empty() || !in_flight.is_empty() || !preparations.is_empty() {
-            let capacity_generation = self.inner.admission.capacity_generation();
-            if !draining && self.inner.admission.is_draining() {
-                draining = true;
-                pending.clear();
-                waiting_by_task.clear();
-                preparations.clear();
-            }
-            let mut pending_index = 0;
-            while pending_index < pending.len() {
-                if active_tasks.len() >= self.inner.max_concurrency {
-                    break;
-                }
-                let Some(queued) = pending.get(pending_index) else {
-                    return Err(DifferentialError::new(diff_error!(
-                        "differential scheduler lost a queued coordinate"
-                    )));
-                };
-                if !task_lane_available(&active_tasks, queued, self.inner.max_concurrency) {
-                    pending_index += 1;
-                    continue;
-                }
-                let memory_plan = self.memory_plan(&queued.task, queued.minimum_guest_memory_mb);
-                let requested_memory_mb = memory_plan.pair_admission_memory_mb();
-                match self
-                    .inner
-                    .admission
-                    .try_acquire_many(DIFFERENTIAL_ARMS_PER_PAIR, requested_memory_mb)
-                {
-                    AdmissionAttempt::Acquired(admission) => {
-                        let Some(scheduled) = pending.remove(pending_index) else {
-                            return Err(DifferentialError::new(diff_error!(
-                                "differential scheduler lost a ready coordinate"
-                            )));
-                        };
-                        if !active_tasks.insert(scheduled.task_index) {
-                            return Err(DifferentialError::new(diff_error!(
-                                "differential scheduler admitted two comparisons for task {}",
-                                scheduled.task.name()
-                            )));
-                        }
-                        in_flight.push(run_scheduled_comparison(
-                            self.clone(),
-                            scheduled,
-                            memory_plan,
-                            admission,
-                        ));
-                    }
-                    AdmissionAttempt::Unavailable => pending_index += 1,
-                    AdmissionAttempt::Draining => {
-                        draining = true;
-                        break;
-                    }
-                }
-            }
-
-            if draining {
-                pending.clear();
-                waiting_by_task.clear();
-                preparations.clear();
-            }
-
-            if in_flight.is_empty() && preparations.is_empty() {
-                if draining || self.inner.admission.is_draining() {
-                    break;
-                }
-                if pending.is_empty() {
-                    break;
-                }
-            }
-
-            enum SchedulerEvent<T> {
-                Prepared(T),
-                Completed((ScheduledComparison, DifferentialResult<DifferentialReport>)),
-                Capacity,
-            }
-            let event = tokio::select! {
-                prepared = preparations.next(), if !preparations.is_empty() => {
-                    prepared.map(SchedulerEvent::Prepared)
-                }
-                completed = in_flight.next(), if !in_flight.is_empty() => {
-                    completed.map(SchedulerEvent::Completed)
-                }
-                () = self.inner.admission.wait_for_change(capacity_generation), if (!pending.is_empty() || !preparations.is_empty()) && !draining => {
-                    Some(SchedulerEvent::Capacity)
-                }
-                else => None,
-            };
-            let Some(event) = event else {
-                break;
-            };
-            let SchedulerEvent::Completed((scheduled, result)) = event else {
-                match event {
-                    SchedulerEvent::Prepared((task_index, task, Ok(_environment))) => {
-                        if let Some(mut ready) = waiting_by_task.remove(&task_index) {
-                            info!(
-                                task = task.name(),
-                                ready_coordinates = ready.len(),
-                                "differential task image is ready"
-                            );
-                            pending.append(&mut ready);
-                        }
-                    }
-                    SchedulerEvent::Prepared((task_index, task, Err(error))) => {
-                        waiting_by_task.remove(&task_index);
-                        warn!(
-                            task = task.name(),
-                            error = %error,
-                            "differential task preparation failed; other tasks remain runnable"
-                        );
-                        preparation_errors.push(DifferentialError::new(Box::new(error)));
-                    }
-                    SchedulerEvent::Capacity => {}
-                    SchedulerEvent::Completed(_) => unreachable!("completed event was matched"),
-                }
-                continue;
-            };
-            if !active_tasks.remove(&scheduled.task_index) {
-                return Err(DifferentialError::new(diff_error!(
-                    "differential scheduler completed an inactive task lane for {}",
-                    scheduled.task.name()
-                )));
-            }
-            let task_index = scheduled.task_index;
-            let profile_index = scheduled.profile_index;
-            let trial = scheduled.trial;
-            let memory_attempt = scheduled.memory_attempt;
-            let memory_retry = result
-                .as_ref()
-                .ok()
-                .and_then(|report| scheduled.memory_retry(report));
-            if let Some(memory_retry) = memory_retry {
-                info!(
-                    task = memory_retry.task.name(),
-                    trial,
-                    memory_attempt = memory_retry.memory_attempt,
-                    guest_memory_mb = memory_retry.minimum_guest_memory_mb,
-                    "confirmed OOM retained; scheduled both arms again with more guest memory"
-                );
-                pending.push_front(memory_retry);
-            } else {
-                let replacement_index = task_index
-                    .checked_mul(profile_count)
-                    .and_then(|index| index.checked_add(profile_index));
-                if let Some(state) = replacement_index.and_then(|index| replacements.get_mut(index))
-                {
-                    let valid = result.as_ref().is_ok_and(|report| {
-                        !report.has_infrastructure_failure() && !report.has_operational_error()
-                    });
-                    state.complete(valid);
-                }
-
-                if let Ok(report) = &result
-                    && report.oom_detected()
-                {
-                    warn!(
-                        task = report.task_name(),
-                        trial,
-                        guest_memory_mb = report.configured_guest_memory_mb(),
-                        "confirmed OOM persisted at the task-declared memory ceiling"
-                    );
-                } else if let Ok(report) = &result
-                    && (report.has_infrastructure_failure() || report.has_operational_error())
-                    && let Some(replacement_index) = replacement_index
-                    && let Some(replacement) = replacements
-                        .get_mut(replacement_index)
-                        .and_then(|replacement| replacement.next(task_index, profile_index, trial))
-                {
-                    info!(
-                        task = report.task_name(),
-                        failed_trial = trial,
-                        replacement_trial = replacement.trial,
-                        remaining_replacements = replacements
-                            .get(replacement_index)
-                            .map_or(0, |state| state.remaining),
-                        "scheduled a fresh pair to replace retained invalid comparison"
-                    );
-                    pending.push_front(replacement);
-                }
-            }
-            results.push((task_index, profile_index, trial, memory_attempt, result));
-        }
-        if draining || self.inner.admission.is_draining() {
-            return Err(DifferentialError::new(diff_error!(
-                "differential evaluator is draining"
-            )));
-        }
-        if let Some(error) = preparation_errors.into_iter().next() {
-            return Err(error);
-        }
-        results.sort_unstable_by_key(|(task_index, profile_index, trial, memory_attempt, _)| {
-            (*task_index, *profile_index, *trial, *memory_attempt)
-        });
-        let reports = results
-            .into_iter()
-            .map(|(_, _, _, _, result)| result)
-            .collect::<DifferentialResult<Vec<_>>>()?;
-        summaries.extend(reports.iter().map(DifferentialReportSummary::from_report));
-        summaries.sort_unstable_by(|left, right| {
-            (
-                &left.task_root,
-                &left.thinking,
-                left.nanocodex_tool_mode.as_str(),
-                left.codex_tool_mode.as_str(),
-                left.trial,
-                left.memory_attempt,
-                &left.comparison_path,
-            )
-                .cmp(&(
-                    &right.task_root,
-                    &right.thinking,
-                    right.nanocodex_tool_mode.as_str(),
-                    right.codex_tool_mode.as_str(),
-                    right.trial,
-                    right.memory_attempt,
-                    &right.comparison_path,
-                ))
-        });
-        Ok(DifferentialSweepResults {
-            reports,
-            summaries,
-            skipped,
-        })
-    }
-
-    /// Runs `count` independent matched pairs for every task.
-    ///
-    /// Configured invalid-pair replacements are retained after each task's
-    /// requested trial coordinates, so the returned collection can contain
-    /// more than `tasks.len() * count` reports.
-    ///
-    /// Results are grouped in input task order and then trial order.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error after all admitted pairs finish when any comparison
-    /// cannot be prepared or retained.
-    pub async fn tasks_n(
-        &self,
-        tasks: Vec<Task>,
-        count: NonZeroUsize,
-    ) -> DifferentialResult<DifferentialSweepResults> {
-        self.run_tasks(
-            tasks,
-            count,
-            vec![DifferentialProfile::new(
-                self.inner.thinking,
-                self.inner.nanocodex_tool_mode,
-                self.inner.codex_tool_mode,
-            )],
-        )
-        .await
-    }
-
-    /// Runs one centrally scheduled task × profile × trial matrix.
-    ///
-    /// Profiles are semantic identities: both arms receive the profile's
-    /// reasoning effort and each arm receives its selected tool exposure.
-    /// Images, staged executables, admission limits, and completion handling
-    /// are shared by the complete matrix.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error after admitted work drains when the profile list is
-    /// empty, contains duplicates, or a comparison cannot be retained.
-    pub async fn tasks_n_with_profiles(
-        &self,
-        tasks: Vec<Task>,
-        count: NonZeroUsize,
-        profiles: Vec<DifferentialProfile>,
-    ) -> DifferentialResult<DifferentialSweepResults> {
-        self.run_tasks(tasks, count, profiles).await
-    }
-
-    /// Returns the maximum active-arm capacity expressed in pair equivalents.
-    #[must_use]
-    pub fn max_concurrency(&self) -> usize {
-        self.inner.max_concurrency
-    }
-
-    /// Returns the optional target ceiling on measured host memory across live arms.
-    #[must_use]
-    pub fn max_memory_mb(&self) -> Option<u64> {
-        self.inner.max_memory_mb
-    }
-
-    /// Returns the per-task budget for replacing invalid pairs.
-    #[must_use]
-    pub fn max_infrastructure_replacements(&self) -> usize {
-        self.inner.max_infrastructure_replacements
-    }
-
-    /// Stops admitting pairs that have not started.
-    ///
-    /// Admitted work continues to completion. The return value is the total
-    /// number of pairs admitted since this evaluator was built.
-    pub fn begin_drain(&self) -> usize {
-        self.inner.admission.begin_drain()
-    }
-}
-
-fn initial_differential_schedule(
-    tasks: Vec<Task>,
-    count: usize,
-    profiles: &[DifferentialProfile],
-    max_infrastructure_replacements: usize,
-) -> (
-    Vec<InfrastructureReplacementState>,
-    VecDeque<ScheduledComparison>,
-) {
-    let mut replacements = Vec::new();
-    let mut pending = VecDeque::new();
-    for (task_index, task) in tasks.into_iter().enumerate() {
-        for (profile_index, profile) in profiles.iter().copied().enumerate() {
-            replacements.push(InfrastructureReplacementState {
-                task: task.clone(),
-                profile,
-                next_trial: count.saturating_add(1),
-                remaining: max_infrastructure_replacements,
-                target_valid: count,
-                valid: 0,
-                outstanding: count,
-            });
-            pending.extend((1..=count).map(|trial| ScheduledComparison {
-                task_index,
-                profile_index,
-                task: task.clone(),
-                trial,
-                profile,
-                infrastructure_replacement_for: None,
-                memory_attempt: 1,
-                minimum_guest_memory_mb: None,
-                memory_retry_for: None,
-                queued_at: Utc::now(),
-            }));
-        }
-    }
-    (replacements, pending)
-}
-
-impl InfrastructureReplacementState {
-    fn complete(&mut self, valid: bool) {
-        self.outstanding = self.outstanding.saturating_sub(1);
-        if valid {
-            self.valid = self.valid.saturating_add(1).min(self.target_valid);
-        }
-    }
-
-    fn next(
-        &mut self,
-        task_index: usize,
-        profile_index: usize,
-        infrastructure_replacement_for: usize,
-    ) -> Option<ScheduledComparison> {
-        if self.remaining == 0 || self.valid.saturating_add(self.outstanding) >= self.target_valid {
-            return None;
-        }
-        let trial = self.next_trial;
-        self.remaining -= 1;
-        self.outstanding = self.outstanding.saturating_add(1);
-        if let Some(next_trial) = trial.checked_add(1) {
-            self.next_trial = next_trial;
-        } else {
-            self.remaining = 0;
-        }
-        Some(ScheduledComparison {
-            task_index,
-            profile_index,
-            task: self.task.clone(),
-            trial,
-            profile: self.profile,
-            infrastructure_replacement_for: Some(infrastructure_replacement_for),
-            memory_attempt: 1,
-            minimum_guest_memory_mb: None,
-            memory_retry_for: None,
-            queued_at: Utc::now(),
-        })
-    }
-}
-
-impl ScheduledComparison {
-    fn memory_retry(&self, report: &DifferentialReport) -> Option<Self> {
-        let next_guest_memory_mb = report.next_guest_memory_mb()?;
-        Some(Self {
-            task_index: self.task_index,
-            profile_index: self.profile_index,
-            task: self.task.clone(),
-            trial: self.trial,
-            profile: self.profile,
-            infrastructure_replacement_for: self.infrastructure_replacement_for,
-            memory_attempt: self.memory_attempt.saturating_add(1),
-            minimum_guest_memory_mb: Some(next_guest_memory_mb),
-            memory_retry_for: Some(report.comparison_path().to_path_buf()),
-            queued_at: Utc::now(),
-        })
-    }
-}
-
-fn validate_differential_profiles(profiles: &[DifferentialProfile]) -> DifferentialResult<()> {
-    if profiles.is_empty() {
-        return Err(DifferentialError::new(diff_error!(
-            "differential matrix requires at least one profile"
-        )));
-    }
-    for (index, profile) in profiles.iter().enumerate() {
-        if profiles[..index].contains(profile) {
-            return Err(DifferentialError::new(diff_error!(
-                "differential matrix contains duplicate profile {}",
-                profile.name()
-            )));
-        }
-    }
-    Ok(())
-}
-
-async fn run_scheduled_comparison(
-    evaluator: DifferentialEvaluator,
-    scheduled: ScheduledComparison,
-    memory_plan: DifferentialMemoryPlan,
-    admission: AdmissionPermit,
-) -> (ScheduledComparison, DifferentialResult<DifferentialReport>) {
-    let result = evaluator
-        .run_admitted_task(scheduled.clone(), memory_plan, admission)
-        .await;
-    (scheduled, result)
-}
-
-fn task_lane_available(
-    active_tasks: &BTreeSet<usize>,
-    scheduled: &ScheduledComparison,
-    max_active_tasks: usize,
-) -> bool {
-    active_tasks.len() < max_active_tasks && !active_tasks.contains(&scheduled.task_index)
 }
 
 impl DifferentialComparison {
@@ -2647,7 +1372,6 @@ impl DifferentialComparison {
             nanocodex_build,
             schedule,
             memory_plan,
-            admission,
         } = self;
         let codex_path = codex_release.root.join("codex");
         let started_at = Utc::now();
@@ -2727,20 +1451,7 @@ impl DifferentialComparison {
         let projection = TrajectoryProjection::Codex {
             version: CodexVersion::Guest(Arc::clone(&guest_codex_version)),
         };
-        let nanocodex_release_memory_mb = releasable_differential_arm_memory_mb(
-            memory_plan.nanocodex_admission_memory_mb,
-            memory_plan.pair_admission_memory_mb(),
-            schedule.max_memory_mb,
-        );
-        let codex_release_memory_mb = releasable_differential_arm_memory_mb(
-            memory_plan.codex_admission_memory_mb,
-            memory_plan.pair_admission_memory_mb(),
-            schedule.max_memory_mb,
-        );
-        let (mut nanocodex_arm, mut codex_arm) = join_differential_arms(
-            admission,
-            nanocodex_release_memory_mb,
-            codex_release_memory_mb,
+        let (mut nanocodex_arm, mut codex_arm) = tokio::join!(
             run_arm(
                 task.clone(),
                 nanocodex_evaluator,
@@ -2755,8 +1466,7 @@ impl DifferentialComparison {
                 true,
                 progress.clone(),
             ),
-        )
-        .await;
+        );
         nanocodex_arm.memory = nanocodex_memory
             .get()
             .map(|memory| ArmMemoryReport::from(memory.snapshot()));
@@ -2928,28 +1638,6 @@ impl DifferentialEvaluatorBuilder {
         self
     }
 
-    /// Sets the active task-lane limit and arm capacity in matched-pair equivalents.
-    ///
-    /// At most this many distinct tasks may have a comparison in flight. A pair
-    /// initially occupies two arm slots; each completed arm returns one slot and
-    /// its measured-memory charge. The default is one task lane and one pair
-    /// equivalent. [`Self::prepare`] rejects zero.
-    #[must_use]
-    pub const fn max_concurrency(mut self, max_concurrency: usize) -> Self {
-        self.max_concurrency = max_concurrency;
-        self
-    }
-
-    /// Bounds the sum of learned host-RSS estimates across live arms. Both arms
-    /// are charged when a pair starts; each charge and active-arm slot is
-    /// released after that arm's evaluator and VM cleanup finish. A pair that
-    /// exceeds the target runs alone.
-    #[must_use]
-    pub const fn max_memory_mb(mut self, max_memory_mb: u64) -> Self {
-        self.max_memory_mb = Some(max_memory_mb);
-        self
-    }
-
     /// Sets the low per-arm guest allocation used until a task has measured
     /// memory history. The allocation is always capped by the task declaration.
     #[must_use]
@@ -2958,25 +1646,10 @@ impl DifferentialEvaluatorBuilder {
         self
     }
 
-    /// Selects the durable task-memory profile shared by future sweeps.
+    /// Selects the durable task-memory profile shared by future coordinates.
     #[must_use]
     pub fn memory_profile_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.memory_profile_path = Some(path.into());
-        self
-    }
-
-    /// Replaces retained pairs that are invalid for comparison.
-    ///
-    /// Infrastructure failures and operationally invalid comparisons consume
-    /// the same bounded per-task budget. Replacement pairs use fresh trial
-    /// coordinates after the requested trials and remain linked to the retained
-    /// invalid evidence. The default is zero.
-    #[must_use]
-    pub const fn max_infrastructure_replacements(
-        mut self,
-        max_infrastructure_replacements: usize,
-    ) -> Self {
-        self.max_infrastructure_replacements = max_infrastructure_replacements;
         self
     }
 
@@ -2989,16 +1662,6 @@ impl DifferentialEvaluatorBuilder {
     pub async fn prepare(
         self,
     ) -> std::result::Result<DifferentialEvaluator, DifferentialBuildError> {
-        let Some(max_active_arms) = self.max_concurrency.checked_mul(DIFFERENTIAL_ARMS_PER_PAIR)
-        else {
-            return Err(DifferentialBuildError::InvalidConcurrency);
-        };
-        if max_active_arms == 0 {
-            return Err(DifferentialBuildError::InvalidConcurrency);
-        }
-        if self.max_memory_mb == Some(0) {
-            return Err(DifferentialBuildError::InvalidMemory);
-        }
         if self.initial_guest_memory_mb == 0 {
             return Err(DifferentialBuildError::InvalidInitialGuestMemory);
         }
@@ -3055,144 +1718,9 @@ impl DifferentialEvaluatorBuilder {
                 nanocodex_tool_mode: self.nanocodex_tool_mode,
                 codex_tool_mode: self.codex_tool_mode,
                 nanocodex_build,
-                admission: Arc::new(AdmissionController::new(
-                    max_active_arms,
-                    self.max_memory_mb,
-                )),
-                max_concurrency: self.max_concurrency,
-                max_memory_mb: self.max_memory_mb,
-                max_infrastructure_replacements: self.max_infrastructure_replacements,
                 memory: Mutex::new(memory),
             }),
         })
-    }
-}
-
-impl DifferentialSweepResults {
-    /// Returns reports produced by this process after resume filtering.
-    #[must_use]
-    pub fn reports(&self) -> &[DifferentialReport] {
-        &self.reports
-    }
-
-    /// Returns the complete durable index, including resumed reports.
-    #[must_use]
-    pub fn summaries(&self) -> &[DifferentialReportSummary] {
-        &self.summaries
-    }
-
-    /// Returns the number of already-valid requested coordinates not rerun.
-    #[must_use]
-    pub const fn skipped(&self) -> usize {
-        self.skipped
-    }
-}
-
-impl DifferentialReportSummary {
-    fn from_report(report: &DifferentialReport) -> Self {
-        Self {
-            task_name: report.task.name.clone(),
-            task_root: report.task.root.clone(),
-            task_content_digest: report.task.content_digest.clone(),
-            trial: report.trial,
-            thinking: report.thinking.clone(),
-            nanocodex_tool_mode: report.policy.nanocodex_tool_mode,
-            codex_tool_mode: report.policy.codex_tool_mode,
-            classification: report.classification,
-            infrastructure_failure: report.has_infrastructure_failure(),
-            operational_error: report.has_operational_error(),
-            oom_detected: report.oom_detected(),
-            memory_attempt: report.memory_attempt(),
-            configured_guest_memory_mb: report.configured_guest_memory_mb(),
-            declared_guest_memory_mb: report.declared_arm_memory_mb(),
-            infrastructure_replacement_for: report.schedule.infrastructure_replacement_for,
-            comparison_path: report.artifacts.comparison.clone(),
-        }
-    }
-
-    fn matches(&self, task: &Task, profile: DifferentialProfile) -> bool {
-        self.task_root == task.root()
-            && self.task_name == task.name()
-            && self.task_content_digest == task.content_digest()
-            && self.thinking == profile.thinking.as_str()
-            && self.nanocodex_tool_mode == profile.nanocodex_tool_mode
-            && self.codex_tool_mode == profile.codex_tool_mode
-    }
-
-    const fn is_valid(&self) -> bool {
-        !self.infrastructure_failure && !self.operational_error
-    }
-
-    /// Returns the retained task name.
-    #[must_use]
-    pub fn task_name(&self) -> &str {
-        &self.task_name
-    }
-
-    /// Returns the shared reasoning effort.
-    #[must_use]
-    pub fn thinking(&self) -> &str {
-        &self.thinking
-    }
-
-    /// Returns Nanocodex's tool-exposure treatment.
-    #[must_use]
-    pub const fn nanocodex_tool_mode(&self) -> NanocodexToolMode {
-        self.nanocodex_tool_mode
-    }
-
-    /// Returns stock Codex's tool-exposure treatment.
-    #[must_use]
-    pub const fn codex_tool_mode(&self) -> CodexToolMode {
-        self.codex_tool_mode
-    }
-
-    /// Returns the one-indexed retained trial coordinate.
-    #[must_use]
-    pub const fn trial(&self) -> usize {
-        self.trial
-    }
-
-    /// Returns the verifier relationship retained for the pair.
-    #[must_use]
-    pub const fn classification(&self) -> DifferentialClassification {
-        self.classification
-    }
-
-    /// Returns whether this attempt was unscored infrastructure evidence.
-    #[must_use]
-    pub const fn has_infrastructure_failure(&self) -> bool {
-        self.infrastructure_failure
-    }
-
-    /// Returns whether this attempt retained an operational error.
-    #[must_use]
-    pub const fn has_operational_error(&self) -> bool {
-        self.operational_error
-    }
-
-    /// Returns whether this attempt retained confirmed OOM evidence.
-    #[must_use]
-    pub const fn oom_detected(&self) -> bool {
-        self.oom_detected
-    }
-
-    /// Returns the per-arm guest allocation used for this attempt.
-    #[must_use]
-    pub const fn configured_guest_memory_mb(&self) -> u64 {
-        self.configured_guest_memory_mb
-    }
-
-    /// Returns the one-indexed memory attempt for this logical trial.
-    #[must_use]
-    pub const fn memory_attempt(&self) -> usize {
-        self.memory_attempt
-    }
-
-    /// Returns the durable comparison record path.
-    #[must_use]
-    pub fn comparison_path(&self) -> &Path {
-        &self.comparison_path
     }
 }
 
@@ -3289,16 +1817,6 @@ impl DifferentialReport {
 
     const fn declared_arm_memory_mb(&self) -> u64 {
         self.schedule.declared_pair_memory_mb / 2
-    }
-
-    fn next_guest_memory_mb(&self) -> Option<u64> {
-        if !self.oom_detected() {
-            return None;
-        }
-        next_guest_memory_after_oom(
-            self.configured_guest_memory_mb(),
-            self.declared_arm_memory_mb(),
-        )
     }
 
     fn is_memory_calibration_success(&self) -> bool {

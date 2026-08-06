@@ -100,10 +100,7 @@ process state cannot leak between profile repetitions.
 ## CLI
 
 ```sh
-# Materialize the complete closed profile in ~/.nanocodex/evals/state.sqlite3.
-nanocodex eval init local-smoke
-
-# Inspect exact family and repetition counts.
+# Materialize the complete closed profile and inspect exact counts.
 nanocodex eval status local-smoke --json
 
 # Execute one SQLite-assigned repetition from an exact profile task.
@@ -123,7 +120,7 @@ needed model, thinking, or tool-mode selectors.
 
 Compiled examples retain only the per-coordinate boundaries:
 
-- `eval-task`: one VM attempt, independent events, and Harbor projection.
+- `eval-task`: one VM attempt and its independent event stream.
 - `eval-differential`: one matched Nanocodex-versus-Codex pair.
 
 Set `NANOCODEX_BIN` and `NANOCODEX_VM_RUNTIME` when the default development

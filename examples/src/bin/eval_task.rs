@@ -1,7 +1,7 @@
 use std::{env, path::PathBuf};
 
 use nanocodex::{Nanocodex, OpenAi};
-use nanocodex_eval::{EvalEventKind, Evaluator, Task, harbor::Harbor};
+use nanocodex_eval::{EvalEventKind, Evaluator, Task};
 use nanocodex_examples::eval_support as support;
 
 #[tokio::main]
@@ -18,7 +18,6 @@ async fn main() -> Result<(), support::AnyError> {
 
     let run = evaluator.task(task);
     let mut events = run.events().subscribe();
-    let recorder = Harbor::new(&evaluator)?.record(run.events().subscribe())?;
     let observer = tokio::spawn(async move {
         while let Some(event) = events.recv().await? {
             if let EvalEventKind::Agent(agent) = &event.kind {
@@ -29,9 +28,8 @@ async fn main() -> Result<(), support::AnyError> {
     });
 
     let outcome = run.await?;
-    let job = recorder.finish(vec![outcome.clone()]).await?;
     observer.await??;
     println!("{}: {:?}", outcome.trial_name(), outcome.outcome());
-    println!("artifacts: {}", job.directory().display());
+    println!("artifacts: {}", evaluator.directory().display());
     Ok(())
 }

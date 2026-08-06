@@ -5,7 +5,7 @@ use nanocodex_oai_api::pricing::EstimatedUsdCost;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{AgentId, Task};
+use crate::Task;
 
 /// Execution environment used for one evaluation attempt.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -292,94 +292,6 @@ pub struct EvalResult {
     pub(crate) task: Task,
 }
 
-/// Results from an advanced task-by-agent-by-trial sweep.
-#[derive(Clone, Debug, Serialize)]
-pub struct SweepResults {
-    attempts: Vec<SweepAttemptResult>,
-    skipped: usize,
-}
-
-/// One self-identifying result in a [`SweepResults`] collection.
-#[derive(Clone, Debug, Serialize)]
-pub struct SweepAttemptResult {
-    agent: AgentId,
-    trial: u16,
-    outcome: EvalAttemptOutcome,
-}
-
-impl SweepResults {
-    pub(crate) const fn new(attempts: Vec<SweepAttemptResult>, skipped: usize) -> Self {
-        Self { attempts, skipped }
-    }
-
-    /// Returns attempts in stable task × agent × trial order.
-    #[must_use]
-    pub fn attempts(&self) -> &[SweepAttemptResult] {
-        &self.attempts
-    }
-
-    /// Returns the number of already-completed attempts skipped while resuming.
-    #[must_use]
-    pub const fn skipped(&self) -> usize {
-        self.skipped
-    }
-
-    /// Consumes the sweep and discards its coordinate wrappers.
-    #[must_use]
-    pub fn into_outcomes(self) -> Vec<EvalAttemptOutcome> {
-        self.attempts
-            .into_iter()
-            .map(|attempt| attempt.outcome)
-            .collect()
-    }
-}
-
-impl SweepAttemptResult {
-    pub(crate) const fn new(agent: AgentId, trial: u16, outcome: EvalAttemptOutcome) -> Self {
-        Self {
-            agent,
-            trial,
-            outcome,
-        }
-    }
-
-    /// Returns the task name for this coordinate.
-    #[must_use]
-    pub fn task_name(&self) -> &str {
-        self.outcome.task_name()
-    }
-
-    /// Returns the caller-defined agent recipe identity.
-    #[must_use]
-    pub const fn agent(&self) -> &AgentId {
-        &self.agent
-    }
-
-    /// Returns the one-based trial number.
-    #[must_use]
-    pub const fn trial(&self) -> u16 {
-        self.trial
-    }
-
-    /// Returns the complete typed terminal attempt output.
-    #[must_use]
-    pub const fn outcome(&self) -> &EvalAttemptOutcome {
-        &self.outcome
-    }
-
-    /// Returns the scored verifier result, when one exists.
-    #[must_use]
-    pub const fn result(&self) -> Option<&EvalResult> {
-        self.outcome.scored()
-    }
-
-    /// Returns the unscored terminal failure, when one exists.
-    #[must_use]
-    pub const fn failure(&self) -> Option<&EvalFailure> {
-        self.outcome.unscored()
-    }
-}
-
 impl EvalAttemptOutcome {
     /// Returns the stable semantic outcome.
     #[must_use]
@@ -488,24 +400,6 @@ impl EvalFailure {
     #[must_use]
     pub const fn occurred_at(&self) -> DateTime<Utc> {
         self.exception.occurred_at
-    }
-}
-
-impl EvalExceptionKind {
-    /// Harbor's exception class for this terminal failure.
-    #[must_use]
-    pub const fn harbor_exception_type(self) -> &'static str {
-        match self {
-            Self::AgentSafetyRefusal => "AgentSafetyRefusalError",
-            Self::AgentAuthentication => "AgentAuthenticationError",
-            Self::AgentTimeout => "AgentTimeoutError",
-            Self::VerifierTimeout => "VerifierTimeoutError",
-            Self::Agent => "AgentError",
-            Self::Verifier => "VerifierError",
-            Self::Cleanup => "CleanupError",
-            Self::Environment => "EnvironmentError",
-            Self::Internal => "NanocodexEvalError",
-        }
     }
 }
 
@@ -687,7 +581,7 @@ pub struct EvalTiming {
     pub started_at: DateTime<Utc>,
     /// Time at which the terminal result became durable.
     pub finished_at: DateTime<Utc>,
-    /// Interval spent waiting for scheduler admission.
+    /// Interval between invocation and attempt setup.
     pub queue_wait: PhaseTiming,
     /// Disposable environment preparation interval.
     pub environment_setup: PhaseTiming,
@@ -704,7 +598,7 @@ pub struct EvalTiming {
 /// Completed attempt phases retained for an unscored terminal failure.
 #[derive(Clone, Debug, Serialize)]
 pub struct EvalFailureTiming {
-    /// Time waiting for scheduler admission, from queued to admitted.
+    /// Time between invocation and attempt setup.
     pub queue_wait: PhaseTiming,
     /// Disposable environment preparation interval, when it completed.
     pub environment_setup: Option<PhaseTiming>,

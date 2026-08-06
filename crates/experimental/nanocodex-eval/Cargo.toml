@@ -11,7 +11,7 @@ repository.workspace = true
 readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
-description = "Typed, durable evaluation and Harbor artifacts for Nanocodex agents"
+description = "VM-isolated profile coordinates for Nanocodex agents"
 
 [dependencies]
 axum = { workspace = true, features = ["ws"] }
@@ -22,7 +22,6 @@ filetime.workspace = true
 futures-util.workspace = true
 fs2.workspace = true
 hex.workspace = true
-ignore.workspace = true
 jiff.workspace = true
 nanocodex-agent.workspace = true
 nanocodex-oai-api.workspace = true
@@ -39,20 +38,10 @@ tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "proce
 tokio-tungstenite.workspace = true
 toml.workspace = true
 tracing.workspace = true
-url.workspace = true
 uuid.workspace = true
 
 [target.'cfg(any(all(target_os = "linux", not(target_env = "musl")), all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
 nanocodex-vm.workspace = true
-
-[dev-dependencies]
-async-trait.workspace = true
-criterion.workspace = true
-tracing-subscriber.workspace = true
-
-[[bench]]
-name = "eval_runtime"
-harness = false
 
 [lints]
 workspace = true

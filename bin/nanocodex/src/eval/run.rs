@@ -1,37 +1,11 @@
-use std::{
-    fs,
-    io::{self, Write as _},
-    path::{Path, PathBuf},
-};
+use std::{fs, io, io::Write as _, path::Path};
 
 use eyre::{Result, eyre};
 use serde::Serialize;
 
 mod runtime;
 
-pub(crate) use runtime::{prepare_vm_guest_runtime, prepare_vm_guest_runtime_from};
-
-pub(crate) fn load_task_paths(
-    mut paths: Vec<PathBuf>,
-    suites: Vec<PathBuf>,
-) -> Result<Vec<PathBuf>> {
-    for suite in suites {
-        let mut suite_tasks = fs::read_dir(&suite)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir() && path.join("task.toml").is_file())
-            .collect::<Vec<_>>();
-        suite_tasks.sort();
-        if suite_tasks.is_empty() {
-            return Err(eyre!(
-                "suite contains no immediate task directories: {}",
-                suite.display()
-            ));
-        }
-        paths.extend(suite_tasks);
-    }
-    Ok(paths)
-}
+pub(crate) use runtime::prepare_vm_guest_runtime_from;
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path

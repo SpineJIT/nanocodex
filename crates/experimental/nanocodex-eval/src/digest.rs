@@ -9,7 +9,6 @@ use sha2::{Digest, Sha256};
 
 const PACKAGE_FILES: [&str; 3] = ["task.toml", "instruction.md", "README.md"];
 const PACKAGE_DIRECTORIES: [&str; 4] = ["environment", "tests", "solution", "steps"];
-pub(crate) const PACKAGE_DIGEST_SCHEMA: &str = "nanocodex-task-package-v1";
 const PACKAGE_DIGEST_DOMAIN: &[u8] = b"nanocodex-task-package-v1\0";
 
 #[derive(Debug, Eq, PartialEq)]

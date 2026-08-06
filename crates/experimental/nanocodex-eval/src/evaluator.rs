@@ -1,11 +1,9 @@
 use std::{
-    collections::VecDeque,
     error::Error,
-    ffi::OsString,
     fmt, fs,
     future::Future,
     io,
-    num::{NonZeroUsize, ParseFloatError},
+    num::ParseFloatError,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -17,7 +15,6 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use futures_util::{StreamExt, stream::FuturesUnordered};
 use nanocodex_agent::{
     Nanocodex, NanocodexBuilder, NanocodexError,
     events::{
@@ -30,19 +27,16 @@ use nanocodex_agent::{
 };
 use nanocodex_oai_api::{MODEL, pricing::CostStatus, responses::Usage};
 use serde::Deserialize;
-use tokio::{
-    sync::{Notify, broadcast},
-    time::timeout,
-};
+use tokio::{sync::broadcast, time::timeout};
 use tracing::{Instrument, Span, info, info_span};
 use uuid::Uuid;
 
 use crate::{
-    AgentId, AgentMetadata, AgentResult, AgentStatus, BillingCompleteness, CleanupPhase,
-    EvalArtifacts, EvalAttemptOutcome, EvalCleanup, EvalEnvironment, EvalEvent, EvalEventAttempt,
-    EvalEventKind, EvalEvents, EvalException, EvalExceptionKind, EvalFailure, EvalFailureTiming,
-    EvalOutcome, EvalResult, EvalStatus, EvalTiming, PhaseTiming, Sweep, SweepAttemptResult,
-    SweepResults, Task, TaskLoadError, UsageTotals, VerifierResult,
+    AgentMetadata, AgentResult, AgentStatus, BillingCompleteness, CleanupPhase, EvalArtifacts,
+    EvalAttemptOutcome, EvalCleanup, EvalEnvironment, EvalEvent, EvalEventAttempt, EvalEventKind,
+    EvalEvents, EvalException, EvalExceptionKind, EvalFailure, EvalFailureTiming, EvalOutcome,
+    EvalResult, EvalStatus, EvalTiming, PhaseTiming, Task, TaskLoadError, UsageTotals,
+    VerifierResult,
     codex::{CodexExec, CodexRunError},
     job::EvalJob,
     native::{NativeAttempt, VerifierExecution},
@@ -80,67 +74,16 @@ pub struct EvalRun<T> {
 pub struct EvaluatorBuilder {
     nanocodex: NanocodexBuilder,
     output_directory: PathBuf,
-    max_concurrency: usize,
-    max_memory_mb: Option<u64>,
     attempt_environment: EvalEnvironment,
     attempt_agent: Option<AttemptAgentFactory>,
-    finite_run: Option<FiniteRun>,
-    #[cfg(test)]
-    malformed_terminal_metrics: bool,
 }
 
 struct EvaluatorInner {
     nanocodex: NanocodexBuilder,
     job: EvalJob,
-    planned_attempts: Option<usize>,
-    admission: Arc<AdmissionController>,
-    max_concurrency: usize,
-    max_memory_mb: Option<u64>,
     attempt_environment: EvalEnvironment,
-    sweep: Option<Sweep>,
     next_prompt_cache_attempt: AtomicU64,
     attempt_agent: Option<AttemptAgentFactory>,
-    #[cfg(test)]
-    malformed_terminal_metrics: bool,
-}
-
-pub(crate) struct AdmissionController {
-    max_concurrency: usize,
-    max_memory_mb: Option<u64>,
-    state: Mutex<AdmissionState>,
-    changed: Notify,
-}
-
-#[derive(Default)]
-struct AdmissionState {
-    running: usize,
-    memory_mb: u64,
-    admitted: usize,
-    draining: bool,
-    generation: u64,
-}
-
-pub(crate) struct AdmissionPermit {
-    controller: Arc<AdmissionController>,
-    concurrency: usize,
-    memory_mb: u64,
-}
-
-pub(crate) enum AdmissionAttempt {
-    Acquired(AdmissionPermit),
-    Unavailable,
-    Draining,
-}
-
-struct FiniteRun {
-    sweep: Sweep,
-    mode: FiniteRunMode,
-}
-
-#[derive(Clone, Copy)]
-enum FiniteRunMode {
-    Fresh,
-    Resume,
 }
 
 type AttemptError = Box<dyn Error + Send + Sync + 'static>;
@@ -257,21 +200,11 @@ pub(crate) struct AttemptVerification {
 struct AttemptInput {
     task: Task,
     nanocodex: NanocodexBuilder,
-    coordinate: Option<SweepCoordinate>,
     queued_at: DateTime<Utc>,
     run: RunEmitter,
 }
 
-struct AttemptOutput {
-    outcome: EvalAttemptOutcome,
-    coordinate: Option<SweepCoordinate>,
-}
-
-#[derive(Clone)]
-struct SweepCoordinate {
-    agent: AgentId,
-    trial: u16,
-}
+type AttemptOutput = EvalAttemptOutcome;
 
 /// Immutable paths and task metadata available while configuring one attempt.
 #[derive(Clone, Copy)]
@@ -284,26 +217,6 @@ pub(crate) struct EvalAttempt<'a> {
 /// Failure to configure, execute, verify, or durably retain an attempt.
 #[derive(Debug, thiserror::Error)]
 pub enum EvalError {
-    /// Configured concurrency was zero.
-    #[error("maximum concurrency must be greater than zero")]
-    InvalidConcurrency,
-
-    /// Configured aggregate memory was zero.
-    #[error("maximum task memory must be greater than zero")]
-    InvalidMemory,
-
-    /// A batch invocation did not contain any tasks.
-    #[error("evaluation requires at least one task")]
-    NoTasks,
-
-    /// Sweep execution was requested from an evaluator not bound to a sweep.
-    #[error("evaluator is not bound to a finite sweep")]
-    MissingSweep,
-
-    /// The evaluator stopped admitting new attempts while draining.
-    #[error("evaluation is draining and no longer admits new attempts")]
-    Draining,
-
     /// A task requires behavior unavailable in the native backend.
     #[error("task {task} cannot run with the native backend: {reason}")]
     UnsupportedNativeTask {
@@ -370,29 +283,9 @@ pub enum EvalError {
     #[error("failed to encode or decode JSON: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// An existing job is bound to a different sweep manifest.
-    #[error("evaluation job is already bound to a different run: {0}")]
-    RunConflict(PathBuf),
-
-    /// A retained terminal result did not belong to its finite run.
-    #[error("invalid durable evaluation trial: {0}")]
-    InvalidDurableTrial(String),
-
-    /// Another process still owns the matching resumable job.
-    #[error("matching incomplete evaluation job is already active: {0}")]
-    RunActive(PathBuf),
-
     /// A verifier emitted an invalid numeric reward.
     #[error("invalid verifier reward: {0}")]
     ParseReward(#[from] ParseFloatError),
-
-    /// Internal sweep execution lost its stable coordinate.
-    #[error("sweep execution lost its task-agent-trial coordinates")]
-    MissingSweepCoordinate,
-
-    /// Batch scheduling completed without producing one admitted task result.
-    #[error("evaluation scheduler lost an admitted task result")]
-    MissingScheduledAttempt,
 }
 
 impl<T> EvalRun<T> {
@@ -428,13 +321,8 @@ impl Evaluator {
         EvaluatorBuilder {
             nanocodex: nanocodex.shared_prompt_cache(),
             output_directory: PathBuf::from(".nanocodex/evals"),
-            max_concurrency: 1,
-            max_memory_mb: None,
             attempt_environment: EvalEnvironment::Native,
             attempt_agent: None,
-            finite_run: None,
-            #[cfg(test)]
-            malformed_terminal_metrics: false,
         }
     }
 
@@ -452,151 +340,15 @@ impl Evaluator {
 
     async fn run_one(&self, task: Task, run: RunEmitter) -> Result<EvalAttemptOutcome, EvalError> {
         let queued_at = Utc::now();
-        let permit = self
-            .inner
-            .admission
-            .acquire(task.resources().memory_mb)
-            .await
-            .ok_or(EvalError::Draining);
-        let result = match permit {
-            Ok(_permit) => self
-                .run_task(AttemptInput {
-                    task,
-                    nanocodex: self.inner.nanocodex.clone(),
-                    coordinate: None,
-                    queued_at,
-                    run: run.clone(),
-                })
-                .await
-                .map(|output| output.outcome),
-            Err(error) => Err(error),
-        };
-        run.finish(&result, usize::from(result.is_ok()), 0);
-        result
-    }
-
-    /// Runs `count` fresh attempts of the same immutable task.
-    ///
-    /// Results preserve attempt order even when work completes out of order.
-    ///
-    /// # Errors
-    ///
-    /// Returns an operational error when the batch cannot be scheduled or
-    /// retained. Attempt failures remain in their original positions.
-    pub fn task_n(&self, task: Task, count: NonZeroUsize) -> EvalRun<Vec<EvalAttemptOutcome>> {
-        self.tasks(std::iter::repeat_n(task, count.get()).collect())
-    }
-
-    /// Runs one independent attempt for every task in `tasks`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an operational error when the batch cannot be scheduled or
-    /// retained. Attempt failures remain in their original positions.
-    pub fn tasks(&self, tasks: Vec<Task>) -> EvalRun<Vec<EvalAttemptOutcome>> {
-        let evaluator = self.clone();
-        self.start_run(move |run| async move { evaluator.run_many(tasks, run).await })
-    }
-
-    async fn run_many(
-        &self,
-        tasks: Vec<Task>,
-        run: RunEmitter,
-    ) -> Result<Vec<EvalAttemptOutcome>, EvalError> {
-        if tasks.is_empty() {
-            let result = Err(EvalError::NoTasks);
-            run.finish::<Vec<EvalAttemptOutcome>>(&result, 0, 0);
-            return result;
-        }
-        let inputs = tasks
-            .into_iter()
-            .map(|task| AttemptInput {
+        let result = self
+            .run_task(AttemptInput {
                 task,
                 nanocodex: self.inner.nanocodex.clone(),
-                coordinate: None,
-                queued_at: Utc::now(),
+                queued_at,
                 run: run.clone(),
             })
-            .collect();
-        let result = self.run_tasks(inputs).await.map(|outputs| {
-            outputs
-                .into_iter()
-                .map(|output| output.outcome)
-                .collect::<Vec<_>>()
-        });
-        let attempts = result.as_ref().map_or(0, Vec::len);
-        run.finish(&result, attempts, 0);
-        result
-    }
-
-    /// Runs an advanced finite task-by-agent-by-trial sweep.
-    ///
-    /// # Errors
-    ///
-    /// Returns an operational error when run binding or durable recovery fails.
-    /// Every accepted task × agent × trial coordinate is returned, including
-    /// unscored attempts.
-    pub fn sweep(&self) -> EvalRun<SweepResults> {
-        let evaluator = self.clone();
-        self.start_run(move |run| async move { evaluator.run_sweep(run).await })
-    }
-
-    async fn run_sweep(&self, run: RunEmitter) -> Result<SweepResults, EvalError> {
-        let Some(sweep) = self.inner.sweep.clone() else {
-            let result = Err(EvalError::MissingSweep);
-            run.finish::<SweepResults>(&result, 0, 0);
-            return result;
-        };
-        let manifest = sweep.manifest();
-        if let Err(error) = self.inner.job.bind_run(&manifest) {
-            let result = Err(error);
-            run.finish::<SweepResults>(&result, 0, 0);
-            return result;
-        }
-        let completed = match self.inner.job.completed_coordinates(&manifest) {
-            Ok(completed) => completed,
-            Err(error) => {
-                let result = Err(error);
-                run.finish::<SweepResults>(&result, 0, 0);
-                return result;
-            }
-        };
-        let mut skipped = 0;
-        let mut inputs = Vec::new();
-        for attempt in sweep.attempts() {
-            if completed.contains(&attempt.coordinate()) {
-                skipped += 1;
-                continue;
-            }
-            inputs.push(AttemptInput {
-                task: attempt.task().clone(),
-                nanocodex: attempt.nanocodex().clone(),
-                coordinate: Some(SweepCoordinate {
-                    agent: attempt.agent_id().clone(),
-                    trial: attempt.trial(),
-                }),
-                queued_at: Utc::now(),
-                run: run.clone(),
-            });
-        }
-        let result = self.run_tasks(inputs).await.and_then(|outputs| {
-            let attempts = outputs
-                .into_iter()
-                .map(|output| {
-                    let coordinate = output.coordinate.ok_or(EvalError::MissingSweepCoordinate)?;
-                    Ok(SweepAttemptResult::new(
-                        coordinate.agent,
-                        coordinate.trial,
-                        output.outcome,
-                    ))
-                })
-                .collect::<Result<Vec<_>, EvalError>>()?;
-            Ok(SweepResults::new(attempts, skipped))
-        });
-        let attempts = result
-            .as_ref()
-            .map_or(0, |results| results.attempts().len());
-        run.finish(&result, attempts, skipped);
+            .await;
+        run.finish(&result, usize::from(result.is_ok()), 0);
         result
     }
 
@@ -616,154 +368,16 @@ impl Evaluator {
         }
     }
 
-    /// Returns how many attempts in `sweep` do not yet have a durable terminal
-    /// result in this evaluator's job directory.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the job is bound to another sweep or its retained
-    /// artifacts cannot be inspected.
-    pub fn remaining_attempts(&self) -> Result<usize, EvalError> {
-        let sweep = self.inner.sweep.as_ref().ok_or(EvalError::MissingSweep)?;
-        let manifest = sweep.manifest();
-        self.inner.job.bind_run(&manifest)?;
-        let completed = self.inner.job.completed_coordinates(&manifest)?;
-        let mut remaining = 0;
-        for attempt in sweep.attempts() {
-            if !completed.contains(&attempt.coordinate()) {
-                remaining += 1;
-            }
-        }
-        Ok(remaining)
-    }
-
-    async fn run_tasks(&self, tasks: Vec<AttemptInput>) -> Result<Vec<AttemptOutput>, EvalError> {
-        let task_count = tasks.len();
-        let mut pending = tasks.into_iter().enumerate().collect::<VecDeque<_>>();
-        let mut in_flight = FuturesUnordered::new();
-        let mut results = std::iter::repeat_with(|| None)
-            .take(task_count)
-            .collect::<Vec<_>>();
-        let mut draining = false;
-
-        while !pending.is_empty() || !in_flight.is_empty() {
-            let capacity_generation = self.inner.admission.capacity_generation();
-            let mut pending_index = 0;
-            while pending_index < pending.len() {
-                let requested_memory_mb = pending
-                    .get(pending_index)
-                    .map(|(_, input)| input.task.resources().memory_mb)
-                    .ok_or(EvalError::MissingScheduledAttempt)?;
-                match self
-                    .inner
-                    .admission
-                    .try_acquire_many(1, requested_memory_mb)
-                {
-                    AdmissionAttempt::Acquired(permit) => {
-                        let (index, input) = pending
-                            .remove(pending_index)
-                            .ok_or(EvalError::MissingScheduledAttempt)?;
-                        let evaluator = self.clone();
-                        in_flight.push(async move {
-                            let result = evaluator.run_task(input).await;
-                            drop(permit);
-                            (index, result)
-                        });
-                    }
-                    AdmissionAttempt::Unavailable => pending_index += 1,
-                    AdmissionAttempt::Draining => {
-                        draining = true;
-                        break;
-                    }
-                }
-            }
-            if draining {
-                pending.clear();
-            }
-
-            if in_flight.is_empty() {
-                if draining || pending.is_empty() {
-                    break;
-                }
-                self.inner
-                    .admission
-                    .wait_for_change(capacity_generation)
-                    .await;
-                continue;
-            }
-
-            tokio::select! {
-                Some((index, result)) = in_flight.next() => {
-                    results[index] = Some(result?);
-                }
-                () = self.inner.admission.wait_for_change(capacity_generation), if !pending.is_empty() && !draining => {}
-            }
-        }
-        if draining {
-            return Err(EvalError::Draining);
-        }
-        results
-            .into_iter()
-            .map(|result| result.ok_or(EvalError::MissingScheduledAttempt))
-            .collect()
-    }
-
     /// Returns the stable identifier shared by this evaluator's attempts.
     #[must_use]
     pub fn id(&self) -> Uuid {
         self.inner.job.id()
     }
 
-    /// Returns when this evaluator was built.
-    #[must_use]
-    pub fn started_at(&self) -> DateTime<Utc> {
-        self.inner.job.started_at()
-    }
-
     /// Returns the directory containing this evaluator's attempt artifacts.
     #[must_use]
     pub fn directory(&self) -> &std::path::Path {
         self.inner.job.directory()
-    }
-
-    /// Returns the parent directory containing evaluation jobs.
-    #[must_use]
-    pub fn parent_directory(&self) -> &std::path::Path {
-        self.inner.job.parent_directory()
-    }
-
-    /// Returns whether this evaluator reopened an incomplete matching job.
-    #[must_use]
-    pub fn resumed(&self) -> bool {
-        self.inner.job.resumed()
-    }
-
-    /// Returns the finite attempt count fixed by `resume_incomplete`, when set.
-    #[must_use]
-    pub fn planned_attempts(&self) -> Option<usize> {
-        self.inner.planned_attempts
-    }
-
-    /// Returns the maximum number of concurrently executing attempts.
-    #[must_use]
-    pub fn max_concurrency(&self) -> usize {
-        self.inner.max_concurrency
-    }
-
-    /// Returns the optional ceiling on concurrently admitted task-declared
-    /// memory.
-    #[must_use]
-    pub fn max_memory_mb(&self) -> Option<u64> {
-        self.inner.max_memory_mb
-    }
-
-    /// Stops admission of attempts that have not started and returns the number
-    /// admitted since this evaluator was built.
-    ///
-    /// Attempts that already hold admission continue normally. Repeated calls
-    /// are idempotent and return the same final admitted count.
-    pub fn begin_drain(&self) -> usize {
-        self.inner.admission.begin_drain()
     }
 
     /// Returns the execution environment selected for every attempt.
@@ -776,7 +390,6 @@ impl Evaluator {
         let AttemptInput {
             task,
             nanocodex,
-            coordinate,
             queued_at,
             run,
         } = input;
@@ -787,7 +400,7 @@ impl Evaluator {
             .next_prompt_cache_attempt
             .fetch_add(1, Ordering::Relaxed)
             / PROMPT_CACHE_COHORT_SIZE;
-        let trial_name = trial_name(&task, attempt_id, coordinate.as_ref());
+        let trial_name = trial_name(&task, attempt_id);
         let admitted_at = Utc::now();
         let queue_wait = PhaseTiming {
             started_at: queued_at,
@@ -796,14 +409,7 @@ impl Evaluator {
         let started_at = queued_at;
         let mut emitter =
             AttemptEmitter::new(run, session_id, prompt_cache_cohort, &task, &trial_name);
-        let span = attempt_span(
-            self,
-            &task,
-            attempt_id,
-            &trial_name,
-            prompt_cache_cohort,
-            coordinate.as_ref(),
-        );
+        let span = attempt_span(self, &task, attempt_id, &trial_name, prompt_cache_cohort);
         record_content(&span, "task.prompt", task.prompt());
         let trace_started = Instant::now();
         let result = self
@@ -828,10 +434,7 @@ impl Evaluator {
                 EvalAttemptOutcome::Unscored(failure)
             }
         };
-        Ok(AttemptOutput {
-            outcome,
-            coordinate,
-        })
+        Ok(outcome)
     }
 
     async fn run_task_inner(
@@ -1156,19 +759,6 @@ impl Evaluator {
             .await;
             match event_result {
                 Ok(Ok(terminal)) => {
-                    #[cfg(test)]
-                    let terminal = {
-                        let mut terminal = terminal;
-                        if self.inner.malformed_terminal_metrics {
-                            terminal.payload = Arc::from(
-                                serde_json::value::to_raw_value(
-                                    &serde_json::json!({"malformed": true}),
-                                )
-                                .map_err(EvalError::Json)?,
-                            );
-                        }
-                        terminal
-                    };
                     let (primary, final_message) = match turn.result().await {
                         Ok(result) => (None, result.into_final_message()),
                         Err(error) => (
@@ -2216,12 +1806,6 @@ enum PreparedAgent {
 }
 
 impl EvaluatorBuilder {
-    #[cfg(test)]
-    const fn with_malformed_terminal_metrics(mut self) -> Self {
-        self.malformed_terminal_metrics = true;
-        self
-    }
-
     /// Sets the parent under which this evaluator creates one UUID-named
     /// artifact directory.
     #[must_use]
@@ -2230,47 +1814,7 @@ impl EvaluatorBuilder {
         self
     }
 
-    /// Reopens the newest incomplete job whose durable run manifest matches
-    /// `sweep`, or creates a new job when none exists.
-    #[must_use]
-    pub fn resume_incomplete(mut self, sweep: Sweep) -> Self {
-        self.finite_run = Some(FiniteRun {
-            sweep,
-            mode: FiniteRunMode::Resume,
-        });
-        self
-    }
-
-    /// Creates a new job already bound to `sweep`, even when a matching
-    /// incomplete job exists.
-    #[must_use]
-    pub fn fresh_run(mut self, sweep: Sweep) -> Self {
-        self.finite_run = Some(FiniteRun {
-            sweep,
-            mode: FiniteRunMode::Fresh,
-        });
-        self
-    }
-
-    /// Sets the maximum number of attempts allowed to execute concurrently.
-    ///
-    /// The default is one. [`Self::build`] rejects zero.
-    #[must_use]
-    pub const fn max_concurrency(mut self, max_concurrency: usize) -> Self {
-        self.max_concurrency = max_concurrency;
-        self
-    }
-
-    /// Bounds the sum of task-declared memory for concurrently running
-    /// attempts. A task whose own declaration exceeds the ceiling runs alone.
-    #[must_use]
-    pub const fn max_memory_mb(mut self, max_memory_mb: u64) -> Self {
-        self.max_memory_mb = Some(max_memory_mb);
-        self
-    }
-
-    /// Records the execution environment used by the configured attempt
-    /// backend in results and durable Harbor artifacts.
+    /// Records the execution environment used by the configured attempt.
     #[must_use]
     pub(crate) const fn attempt_environment(mut self, environment: EvalEnvironment) -> Self {
         self.attempt_environment = environment;
@@ -2301,200 +1845,18 @@ impl EvaluatorBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid concurrency or an unavailable output path.
+    /// Returns an error when the output path is unavailable.
     pub fn build(self) -> Result<Evaluator, EvalError> {
-        if self.max_concurrency == 0 {
-            return Err(EvalError::InvalidConcurrency);
-        }
-        if self.max_memory_mb == Some(0) {
-            return Err(EvalError::InvalidMemory);
-        }
-        if let Some(run) = &self.finite_run {
-            let manifest = run.sweep.manifest();
-            let output = prospective_canonical_directory(&self.output_directory)?;
-            for task in manifest.task_roots() {
-                reject_output_overlap(&output, task)?;
-            }
-        }
-        let planned_attempts = self
-            .finite_run
-            .as_ref()
-            .map(|run| run.sweep.attempt_count());
-        let job = match &self.finite_run {
-            Some(run) => {
-                let manifest = run.sweep.manifest();
-                let job = match run.mode {
-                    FiniteRunMode::Fresh => EvalJob::create(&self.output_directory)?,
-                    FiniteRunMode::Resume => {
-                        EvalJob::resume_or_create(&self.output_directory, &manifest)?
-                    }
-                };
-                job.bind_run(&manifest)?;
-                job
-            }
-            None => EvalJob::create(&self.output_directory)?,
-        };
+        let job = EvalJob::create(&self.output_directory)?;
         Ok(Evaluator {
             inner: Arc::new(EvaluatorInner {
                 nanocodex: self.nanocodex,
                 job,
-                planned_attempts,
-                admission: Arc::new(AdmissionController::new(
-                    self.max_concurrency,
-                    self.max_memory_mb,
-                )),
-                max_concurrency: self.max_concurrency,
-                max_memory_mb: self.max_memory_mb,
                 attempt_environment: self.attempt_environment,
-                sweep: self.finite_run.as_ref().map(|run| run.sweep.clone()),
                 next_prompt_cache_attempt: AtomicU64::new(0),
                 attempt_agent: self.attempt_agent,
-                #[cfg(test)]
-                malformed_terminal_metrics: self.malformed_terminal_metrics,
             }),
         })
-    }
-}
-
-impl AdmissionController {
-    pub(crate) fn new(max_concurrency: usize, max_memory_mb: Option<u64>) -> Self {
-        Self {
-            max_concurrency,
-            max_memory_mb,
-            state: Mutex::new(AdmissionState::default()),
-            changed: Notify::new(),
-        }
-    }
-
-    pub(crate) async fn acquire(
-        self: &Arc<Self>,
-        requested_memory_mb: u64,
-    ) -> Option<AdmissionPermit> {
-        self.acquire_many(1, requested_memory_mb).await
-    }
-
-    pub(crate) async fn acquire_many(
-        self: &Arc<Self>,
-        requested_concurrency: usize,
-        requested_memory_mb: u64,
-    ) -> Option<AdmissionPermit> {
-        loop {
-            let generation = self.capacity_generation();
-            match self.try_acquire_many(requested_concurrency, requested_memory_mb) {
-                AdmissionAttempt::Acquired(permit) => return Some(permit),
-                AdmissionAttempt::Draining => return None,
-                AdmissionAttempt::Unavailable => self.wait_for_change(generation).await,
-            }
-        }
-    }
-
-    pub(crate) fn try_acquire_many(
-        self: &Arc<Self>,
-        requested_concurrency: usize,
-        requested_memory_mb: u64,
-    ) -> AdmissionAttempt {
-        let concurrency = requested_concurrency.clamp(1, self.max_concurrency);
-        let memory_mb = self
-            .max_memory_mb
-            .map_or(0, |limit| requested_memory_mb.min(limit));
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.draining {
-            return AdmissionAttempt::Draining;
-        }
-        let concurrency_available = state
-            .running
-            .checked_add(concurrency)
-            .is_some_and(|running| running <= self.max_concurrency);
-        let memory_available = self.max_memory_mb.is_none_or(|limit| {
-            state
-                .memory_mb
-                .checked_add(memory_mb)
-                .is_some_and(|total| total <= limit)
-        });
-        if !concurrency_available || !memory_available {
-            return AdmissionAttempt::Unavailable;
-        }
-        state.running += concurrency;
-        state.memory_mb += memory_mb;
-        state.admitted = state.admitted.saturating_add(1);
-        AdmissionAttempt::Acquired(AdmissionPermit {
-            controller: Arc::clone(self),
-            concurrency,
-            memory_mb,
-        })
-    }
-
-    pub(crate) fn capacity_generation(&self) -> u64 {
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .generation
-    }
-
-    pub(crate) async fn wait_for_change(&self, observed_generation: u64) {
-        let notified = self.changed.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if self.capacity_generation() == observed_generation {
-            notified.await;
-        }
-    }
-
-    pub(crate) fn is_draining(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .draining
-    }
-
-    pub(crate) fn begin_drain(&self) -> usize {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.draining = true;
-        state.generation = state.generation.saturating_add(1);
-        let admitted = state.admitted;
-        drop(state);
-        self.changed.notify_waiters();
-        admitted
-    }
-}
-
-impl Drop for AdmissionPermit {
-    fn drop(&mut self) {
-        let mut state = self
-            .controller
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        state.running = state.running.saturating_sub(self.concurrency);
-        state.memory_mb = state.memory_mb.saturating_sub(self.memory_mb);
-        state.generation = state.generation.saturating_add(1);
-        drop(state);
-        self.controller.changed.notify_waiters();
-    }
-}
-
-impl AdmissionPermit {
-    /// Releases part of a running admission after one independently owned
-    /// execution unit has completed.
-    pub(crate) fn release(&mut self, concurrency: usize, memory_mb: u64) -> (usize, u64) {
-        let released_concurrency = self.concurrency.min(concurrency);
-        let released_memory_mb = self.memory_mb.min(memory_mb);
-        if released_concurrency == 0 && released_memory_mb == 0 {
-            return (0, 0);
-        }
-        self.concurrency -= released_concurrency;
-        self.memory_mb -= released_memory_mb;
-        let mut state = self
-            .controller
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        state.running = state.running.saturating_sub(released_concurrency);
-        state.memory_mb = state.memory_mb.saturating_sub(released_memory_mb);
-        state.generation = state.generation.saturating_add(1);
-        drop(state);
-        self.controller.changed.notify_waiters();
-        (released_concurrency, released_memory_mb)
     }
 }
 
@@ -2834,18 +2196,7 @@ fn failure_kind(error: &EvalError) -> EvalExceptionKind {
         | EvalError::TaskPackage(_)
         | EvalError::OutputOverlapsTask { .. }
         | EvalError::AttemptAgent(_) => EvalExceptionKind::Environment,
-        EvalError::InvalidConcurrency
-        | EvalError::InvalidMemory
-        | EvalError::NoTasks
-        | EvalError::MissingSweep
-        | EvalError::Draining
-        | EvalError::InvalidDurableTrial(_)
-        | EvalError::Io(_)
-        | EvalError::Json(_)
-        | EvalError::RunConflict(_)
-        | EvalError::RunActive(_)
-        | EvalError::MissingSweepCoordinate
-        | EvalError::MissingScheduledAttempt => EvalExceptionKind::Internal,
+        EvalError::Io(_) | EvalError::Json(_) => EvalExceptionKind::Internal,
     }
 }
 
@@ -2940,53 +2291,6 @@ fn output_aliases_task_package(_output: &Path, _task: &Path) -> io::Result<bool>
     Ok(false)
 }
 
-fn prospective_canonical_directory(path: &Path) -> io::Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut missing = Vec::<OsString>::new();
-    let mut ancestor = absolute.as_path();
-    loop {
-        match fs::metadata(ancestor) {
-            Ok(metadata) if metadata.is_dir() => break,
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotADirectory,
-                    format!("path component is not a directory: {}", ancestor.display()),
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                missing.push(
-                    ancestor
-                        .file_name()
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::NotFound,
-                                format!(
-                                    "directory has no existing ancestor: {}",
-                                    absolute.display()
-                                ),
-                            )
-                        })?
-                        .to_os_string(),
-                );
-                ancestor = ancestor.parent().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("directory has no existing ancestor: {}", absolute.display()),
-                    )
-                })?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    let mut canonical = fs::canonicalize(ancestor)?;
-    canonical.extend(missing.into_iter().rev());
-    Ok(canonical)
-}
-
 fn is_safety_refusal(error: &NanocodexError) -> bool {
     let Some(ResponsesError::Api { event }) = error.responses_error() else {
         return false;
@@ -3019,9 +2323,8 @@ fn attempt_span(
     attempt_id: Uuid,
     trial_name: &str,
     prompt_cache_cohort: u64,
-    coordinate: Option<&SweepCoordinate>,
 ) -> Span {
-    let span = info_span!(
+    info_span!(
         target: "nanocodex_eval",
         parent: None,
         "eval.attempt",
@@ -3031,8 +2334,6 @@ fn attempt_span(
         eval.attempt.id = %attempt_id,
         eval.task.name = task.name(),
         eval.trial.name = trial_name,
-        eval.agent.id = tracing::field::Empty,
-        eval.trial.number = tracing::field::Empty,
         eval.task.image = task.image().reference(),
         eval.resource.cpus = task.resources().cpus,
         eval.resource.memory_mib = task.resources().memory_mb,
@@ -3071,12 +2372,7 @@ fn attempt_span(
         status = tracing::field::Empty,
         error.message = tracing::field::Empty,
         duration_ns = tracing::field::Empty,
-    );
-    if let Some(coordinate) = coordinate {
-        span.record("eval.agent.id", coordinate.agent.as_str());
-        span.record("eval.trial.number", coordinate.trial);
-    }
-    span
+    )
 }
 
 fn record_attempt_result(
@@ -3328,16 +2624,10 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn trial_name(task: &Task, attempt_id: Uuid, coordinate: Option<&SweepCoordinate>) -> String {
+fn trial_name(task: &Task, attempt_id: Uuid) -> String {
     let short_name = task.name().rsplit('/').next().unwrap_or(task.name());
     let compact_id = attempt_id.simple().to_string();
-    match coordinate {
-        Some(coordinate) => format!(
-            "{short_name}__{}__{:03}__{}",
-            coordinate.agent, coordinate.trial, compact_id
-        ),
-        None => format!("{short_name}__{compact_id}"),
-    }
+    format!("{short_name}__{compact_id}")
 }
 
 impl AgentResult {
@@ -3450,11 +2740,3 @@ impl AgentTerminalMetadata {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "evaluator/lifecycle_tests.rs"]
-mod lifecycle_tests;
-
-#[cfg(test)]
-#[path = "evaluator/tracing_tests.rs"]
-mod tracing_tests;

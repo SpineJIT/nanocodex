@@ -49,12 +49,6 @@ pub(super) struct ProfileTarget {
 }
 
 #[derive(Args)]
-pub(super) struct Init {
-    #[command(flatten)]
-    target: ProfileTarget,
-}
-
-#[derive(Args)]
 pub(super) struct Status {
     #[command(flatten)]
     target: ProfileTarget,
@@ -69,7 +63,7 @@ pub(super) struct Run {
     #[command(flatten)]
     target: ProfileTarget,
 
-    /// Exact task selector from the initialized profile.
+    /// Exact task selector from the configured profile.
     #[arg(long, value_name = "TASK", required = true)]
     task: String,
 
@@ -131,15 +125,6 @@ enum RunOutput<'a> {
         reason: &'a str,
         retry_after_ms: u64,
     },
-}
-
-impl Init {
-    pub(super) fn run(self) -> Result<()> {
-        let (_, workset, _) = self.target.open()?;
-        serde_json::to_writer_pretty(std::io::stdout().lock(), &workset.status()?)?;
-        println!();
-        Ok(())
-    }
 }
 
 impl Status {
@@ -378,7 +363,6 @@ async fn execute_coordinate(
                 )
                 .initial_guest_memory_mb(guest_memory_mb)
                 .memory_profile_path(vm.vm_cache.join(MEMORY_PROFILE_FILE))
-                .max_concurrency(1)
                 .prepare()
                 .await?;
             let report = evaluator.task(task).await?;

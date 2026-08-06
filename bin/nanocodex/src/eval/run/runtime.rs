@@ -27,10 +27,6 @@ const VM_GUEST_ELF_MACHINE: u16 = 62;
 compile_error!("Evaluator VM guests are only supported on aarch64 and x86_64 hosts");
 const VM_GUEST_BUILD_RECORD_VERSION: u32 = 1;
 
-pub(crate) async fn prepare_vm_guest_runtime() -> Result<PathBuf> {
-    prepare_vm_guest_runtime_from(None, Path::new(DEFAULT_VM_CACHE)).await
-}
-
 pub(crate) async fn prepare_vm_guest_runtime_from(
     prebuilt: Option<&Path>,
     cache: &Path,

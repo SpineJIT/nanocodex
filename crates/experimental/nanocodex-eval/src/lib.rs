@@ -57,8 +57,6 @@
     allow(dead_code, unused_imports)
 )]
 
-/// Aggregated metrics derived from retained evaluator outcomes.
-pub mod aggregate;
 /// Agent Trajectory Interchange Format projection and wire types.
 pub mod atif;
 mod capture_proxy;
@@ -70,10 +68,8 @@ mod codex;
 /// Matched Nanocodex-versus-Codex execution and retained comparison reports.
 pub mod differential;
 mod digest;
-mod durable;
 mod evaluator;
 mod event;
-pub mod harbor;
 mod job;
 mod native;
 #[cfg(any(
@@ -83,7 +79,6 @@ mod native;
 /// Closed, declarative evaluation profiles over native task packages.
 pub mod profile;
 mod result;
-mod sweep;
 mod task;
 #[cfg(any(
     all(target_os = "linux", not(target_env = "musl")),
@@ -93,11 +88,6 @@ pub mod vm;
 /// Durable SQLite ledger for agent-selected evaluation coordinates.
 pub mod workset;
 
-pub(crate) use aggregate::{
-    AggregateDataset, AttemptBuildIdentity, AttemptConfigurationIdentity, AttemptFact,
-    AttemptFactArtifacts, AttemptRuntimeMetrics, AttemptTaskIdentity, AttemptUsage,
-    AttemptVerifierFact, AttemptVerifierIdentity, LatencyBreakdown,
-};
 pub(crate) use atif::{
     AtifAgent, AtifAgentExtra, AtifBuilder, AtifObservation, AtifObservationExtra,
     AtifObservationResult, AtifSource, AtifStep, AtifToolCall, AtifToolCallExtra, AtifTrajectory,
@@ -117,10 +107,8 @@ pub use result::{
     AgentMetadata, AgentResult, AgentStatus, BillingCompleteness, CleanupDiagnostic, CleanupPhase,
     CleanupStatus, EvalArtifacts, EvalAttemptOutcome, EvalCleanup, EvalEnvironment, EvalException,
     EvalExceptionKind, EvalFailure, EvalFailureTiming, EvalOutcome, EvalResult, EvalStatus,
-    EvalTiming, MeasurementCompleteness, PhaseTiming, SweepAttemptResult, SweepResults,
-    UsageTotals, VerifierResult,
+    EvalTiming, MeasurementCompleteness, PhaseTiming, UsageTotals, VerifierResult,
 };
-pub use sweep::{AgentId, AgentIdError, Sweep, SweepBuilder, SweepError};
 pub use task::{
     NetworkPolicy, OciImage, Resources, Task, TaskLoadError, Verifier, VerifierCollect,
     VerifierEnvironmentMode,

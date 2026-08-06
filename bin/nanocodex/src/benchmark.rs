@@ -11,9 +11,8 @@ pub(crate) fn prompt(profile: Option<&str>, config: &Path, state_dir: Option<&Pa
     format!(
         r#"Drive the closed Nanocodex evaluation profile {selected} to durable completion.
 
-The desired amount of work is defined only by `{config}`. Never add an ad-hoc task, treatment, model, reasoning effort, or trial. Initialize and inspect its durable SQLite ledger with:
+The desired amount of work is defined only by `{config}`. Never add an ad-hoc task, treatment, model, reasoning effort, or trial. Materialize and inspect its durable SQLite ledger with:
 
-    nanocodex eval init{profile_argument} --config {config_argument}{state_argument}
     nanocodex eval status{profile_argument} --config {config_argument}{state_argument} --json
 
 You own execution strategy. Read the family records, choose an exact pending task and treatment, and invoke one repetition with `nanocodex eval run{profile_argument} --config {config_argument}{state_argument} --task <exact-profile-selector>` plus any model, thinking, or tool-mode selectors required to disambiguate that profile family. The CLI allocates the internal repetition; never pass or invent a trial number.
@@ -58,7 +57,7 @@ mod tests {
             Some(Path::new("/mnt/eval state")),
         );
 
-        assert!(prompt.contains("init 'release candidate' --config 'configs/eval profile.toml'"));
+        assert!(prompt.contains("status 'release candidate' --config 'configs/eval profile.toml'"));
         assert!(prompt.contains("--state-dir '/mnt/eval state'"));
     }
 }
