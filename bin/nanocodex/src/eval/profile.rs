@@ -278,7 +278,7 @@ async fn prepare_resources(task: &Task, vm: &VmPreparationArgs) -> Result<VmReso
     let current_executable = std::env::current_exe()?;
     let runtime_image =
         run::prepare_vm_guest_runtime_from(vm.vm_guest_runtime.as_deref(), &vm.vm_cache).await?;
-    Ok(VmResources::builder(&current_executable, runtime_image)
+    let resources = VmResources::builder(&current_executable, runtime_image)
         .task(task.clone())
         .cache_directory(&vm.vm_cache)
         .cache_policy(if vm.vm_refresh {
@@ -288,7 +288,11 @@ async fn prepare_resources(task: &Task, vm: &VmPreparationArgs) -> Result<VmReso
         })
         .image_preparation_concurrency(1)
         .prepare()
-        .await?)
+        .await?;
+    // The durable preparation lease covers the complete immutable task
+    // environment, not merely the lazy recipe used to build it.
+    resources.backend().await?;
+    Ok(resources)
 }
 
 #[allow(clippy::too_many_arguments)]
