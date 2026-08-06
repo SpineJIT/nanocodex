@@ -355,6 +355,33 @@ impl EvalAttemptOutcome {
             Self::Unscored(failure) => Some(failure),
         }
     }
+
+    /// Returns the immutable task definition used by this attempt.
+    #[must_use]
+    pub const fn task(&self) -> &Task {
+        match self {
+            Self::Scored(result) => result.task(),
+            Self::Unscored(failure) => failure.task(),
+        }
+    }
+
+    /// Returns the terminal agent output, when the attempt produced one.
+    #[must_use]
+    pub const fn agent(&self) -> Option<&AgentResult> {
+        match self {
+            Self::Scored(result) => result.agent.as_ref(),
+            Self::Unscored(failure) => failure.agent.as_ref(),
+        }
+    }
+
+    /// Returns the artifacts retained for this attempt.
+    #[must_use]
+    pub const fn artifacts(&self) -> &EvalArtifacts {
+        match self {
+            Self::Scored(result) => &result.artifacts,
+            Self::Unscored(failure) => &failure.artifacts,
+        }
+    }
 }
 
 impl EvalResult {

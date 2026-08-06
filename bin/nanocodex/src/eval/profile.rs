@@ -7,8 +7,9 @@ use clap::{Args, ValueEnum};
 use eyre::{Result, WrapErr as _, eyre};
 use nanocodex::Model;
 use nanocodex_eval::{
-    EvalOutcome, Evaluation, EvaluationClaim, EvaluationMode, EvaluationSelection,
-    EvaluationSelector, Evaluator, Task,
+    EvalAttemptOutcome, EvalEventKind, EvalEventStream, EvalOutcome, Evaluation, EvaluationClaim,
+    EvaluationMode, EvaluationSelection, EvaluationSelector, Evaluator, Task,
+    atif::AtifBuilder,
     coordinator::{CoordinatorClient, RemoteClaim, RemoteLease},
     differential::{
         CodexAuth, CodexToolMode, DifferentialEvaluator, ExecutableIdentity, NanocodexToolMode,
@@ -16,6 +17,7 @@ use nanocodex_eval::{
     vm::{CachePolicy, VmResources},
 };
 use serde::Serialize;
+use tokio::io::AsyncWriteExt as _;
 
 use super::{args::VmPreparationArgs, run};
 use crate::{
@@ -484,7 +486,7 @@ async fn execute_coordinate(
             let evaluator = Evaluator::builder(nanocodex, backend)
                 .output_directory(&output)
                 .build()?;
-            let outcome = evaluator.task(task).await?;
+            let outcome = run_native(&evaluator, task).await?;
             let evidence = evaluator.directory().to_path_buf();
             if outcome.outcome() == EvalOutcome::InfrastructureError {
                 Ok(ExecutionResult::Retryable {
@@ -536,6 +538,80 @@ async fn execute_coordinate(
             }
         }
     }
+}
+
+struct NativeEventRecording {
+    atif: AtifBuilder,
+    atif_error: Option<String>,
+}
+
+async fn run_native(evaluator: &Evaluator, task: Task) -> Result<EvalAttemptOutcome> {
+    let event_log = evaluator.directory().join("events.jsonl");
+    let run = evaluator.task(task);
+    let stream = run.events().subscribe();
+    let recorder = tokio::spawn(async move { record_native_events(stream, &event_log).await });
+    let outcome = run.await;
+    let recording = recorder
+        .await
+        .wrap_err("native event recorder task failed")??;
+    let outcome = outcome?;
+    retain_native_trajectory(&outcome, recording).await?;
+    Ok(outcome)
+}
+
+async fn record_native_events(
+    mut stream: EvalEventStream,
+    path: &Path,
+) -> Result<NativeEventRecording> {
+    let mut output = tokio::fs::File::create(path)
+        .await
+        .wrap_err_with(|| format!("failed to create evaluator event log {}", path.display()))?;
+    let mut atif = AtifBuilder::default();
+    let mut atif_error = None;
+    while let Some(event) = stream.recv().await? {
+        if let EvalEventKind::Agent(agent_event) = &event.kind
+            && atif_error.is_none()
+            && let Err(error) = atif.apply(agent_event)
+        {
+            atif_error = Some(format!(
+                "failed to project agent event sequence {} into ATIF: {error}",
+                event.sequence
+            ));
+        }
+        let mut encoded = serde_json::to_vec(event.as_ref())?;
+        encoded.push(b'\n');
+        output.write_all(&encoded).await?;
+    }
+    output.flush().await?;
+    output.sync_all().await?;
+    Ok(NativeEventRecording { atif, atif_error })
+}
+
+async fn retain_native_trajectory(
+    outcome: &EvalAttemptOutcome,
+    recording: NativeEventRecording,
+) -> Result<()> {
+    if let Some(error) = recording.atif_error {
+        return Err(eyre!(error));
+    }
+    let trajectory = match outcome.agent() {
+        Some(agent) => recording.atif.finish(outcome.task(), agent),
+        None => recording.atif.finish_failure(outcome.task()),
+    };
+    let path = outcome.artifacts().directory.join("agent/trajectory.json");
+    let parent = path
+        .parent()
+        .ok_or_else(|| eyre!("trajectory path has no parent: {}", path.display()))?;
+    tokio::fs::create_dir_all(parent).await?;
+    let mut encoded = serde_json::to_vec_pretty(&trajectory)?;
+    encoded.push(b'\n');
+    let mut output = tokio::fs::File::create(&path)
+        .await
+        .wrap_err_with(|| format!("failed to create trajectory {}", path.display()))?;
+    output.write_all(&encoded).await?;
+    output.flush().await?;
+    output.sync_all().await?;
+    Ok(())
 }
 
 pub(super) fn default_state_dir() -> Result<PathBuf> {

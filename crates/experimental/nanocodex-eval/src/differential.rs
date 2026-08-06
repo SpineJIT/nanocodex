@@ -2093,7 +2093,7 @@ impl ArmReport {
         codex_artifacts: bool,
         api_capture_required: bool,
     ) -> Self {
-        let attempt_directory = outcome_directory(&outcome);
+        let attempt_directory = &outcome.artifacts().directory;
         let (codex_events, codex_stderr, codex_summary) = if codex_artifacts {
             (
                 retained_file(attempt_directory.join("agent/codex-events.jsonl")),
@@ -2399,29 +2399,32 @@ fn retain_trajectory(
     recording: EventRecording,
     projection: TrajectoryProjection,
 ) -> InternalResult<TrajectoryArtifact> {
-    let task = outcome_task(outcome);
+    let task = outcome.task();
     let trajectory = match projection {
         TrajectoryProjection::Nanocodex => {
             if let Some(error) = recording.atif_error {
                 return Err(diff_error!(error));
             }
-            match outcome_agent(outcome) {
+            match outcome.agent() {
                 Some(agent) => recording.atif.finish(task, agent),
                 None => recording.atif.finish_failure(task),
             }
         }
         TrajectoryProjection::Codex { version } => {
-            let agent = outcome_agent(outcome).ok_or_else(|| {
+            let agent = outcome.agent().ok_or_else(|| {
                 diff_error!("stock Codex attempt retained no terminal agent result")
             })?;
-            let events = outcome_directory(outcome).join("agent/codex-events.jsonl");
+            let events = outcome
+                .artifacts()
+                .directory
+                .join("agent/codex-events.jsonl");
             let version = version.resolve()?;
             project_codex_atif(&events, task.prompt(), agent, &version).wrap_err_with(|| {
                 format!("failed to project stock Codex stream {}", events.display())
             })?
         }
     };
-    let path = outcome_directory(outcome).join(TRAJECTORY_FILE);
+    let path = outcome.artifacts().directory.join(TRAJECTORY_FILE);
     let parent = path
         .parent()
         .ok_or_else(|| diff_error!("trajectory path has no parent: {}", path.display()))?;
@@ -2468,27 +2471,6 @@ where
             directory.display()
         )
     })
-}
-
-fn outcome_directory(outcome: &EvalAttemptOutcome) -> &Path {
-    match outcome {
-        EvalAttemptOutcome::Scored(result) => &result.artifacts.directory,
-        EvalAttemptOutcome::Unscored(failure) => &failure.artifacts.directory,
-    }
-}
-
-const fn outcome_task(outcome: &EvalAttemptOutcome) -> &Task {
-    match outcome {
-        EvalAttemptOutcome::Scored(result) => result.task(),
-        EvalAttemptOutcome::Unscored(failure) => failure.task(),
-    }
-}
-
-const fn outcome_agent(outcome: &EvalAttemptOutcome) -> Option<&AgentResult> {
-    match outcome {
-        EvalAttemptOutcome::Scored(result) => result.agent.as_ref(),
-        EvalAttemptOutcome::Unscored(failure) => failure.agent.as_ref(),
-    }
 }
 
 fn retained_file(path: PathBuf) -> Option<PathBuf> {

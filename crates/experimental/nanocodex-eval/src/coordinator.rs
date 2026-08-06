@@ -778,9 +778,19 @@ thinking = ["high"]
 
         for (lease, name) in [(&first_lease, "first"), (&second_lease, "second")] {
             let output = directory.path().join(format!("worker-{name}"));
-            fs::create_dir(&output).unwrap();
+            fs::create_dir_all(output.join("agent")).unwrap();
             let evidence = output.join("comparison.json");
             fs::write(&evidence, format!("{{\"worker\":\"{name}\"}}\n")).unwrap();
+            fs::write(
+                output.join("events.jsonl"),
+                format!("{{\"worker\":\"{name}\"}}\n"),
+            )
+            .unwrap();
+            fs::write(
+                output.join("agent/trajectory.json"),
+                format!("{{\"worker\":\"{name}\"}}\n"),
+            )
+            .unwrap();
             client.complete(lease, &output, &evidence).await.unwrap();
         }
 
@@ -788,11 +798,28 @@ thinking = ["high"]
         assert_eq!(status["coordinates"]["complete"], 2);
         assert_eq!(status["coordinates"]["pending"], 0);
         assert_eq!(status["families"][0]["assigned_host"], "127.0.0.1");
+        let artifacts = directory.path().join("state/artifacts");
+        assert_eq!(count_named_files(&artifacts, "events.jsonl"), 2);
+        assert_eq!(count_named_files(&artifacts, "trajectory.json"), 2);
         assert!(matches!(
             client.claim(&selection).await.unwrap(),
             RemoteClaim::Complete
         ));
         server.abort();
+    }
+
+    fn count_named_files(directory: &Path, name: &str) -> usize {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .map(|path| {
+                if path.is_dir() {
+                    count_named_files(&path, name)
+                } else {
+                    usize::from(path.file_name().is_some_and(|file| file == name))
+                }
+            })
+            .sum()
     }
 
     #[tokio::test]
