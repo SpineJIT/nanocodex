@@ -252,14 +252,12 @@ struct ProfileIdentity<'a> {
     name: &'a str,
     profile: &'a Profile,
     tasks: Vec<TaskIdentity<'a>>,
-    codex_command: Option<&'a Path>,
     codex_digest: Option<&'a str>,
 }
 
 #[derive(Serialize)]
 struct TaskIdentity<'a> {
     selector: &'a str,
-    root: &'a Path,
     digest: &'a str,
 }
 
@@ -321,18 +319,16 @@ impl EvaluationManifest {
         let codex_digest = codex_command.as_deref().map(harness_digest).transpose()?;
         let families = expand_families(profile, &tasks);
         let identity = ProfileIdentity {
-            schema: 1,
+            schema: 2,
             name: &name,
             profile,
             tasks: tasks
                 .iter()
                 .map(|task| TaskIdentity {
                     selector: &task.selector,
-                    root: task.task.root(),
                     digest: task.task.package_digest(),
                 })
                 .collect(),
-            codex_command: codex_command.as_deref(),
             codex_digest: codex_digest.as_deref(),
         };
         let digest = hex::encode(Sha256::digest(serde_json::to_vec(&identity)?));
@@ -776,5 +772,33 @@ mode = "differential"
         let second = EvaluationManifest::load_profile(&config, Some("release")).unwrap();
 
         assert_ne!(first.digest, second.digest);
+    }
+
+    #[test]
+    fn profile_revision_is_independent_of_the_checkout_path() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for directory in [&first, &second] {
+            write_task(directory.path(), "one");
+            fs::write(
+                directory.path().join("nanocodex.toml"),
+                r#"[profiles.release]
+tasks = ["one"]
+trials = 2
+model = ["sol"]
+thinking = ["high"]
+"#,
+            )
+            .unwrap();
+        }
+
+        let first =
+            EvaluationManifest::load_profile(first.path().join("nanocodex.toml"), Some("release"))
+                .unwrap();
+        let second =
+            EvaluationManifest::load_profile(second.path().join("nanocodex.toml"), Some("release"))
+                .unwrap();
+
+        assert_eq!(first.digest, second.digest);
     }
 }
