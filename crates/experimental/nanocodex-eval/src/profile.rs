@@ -33,6 +33,10 @@ pub struct EvaluationManifest {
 #[serde(deny_unknown_fields)]
 pub struct Harness {
     command: PathBuf,
+    /// Semantic harness release shared by architecture-specific executables.
+    ///
+    /// When omitted, legacy manifests continue to pin the exact command bytes.
+    version: Option<String>,
 }
 
 /// One closed desired bundle of native task coordinates.
@@ -193,6 +197,9 @@ pub enum ProfileError {
     /// Differential execution requires a pinned stock-Codex harness.
     #[error("differential profile `{0}` requires [harness.codex].command")]
     MissingCodex(String),
+    /// A semantic harness version was present but empty.
+    #[error("evaluation harness `{0}` has an empty version")]
+    EmptyHarnessVersion(String),
     /// A resolved path could not be canonicalized.
     #[error("failed to resolve {path}: {source}")]
     ResolvePath {
@@ -304,19 +311,23 @@ impl EvaluationManifest {
             .parent()
             .expect("a canonical manifest path has a parent");
         let tasks = load_tasks(root, profile)?;
-        let codex_command = if profile.mode == EvaluationMode::Differential {
-            Some(resolve_path(
-                root,
-                &self
-                    .harness
-                    .get("codex")
-                    .ok_or_else(|| ProfileError::MissingCodex(name.clone()))?
-                    .command,
-            )?)
+        let (codex_command, codex_digest) = if profile.mode == EvaluationMode::Differential {
+            let harness = self
+                .harness
+                .get("codex")
+                .ok_or_else(|| ProfileError::MissingCodex(name.clone()))?;
+            let command = resolve_path(root, &harness.command)?;
+            let digest = match harness.version.as_deref() {
+                Some(version) if version.trim().is_empty() => {
+                    return Err(ProfileError::EmptyHarnessVersion("codex".to_owned()));
+                }
+                Some(version) => format!("version:{version}"),
+                None => harness_digest(&command)?,
+            };
+            (Some(command), Some(digest))
         } else {
-            None
+            (None, None)
         };
-        let codex_digest = codex_command.as_deref().map(harness_digest).transpose()?;
         let families = expand_families(profile, &tasks);
         let identity = ProfileIdentity {
             schema: 2,
@@ -772,6 +783,38 @@ mode = "differential"
         let second = EvaluationManifest::load_profile(&config, Some("release")).unwrap();
 
         assert_ne!(first.digest, second.digest);
+    }
+
+    #[test]
+    fn differential_profile_can_pin_one_version_across_architecture_builds() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for (directory, command) in [(&first, "aarch64 build"), (&second, "x86_64 build")] {
+            write_task(directory.path(), "one");
+            fs::write(directory.path().join("codex"), command).unwrap();
+            fs::write(
+                directory.path().join("nanocodex.toml"),
+                r#"[harness.codex]
+command = "codex"
+version = "0.145.0"
+
+[profiles.release]
+tasks = ["one"]
+trials = 1
+mode = "differential"
+"#,
+            )
+            .unwrap();
+        }
+
+        let first =
+            EvaluationManifest::load_profile(first.path().join("nanocodex.toml"), Some("release"))
+                .unwrap();
+        let second =
+            EvaluationManifest::load_profile(second.path().join("nanocodex.toml"), Some("release"))
+                .unwrap();
+
+        assert_eq!(first.digest, second.digest);
     }
 
     #[test]
