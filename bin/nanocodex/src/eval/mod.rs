@@ -1,7 +1,9 @@
 mod args;
+mod benchmark;
 mod cleanup;
 mod diff;
 mod inspect;
+mod profile;
 mod run;
 
 use std::{
@@ -21,17 +23,25 @@ use nanocodex_vm::image::{CachePolicy, DiskStatus};
 use serde::Serialize;
 
 #[derive(Args)]
-#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub(crate) struct Eval {
     #[command(subcommand)]
-    command: Option<EvalCommand>,
-
-    #[command(flatten)]
-    run: run::Run,
+    command: EvalCommand,
 }
 
 #[derive(Subcommand)]
 enum EvalCommand {
+    /// Launch the agent-owned benchmark workflow in the TUI or headlessly.
+    Benchmark(benchmark::Benchmark),
+
+    /// Initialize every desired coordinate in the durable profile ledger.
+    Init(profile::Init),
+
+    /// Inspect one immutable profile revision and its durable progress.
+    Status(profile::Status),
+
+    /// Durably execute one agent-selected task repetition from a profile.
+    Run(profile::Run),
+
     /// Prepare task VM images without running agents.
     Prepare(Prepare),
 
@@ -52,7 +62,7 @@ enum EvalCommand {
     /// Explain a retained Harbor job or trial and surface exact failure evidence.
     Inspect(inspect::Inspect),
 
-    /// Run matched Nanocodex and pinned stock-Codex task sweeps.
+    /// Run one matched Nanocodex and pinned stock-Codex task pair.
     Diff(diff::Diff),
 
     /// Remove disposable VM disks from completed retained trials.
@@ -225,20 +235,22 @@ async fn prepare_tasks(
 }
 
 async fn run(eval: Eval) -> Result<()> {
-    let Eval { command, run } = eval;
-    match command {
-        None => run.run().await?,
-        Some(EvalCommand::Prepare(Prepare {
+    match eval.command {
+        EvalCommand::Benchmark(command) => command.run().await?,
+        EvalCommand::Init(command) => command.run()?,
+        EvalCommand::Status(command) => command.run()?,
+        EvalCommand::Run(command) => command.run().await?,
+        EvalCommand::Prepare(Prepare {
             tasks,
             suites,
             cache,
             refresh,
-        })) => prepare_tasks(tasks, suites, cache, refresh).await?,
-        Some(EvalCommand::Task {
+        }) => prepare_tasks(tasks, suites, cache, refresh).await?,
+        EvalCommand::Task {
             directory,
             json,
             prompt,
-        }) => {
+        } => {
             let task = Task::load(directory)?;
             let output = TaskOutput::from(&task);
             let stdout = io::stdout();
@@ -250,9 +262,9 @@ async fn run(eval: Eval) -> Result<()> {
                 output.write_human(&mut stdout, prompt)?;
             }
         }
-        Some(EvalCommand::Inspect(command)) => command.run()?,
-        Some(EvalCommand::Diff(command)) => command.run().await?,
-        Some(EvalCommand::Cleanup(command)) => command.run()?,
+        EvalCommand::Inspect(command) => command.run()?,
+        EvalCommand::Diff(command) => command.run().await?,
+        EvalCommand::Cleanup(command) => command.run()?,
     }
     Ok(())
 }
@@ -377,8 +389,7 @@ mod tests {
         ])
         .unwrap();
         let Some(Command::Eval(Eval {
-            command: Some(EvalCommand::Prepare(super::Prepare { tasks, .. })),
-            ..
+            command: EvalCommand::Prepare(super::Prepare { tasks, .. }),
         })) = cli.command
         else {
             panic!("expected vm prepare command");
@@ -404,8 +415,7 @@ mod tests {
         ])
         .unwrap();
         let Some(Command::Eval(Eval {
-            command: Some(EvalCommand::Prepare(super::Prepare { suites, .. })),
-            ..
+            command: EvalCommand::Prepare(super::Prepare { suites, .. }),
         })) = cli.command
         else {
             panic!("expected vm prepare command");
@@ -417,14 +427,19 @@ mod tests {
     #[test]
     fn complete_eval_surface_is_nested_under_nanocodex() {
         for arguments in [
+            vec!["nanocodex", "eval", "init", "local-smoke"],
             vec![
                 "nanocodex",
                 "eval",
+                "run",
+                "local-smoke",
                 "--task",
                 "tasks/write-greeting",
                 "--vm-cache",
                 "/var/cache/nanocodex-vm",
             ],
+            vec!["nanocodex", "eval", "status", "local-smoke"],
+            vec!["nanocodex", "eval", "benchmark", "local-smoke"],
             vec![
                 "nanocodex",
                 "eval",

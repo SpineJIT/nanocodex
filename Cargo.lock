@@ -5152,6 +5152,7 @@ dependencies = [
  "nanocodex-vm",
  "nix 0.31.3",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.11.0",

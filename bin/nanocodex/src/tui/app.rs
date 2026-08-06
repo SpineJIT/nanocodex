@@ -90,6 +90,7 @@ struct PendingPaste {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SubmittedPrompt {
     display: String,
+    instruction: Option<String>,
     local_images: Vec<PathBuf>,
 }
 
@@ -97,6 +98,7 @@ impl SubmittedPrompt {
     const fn new(display: String, local_images: Vec<PathBuf>) -> Self {
         Self {
             display,
+            instruction: None,
             local_images,
         }
     }
@@ -111,19 +113,42 @@ impl SubmittedPrompt {
 
     pub(super) fn set_display(&mut self, display: String) {
         self.display = display;
+        self.instruction = None;
     }
 
-    pub(super) fn prepend_text(&mut self, prefix: &str) {
-        self.display.insert_str(0, prefix);
+    pub(super) fn set_instruction(&mut self, instruction: String) {
+        self.instruction = Some(instruction);
+    }
+
+    pub(super) fn prepend_instruction(&mut self, prefix: &str) {
+        let instruction = self.instruction.get_or_insert_with(|| self.display.clone());
+        instruction.insert_str(0, prefix);
     }
 
     fn append(&mut self, mut other: Self) {
         let image_offset = self.local_images.len();
         for index in (1..=other.local_images.len()).rev() {
-            other.display = other.display.replace(
-                &format!("[Image #{index}]"),
-                &format!("[Image #{}]", image_offset + index),
-            );
+            let old = format!("[Image #{index}]");
+            let new = format!("[Image #{}]", image_offset + index);
+            other.display = other.display.replace(&old, &new);
+            if let Some(instruction) = &mut other.instruction {
+                *instruction = instruction.replace(&old, &new);
+            }
+        }
+        if self.instruction.is_some() || other.instruction.is_some() {
+            let mut instruction = self
+                .instruction
+                .take()
+                .unwrap_or_else(|| self.display.clone());
+            let other_instruction = other
+                .instruction
+                .take()
+                .unwrap_or_else(|| other.display.clone());
+            if !instruction.is_empty() && !other_instruction.is_empty() {
+                instruction.push('\n');
+            }
+            instruction.push_str(&other_instruction);
+            self.instruction = Some(instruction);
         }
         if !self.display.is_empty() && !other.display.is_empty() {
             self.display.push('\n');
@@ -133,8 +158,9 @@ impl SubmittedPrompt {
     }
 
     pub(super) fn into_prompt(self) -> Prompt {
+        let instruction = self.instruction.unwrap_or(self.display);
         if self.local_images.is_empty() {
-            return Prompt::new(self.display);
+            return Prompt::new(instruction);
         }
 
         let mut content = self
@@ -142,8 +168,8 @@ impl SubmittedPrompt {
             .into_iter()
             .map(|path| UserInput::LocalImage { path, detail: None })
             .collect::<Vec<_>>();
-        if !self.display.is_empty() {
-            content.push(UserInput::Text { text: self.display });
+        if !instruction.is_empty() {
+            content.push(UserInput::Text { text: instruction });
         }
         Prompt::content(content)
     }

@@ -392,18 +392,24 @@ impl AuthArgs {
     all(target_os = "macos", target_arch = "aarch64")
 ))]
 impl EvalAgentArgs {
-    pub(crate) fn builder(self, thinking: Thinking, web_search: bool) -> Result<NanocodexBuilder> {
+    pub(crate) fn builder(
+        self,
+        model: Model,
+        thinking: Thinking,
+        web_search: bool,
+    ) -> Result<NanocodexBuilder> {
         let auth = self.auth.resolve()?;
-        eval_builder_with_auth(auth.nanocodex()?, thinking, web_search)
+        eval_builder_with_auth(auth.nanocodex()?, model, thinking, web_search)
     }
 
     pub(crate) fn shared_builder(
         self,
+        model: Model,
         thinking: Thinking,
         web_search: bool,
     ) -> Result<(NanocodexBuilder, SharedAuth)> {
         let auth = self.auth.resolve()?;
-        let builder = eval_builder_with_auth(auth.nanocodex()?, thinking, web_search)?;
+        let builder = eval_builder_with_auth(auth.nanocodex()?, model, thinking, web_search)?;
         Ok((builder, auth))
     }
 
@@ -431,12 +437,16 @@ impl SharedAuth {
 ))]
 fn eval_builder_with_auth(
     auth: OpenAiAuth,
+    model: Model,
     thinking: Thinking,
     web_search: bool,
 ) -> Result<NanocodexBuilder> {
     let tools = Tools::builder().web_search(web_search).build()?;
     let openai = OpenAi::new(auth)?;
-    Ok(Nanocodex::builder(openai).thinking(thinking).tools(tools))
+    Ok(Nanocodex::builder(openai)
+        .model(model)
+        .thinking(thinking)
+        .tools(tools))
 }
 
 fn prepare_session_build(

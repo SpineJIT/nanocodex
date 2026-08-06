@@ -1,0 +1,8 @@
+default = "local-smoke"
+
+[profiles.local-smoke]
+tasks = ["tasks/write-greeting"]
+trials = 1
+model = ["sol"]
+thinking = ["low"]
+mode = "nanocodex"

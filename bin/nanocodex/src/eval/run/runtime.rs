@@ -1,62 +1,28 @@
-use super::*;
+use std::{
+    fs,
+    io::{self, Read as _},
+    path::{Path, PathBuf},
+    time::{Instant, UNIX_EPOCH},
+};
 
-#[derive(Debug)]
-pub(super) struct PreparedGuestRuntime {
-    pub(super) disk: PathBuf,
-    pub(super) identity: Option<RetainedGuestRuntime>,
-}
+use eyre::{Result, eyre};
+use nanocodex_vm::tools::{GuestRuntimeDisk, GuestRuntimeDiskStatus};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use tokio::process::Command;
+use tracing::{info, warn};
 
-pub(super) async fn prepare_runtime_for_vm(
-    rootfs: Option<&Path>,
-    guest_runtime: Option<&Path>,
-    job: &Path,
-    origin: Option<&RetainedGuestRuntimeOrigin>,
-) -> Result<PreparedGuestRuntime> {
-    let embedded_runtime = rootfs
-        .filter(|rootfs| rootfs.is_dir())
-        .map(|rootfs| rootfs.join(EMBEDDED_GUEST_TOOL_RUNTIME.trim_start_matches('/')));
-    if let Some(rootfs) = rootfs.filter(|rootfs| rootfs.is_dir())
-        && guest_runtime.is_some()
-    {
-        return Err(eyre!(
-            "--vm-guest-runtime cannot override the runtime embedded in directory rootfs {}",
-            rootfs.display()
-        ));
-    }
-    let block_runtime = embedded_runtime.is_none();
-    if let Some(origin) = origin {
-        return prepare_retained_guest_runtime(job, origin, guest_runtime, block_runtime);
-    }
+use super::write_json_atomic;
 
-    let source = match embedded_runtime {
-        Some(runtime) => SourceGuestRuntime {
-            path: fs::canonicalize(&runtime).map_err(|error| {
-                eyre!(
-                    "failed to resolve VM guest runtime embedded in {}: {error}",
-                    runtime.display()
-                )
-            })?,
-            build_status: "embedded",
-            source: "embedded_rootfs",
-        },
-        None => resolve_vm_guest_runtime_source(guest_runtime).await?,
-    };
-    prepare_new_guest_runtime(job, source, block_runtime)
-}
-
-const EMBEDDED_GUEST_TOOL_RUNTIME: &str = "/usr/local/bin/nanocodex-vm-guest";
-const GUEST_RUNTIME_DISK_BINARY_PATH: &str = "/nanocodex-vm-guest";
-pub(super) const GUEST_RUNTIME_ARTIFACT_ROOT: &str = "guest-runtime/artifacts";
-pub(super) const GUEST_RUNTIME_CACHE_ROOT: &str = "guest-runtime/cache";
 const DEFAULT_VM_CACHE: &str = ".cache/vm";
 #[cfg(target_arch = "aarch64")]
-pub(super) const VM_GUEST_TARGET: &str = "aarch64-unknown-linux-musl";
+const VM_GUEST_TARGET: &str = "aarch64-unknown-linux-musl";
 #[cfg(target_arch = "x86_64")]
-pub(super) const VM_GUEST_TARGET: &str = "x86_64-unknown-linux-musl";
+const VM_GUEST_TARGET: &str = "x86_64-unknown-linux-musl";
 #[cfg(target_arch = "aarch64")]
-pub(super) const VM_GUEST_ELF_MACHINE: u16 = 183;
+const VM_GUEST_ELF_MACHINE: u16 = 183;
 #[cfg(target_arch = "x86_64")]
-pub(super) const VM_GUEST_ELF_MACHINE: u16 = 62;
+const VM_GUEST_ELF_MACHINE: u16 = 62;
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 compile_error!("Evaluator VM guests are only supported on aarch64 and x86_64 hosts");
 const VM_GUEST_BUILD_RECORD_VERSION: u32 = 1;
@@ -151,336 +117,6 @@ async fn resolve_vm_guest_runtime_source(prebuilt: Option<&Path>) -> Result<Sour
     })
 }
 
-fn prepare_new_guest_runtime(
-    job: &Path,
-    source: SourceGuestRuntime,
-    block_runtime: bool,
-) -> Result<PreparedGuestRuntime> {
-    let started_at = Instant::now();
-    let (bytes, _) = stable_file_bytes(&source.path)?;
-    validate_vm_guest_elf(&bytes, &source.path)?;
-    let (artifact_path, artifact) = retain_guest_runtime_bytes(job, &bytes)?;
-    let (disk, runtime_disk_digest, cache_status) = if block_runtime {
-        let runtime_disk = prepare_job_guest_runtime_disk(job, &artifact)?;
-        let cache_status = runtime_disk.status();
-        (
-            runtime_disk.path().to_path_buf(),
-            Some(runtime_disk.digest().to_owned()),
-            Some(cache_status),
-        )
-    } else {
-        (artifact, None, None)
-    };
-    let binary_sha256 = hex::encode(Sha256::digest(&bytes));
-    if let Some(cache_status) = cache_status {
-        let runtime_disk = GuestRuntimeDiskView {
-            path: &disk,
-            digest: runtime_disk_digest.as_deref().unwrap_or_default(),
-            status: cache_status,
-        };
-        record_guest_runtime_view(started_at, source.build_status, source.source, runtime_disk);
-    }
-    Ok(PreparedGuestRuntime {
-        disk,
-        identity: Some(RetainedGuestRuntime {
-            target: VM_GUEST_TARGET.to_owned(),
-            binary_sha256,
-            runtime_disk_digest,
-            artifact_path: Some(artifact_path),
-            source: source.source.to_owned(),
-            source_path: source.path,
-            host_git_sha: env!("VERGEN_GIT_SHA").to_owned(),
-        }),
-    })
-}
-
-pub(super) fn prepare_retained_guest_runtime(
-    job: &Path,
-    origin: &RetainedGuestRuntimeOrigin,
-    requested: Option<&Path>,
-    block_runtime: bool,
-) -> Result<PreparedGuestRuntime> {
-    if origin.runtime.target != VM_GUEST_TARGET {
-        return Err(eyre!(
-            "retained VM guest runtime targets {}, but this host requires {}",
-            origin.runtime.target,
-            VM_GUEST_TARGET
-        ));
-    }
-    let bytes = retained_guest_runtime_bytes(origin, requested)?;
-    validate_vm_guest_elf(&bytes, Path::new("<retained VM guest runtime>"))?;
-    let binary_sha256 = hex::encode(Sha256::digest(&bytes));
-    if binary_sha256 != origin.runtime.binary_sha256 {
-        return Err(eyre!(
-            "retained VM guest runtime bytes hash to {binary_sha256}, expected {}",
-            origin.runtime.binary_sha256
-        ));
-    }
-    let (artifact_path, artifact) = retain_guest_runtime_bytes(job, &bytes)?;
-    let (disk, runtime_disk_digest) = if block_runtime {
-        let expected = origin
-            .runtime
-            .runtime_disk_digest
-            .as_deref()
-            .ok_or_else(|| {
-                eyre!("retained block VM guest runtime is missing its runtime disk digest")
-            })?;
-        let runtime_disk = prepare_job_guest_runtime_disk(job, &artifact)?;
-        if runtime_disk.digest() != expected {
-            return Err(eyre!(
-                "retained VM guest runtime disk digest is {}, expected {expected}",
-                runtime_disk.digest()
-            ));
-        }
-        record_guest_runtime_ready(Instant::now(), "retained", "job_artifact", &runtime_disk);
-        (
-            runtime_disk.path().to_path_buf(),
-            Some(runtime_disk.digest().to_owned()),
-        )
-    } else {
-        if origin.runtime.runtime_disk_digest.is_some() {
-            return Err(eyre!(
-                "retained directory-rootfs guest runtime unexpectedly has a disk digest"
-            ));
-        }
-        (artifact, None)
-    };
-    let mut identity = origin.runtime.clone();
-    identity.artifact_path = Some(artifact_path);
-    identity.runtime_disk_digest = runtime_disk_digest;
-    Ok(PreparedGuestRuntime {
-        disk,
-        identity: Some(identity),
-    })
-}
-
-fn retained_guest_runtime_bytes(
-    origin: &RetainedGuestRuntimeOrigin,
-    requested: Option<&Path>,
-) -> Result<Vec<u8>> {
-    let requested_bytes = if let Some(requested) = requested {
-        let requested = fs::canonicalize(requested)?;
-        let (bytes, _) = stable_file_bytes(&requested)?;
-        validate_vm_guest_elf(&bytes, &requested)?;
-        let digest = hex::encode(Sha256::digest(&bytes));
-        if digest != origin.runtime.binary_sha256 {
-            return Err(eyre!(
-                "requested VM guest runtime {} hashes to {digest}, but the retained workload \
-                 requires {}",
-                requested.display(),
-                origin.runtime.binary_sha256
-            ));
-        }
-        Some(bytes)
-    } else {
-        None
-    };
-    if let Some(artifact_path) = &origin.runtime.artifact_path {
-        let expected = guest_runtime_artifact_path(&origin.runtime.binary_sha256)?;
-        if artifact_path != &expected {
-            return Err(eyre!(
-                "retained VM guest runtime artifact path {} does not match its content address {}",
-                artifact_path.display(),
-                expected.display()
-            ));
-        }
-        let artifact = origin.job.join(artifact_path);
-        let artifact_parent = artifact
-            .parent()
-            .ok_or_else(|| eyre!("VM guest runtime artifact path has no parent"))?;
-        ensure_job_owned_path(&origin.job, artifact_parent)?;
-        match fs::symlink_metadata(&artifact) {
-            Ok(metadata) if metadata.file_type().is_file() => {
-                let (bytes, _) = stable_file_bytes(&artifact)?;
-                return Ok(bytes);
-            }
-            Ok(_) => {
-                return Err(eyre!(
-                    "retained VM guest runtime artifact is not a regular job-owned file: {}",
-                    artifact.display()
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        return requested_bytes.map_or_else(|| recover_retained_guest_runtime_disk(origin), Ok);
-    }
-    if let Some(bytes) = requested_bytes {
-        return Ok(bytes);
-    }
-    recover_retained_guest_runtime_disk(origin)
-}
-
-fn recover_retained_guest_runtime_disk(origin: &RetainedGuestRuntimeOrigin) -> Result<Vec<u8>> {
-    let digest = origin
-        .runtime
-        .runtime_disk_digest
-        .as_deref()
-        .ok_or_else(|| {
-            eyre!(
-                "retained VM guest runtime has no immutable artifact; pass --vm-guest-runtime with \
-             the exact ELF or start a new job with --new"
-            )
-        })?;
-    validate_sha256_digest(digest, "runtime disk digest")?;
-    let disks = [
-        origin
-            .job
-            .join(GUEST_RUNTIME_CACHE_ROOT)
-            .join("runtimes")
-            .join(digest)
-            .join("runtime.ext4"),
-        Path::new(DEFAULT_VM_CACHE)
-            .join("runtimes")
-            .join(digest)
-            .join("runtime.ext4"),
-    ];
-    for disk in disks {
-        let Ok(mut reader) = Reader::new(&disk) else {
-            continue;
-        };
-        if let Ok(bytes) = reader.read_file(GUEST_RUNTIME_DISK_BINARY_PATH, 0, None) {
-            return Ok(bytes);
-        }
-    }
-    Err(eyre!(
-        "retained VM guest runtime artifact and runtime disk {digest} are unavailable; pass \
-         --vm-guest-runtime with the exact ELF or start a new job with --new"
-    ))
-}
-
-pub(super) fn prepare_job_guest_runtime_disk(
-    job: &Path,
-    artifact: &Path,
-) -> Result<GuestRuntimeDisk> {
-    let cache = job.join(GUEST_RUNTIME_CACHE_ROOT);
-    ensure_job_owned_path(job, &cache)?;
-    let runtime_disk = GuestRuntimeDisk::prepare(artifact, &cache)?;
-    ensure_job_owned_path(job, &cache)?;
-    Ok(runtime_disk)
-}
-
-pub(super) fn retain_guest_runtime_bytes(job: &Path, bytes: &[u8]) -> Result<(PathBuf, PathBuf)> {
-    validate_vm_guest_elf(bytes, Path::new("<VM guest runtime artifact>"))?;
-    let digest = hex::encode(Sha256::digest(bytes));
-    let relative = guest_runtime_artifact_path(&digest)?;
-    let artifact = job.join(&relative);
-    let parent = artifact
-        .parent()
-        .ok_or_else(|| eyre!("VM guest runtime artifact path has no parent"))?;
-    ensure_job_owned_path(job, parent)?;
-    fs::create_dir_all(parent)?;
-    ensure_job_owned_path(job, parent)?;
-    match fs::symlink_metadata(&artifact) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            let (retained, _) = stable_file_bytes(&artifact)?;
-            if retained != bytes {
-                return Err(eyre!(
-                    "content-addressed VM guest runtime artifact has conflicting bytes: {}",
-                    artifact.display()
-                ));
-            }
-            return Ok((relative, artifact));
-        }
-        Ok(_) => {
-            return Err(eyre!(
-                "content-addressed VM guest runtime artifact is not a regular file: {}",
-                artifact.display()
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(bytes)?;
-    temporary.as_file().sync_all()?;
-    #[cfg(unix)]
-    temporary
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o755))?;
-    match temporary.persist_noclobber(&artifact) {
-        Ok(file) => file.sync_all()?,
-        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-            let (retained, _) = stable_file_bytes(&artifact)?;
-            if retained != bytes {
-                return Err(eyre!(
-                    "content-addressed VM guest runtime artifact has conflicting bytes: {}",
-                    artifact.display()
-                ));
-            }
-        }
-        Err(error) => return Err(error.error.into()),
-    }
-    fs::File::open(parent)?.sync_all()?;
-    Ok((relative, artifact))
-}
-
-// Eval job directories are application-owned. This rejects pre-existing path and symlink escapes
-// and rechecks created paths, but does not claim a capability boundary against hostile concurrent
-// mutation of the job tree.
-pub(super) fn ensure_job_owned_path(job: &Path, path: &Path) -> Result<()> {
-    let relative = path.strip_prefix(job).map_err(|_| {
-        eyre!(
-            "VM guest runtime path {} escapes job {}",
-            path.display(),
-            job.display()
-        )
-    })?;
-    if relative
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(eyre!(
-            "VM guest runtime path {} escapes job {}",
-            path.display(),
-            job.display()
-        ));
-    }
-    let job = fs::canonicalize(job)?;
-    let mut existing = path;
-    let resolved = loop {
-        match fs::symlink_metadata(existing) {
-            Ok(_) => break fs::canonicalize(existing)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                existing = existing.parent().ok_or_else(|| {
-                    eyre!(
-                        "VM guest runtime path has no existing ancestor: {}",
-                        path.display()
-                    )
-                })?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    };
-    if !resolved.starts_with(&job) {
-        return Err(eyre!(
-            "VM guest runtime path {} escapes job {}",
-            resolved.display(),
-            job.display()
-        ));
-    }
-    Ok(())
-}
-
-fn guest_runtime_artifact_path(binary_sha256: &str) -> Result<PathBuf> {
-    validate_sha256_digest(binary_sha256, "guest runtime binary digest")?;
-    Ok(Path::new(GUEST_RUNTIME_ARTIFACT_ROOT)
-        .join(binary_sha256)
-        .join("nanocodex-vm-guest"))
-}
-
-fn validate_sha256_digest(digest: &str, label: &str) -> Result<()> {
-    if digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        Ok(())
-    } else {
-        Err(eyre!("{label} is not a lowercase SHA-256 digest: {digest}"))
-    }
-}
-
 fn validate_vm_guest_elf(bytes: &[u8], path: &Path) -> Result<()> {
     let header = bytes.get(..20).ok_or_else(|| {
         eyre!(
@@ -522,42 +158,13 @@ fn stable_file_bytes(path: &Path) -> Result<(Vec<u8>, FileMetadataSnapshot)> {
     Ok((bytes, snapshot))
 }
 
-pub(super) fn stable_file_sha256(path: &Path) -> Result<String> {
-    let (bytes, _) = stable_file_bytes(path)?;
-    Ok(hex::encode(Sha256::digest(bytes)))
-}
-
 fn record_guest_runtime_ready(
     started_at: Instant,
     build_status: &str,
     source: &str,
     runtime_disk: &GuestRuntimeDisk,
 ) {
-    record_guest_runtime_view(
-        started_at,
-        build_status,
-        source,
-        GuestRuntimeDiskView {
-            path: runtime_disk.path(),
-            digest: runtime_disk.digest(),
-            status: runtime_disk.status(),
-        },
-    );
-}
-
-struct GuestRuntimeDiskView<'a> {
-    path: &'a Path,
-    digest: &'a str,
-    status: GuestRuntimeDiskStatus,
-}
-
-fn record_guest_runtime_view(
-    started_at: Instant,
-    build_status: &str,
-    source: &str,
-    runtime_disk: GuestRuntimeDiskView<'_>,
-) {
-    let cache_status = match runtime_disk.status {
+    let cache_status = match runtime_disk.status() {
         GuestRuntimeDiskStatus::Hit => "hit",
         GuestRuntimeDiskStatus::Created => "created",
     };
@@ -568,8 +175,8 @@ fn record_guest_runtime_view(
         vm_guest_target = VM_GUEST_TARGET,
         vm_guest_runtime_source = source,
         vm_guest_runtime_cache_status = cache_status,
-        vm_guest_runtime_digest = runtime_disk.digest,
-        vm_guest_runtime_disk = %runtime_disk.path.display(),
+        vm_guest_runtime_digest = runtime_disk.digest(),
+        vm_guest_runtime_disk = %runtime_disk.path().display(),
         "VM guest runtime ready"
     );
 }
@@ -601,7 +208,13 @@ async fn validate_vm_guest_source_identity(workspace: &Path) -> Result<()> {
         ));
     }
     let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
-    validate_vm_guest_commit(env!("VERGEN_GIT_SHA"), &head)?;
+    if head != env!("VERGEN_GIT_SHA") {
+        return Err(eyre!(
+            "refusing to build the VM guest runtime from source commit {head}; host binary was \
+             built from {}. Pass --vm-guest-runtime with a pinned prebuilt ELF",
+            env!("VERGEN_GIT_SHA")
+        ));
+    }
 
     let status = Command::new("git")
         .current_dir(workspace)
@@ -614,34 +227,22 @@ async fn validate_vm_guest_source_identity(workspace: &Path) -> Result<()> {
         .await?;
     if !status.status.success() {
         return Err(eyre!(
-            "cannot inspect VM guest source at {}; pass --vm-guest-runtime \
-             with a pinned prebuilt ELF",
+            "cannot inspect VM guest source at {}; pass --vm-guest-runtime with a pinned prebuilt ELF",
             workspace.display()
         ));
     }
     let dirty = String::from_utf8_lossy(&status.stdout);
     if !dirty.trim().is_empty() {
         return Err(eyre!(
-            "refusing to build the VM guest runtime from source that differs from host commit {}: \
-             {}; pass --vm-guest-runtime with a pinned prebuilt ELF",
-            env!("VERGEN_GIT_SHA"),
+            "refusing to build the VM guest runtime from dirty source: {}; pass \
+             --vm-guest-runtime with a pinned prebuilt ELF",
             dirty.lines().take(8).collect::<Vec<_>>().join(", ")
         ));
     }
     Ok(())
 }
 
-pub(super) fn validate_vm_guest_commit(host: &str, source: &str) -> Result<()> {
-    if host == source {
-        return Ok(());
-    }
-    Err(eyre!(
-        "refusing to build the VM guest runtime from source commit {source}; \
-         host binary was built from {host}. Pass --vm-guest-runtime with a pinned prebuilt ELF"
-    ))
-}
-
-pub(super) fn vm_guest_build_command(workspace: &Path) -> Command {
+fn vm_guest_build_command(workspace: &Path) -> Command {
     let mut command = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     command
         .current_dir(workspace)
@@ -677,7 +278,7 @@ struct FileMetadataSnapshot {
     modified_unix_ns: u64,
 }
 
-pub(super) fn vm_guest_runtime_is_fresh(workspace: &Path, runtime: &Path) -> Result<bool> {
+fn vm_guest_runtime_is_fresh(workspace: &Path, runtime: &Path) -> Result<bool> {
     let path = vm_guest_build_record_path(workspace);
     let record = match fs::read(&path) {
         Ok(contents) => match serde_json::from_slice::<VmGuestBuildRecord>(&contents) {
@@ -698,7 +299,7 @@ pub(super) fn vm_guest_runtime_is_fresh(workspace: &Path, runtime: &Path) -> Res
     Ok(vm_guest_build_record(workspace, runtime)?.as_ref() == Some(&record))
 }
 
-pub(super) fn write_vm_guest_build_record(workspace: &Path, runtime: &Path) -> Result<()> {
+fn write_vm_guest_build_record(workspace: &Path, runtime: &Path) -> Result<()> {
     let record = vm_guest_build_record(workspace, runtime)?.ok_or_else(|| {
         eyre!(
             "Cargo completed without producing {} and its dependency record",
@@ -786,7 +387,7 @@ fn file_metadata_snapshot(path: &Path) -> io::Result<Option<FileMetadataSnapshot
     }))
 }
 
-pub(super) fn parse_cargo_dep_info(contents: &str) -> io::Result<Vec<PathBuf>> {
+fn parse_cargo_dep_info(contents: &str) -> io::Result<Vec<PathBuf>> {
     let (_, dependencies) = contents
         .split_once(": ")
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid Cargo dep-info"))?;

@@ -288,8 +288,17 @@ impl Task {
         &self.root
     }
 
-    pub(crate) fn content_digest(&self) -> &str {
+    /// Returns the stable content digest of the complete task package.
+    ///
+    /// Durable profile ledgers use this identity to prevent a task selector
+    /// from silently changing after desired coordinates are materialized.
+    #[must_use]
+    pub fn package_digest(&self) -> &str {
         &self.content_digest
+    }
+
+    pub(crate) fn content_digest(&self) -> &str {
+        self.package_digest()
     }
 
     /// Re-fingerprints every packaged execution input and rejects mutation

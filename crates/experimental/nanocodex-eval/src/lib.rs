@@ -1,14 +1,15 @@
 //! Typed, VM-isolated evaluation for Nanocodex agents.
 //!
-//! This crate owns task loading, bounded scheduling, resumable jobs, typed
-//! events and outcomes, and task × agent × trial sweeps. Every benchmark
-//! attempt executes its tools and verifier in a prepared microVM.
+//! This crate owns task loading, durable profile worksets, typed events and
+//! outcomes, and VM-isolated execution. Applications choose one exact profile
+//! coordinate family; SQLite allocates its internal repetition and fences the
+//! accepted completion.
 //!
-//! # Run a sweep
+//! # Run one task
 //!
 //! ```no_run
 //! use nanocodex_agent::{Nanocodex, OpenAi, Thinking};
-//! use nanocodex_eval::{Evaluator, Sweep, Task, VmResources};
+//! use nanocodex_eval::{Evaluator, Task, VmResources};
 //!
 //! # async fn evaluate() -> Result<(), Box<dyn std::error::Error>> {
 //! let task = Task::load("tasks/write-greeting")?;
@@ -23,19 +24,10 @@
 //!          task, verify your changes, and keep the final answer concise.",
 //!     )
 //!     .thinking(Thinking::Medium);
-//! let sweep = Sweep::builder()
-//!     .task(task)
-//!     .agent("gpt-5.6-sol-medium", agent.clone())?
-//!     .trials(5)
-//!     .build()?;
-//!
 //! let evaluator = Evaluator::builder(agent, backend)
 //!     .output_directory(".nanocodex/evals")
-//!     .max_concurrency(4)
-//!     .max_memory_mb(16_384)
-//!     .resume_incomplete(sweep)
 //!     .build()?;
-//! let run = evaluator.sweep();
+//! let run = evaluator.task(task);
 //! let mut stream = run.events().subscribe();
 //! let event_task = tokio::spawn(async move {
 //!     while let Some(event) = stream.recv().await? {
@@ -45,7 +37,7 @@
 //! });
 //!
 //! let results = run.await?;
-//! println!("{} attempts, {} skipped", results.attempts().len(), results.skipped());
+//! println!("outcome: {:?}", results.outcome());
 //! event_task.await??;
 //! # Ok(())
 //! # }
@@ -84,6 +76,12 @@ mod event;
 pub mod harbor;
 mod job;
 mod native;
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+/// Closed, declarative evaluation profiles over native task packages.
+pub mod profile;
 mod result;
 mod sweep;
 mod task;
@@ -92,6 +90,8 @@ mod task;
     all(target_os = "macos", target_arch = "aarch64")
 ))]
 pub mod vm;
+/// Durable SQLite ledger for agent-selected evaluation coordinates.
+pub mod workset;
 
 pub(crate) use aggregate::{
     AggregateDataset, AttemptBuildIdentity, AttemptConfigurationIdentity, AttemptFact,

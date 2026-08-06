@@ -1,4 +1,6 @@
-use std::{env, num::NonZeroUsize, path::PathBuf};
+#![recursion_limit = "256"]
+
+use std::{env, path::PathBuf};
 
 use nanocodex::{Nanocodex, OpenAi};
 use nanocodex_eval::{
@@ -33,8 +35,10 @@ async fn main() -> Result<(), support::AnyError> {
             .prepare()
             .await?;
 
-    let trials = NonZeroUsize::new(3).ok_or("trial count must be non-zero")?;
-    let reports = evaluator.task_n(task, trials).await?;
-    println!("retained {} matched comparisons", reports.reports().len());
+    let report = evaluator.task(task).await?;
+    println!(
+        "retained matched comparison: {}",
+        report.comparison_path().display()
+    );
     Ok(())
 }

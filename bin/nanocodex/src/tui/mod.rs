@@ -69,6 +69,27 @@ const JAEGER_UI_URL_ENV: &str = "NANOCODEX_JAEGER_UI_URL";
 const MOUSE_SCROLL_ROWS: usize = 3;
 const MAX_AGENT_EVENTS_PER_BATCH: usize = 256;
 
+pub(crate) struct InitialPrompt {
+    display: String,
+    instruction: Option<String>,
+}
+
+impl InitialPrompt {
+    pub(crate) const fn plain(display: String) -> Self {
+        Self {
+            display,
+            instruction: None,
+        }
+    }
+
+    pub(crate) const fn workflow(display: String, instruction: String) -> Self {
+        Self {
+            display,
+            instruction: Some(instruction),
+        }
+    }
+}
+
 enum WorkerCommand {
     Prompt {
         target: PaneId,
@@ -295,7 +316,7 @@ impl BtwWorker {
 fn prepare_btw_prompt(first_prompt: &mut bool, mut prompt: SubmittedPrompt) -> SubmittedPrompt {
     if *first_prompt {
         *first_prompt = false;
-        prompt.prepend_text(BTW_BOUNDARY);
+        prompt.prepend_instruction(BTW_BOUNDARY);
     }
     prompt
 }
@@ -562,7 +583,7 @@ enum VoiceControl {
 pub(crate) async fn run(
     config: AgentArgs,
     vm: crate::vm::VmArgs,
-    initial_prompt: Option<String>,
+    initial_prompt: Option<InitialPrompt>,
     resume: Option<DurableSession>,
 ) -> Result<()> {
     let initial_model = resume
@@ -920,11 +941,30 @@ fn submit_initial_prompt(
     app: &mut App,
     root_session_id: &str,
     worker: &mpsc::UnboundedSender<WorkerCommand>,
-    initial_prompt: Option<String>,
+    initial_prompt: Option<InitialPrompt>,
 ) -> Result<()> {
     if let Some(prompt) = initial_prompt {
-        app.input = prompt;
+        app.input = prompt.display;
         app.cursor = app.input.len();
+        if let Some(instruction) = prompt.instruction {
+            let Some(input) = app.take_submission() else {
+                return Ok(());
+            };
+            let mut submitted = input;
+            submitted.set_instruction(instruction);
+            let target = app.focus;
+            if let Some(prompt_id) = app.queue_prompt(target, submitted.display().to_owned()) {
+                send_command(
+                    worker,
+                    WorkerCommand::Prompt {
+                        target,
+                        prompt_id,
+                        prompt: submitted,
+                    },
+                )?;
+            }
+            return Ok(());
+        }
         submit(app, root_session_id, worker, SubmitIntent::Immediate)?;
     }
     Ok(())
@@ -2736,6 +2776,21 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
     if trimmed == "/trace" {
         return Submission::Trace;
     }
+    if trimmed == "/benchmark" || trimmed.starts_with("/benchmark ") {
+        let display = trimmed.to_owned();
+        let argument = trimmed
+            .strip_prefix("/benchmark")
+            .map(str::trim)
+            .filter(|argument| !argument.is_empty());
+        if argument.is_some_and(|argument| argument.split_whitespace().count() != 1) {
+            return Submission::InvalidCommand("Usage: /benchmark [profile]".to_owned());
+        }
+        let instruction =
+            crate::benchmark::prompt(argument, std::path::Path::new("nanocodex.toml"), None);
+        input.set_display(display);
+        input.set_instruction(instruction);
+        return Submission::Prompt(input);
+    }
     if trimmed == "/voice" {
         return Submission::Voice(VoiceControl::Toggle);
     }
@@ -2867,7 +2922,9 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use futures_util::{SinkExt, StreamExt};
     use nanocodex::{
-        Nanocodex, OpenAi, Thinking, agent::events::AgentEventKind, oai::__private::EventSink,
+        Nanocodex, OpenAi, Thinking,
+        agent::events::AgentEventKind,
+        oai::{__private::EventSink, PromptInput},
     };
     use nanocodex_voice::RealtimeVoice;
     use serde_json::{Value, json};
@@ -2917,6 +2974,18 @@ mod tests {
         assert_eq!(
             classify_submission(" /trace ".to_owned()),
             Submission::Trace
+        );
+        let Submission::Prompt(benchmark) = classify_submission(" /benchmark release ") else {
+            panic!("benchmark must expand into a private workflow prompt");
+        };
+        assert_eq!(benchmark.display(), "/benchmark release");
+        assert_ne!(
+            benchmark,
+            super::app::SubmittedPrompt::text("/benchmark release".to_owned())
+        );
+        assert_eq!(
+            classify_submission("/benchmark release extra"),
+            Submission::InvalidCommand("Usage: /benchmark [profile]".to_owned())
         );
         assert_eq!(
             classify_submission(" /voice "),
@@ -3113,14 +3182,19 @@ mod tests {
     #[test]
     fn side_boundary_wraps_only_the_first_btw_prompt() {
         let mut first = true;
-        assert_eq!(
-            prepare_btw_prompt(&mut first, "first".into()).display(),
-            format!("{BTW_BOUNDARY}first")
-        );
-        assert_eq!(
-            prepare_btw_prompt(&mut first, "follow-up".into()).display(),
-            "follow-up"
-        );
+        let first_prompt = prepare_btw_prompt(&mut first, "first".into());
+        assert_eq!(first_prompt.display(), "first");
+        assert!(matches!(
+            first_prompt.into_prompt().instruction,
+            PromptInput::Text(text) if text == format!("{BTW_BOUNDARY}first")
+        ));
+
+        let follow_up = prepare_btw_prompt(&mut first, "follow-up".into());
+        assert_eq!(follow_up.display(), "follow-up");
+        assert!(matches!(
+            follow_up.into_prompt().instruction,
+            PromptInput::Text(text) if text == "follow-up"
+        ));
     }
 
     #[test]

@@ -79,6 +79,10 @@ impl Run {
     }
 }
 
+pub(crate) async fn run_prompt(prompt: String, config: AgentArgs, vm: VmArgs) -> Result<()> {
+    Run { prompt, repeat: 1 }.run(config, vm).await
+}
+
 async fn write_turn_jsonl(
     events: &mut AgentEvents,
     output: &mut (impl AsyncWrite + Unpin),

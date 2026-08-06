@@ -103,10 +103,6 @@ name = "eval-task"
 path = "src/bin/eval_task.rs"
 
 [[bin]]
-name = "eval-sweep"
-path = "src/bin/eval_sweep.rs"
-
-[[bin]]
 name = "eval-differential"
 path = "src/bin/eval_differential.rs"
 

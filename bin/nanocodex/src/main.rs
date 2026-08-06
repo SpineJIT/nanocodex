@@ -1,4 +1,5 @@
 mod auth;
+mod benchmark;
 mod browser;
 mod config;
 #[cfg(feature = "tempo")]
@@ -181,12 +182,24 @@ async fn run(cli: Cli) -> Result<()> {
                 .wrap_err_with(|| format!("failed to load Codex thread {thread_id}"))?;
             let workspace = PathBuf::from(session.workspace());
             let _observability = command.observability.install(true, &workspace)?;
-            tui::run(command.agent, command.vm, command.prompt, Some(session)).await
+            tui::run(
+                command.agent,
+                command.vm,
+                command.prompt.map(tui::InitialPrompt::plain),
+                Some(session),
+            )
+            .await
         }
         Some(Command::Update(command)) => command.run().await,
         None => {
             let _observability = cli.observability.install(true, cli.agent.cwd())?;
-            tui::run(cli.agent, cli.vm, cli.prompt, None).await
+            tui::run(
+                cli.agent,
+                cli.vm,
+                cli.prompt.map(tui::InitialPrompt::plain),
+                None,
+            )
+            .await
         }
     }
 }
