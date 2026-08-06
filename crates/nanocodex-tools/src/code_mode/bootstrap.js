@@ -254,24 +254,10 @@
         description: tool.description,
       });
     }));
-    function toolSchema(name) {
-      if (typeof name !== "string" || !name) {
-        throw "toolSchema expects a non-empty tool name";
-      }
-      const definition = definitions.find((tool) =>
-        tool.name === name || tool.tool_name === name
-      );
-      if (!definition) return undefined;
-      return cloneValue({
-        inputSchema: definition.input_schema ?? null,
-        outputSchema: definition.output_schema ?? null,
-      });
-    }
     try {
       const script = new AsyncFunction(
         "tools",
         "ALL_TOOLS",
-        "toolSchema",
         "text",
         "image",
         "audio",
@@ -289,7 +275,6 @@
         await script(
           tools,
           allTools,
-          toolSchema,
           text,
           image,
           audio,

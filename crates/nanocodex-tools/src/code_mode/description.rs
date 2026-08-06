@@ -106,7 +106,6 @@ const EXEC_DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose too
 - `setTimeout(callback: () => void, delayMs?: number)`: schedules a callback to run later and returns a timeout id. Pending timeouts do not keep `exec` alive by themselves; await an explicit promise if you need to wait for one.
 - `clearTimeout(timeoutId?: number)`: cancels a timeout created by `setTimeout`.
 - `ALL_TOOLS`: metadata for the enabled nested tools as `{ name, description }` entries.
-- `toolSchema(name: string)`: returns cloned `{ inputSchema, outputSchema }` JSON Schemas for one enabled nested tool, or `undefined` when the name is unknown. Use it inside Code Mode to inspect deferred-tool payloads without emitting the complete schema.
 - `yield_control()`: yields the accumulated output to the model immediately while the script keeps running."#;
 
 pub(super) fn exec_description(
