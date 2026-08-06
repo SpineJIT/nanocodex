@@ -18,7 +18,7 @@ use std::{
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex, OnceLock},
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -30,13 +30,13 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt as _;
 use jiff::{Timestamp, tz::TimeZone};
 use nanocodex_agent::{ExecutionEnvironment, NanocodexBuilder};
-use nanocodex_tools::{ToolExposure, Tools, ToolsBuildError, standard::UpdatePlanTool};
+use nanocodex_tools::{Tools, ToolsBuildError, standard::UpdatePlanTool};
 use nanocodex_vm::{
     host::{
         BlockDevice, GuestCommand, Gvproxy as GvproxyProcess, GvproxyError as VmGvproxyError,
         Network, OverlayDiskError, VmConfig, create_sparse_overlay_disk, overlay_guest_command,
     },
-    tools::{VmCommandOutput, VmCommandPartialOutput, VmMemoryObservation, VmToolSession},
+    tools::{VmCommandOutput, VmCommandPartialOutput, VmToolSession},
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -59,7 +59,7 @@ pub use nanocodex_vm::{
 };
 
 use crate::{
-    CleanupPhase, CodexExec, EvalEnvironment, Evaluator, EvaluatorBuilder, NetworkPolicy, Task,
+    CleanupPhase, EvalEnvironment, Evaluator, EvaluatorBuilder, HarnessExec, NetworkPolicy, Task,
     TaskLoadError, VerifierEnvironmentMode, VerifierResult,
     evaluator::{
         AttemptAgent, AttemptVerification, AttemptVerificationFailure, AttemptVerifier, EvalAttempt,
@@ -320,8 +320,8 @@ impl VmResources {
     /// Prepares and returns one task environment through its shared
     /// single-flight cell.
     ///
-    /// This detailed accessor is intended for custom guest agents such as the
-    /// stock-Codex differential arm. Normal Nanocodex evaluators only need
+    /// This detailed accessor is intended for custom guest harnesses such as
+    /// external harness. Normal Nanocodex evaluators only need
     /// [`Self::backend`].
     pub(crate) async fn environment(&self, task: &Task) -> Result<VmEnvironment, VmResourcesError> {
         let cell = self
@@ -1350,7 +1350,7 @@ impl EvaluatorBuilder {
     /// Runs a custom attempt driver inside the configured VM backend.
     ///
     /// The factory receives the immutable attempt metadata, fresh Nanocodex
-    /// recipe, and materialized VM attempt. Stock-Codex differential runners
+    /// recipe, and materialized VM attempt. Stock-Codex harness adapters
     /// use this boundary to execute a guest binary while retaining the same
     /// evaluator-owned verifier and cleanup lifecycle.
     ///
@@ -1433,7 +1433,7 @@ impl AttemptGvproxy {
 
 // The attempt lifecycle below is intentionally private except for
 // `VmAttempt`. Its public methods expose only the agent/verifier composition
-// needed by Nanocodex and stock-Codex evaluator arms.
+// needed by Nanocodex and external harness evaluator arms.
 /// Failure to configure, materialize, execute, verify, or clean up a VM attempt.
 #[derive(Debug, thiserror::Error)]
 pub enum VmAttemptError {
@@ -1505,85 +1505,7 @@ pub(crate) struct VmAttempt {
     verifier: VmVerifier,
 }
 
-/// Memory observed across the agent and verifier VM sessions for one attempt.
-#[derive(Clone, Default)]
-pub(crate) struct VmAttemptMemory {
-    inner: Arc<StdMutex<VmAttemptMemorySnapshot>>,
-}
-
-/// Best-effort peak memory and confirmed OOM evidence for one VM attempt.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct VmAttemptMemorySnapshot {
-    host_peak_rss_mib: Option<u64>,
-    guest_total_mib: Option<u64>,
-    guest_peak_used_mib: Option<u64>,
-    guest_oom_kills: u64,
-    oom_detected: bool,
-}
-
-impl VmAttemptMemorySnapshot {
-    pub(crate) const fn host_peak_rss_mib(self) -> Option<u64> {
-        self.host_peak_rss_mib
-    }
-
-    pub(crate) const fn guest_total_mib(self) -> Option<u64> {
-        self.guest_total_mib
-    }
-
-    pub(crate) const fn guest_peak_used_mib(self) -> Option<u64> {
-        self.guest_peak_used_mib
-    }
-
-    pub(crate) const fn guest_oom_kills(self) -> u64 {
-        self.guest_oom_kills
-    }
-
-    pub(crate) const fn oom_detected(self) -> bool {
-        self.oom_detected
-    }
-}
-
-impl VmAttemptMemory {
-    pub(crate) fn snapshot(&self) -> VmAttemptMemorySnapshot {
-        *lock_memory(&self.inner)
-    }
-
-    fn record(&self, observation: VmMemoryObservation) {
-        let mut memory = lock_memory(&self.inner);
-        memory.host_peak_rss_mib =
-            max_optional(memory.host_peak_rss_mib, observation.host_peak_rss_mib());
-        memory.guest_total_mib =
-            max_optional(memory.guest_total_mib, observation.guest_total_mib());
-        memory.guest_peak_used_mib = max_optional(
-            memory.guest_peak_used_mib,
-            observation.guest_peak_used_mib(),
-        );
-        memory.guest_oom_kills = memory.guest_oom_kills.max(observation.guest_oom_kills());
-        memory.oom_detected |= observation.oom_detected();
-    }
-}
-
-fn lock_memory(
-    memory: &StdMutex<VmAttemptMemorySnapshot>,
-) -> std::sync::MutexGuard<'_, VmAttemptMemorySnapshot> {
-    memory
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-const fn max_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(if left > right { left } else { right }),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
-}
-
 impl VmAttempt {
-    pub(crate) fn memory_observation(&self) -> VmAttemptMemory {
-        self.verifier.memory.clone()
-    }
-
     /// Returns a cheap handle for guest commands used by a custom attempt driver.
     ///
     /// # Errors
@@ -1606,38 +1528,12 @@ impl VmAttempt {
         self,
         builder: NanocodexBuilder,
     ) -> Result<AttemptAgent, VmAttemptError> {
-        self.nanocodex_inner(builder, None)
-    }
-
-    /// Attaches the guest tools with an explicit model-visible exposure policy.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error after the owned guest session has been consumed or if
-    /// the resulting tool selection is invalid.
-    pub(crate) fn nanocodex_with_exposure(
-        self,
-        builder: NanocodexBuilder,
-        exposure: ToolExposure,
-    ) -> Result<AttemptAgent, VmAttemptError> {
-        self.nanocodex_inner(builder, Some(exposure))
-    }
-
-    fn nanocodex_inner(
-        self,
-        builder: NanocodexBuilder,
-        exposure: Option<ToolExposure>,
-    ) -> Result<AttemptAgent, VmAttemptError> {
         let readiness = self.session_handle()?;
         let context_session = readiness.clone();
         let guest_workspace = self.verifier.launch.workspace.clone();
         let current_date = current_date(&self.timezone);
-        let tools = match exposure {
-            Some(exposure) => self.tools.into_builder().exposure(exposure).build()?,
-            None => self.tools,
-        };
         let timezone = self.timezone;
-        let builder = builder.tools(tools);
+        let builder = builder.tools(self.tools);
         Ok(AttemptAgent::preparing_nanocodex(async move {
             let project_instructions =
                 load_guest_project_instructions(&context_session, &guest_workspace).await?;
@@ -1651,10 +1547,10 @@ impl VmAttempt {
         .verifier(self.verifier))
     }
 
-    /// Attaches the owned VM verifier to a stock-Codex attempt driver.
+    /// Attaches the owned VM verifier to a external harness attempt driver.
     #[must_use]
-    pub(crate) fn codex(self, codex: CodexExec) -> AttemptAgent {
-        AttemptAgent::codex(codex).verifier(self.verifier)
+    pub(crate) fn harness(self, harness: HarnessExec) -> AttemptAgent {
+        AttemptAgent::harness(harness).verifier(self.verifier)
     }
 }
 
@@ -1735,7 +1631,6 @@ struct VmVerifier {
     retain_passed_rootfs: bool,
     retain_failed_rootfs: bool,
     root_disks_finalized: bool,
-    memory: VmAttemptMemory,
     _network: Option<AttemptGvproxy>,
 }
 
@@ -1895,7 +1790,6 @@ fn vm_attempt_inner(
         setup_guard.track_attempt_cache(cache.disk.clone());
     }
     let session = launch.spawn(attempt_cache.as_ref(), VmProcessGroup::Isolated)?;
-    let memory = VmAttemptMemory::default();
     let vm = session.tools();
     let tools = Tools::builder()
         .without_defaults()
@@ -1919,7 +1813,6 @@ fn vm_attempt_inner(
         retain_passed_rootfs: host.retain_passed_rootfs,
         retain_failed_rootfs: host.retain_failed_rootfs,
         root_disks_finalized: false,
-        memory,
         _network: network,
     };
     setup_guard.disarm();
@@ -2788,9 +2681,7 @@ impl VmVerifier {
         .await;
         let verification_error_at = verification.as_ref().err().map(|_| Utc::now());
         let cleanup_started = Utc::now();
-        self.observe_session(&verifier_session).await;
         let shutdown = verifier_session.shutdown().await;
-        self.observe_session(&verifier_session).await;
         let (output, stdout, stderr, reward) = match verification {
             Ok(verification) => verification,
             Err(primary) => {
@@ -2880,9 +2771,7 @@ impl VmVerifier {
                 }
             };
             let cleanup_started = Utc::now();
-            self.observe_session(&agent_session).await;
             if let Err(primary) = agent_session.shutdown().await {
-                self.observe_session(&agent_session).await;
                 let occurred_at = Utc::now();
                 if let Err(cache_error) = self.try_remove_attempt_cache() {
                     warn!(
@@ -2907,7 +2796,6 @@ impl VmVerifier {
                     cleanup,
                 ));
             }
-            self.observe_session(&agent_session).await;
             let session = match launch.spawn(None, VmProcessGroup::Isolated) {
                 Ok(session) => session,
                 Err(primary) => {
@@ -2987,19 +2875,10 @@ impl VmVerifier {
         }
         let cleanup_started = Utc::now();
         let shutdown = match session {
-            Some(session) => {
-                self.observe_session(session).await;
-                let shutdown = session.shutdown().await;
-                self.observe_session(session).await;
-                shutdown
-            }
+            Some(session) => session.shutdown().await,
             None => Ok(()),
         };
         self.cleanup_after_shutdown(cleanup_started, shutdown, false)
-    }
-
-    async fn observe_session(&self, session: &VmToolSession) {
-        self.memory.record(session.memory_observation().await);
     }
 
     fn cleanup_after_shutdown(

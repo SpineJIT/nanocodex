@@ -48,36 +48,6 @@ pub struct ResponsesCaptureProxyConfig {
     pub upstream: String,
     /// Flushed JSONL payload capture written by the proxy.
     pub output: PathBuf,
-    /// Optional evaluator-owned selector overrides applied to one `/models`
-    /// entry before the catalog is delivered to the client.
-    pub model_catalog_override: Option<ResponsesModelCatalogOverride>,
-}
-
-/// Explicit model-catalog selector overrides for a controlled evaluation.
-///
-/// The proxy retains both the exact upstream catalog and the exact catalog
-/// delivered to the client whenever this override is applied.
-#[doc(hidden)]
-#[derive(Clone)]
-pub struct ResponsesModelCatalogOverride {
-    /// Model slug whose runtime tool-mode selector is pinned.
-    pub model: String,
-    /// Tool-mode selector delivered to the client.
-    pub tool_mode: String,
-    /// Multi-agent selector delivered to the client.
-    pub multi_agent_version: Option<String>,
-}
-
-impl ResponsesModelCatalogOverride {
-    /// Pins one model to an explicit Codex tool-mode selector.
-    #[must_use]
-    pub fn tool_mode(model: impl Into<String>, tool_mode: impl Into<String>) -> Self {
-        Self {
-            model: model.into(),
-            tool_mode: tool_mode.into(),
-            multi_agent_version: Some("disabled".to_owned()),
-        }
-    }
 }
 
 /// Failure while running the host Responses payload capture proxy.
@@ -121,7 +91,6 @@ struct ProxyState {
     upstream: Arc<str>,
     http: reqwest::Client,
     recorder: Arc<Mutex<CaptureRecorder>>,
-    model_catalog_override: Option<ResponsesModelCatalogOverride>,
 }
 
 struct CaptureRecorder {
@@ -319,7 +288,6 @@ impl ResponsesCaptureProxy {
                 .build()
                 .map_err(ResponsesCaptureProxyError::HttpClient)?,
             recorder: Arc::new(Mutex::new(recorder)),
-            model_catalog_override: config.model_catalog_override,
         };
         let app = Router::new().fallback(proxy_request).with_state(state);
         let (shutdown, shutdown_request) = oneshot::channel();
@@ -562,9 +530,6 @@ async fn proxy_http(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, String> {
-    let model_catalog_override = (uri.path() == "/models")
-        .then(|| state.model_catalog_override.clone())
-        .flatten();
     let upstream = upstream_url(&state.upstream, &uri, false);
     let body = to_bytes(body, MAX_HTTP_REQUEST_BYTES)
         .await
@@ -610,17 +575,6 @@ async fn proxy_http(
         )
         .await
         .map_err(|error| format!("failed to record HTTP response start: {error}"))?;
-    if let Some(model_catalog_override) = model_catalog_override {
-        return proxy_overridden_model_catalog(
-            &state,
-            upstream_response,
-            response_headers,
-            status,
-            &request,
-            &model_catalog_override,
-        )
-        .await;
-    }
     let recorder = Arc::clone(&state.recorder);
     let response_request = request.clone();
     let chunks = upstream_response.bytes_stream().then(move |chunk| {
@@ -663,105 +617,6 @@ async fn proxy_http(
         .map_err(|error| format!("invalid upstream HTTP status: {error}"))?;
     copy_http_response_headers(&response_headers, response.headers_mut());
     Ok(response)
-}
-
-async fn proxy_overridden_model_catalog(
-    state: &ProxyState,
-    upstream_response: reqwest::Response,
-    response_headers: HeaderMap,
-    status: reqwest::StatusCode,
-    request: &RequestIdentity,
-    model_catalog_override: &ResponsesModelCatalogOverride,
-) -> Result<Response, String> {
-    let upstream = upstream_response
-        .bytes()
-        .await
-        .map_err(|error| format!("failed to read upstream model catalog: {error}"))?;
-    if upstream.len() > MAX_HTTP_REQUEST_BYTES {
-        return Err(format!(
-            "upstream model catalog exceeded {MAX_HTTP_REQUEST_BYTES} bytes"
-        ));
-    }
-    let delivered = override_model_catalog(&upstream, model_catalog_override)?;
-    let mut recorder = state.recorder.lock().await;
-    recorder
-        .inbound(
-            "responses_https",
-            "model_catalog_upstream_body",
-            request,
-            Some(status.as_u16()),
-            &upstream,
-        )
-        .await
-        .map_err(|error| format!("failed to record upstream model catalog: {error}"))?;
-    recorder
-        .inbound(
-            "responses_https",
-            "body_chunk",
-            request,
-            Some(status.as_u16()),
-            &delivered,
-        )
-        .await
-        .map_err(|error| format!("failed to record delivered model catalog: {error}"))?;
-    recorder
-        .inbound(
-            "responses_https",
-            "response_completed",
-            request,
-            Some(status.as_u16()),
-            &[],
-        )
-        .await
-        .map_err(|error| format!("failed to record model catalog completion: {error}"))?;
-    drop(recorder);
-
-    let mut response = Response::new(Body::from(delivered));
-    *response.status_mut() = StatusCode::from_u16(status.as_u16())
-        .map_err(|error| format!("invalid upstream HTTP status: {error}"))?;
-    copy_http_response_headers(&response_headers, response.headers_mut());
-    Ok(response)
-}
-
-fn override_model_catalog(
-    upstream: &[u8],
-    model_catalog_override: &ResponsesModelCatalogOverride,
-) -> Result<Vec<u8>, String> {
-    let mut catalog: Value = serde_json::from_slice(upstream)
-        .map_err(|error| format!("upstream /models response was not valid JSON: {error}"))?;
-    let models = catalog
-        .get_mut("models")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| "upstream /models response had no models array".to_owned())?;
-    let model = models
-        .iter_mut()
-        .find(|model| {
-            model.get("slug").and_then(Value::as_str) == Some(&model_catalog_override.model)
-        })
-        .ok_or_else(|| {
-            format!(
-                "upstream /models response had no `{}` entry",
-                model_catalog_override.model
-            )
-        })?;
-    let object = model.as_object_mut().ok_or_else(|| {
-        format!(
-            "upstream /models entry `{}` was not an object",
-            model_catalog_override.model
-        )
-    })?;
-    object.insert(
-        "tool_mode".to_owned(),
-        Value::String(model_catalog_override.tool_mode.clone()),
-    );
-    if let Some(multi_agent_version) = &model_catalog_override.multi_agent_version {
-        object.insert(
-            "multi_agent_version".to_owned(),
-            Value::String(multi_agent_version.clone()),
-        );
-    }
-    serde_json::to_vec(&catalog)
-        .map_err(|error| format!("failed to encode overridden /models response: {error}"))
 }
 
 fn upstream_url(base: &str, uri: &Uri, websocket: bool) -> String {
@@ -870,10 +725,7 @@ mod tests {
     };
     use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 
-    use super::{
-        ResponsesCaptureProxy, ResponsesCaptureProxyConfig, ResponsesModelCatalogOverride,
-        request_phase, upstream_url,
-    };
+    use super::{ResponsesCaptureProxy, ResponsesCaptureProxyConfig, request_phase, upstream_url};
 
     #[test]
     fn classifies_warmup_and_generation_payloads() {
@@ -932,7 +784,6 @@ mod tests {
             ResponsesCaptureProxyConfig {
                 upstream: format!("http://{upstream_address}"),
                 output: output.clone(),
-                model_catalog_override: None,
             },
         )
         .await
@@ -998,7 +849,6 @@ mod tests {
             ResponsesCaptureProxyConfig {
                 upstream: format!("http://{upstream_address}"),
                 output: output.clone(),
-                model_catalog_override: None,
             },
         )
         .await
@@ -1023,87 +873,5 @@ mod tests {
         assert_eq!(records[1]["status"], 201);
         assert_eq!(records.last().unwrap()["kind"], "response_completed");
         assert_eq!(records.last().unwrap()["status"], 201);
-    }
-
-    #[tokio::test]
-    async fn pins_model_tool_mode_and_retains_upstream_and_delivered_catalogs() {
-        let upstream_catalog = serde_json::json!({
-            "models": [
-                {"slug": "gpt-test", "tool_mode": "code_mode"},
-                {"slug": "other", "tool_mode": "direct"}
-            ]
-        })
-        .to_string();
-        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_address = upstream_listener.local_addr().unwrap();
-        let upstream = tokio::spawn(async move {
-            let (mut stream, _) = upstream_listener.accept().await.unwrap();
-            let mut request = vec![0_u8; 4096];
-            let read = stream.read(&mut request).await.unwrap();
-            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /models "));
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                upstream_catalog.len(),
-                upstream_catalog
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-        });
-
-        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
-        let proxy_address = listener.local_addr().unwrap();
-        let directory = tempdir().unwrap();
-        let output = directory.path().join("api-exchanges.jsonl");
-        let proxy = ResponsesCaptureProxy::start(
-            listener,
-            ResponsesCaptureProxyConfig {
-                upstream: format!("http://{upstream_address}"),
-                output: output.clone(),
-                model_catalog_override: Some(ResponsesModelCatalogOverride::tool_mode(
-                    "gpt-test",
-                    "code_mode_only",
-                )),
-            },
-        )
-        .await
-        .unwrap();
-
-        let delivered: Value = reqwest::get(format!("http://{proxy_address}/models"))
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(delivered["models"][0]["tool_mode"], "code_mode_only");
-        assert_eq!(delivered["models"][0]["multi_agent_version"], "disabled");
-        assert_eq!(delivered["models"][1]["tool_mode"], "direct");
-        upstream.await.unwrap();
-        proxy.shutdown().await.unwrap();
-
-        let records = fs::read_to_string(output).await.unwrap();
-        let records = records
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        let upstream = records
-            .iter()
-            .find(|record| record["kind"] == "model_catalog_upstream_body")
-            .unwrap();
-        assert_eq!(
-            upstream["payload"]["event"]["models"][0]["tool_mode"],
-            "code_mode"
-        );
-        let delivered = records
-            .iter()
-            .find(|record| record["kind"] == "body_chunk")
-            .unwrap();
-        assert_eq!(
-            delivered["payload"]["event"]["models"][0]["tool_mode"],
-            "code_mode_only"
-        );
-        assert_eq!(
-            delivered["payload"]["event"]["models"][0]["multi_agent_version"],
-            "disabled"
-        );
-        assert_eq!(records.last().unwrap()["kind"], "response_completed");
     }
 }

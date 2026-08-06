@@ -50,18 +50,18 @@
 /// Agent Trajectory Interchange Format projection and wire types.
 pub mod atif;
 mod capture_proxy;
-mod codex;
 pub mod coordinator;
-#[cfg(any(
-    all(target_os = "linux", not(target_env = "musl")),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
-/// Matched Nanocodex-versus-Codex execution and retained comparison reports.
-pub mod differential;
 mod digest;
 mod evaluation;
 mod evaluator;
 mod event;
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+/// Configured external harness execution inside evaluator-owned sandboxes.
+pub mod harness;
+mod harness_exec;
 mod job;
 mod native;
 #[cfg(any(
@@ -79,16 +79,10 @@ pub mod vm;
 mod workset;
 
 pub(crate) use atif::{
-    AtifAgent, AtifAgentExtra, AtifBuilder, AtifObservation, AtifObservationExtra,
-    AtifObservationResult, AtifSource, AtifStep, AtifToolCall, AtifToolCallExtra, AtifTrajectory,
+    AtifAgent, AtifAgentExtra, AtifObservation, AtifObservationExtra, AtifObservationResult,
+    AtifSource, AtifStep, AtifToolCall, AtifToolCallExtra, AtifTrajectory,
 };
-pub(crate) use capture_proxy::{
-    ResponsesCaptureProxy, ResponsesCaptureProxyConfig, ResponsesModelCatalogOverride,
-};
-pub(crate) use codex::{
-    CodexCommandOutput, CodexCommandRunner, CodexCommandRunnerError, CodexCommandStatus, CodexExec,
-    CodexExecError, project_codex_atif,
-};
+pub(crate) use capture_proxy::{ResponsesCaptureProxy, ResponsesCaptureProxyConfig};
 pub use evaluation::{
     CoordinateClaim, Evaluation, EvaluationBusy, EvaluationClaim, EvaluationCounts,
     EvaluationError, EvaluationFamilyStatus, EvaluationSelection, EvaluationSelector,
@@ -98,7 +92,11 @@ pub use evaluator::{EvalError, EvalRun, Evaluator, EvaluatorBuilder};
 pub use event::{
     EvalEvent, EvalEventAttempt, EvalEventKind, EvalEventStream, EvalEventStreamError, EvalEvents,
 };
-pub use profile::EvaluationMode;
+pub(crate) use harness_exec::{
+    HarnessCommandOutput, HarnessCommandRunner, HarnessCommandRunnerError, HarnessCommandStatus,
+    HarnessExec, HarnessExecError,
+};
+pub use profile::ResolvedHarness;
 pub use result::{
     AgentMetadata, AgentResult, AgentStatus, BillingCompleteness, CleanupDiagnostic, CleanupPhase,
     CleanupStatus, EvalArtifacts, EvalAttemptOutcome, EvalCleanup, EvalEnvironment, EvalException,

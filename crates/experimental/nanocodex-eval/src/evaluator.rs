@@ -37,7 +37,7 @@ use crate::{
     EvalEvents, EvalException, EvalExceptionKind, EvalFailure, EvalFailureTiming, EvalOutcome,
     EvalResult, EvalStatus, EvalTiming, PhaseTiming, Task, TaskLoadError, UsageTotals,
     VerifierResult,
-    codex::{CodexExec, CodexRunError},
+    harness_exec::{HarnessExec, HarnessRunError},
     job::EvalJob,
     native::{NativeAttempt, VerifierExecution},
 };
@@ -117,7 +117,7 @@ enum AttemptDriverSetup {
 
 enum AttemptDriver {
     Nanocodex(NanocodexBuilder),
-    Codex(CodexExec),
+    Harness(HarnessExec),
 }
 
 /// A verifier that runs against the same retained environment as the agent.
@@ -251,9 +251,9 @@ pub enum EvalError {
     #[error("Nanocodex cleanup failed: {0}")]
     AgentCleanup(#[source] NanocodexError),
 
-    /// A pinned stock-Codex child process failed.
-    #[error("Codex failed: {0}")]
-    Codex(#[source] crate::CodexExecError),
+    /// A pinned external harness child process failed.
+    #[error("External harness failed: {0}")]
+    Harness(#[source] crate::HarnessExecError),
 
     /// The attempt backend factory failed.
     #[error("failed to configure attempt agent: {0}")]
@@ -709,12 +709,12 @@ impl Evaluator {
                 )
                 .await
             }
-            PreparedAgent::Codex(codex) => {
-                self.execute_codex_agent(
+            PreparedAgent::Harness(harness) => {
+                self.execute_harness_agent(
                     emitter,
                     task,
                     attempt,
-                    codex,
+                    harness,
                     verifier,
                     readiness_timing,
                     setup_timing,
@@ -912,12 +912,12 @@ impl Evaluator {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn execute_codex_agent(
+    async fn execute_harness_agent(
         &self,
         emitter: &AttemptEmitter,
         task: &Task,
         attempt: &NativeAttempt,
-        codex: CodexExec,
+        harness: HarnessExec,
         verifier: Option<Box<dyn AttemptVerifier>>,
         readiness_timing: PhaseTiming,
         setup_timing: PhaseTiming,
@@ -930,14 +930,14 @@ impl Evaluator {
             otel.status_code = tracing::field::Empty,
             eval.task.name = task.name(),
             eval.attempt.id = %emitter.attempt_id,
-            agent.kind = "stock_codex_cli",
+            agent.kind = "external_harness",
             agent.timeout_ms = duration_ms(task.agent_timeout()),
             status = tracing::field::Empty,
             error.message = tracing::field::Empty,
             duration_ns = tracing::field::Empty,
         );
         let trace_started = Instant::now();
-        let execution = codex
+        let execution = harness
             .run(
                 &attempt.paths.workspace,
                 &attempt.paths.root,
@@ -949,8 +949,8 @@ impl Evaluator {
         let execution_timing = PhaseTiming::finished(execution_started);
         let error = execution.error.map(|error| {
             RecordedEvalError::now(match error {
-                CodexRunError::Timeout(timeout) => EvalError::AgentTimeout(timeout),
-                CodexRunError::Execution(error) => EvalError::Codex(error),
+                HarnessRunError::Timeout(timeout) => EvalError::AgentTimeout(timeout),
+                HarnessRunError::Execution(error) => EvalError::Harness(error),
             })
         });
         if let Some(error) = &error {
@@ -1068,8 +1068,8 @@ impl Evaluator {
                         ))
                     }
                 },
-                AttemptDriver::Codex(codex) => Ok(AgentSetup {
-                    agent: PreparedAgent::Codex(codex),
+                AttemptDriver::Harness(codex) => Ok(AgentSetup {
+                    agent: PreparedAgent::Harness(codex),
                     verifier,
                     readiness_timing,
                     timing: PhaseTiming::finished(setup_started),
@@ -1802,7 +1802,7 @@ enum PreparedAgent {
         agent: Nanocodex,
         events: AgentEvents,
     },
-    Codex(CodexExec),
+    Harness(HarnessExec),
 }
 
 impl EvaluatorBuilder {
@@ -1888,15 +1888,15 @@ impl AttemptAgent {
         }
     }
 
-    /// Uses one pinned stock-Codex CLI process for an evaluator attempt.
+    /// Uses one pinned stock-harness CLI process for an evaluator attempt.
     ///
     /// This concrete adapter preserves the evaluator's workspace, timeout,
     /// verifier, cleanup, and retention lifecycle.
     #[doc(hidden)]
     #[must_use]
-    pub(crate) fn codex(codex: CodexExec) -> Self {
+    pub(crate) fn harness(harness: HarnessExec) -> Self {
         Self {
-            driver: AttemptDriverSetup::Ready(AttemptDriver::Codex(codex)),
+            driver: AttemptDriverSetup::Ready(AttemptDriver::Harness(harness)),
             readiness: None,
             verifier: None,
         }
@@ -2163,7 +2163,7 @@ fn eval_exception(error: &EvalError, occurred_at: DateTime<Utc>) -> EvalExceptio
 fn failure_outcome(error: &EvalError) -> EvalOutcome {
     match error {
         EvalError::Nanocodex(error) if is_safety_refusal(error) => EvalOutcome::SafetyRefusal,
-        EvalError::Codex(error) if error.is_safety_refusal() => EvalOutcome::SafetyRefusal,
+        EvalError::Harness(error) if error.is_safety_refusal() => EvalOutcome::SafetyRefusal,
         EvalError::AgentTimeout(_) => EvalOutcome::AgentTimeout,
         _ => EvalOutcome::InfrastructureError,
     }
@@ -2174,7 +2174,7 @@ fn failure_kind(error: &EvalError) -> EvalExceptionKind {
         EvalError::Nanocodex(error) if is_safety_refusal(error) => {
             EvalExceptionKind::AgentSafetyRefusal
         }
-        EvalError::Codex(error) if error.is_safety_refusal() => {
+        EvalError::Harness(error) if error.is_safety_refusal() => {
             EvalExceptionKind::AgentSafetyRefusal
         }
         EvalError::Nanocodex(error)
@@ -2188,7 +2188,7 @@ fn failure_kind(error: &EvalError) -> EvalExceptionKind {
         EvalError::VerifierTimeout(_) => EvalExceptionKind::VerifierTimeout,
         EvalError::AgentCleanup(_) => EvalExceptionKind::Cleanup,
         EvalError::Nanocodex(_)
-        | EvalError::Codex(_)
+        | EvalError::Harness(_)
         | EvalError::AgentEventsClosed
         | EvalError::AgentTerminal(_) => EvalExceptionKind::Agent,
         EvalError::AttemptVerifier(_) | EvalError::ParseReward(_) => EvalExceptionKind::Verifier,
@@ -2204,7 +2204,7 @@ const fn verifier_workspace_usable_after_agent_error(error: &EvalError) -> bool 
     matches!(
         error,
         EvalError::Nanocodex(_)
-            | EvalError::Codex(_)
+            | EvalError::Harness(_)
             | EvalError::AgentTimeout(_)
             | EvalError::AgentEventsClosed
             | EvalError::AgentTerminal(_)

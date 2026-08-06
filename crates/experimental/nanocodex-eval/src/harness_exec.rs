@@ -33,69 +33,48 @@ use crate::{
     UsageTotals, atif::finish_projected_trajectory,
 };
 
-const EVENTS_FILE: &str = "agent/codex-events.jsonl";
-const STDERR_FILE: &str = "agent/codex-stderr.log";
-const SUMMARY_FILE: &str = "agent/codex-summary.json";
+const EVENTS_FILE: &str = "agent/harness-events.jsonl";
+const STDERR_FILE: &str = "agent/harness-stderr.log";
+const SUMMARY_FILE: &str = "agent/harness-summary.json";
 const STDERR_TAIL_BYTES: usize = 32 * 1024;
 const SUMMARY_ITEM_LIMIT: usize = 10_000;
 const SUMMARY_LABEL_BYTES: usize = 4 * 1024;
 const PROCESS_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
-/// A pinned stock-Codex executable used by the owned evaluator.
+/// A pinned external harness executable used by the owned evaluator.
 ///
 /// This is a concrete evaluation adapter, not an SDK provider abstraction.
 /// The executable runs in the evaluator-owned disposable workspace and its
 /// complete JSONL/stdout and stderr streams are retained in the attempt.
 #[doc(hidden)]
 #[derive(Clone)]
-pub struct CodexExec {
+pub struct HarnessExec {
     binary: PathBuf,
     model: String,
     effort: String,
     web_search: bool,
-    tool_mode: Option<CodexToolMode>,
+    arguments: Vec<String>,
     api_base_url: Option<String>,
-    auth: CodexAuth,
-    command_runner: Option<Arc<dyn CodexCommandRunner>>,
-}
-
-/// Stock Codex's model-visible tool exposure for a controlled evaluation.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CodexToolMode {
-    /// Expose normal tools directly as well as through Code Mode.
-    CodeMode,
-    /// Expose normal tools only through Code Mode's `exec` entrypoint.
-    CodeModeOnly,
-}
-
-impl CodexToolMode {
-    /// Returns Codex's `/models` tool-mode selector.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::CodeMode => "code_mode",
-            Self::CodeModeOnly => "code_mode_only",
-        }
-    }
+    auth: ProcessAuth,
+    command_runner: Option<Arc<dyn HarnessCommandRunner>>,
 }
 
 #[derive(Clone)]
-enum CodexAuth {
+enum ProcessAuth {
     Inherit,
     #[cfg(test)]
     ApiKey(Arc<str>),
 }
 
-impl fmt::Debug for CodexExec {
+impl fmt::Debug for HarnessExec {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("CodexExec")
+            .debug_struct("HarnessExec")
             .field("binary", &self.binary)
             .field("model", &self.model)
             .field("effort", &self.effort)
             .field("web_search", &self.web_search)
-            .field("tool_mode", &self.tool_mode)
+            .field("arguments", &self.arguments)
             .field("api_base_url", &self.api_base_url)
             .field("auth", &"[redacted]")
             .field(
@@ -106,7 +85,7 @@ impl fmt::Debug for CodexExec {
     }
 }
 
-impl CodexExec {
+impl HarnessExec {
     /// Pins one executable and the model policy used for every configured
     /// attempt.
     ///
@@ -117,25 +96,25 @@ impl CodexExec {
         binary: impl Into<PathBuf>,
         model: impl Into<String>,
         effort: impl Into<String>,
-    ) -> Result<Self, CodexExecError> {
+    ) -> Result<Self, HarnessExecError> {
         let requested = binary.into();
         let binary = requested
             .canonicalize()
-            .map_err(|source| CodexExecError::Binary {
+            .map_err(|source| HarnessExecError::Binary {
                 path: requested.clone(),
                 source,
             })?;
         if !binary.is_file() {
-            return Err(CodexExecError::NotAFile(binary));
+            return Err(HarnessExecError::NotAFile(binary));
         }
         Ok(Self {
             binary,
             model: model.into(),
             effort: effort.into(),
             web_search: false,
-            tool_mode: None,
+            arguments: Vec::new(),
             api_base_url: None,
-            auth: CodexAuth::Inherit,
+            auth: ProcessAuth::Inherit,
             command_runner: None,
         })
     }
@@ -148,26 +127,17 @@ impl CodexExec {
         self
     }
 
-    /// Pins stock Codex's model-visible Code Mode exposure.
-    ///
-    /// The evaluator-owned capture proxy must also pin a remote `/models`
-    /// selector because Codex intentionally gives that selector precedence
-    /// over feature flags.
+    /// Replaces the external harness argument vector with a configured harness
+    /// template. Supported placeholders are `{prompt}`, `{model}`,
+    /// `{thinking}`, `{web_search}`, and `{api_base_url}`.
     #[doc(hidden)]
     #[must_use]
-    pub const fn tool_mode(mut self, tool_mode: CodexToolMode) -> Self {
-        self.tool_mode = Some(tool_mode);
+    pub fn arguments(mut self, arguments: Vec<String>) -> Self {
+        self.arguments = arguments;
         self
     }
 
-    /// Returns the model and remote catalog selector that must be pinned.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn model_tool_mode(&self) -> Option<(&str, CodexToolMode)> {
-        self.tool_mode.map(|mode| (self.model.as_str(), mode))
-    }
-
-    /// Routes stock Codex through one evaluator-owned OpenAI-compatible base
+    /// Routes external harness through one evaluator-owned OpenAI-compatible base
     /// URL.
     #[doc(hidden)]
     #[must_use]
@@ -181,15 +151,15 @@ impl CodexExec {
     #[cfg(test)]
     #[must_use]
     pub fn api_key(mut self, api_key: impl Into<Arc<str>>) -> Self {
-        self.auth = CodexAuth::ApiKey(api_key.into());
+        self.auth = ProcessAuth::ApiKey(api_key.into());
         self
     }
 
-    /// Runs the exact Codex argument vector through an evaluator-owned
-    /// execution environment.
+    /// Runs the configured argument vector through an evaluator-owned execution
+    /// environment.
     #[doc(hidden)]
     #[must_use]
-    pub fn command_runner(mut self, runner: Arc<dyn CodexCommandRunner>) -> Self {
+    pub fn command_runner(mut self, runner: Arc<dyn HarnessCommandRunner>) -> Self {
         self.command_runner = Some(runner);
         self
     }
@@ -200,7 +170,7 @@ impl CodexExec {
         attempt_directory: &Path,
         prompt: &str,
         attempt_timeout: Duration,
-    ) -> CodexExecution {
+    ) -> HarnessExecution {
         if let Some(runner) = &self.command_runner {
             return self
                 .run_with_command_runner(
@@ -213,9 +183,9 @@ impl CodexExec {
         }
         let started = Instant::now();
         let mut process =
-            match CodexProcess::spawn(self, workspace, attempt_directory, prompt).await {
+            match HarnessProcess::spawn(self, workspace, attempt_directory, prompt).await {
                 Ok(process) => process,
-                Err(error) => return CodexExecution::setup_failed(error),
+                Err(error) => return HarnessExecution::setup_failed(error),
             };
 
         match timeout(attempt_timeout, process.wait_status()).await {
@@ -226,7 +196,7 @@ impl CodexExec {
                     Err(error) => Err(error),
                 };
                 match output {
-                    Ok(output) => CodexExecution::from_output(
+                    Ok(output) => HarnessExecution::from_output(
                         self,
                         output,
                         started.elapsed(),
@@ -239,9 +209,9 @@ impl CodexExec {
                                 CleanupPhase::failed(cleanup_started, &cleanup_error)
                             }
                         };
-                        CodexExecution {
+                        HarnessExecution {
                             result: None,
-                            error: Some(CodexRunError::Execution(error)),
+                            error: Some(HarnessRunError::Execution(error)),
                             cleanup,
                         }
                     }
@@ -262,9 +232,9 @@ impl CodexExec {
                         BillingCompleteness::Unknown,
                     )
                 });
-                CodexExecution {
+                HarnessExecution {
                     result,
-                    error: Some(CodexRunError::Timeout(attempt_timeout)),
+                    error: Some(HarnessRunError::Timeout(attempt_timeout)),
                     cleanup,
                 }
             }
@@ -273,11 +243,11 @@ impl CodexExec {
 
     async fn run_with_command_runner(
         &self,
-        runner: &dyn CodexCommandRunner,
+        runner: &dyn HarnessCommandRunner,
         attempt_directory: &Path,
         prompt: &str,
         attempt_timeout: Duration,
-    ) -> CodexExecution {
+    ) -> HarnessExecution {
         let started = Instant::now();
         let output = match runner
             .run(self.command_arguments(prompt), attempt_timeout)
@@ -285,13 +255,13 @@ impl CodexExec {
         {
             Ok(output) => output,
             Err(error) => {
-                return CodexExecution::setup_failed(CodexExecError::CommandRunner(error));
+                return HarnessExecution::setup_failed(HarnessExecError::CommandRunner(error));
             }
         };
         let cleanup_started = chrono::Utc::now();
         let agent_directory = attempt_directory.join("agent");
         if let Err(error) = fs::create_dir_all(&agent_directory).await {
-            return CodexExecution::setup_failed(error.into());
+            return HarnessExecution::setup_failed(error.into());
         }
         let events_path = attempt_directory.join(EVENTS_FILE);
         let stderr_path = attempt_directory.join(STDERR_FILE);
@@ -302,9 +272,9 @@ impl CodexExec {
         let transcript = match transcript {
             Ok(transcript) => transcript,
             Err(error) => {
-                return CodexExecution {
+                return HarnessExecution {
                     result: None,
-                    error: Some(CodexRunError::Execution(error)),
+                    error: Some(HarnessRunError::Execution(error)),
                     cleanup: CleanupPhase::completed(cleanup_started),
                 };
             }
@@ -312,9 +282,9 @@ impl CodexExec {
         let stderr_tail = match stderr_tail {
             Ok(stderr_tail) => stderr_tail,
             Err(error) => {
-                return CodexExecution {
+                return HarnessExecution {
                     result: None,
-                    error: Some(CodexRunError::Execution(error)),
+                    error: Some(HarnessRunError::Execution(error)),
                     cleanup: CleanupPhase::completed(cleanup_started),
                 };
             }
@@ -322,20 +292,20 @@ impl CodexExec {
         let duration = started.elapsed();
         let cleanup = CleanupPhase::completed(cleanup_started);
         match output.status {
-            CodexCommandStatus::TimedOut => {
+            HarnessCommandStatus::TimedOut => {
                 let result = transcript.agent_result(
                     self,
                     duration,
                     AgentStatus::Cancelled,
                     BillingCompleteness::Unknown,
                 );
-                CodexExecution {
+                HarnessExecution {
                     result,
-                    error: Some(CodexRunError::Timeout(attempt_timeout)),
+                    error: Some(HarnessRunError::Timeout(attempt_timeout)),
                     cleanup,
                 }
             }
-            CodexCommandStatus::Exited(exit_code) => CodexExecution::from_portable_output(
+            HarnessCommandStatus::Exited(exit_code) => HarnessExecution::from_portable_output(
                 self,
                 exit_code,
                 transcript,
@@ -347,100 +317,54 @@ impl CodexExec {
     }
 
     fn command_arguments(&self, prompt: &str) -> Vec<String> {
-        let mut arguments = vec![
-            "exec".to_owned(),
-            "--json".to_owned(),
-            "--ephemeral".to_owned(),
-            "--ignore-user-config".to_owned(),
-            "--ignore-rules".to_owned(),
-            "--dangerously-bypass-approvals-and-sandbox".to_owned(),
-            "--skip-git-repo-check".to_owned(),
-            "--model".to_owned(),
-            self.model.clone(),
-            "--config".to_owned(),
-            format!("model_reasoning_effort=\"{}\"", self.effort),
-            "--config".to_owned(),
-            format!(
-                "web_search=\"{}\"",
-                if self.web_search { "live" } else { "disabled" }
-            ),
-            "--config".to_owned(),
-            "features.multi_agent=false".to_owned(),
-            "--config".to_owned(),
-            "features.multi_agent_v2=false".to_owned(),
-            "--config".to_owned(),
-            "agents.enabled=false".to_owned(),
-            "--config".to_owned(),
-            "features.apps=false".to_owned(),
-            "--config".to_owned(),
-            "features.plugins=false".to_owned(),
-            "--config".to_owned(),
-            "features.tool_suggest=false".to_owned(),
-            "--config".to_owned(),
-            "suppress_unstable_features_warning=true".to_owned(),
-            "--config".to_owned(),
-            "skills.include_instructions=false".to_owned(),
-            "--config".to_owned(),
-            "skills.bundled.enabled=false".to_owned(),
-            "--config".to_owned(),
-            "tools.experimental_request_user_input.enabled=false".to_owned(),
-            "--config".to_owned(),
-            "model_reasoning_summary=\"auto\"".to_owned(),
-        ];
-        if let Some(api_base_url) = &self.api_base_url {
-            arguments.extend([
-                "--config".to_owned(),
-                format!("openai_base_url={}", toml_string(api_base_url)),
-            ]);
-        }
-        if let Some(tool_mode) = self.tool_mode {
-            arguments.extend([
-                "--config".to_owned(),
-                "features.code_mode=true".to_owned(),
-                "--config".to_owned(),
-                format!(
-                    "features.code_mode_only={}",
-                    tool_mode == CodexToolMode::CodeModeOnly
-                ),
-            ]);
-        }
-        arguments.extend(["--".to_owned(), prompt.to_owned()]);
-        arguments
+        let web_search = if self.web_search { "true" } else { "false" };
+        let api_base_url = self.api_base_url.as_deref().unwrap_or_default();
+        self.arguments
+            .iter()
+            .map(|argument| {
+                argument
+                    .replace("{prompt}", prompt)
+                    .replace("{model}", &self.model)
+                    .replace("{thinking}", &self.effort)
+                    .replace("{web_search}", web_search)
+                    .replace("{api_base_url}", api_base_url)
+            })
+            .collect()
     }
 }
 
-fn toml_string(value: &str) -> String {
-    toml::Value::String(value.to_owned()).to_string()
-}
-
-/// One evaluator-owned way to execute the stock Codex CLI argument vector.
+/// One evaluator-owned way to execute a configured harness argument vector.
 #[doc(hidden)]
-pub trait CodexCommandRunner: Send + Sync {
-    /// Runs one complete `codex exec --json` process, including timeout
-    /// cleanup, and returns its bounded exact output streams.
+pub trait HarnessCommandRunner: Send + Sync {
+    /// Runs one complete harness process, including timeout cleanup, and
+    /// returns its bounded exact output streams.
     fn run<'a>(
         &'a self,
         arguments: Vec<String>,
         timeout: Duration,
     ) -> Pin<
-        Box<dyn Future<Output = Result<CodexCommandOutput, CodexCommandRunnerError>> + Send + 'a>,
+        Box<
+            dyn Future<Output = Result<HarnessCommandOutput, HarnessCommandRunnerError>>
+                + Send
+                + 'a,
+        >,
     >;
 }
 
-/// Complete output from an evaluator-owned stock Codex process.
+/// Complete output from an evaluator-owned external harness process.
 #[doc(hidden)]
-pub struct CodexCommandOutput {
+pub struct HarnessCommandOutput {
     /// Terminal process status.
-    pub status: CodexCommandStatus,
+    pub status: HarnessCommandStatus,
     /// Complete bounded standard output.
     pub stdout: Vec<u8>,
     /// Complete bounded standard error.
     pub stderr: Vec<u8>,
 }
 
-/// Portable terminal status for an evaluator-owned stock Codex process.
+/// Portable terminal status for an evaluator-owned external harness process.
 #[doc(hidden)]
-pub enum CodexCommandStatus {
+pub enum HarnessCommandStatus {
     /// The process exited with this numeric code.
     Exited(i32),
     /// The runner terminated the process after its deadline.
@@ -451,11 +375,11 @@ pub enum CodexCommandStatus {
 #[doc(hidden)]
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
-pub struct CodexCommandRunnerError {
+pub struct HarnessCommandRunnerError {
     message: String,
 }
 
-impl CodexCommandRunnerError {
+impl HarnessCommandRunnerError {
     /// Wraps a runner-specific diagnostic without exposing its concrete
     /// transport type through the evaluator crate.
     pub fn new(message: impl Into<String>) -> Self {
@@ -465,12 +389,12 @@ impl CodexCommandRunnerError {
     }
 }
 
-/// Failure while validating or executing the pinned Codex CLI.
+/// Failure while validating or executing the pinned harness CLI.
 #[doc(hidden)]
 #[derive(Debug, thiserror::Error)]
-pub enum CodexExecError {
+pub enum HarnessExecError {
     /// The configured executable could not be resolved.
-    #[error("failed to resolve Codex executable {path}: {source}")]
+    #[error("failed to resolve harness executable {path}: {source}")]
     Binary {
         /// Requested executable path.
         path: PathBuf,
@@ -480,15 +404,15 @@ pub enum CodexExecError {
     },
 
     /// The configured executable path was not a regular file.
-    #[error("Codex executable is not a regular file: {0}")]
+    #[error("harness executable is not a regular file: {0}")]
     NotAFile(PathBuf),
 
     /// A process or artifact I/O operation failed.
-    #[error("Codex process I/O failed: {0}")]
+    #[error("harness process I/O failed: {0}")]
     Io(#[from] io::Error),
 
     /// A JSONL event was malformed.
-    #[error("invalid Codex JSONL event on line {line}: {source}")]
+    #[error("invalid harness JSONL event on line {line}: {source}")]
     EventJson {
         /// One-based stdout line number.
         line: u64,
@@ -498,23 +422,23 @@ pub enum CodexExecError {
     },
 
     /// A spawned output task failed.
-    #[error("Codex output capture stopped: {0}")]
+    #[error("harness output capture stopped: {0}")]
     Capture(String),
 
-    /// Codex reported a failed turn.
-    #[error("Codex turn failed: {0}")]
+    /// The harness reported a failed turn.
+    #[error("harness turn failed: {0}")]
     TurnFailed(String),
 
-    /// Codex rejected the turn under its safety policy.
-    #[error("Codex safety refusal: {0}")]
+    /// The harness rejected the turn under its safety policy.
+    #[error("harness safety refusal: {0}")]
     SafetyRefusal(String),
 
-    /// Codex exited without a terminal turn event.
-    #[error("Codex exited without a turn.completed event")]
+    /// The harness exited without a terminal turn event.
+    #[error("harness exited without a turn.completed event")]
     MissingTerminal,
 
-    /// Codex returned a non-zero process status.
-    #[error("Codex exited with {status}: {stderr}")]
+    /// The harness returned a non-zero process status.
+    #[error("harness exited with {status}: {stderr}")]
     Exit {
         /// Process exit status.
         status: ExitStatus,
@@ -523,11 +447,11 @@ pub enum CodexExecError {
     },
 
     /// An evaluator-owned command transport failed.
-    #[error("Codex command runner failed: {0}")]
-    CommandRunner(#[source] CodexCommandRunnerError),
+    #[error("harness command runner failed: {0}")]
+    CommandRunner(#[source] HarnessCommandRunnerError),
 
-    /// A portable evaluator-owned Codex process returned a non-zero exit code.
-    #[error("Codex exited with code {code}: {stderr}")]
+    /// A portable evaluator-owned harness returned a non-zero exit code.
+    #[error("harness exited with code {code}: {stderr}")]
     ExitCode {
         /// Numeric exit code returned by the guest process.
         code: i32,
@@ -536,42 +460,44 @@ pub enum CodexExecError {
     },
 }
 
-impl CodexExecError {
+impl HarnessExecError {
     pub(crate) const fn is_safety_refusal(&self) -> bool {
         matches!(self, Self::SafetyRefusal(_))
     }
 }
 
-pub(crate) struct CodexExecution {
+pub(crate) struct HarnessExecution {
     pub(crate) result: Option<AgentResult>,
-    pub(crate) error: Option<CodexRunError>,
+    pub(crate) error: Option<HarnessRunError>,
     pub(crate) cleanup: CleanupPhase,
 }
 
-impl CodexExecution {
-    const fn setup_failed(error: CodexExecError) -> Self {
+impl HarnessExecution {
+    const fn setup_failed(error: HarnessExecError) -> Self {
         Self {
             result: None,
-            error: Some(CodexRunError::Execution(error)),
+            error: Some(HarnessRunError::Execution(error)),
             cleanup: CleanupPhase::not_required(),
         }
     }
 
     fn from_output(
-        config: &CodexExec,
-        output: CodexProcessOutput,
+        config: &HarnessExec,
+        output: HarnessProcessOutput,
         duration: Duration,
         cleanup: CleanupPhase,
     ) -> Self {
         let error = if let Some(error) = output.transcript.failure() {
-            Some(CodexRunError::Execution(error))
+            Some(HarnessRunError::Execution(error))
         } else if !output.status.success() {
-            Some(CodexRunError::Execution(CodexExecError::Exit {
+            Some(HarnessRunError::Execution(HarnessExecError::Exit {
                 status: output.status,
                 stderr: output.stderr_tail,
             }))
         } else if !output.transcript.completed {
-            Some(CodexRunError::Execution(CodexExecError::MissingTerminal))
+            Some(HarnessRunError::Execution(
+                HarnessExecError::MissingTerminal,
+            ))
         } else {
             None
         };
@@ -596,22 +522,24 @@ impl CodexExecution {
     }
 
     fn from_portable_output(
-        config: &CodexExec,
+        config: &HarnessExec,
         exit_code: i32,
-        transcript: CodexTranscript,
+        transcript: HarnessTranscript,
         stderr_tail: String,
         duration: Duration,
         cleanup: CleanupPhase,
     ) -> Self {
         let error = if let Some(error) = transcript.failure() {
-            Some(CodexRunError::Execution(error))
+            Some(HarnessRunError::Execution(error))
         } else if exit_code != 0 {
-            Some(CodexRunError::Execution(CodexExecError::ExitCode {
+            Some(HarnessRunError::Execution(HarnessExecError::ExitCode {
                 code: exit_code,
                 stderr: stderr_tail,
             }))
         } else if !transcript.completed {
-            Some(CodexRunError::Execution(CodexExecError::MissingTerminal))
+            Some(HarnessRunError::Execution(
+                HarnessExecError::MissingTerminal,
+            ))
         } else {
             None
         };
@@ -634,15 +562,15 @@ impl CodexExecution {
     }
 }
 
-pub(crate) enum CodexRunError {
+pub(crate) enum HarnessRunError {
     Timeout(Duration),
-    Execution(CodexExecError),
+    Execution(HarnessExecError),
 }
 
-struct CodexProcess {
+struct HarnessProcess {
     child: Child,
-    stdout: Option<JoinHandle<Result<CodexTranscript, CodexExecError>>>,
-    stderr: Option<JoinHandle<Result<String, CodexExecError>>>,
+    stdout: Option<JoinHandle<Result<HarnessTranscript, HarnessExecError>>>,
+    stderr: Option<JoinHandle<Result<String, HarnessExecError>>>,
     #[cfg(unix)]
     process_group: Pid,
     #[cfg(unix)]
@@ -650,13 +578,13 @@ struct CodexProcess {
     _auth_home: Option<tempfile::TempDir>,
 }
 
-impl CodexProcess {
+impl HarnessProcess {
     async fn spawn(
-        config: &CodexExec,
+        config: &HarnessExec,
         workspace: &Path,
         attempt_directory: &Path,
         prompt: &str,
-    ) -> Result<Self, CodexExecError> {
+    ) -> Result<Self, HarnessExecError> {
         let agent_directory = attempt_directory.join("agent");
         fs::create_dir_all(&agent_directory).await?;
         let auth_home = prepare_auth_home(&config.auth)?;
@@ -673,10 +601,10 @@ impl CodexProcess {
         }
         match &config.auth {
             #[cfg(test)]
-            CodexAuth::ApiKey(api_key) => {
+            ProcessAuth::ApiKey(api_key) => {
                 command.env("OPENAI_API_KEY", api_key.as_ref());
             }
-            CodexAuth::Inherit => {}
+            ProcessAuth::Inherit => {}
         }
         #[cfg(unix)]
         command.process_group(0);
@@ -686,15 +614,15 @@ impl CodexProcess {
             .id()
             .and_then(|id| i32::try_from(id).ok())
             .map(Pid::from_raw)
-            .ok_or_else(|| io::Error::other("spawned Codex process has no process group"))?;
+            .ok_or_else(|| io::Error::other("spawned harness process has no process group"))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| io::Error::other("spawned Codex process has no stdout"))?;
+            .ok_or_else(|| io::Error::other("spawned harness process has no stdout"))?;
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| io::Error::other("spawned Codex process has no stderr"))?;
+            .ok_or_else(|| io::Error::other("spawned harness process has no stderr"))?;
         let events_path = attempt_directory.join(EVENTS_FILE);
         let stderr_path = attempt_directory.join(STDERR_FILE);
         Ok(Self {
@@ -709,11 +637,11 @@ impl CodexProcess {
         })
     }
 
-    async fn wait_status(&mut self) -> Result<ExitStatus, CodexExecError> {
+    async fn wait_status(&mut self) -> Result<ExitStatus, HarnessExecError> {
         Ok(self.child.wait().await?)
     }
 
-    async fn terminate(&mut self) -> Result<CodexProcessOutput, CodexExecError> {
+    async fn terminate(&mut self) -> Result<HarnessProcessOutput, HarnessExecError> {
         #[cfg(unix)]
         self.signal_process_group(Signal::SIGTERM)?;
         #[cfg(not(unix))]
@@ -732,31 +660,34 @@ impl CodexProcess {
         }
     }
 
-    async fn collect(&mut self, status: ExitStatus) -> Result<CodexProcessOutput, CodexExecError> {
+    async fn collect(
+        &mut self,
+        status: ExitStatus,
+    ) -> Result<HarnessProcessOutput, HarnessExecError> {
         #[cfg(unix)]
         self.signal_process_group(Signal::SIGKILL)?;
         let stdout = self
             .stdout
             .take()
-            .ok_or_else(|| CodexExecError::Capture("stdout was already collected".to_owned()))?;
+            .ok_or_else(|| HarnessExecError::Capture("stdout was already collected".to_owned()))?;
         let stderr = self
             .stderr
             .take()
-            .ok_or_else(|| CodexExecError::Capture("stderr was already collected".to_owned()))?;
+            .ok_or_else(|| HarnessExecError::Capture("stderr was already collected".to_owned()))?;
         let transcript = stdout
             .await
-            .map_err(|error| CodexExecError::Capture(error.to_string()))??;
+            .map_err(|error| HarnessExecError::Capture(error.to_string()))??;
         let stderr_tail = stderr
             .await
-            .map_err(|error| CodexExecError::Capture(error.to_string()))??;
-        Ok(CodexProcessOutput {
+            .map_err(|error| HarnessExecError::Capture(error.to_string()))??;
+        Ok(HarnessProcessOutput {
             status,
             transcript,
             stderr_tail,
         })
     }
 
-    async fn finish_cleanup(&mut self) -> Result<(), CodexExecError> {
+    async fn finish_cleanup(&mut self) -> Result<(), HarnessExecError> {
         if !self.child.try_wait()?.is_some() {
             let _ = self.terminate().await?;
         }
@@ -766,7 +697,7 @@ impl CodexProcess {
     }
 
     #[cfg(unix)]
-    fn signal_process_group(&mut self, signal: Signal) -> Result<(), CodexExecError> {
+    fn signal_process_group(&mut self, signal: Signal) -> Result<(), HarnessExecError> {
         match killpg(self.process_group, signal) {
             Ok(()) | Err(Errno::ESRCH) => {
                 if signal == Signal::SIGKILL {
@@ -775,14 +706,14 @@ impl CodexProcess {
                 Ok(())
             }
             Err(error) => Err(io::Error::other(format!(
-                "failed to signal Codex process group with {signal:?}: {error}"
+                "failed to signal harness process group with {signal:?}: {error}"
             ))
             .into()),
         }
     }
 }
 
-impl Drop for CodexProcess {
+impl Drop for HarnessProcess {
     fn drop(&mut self) {
         #[cfg(unix)]
         if !self.process_group_killed {
@@ -798,27 +729,27 @@ impl Drop for CodexProcess {
     }
 }
 
-struct CodexProcessOutput {
+struct HarnessProcessOutput {
     status: ExitStatus,
-    transcript: CodexTranscript,
+    transcript: HarnessTranscript,
     stderr_tail: String,
 }
 
 #[derive(Debug, Default, Serialize)]
-struct CodexTranscript {
+struct HarnessTranscript {
     schema_version: u32,
     thread_id: Option<String>,
     completed: bool,
     terminal_error: Option<String>,
-    usage: Option<CodexUsage>,
+    usage: Option<HarnessUsage>,
     final_message: String,
-    items: Vec<CodexItemSummary>,
+    items: Vec<HarnessItemSummary>,
     omitted_items: usize,
     tool_calls: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct CodexUsage {
+struct HarnessUsage {
     input_tokens: i64,
     cached_input_tokens: i64,
     #[serde(default)]
@@ -829,7 +760,7 @@ struct CodexUsage {
 }
 
 #[derive(Debug, Serialize)]
-struct CodexItemSummary {
+struct HarnessItemSummary {
     line: u64,
     kind: String,
     label: String,
@@ -837,7 +768,7 @@ struct CodexItemSummary {
     status: Option<String>,
 }
 
-impl CodexTranscript {
+impl HarnessTranscript {
     fn new() -> Self {
         Self {
             schema_version: 1,
@@ -845,7 +776,7 @@ impl CodexTranscript {
         }
     }
 
-    fn observe(&mut self, line: u64, event: &Value) -> Result<(), CodexExecError> {
+    fn observe(&mut self, line: u64, event: &Value) -> Result<(), HarnessExecError> {
         let Some(kind) = event.get("type").and_then(Value::as_str) else {
             return Ok(());
         };
@@ -862,7 +793,7 @@ impl CodexTranscript {
                     .cloned()
                     .map(serde_json::from_value)
                     .transpose()
-                    .map_err(|source| CodexExecError::EventJson { line, source })?;
+                    .map_err(|source| HarnessExecError::EventJson { line, source })?;
                 self.completed = true;
             }
             "turn.failed" => {
@@ -870,13 +801,13 @@ impl CodexTranscript {
                     .pointer("/error/message")
                     .and_then(Value::as_str)
                     .map_or_else(
-                        || Some("Codex reported a failed turn".to_owned()),
+                        || Some("harness reported a failed turn".to_owned()),
                         |message| Some(message.to_owned()),
                     );
             }
             "error" => {
                 self.terminal_error = event.get("message").and_then(Value::as_str).map_or_else(
-                    || Some("Codex reported an unrecoverable stream error".to_owned()),
+                    || Some("harness reported an unrecoverable stream error".to_owned()),
                     |message| Some(message.to_owned()),
                 );
             }
@@ -971,7 +902,7 @@ impl CodexTranscript {
             return;
         }
         let (label, label_truncated) = bounded_label(label);
-        self.items.push(CodexItemSummary {
+        self.items.push(HarnessItemSummary {
             line,
             kind: kind.to_owned(),
             label,
@@ -980,23 +911,23 @@ impl CodexTranscript {
         });
     }
 
-    fn failure(&self) -> Option<CodexExecError> {
+    fn failure(&self) -> Option<HarnessExecError> {
         let error = self.terminal_error.clone()?;
         if is_safety_refusal_message(&error) {
-            Some(CodexExecError::SafetyRefusal(error))
+            Some(HarnessExecError::SafetyRefusal(error))
         } else {
-            Some(CodexExecError::TurnFailed(error))
+            Some(HarnessExecError::TurnFailed(error))
         }
     }
 
     fn agent_result(
         &self,
-        config: &CodexExec,
+        config: &HarnessExec,
         duration: Duration,
         status: AgentStatus,
         billing_completeness: BillingCompleteness,
     ) -> Option<AgentResult> {
-        let usage = self.usage.as_ref().and_then(CodexUsage::totals);
+        let usage = self.usage.as_ref().and_then(HarnessUsage::totals);
         if self.final_message.is_empty()
             && usage.is_none()
             && self.items.is_empty()
@@ -1011,8 +942,8 @@ impl CodexTranscript {
             model: config.model.clone(),
             effort: config.effort.clone(),
             reasoning_mode: None,
-            transport: "codex_exec_jsonl".to_owned(),
-            orchestration: "stock_codex_cli".to_owned(),
+            transport: "harness_jsonl".to_owned(),
+            orchestration: "external_harness".to_owned(),
             runtime_completeness: MeasurementCompleteness::ObservedLowerBound,
             duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
             duration_ns,
@@ -1060,7 +991,7 @@ fn is_safety_refusal_message(message: &str) -> bool {
     message.contains("flagged for possible cybersecurity risk")
 }
 
-impl CodexUsage {
+impl HarnessUsage {
     fn totals(&self) -> Option<UsageTotals> {
         let input_tokens = u64::try_from(self.input_tokens).ok()?;
         let cached_input_tokens = u64::try_from(self.cached_input_tokens).ok()?;
@@ -1078,9 +1009,9 @@ impl CodexUsage {
     }
 }
 
-/// Projects one retained stock-Codex `exec --json` stream into ATIF v1.7.
+/// Projects one retained external harness `exec --json` stream into ATIF v1.7.
 ///
-/// The raw JSONL remains authoritative. Codex's exec stream does not expose
+/// The raw JSONL remains authoritative. The harness stream does not expose
 /// logical model-call boundaries or per-call latency, so the resulting
 /// trajectory preserves completed items in stream order and retains the
 /// attempt's observed-lower-bound runtime completeness.
@@ -1090,15 +1021,16 @@ impl CodexUsage {
 /// Returns an error when the stream cannot be read, contains malformed JSON,
 /// or a completed item cannot be represented as an ATIF step.
 #[doc(hidden)]
-pub fn project_codex_atif(
+pub fn project_harness_atif(
     events_path: &Path,
     prompt: &str,
     result: &AgentResult,
-    codex_version: &str,
-) -> Result<AtifTrajectory, CodexExecError> {
+    harness_name: &str,
+    harness_version: &str,
+) -> Result<AtifTrajectory, HarnessExecError> {
     let input = SyncFile::open(events_path)?;
     let mut input = SyncBufReader::new(input);
-    let mut projection = CodexAtifProjection::new(&result.model, &result.effort);
+    let mut projection = HarnessAtifProjection::new(&result.model, &result.effort);
     let mut line_number = 0_u64;
     let mut line = Vec::new();
     loop {
@@ -1107,24 +1039,25 @@ pub fn project_codex_atif(
             break;
         }
         line_number = line_number.saturating_add(1);
-        let event =
-            serde_json::from_slice::<Value>(&line).map_err(|source| CodexExecError::EventJson {
+        let event = serde_json::from_slice::<Value>(&line).map_err(|source| {
+            HarnessExecError::EventJson {
                 line: line_number,
                 source,
-            })?;
+            }
+        })?;
         projection.observe(line_number, &event)?;
     }
-    Ok(projection.finish(prompt, result, codex_version))
+    Ok(projection.finish(prompt, result, harness_name, harness_version))
 }
 
-struct CodexAtifProjection {
+struct HarnessAtifProjection {
     session_id: String,
     model: String,
     effort: String,
     steps: Vec<AtifStep>,
 }
 
-impl CodexAtifProjection {
+impl HarnessAtifProjection {
     fn new(model: &str, effort: &str) -> Self {
         Self {
             session_id: String::new(),
@@ -1134,7 +1067,7 @@ impl CodexAtifProjection {
         }
     }
 
-    fn observe(&mut self, line: u64, event: &Value) -> Result<(), CodexExecError> {
+    fn observe(&mut self, line: u64, event: &Value) -> Result<(), HarnessExecError> {
         match event.get("type").and_then(Value::as_str) {
             Some("thread.started") => {
                 if let Some(thread_id) = event.get("thread_id").and_then(Value::as_str) {
@@ -1151,7 +1084,7 @@ impl CodexAtifProjection {
         Ok(())
     }
 
-    fn observe_item(&mut self, line: u64, item: &Value) -> Result<(), CodexExecError> {
+    fn observe_item(&mut self, line: u64, item: &Value) -> Result<(), HarnessExecError> {
         let kind = item
             .get("type")
             .and_then(Value::as_str)
@@ -1159,7 +1092,7 @@ impl CodexAtifProjection {
         let item_id = item
             .get("id")
             .and_then(Value::as_str)
-            .map_or_else(|| format!("codex-item-{line}"), str::to_owned);
+            .map_or_else(|| format!("harness-item-{line}"), str::to_owned);
         let step = match kind {
             "agent_message" => self.agent_step(
                 item.get("text")
@@ -1265,19 +1198,19 @@ impl CodexAtifProjection {
                 String::new(),
                 Some(
                     serde_json::to_string(item.get("items").unwrap_or(&Value::Null))
-                        .map_err(|source| CodexExecError::EventJson { line, source })?,
+                        .map_err(|source| HarnessExecError::EventJson { line, source })?,
                 ),
             ),
             "error" => self.agent_step(
                 item.get("message")
                     .and_then(Value::as_str)
-                    .unwrap_or("Codex item error")
+                    .unwrap_or("harness item error")
                     .to_owned(),
                 None,
             ),
             _ => self.agent_step(
                 serde_json::to_string(item)
-                    .map_err(|source| CodexExecError::EventJson { line, source })?,
+                    .map_err(|source| HarnessExecError::EventJson { line, source })?,
                 None,
             ),
         };
@@ -1309,10 +1242,10 @@ impl CodexAtifProjection {
         arguments: Value,
         observation: Value,
         status: String,
-    ) -> Result<AtifStep, CodexExecError> {
+    ) -> Result<AtifStep, HarnessExecError> {
         let arguments = object_raw_value(arguments, line)?;
         let content = serde_json::to_string(&observation)
-            .map_err(|source| CodexExecError::EventJson { line, source })?;
+            .map_err(|source| HarnessExecError::EventJson { line, source })?;
         Ok(AtifStep {
             step_id: 0,
             source: AtifSource::Agent,
@@ -1344,13 +1277,19 @@ impl CodexAtifProjection {
         })
     }
 
-    fn finish(self, prompt: &str, result: &AgentResult, codex_version: &str) -> AtifTrajectory {
+    fn finish(
+        self,
+        prompt: &str,
+        result: &AgentResult,
+        harness_name: &str,
+        harness_version: &str,
+    ) -> AtifTrajectory {
         finish_projected_trajectory(
             prompt,
             self.session_id,
             AtifAgent {
-                name: "codex".to_owned(),
-                version: codex_version.to_owned(),
+                name: harness_name.to_owned(),
+                version: harness_version.to_owned(),
                 model_name: result.model.clone(),
                 extra: AtifAgentExtra {
                     transport: result.metadata.transport.clone(),
@@ -1363,7 +1302,7 @@ impl CodexAtifProjection {
     }
 }
 
-fn object_raw_value(value: Value, line: u64) -> Result<Box<RawValue>, CodexExecError> {
+fn object_raw_value(value: Value, line: u64) -> Result<Box<RawValue>, HarnessExecError> {
     let value = if value.is_object() {
         value
     } else {
@@ -1371,9 +1310,9 @@ fn object_raw_value(value: Value, line: u64) -> Result<Box<RawValue>, CodexExecE
     };
     RawValue::from_string(
         serde_json::to_string(&value)
-            .map_err(|source| CodexExecError::EventJson { line, source })?,
+            .map_err(|source| HarnessExecError::EventJson { line, source })?,
     )
-    .map_err(|source| CodexExecError::EventJson { line, source })
+    .map_err(|source| HarnessExecError::EventJson { line, source })
 }
 
 fn item_status(item: &Value) -> String {
@@ -1386,10 +1325,10 @@ fn item_status(item: &Value) -> String {
 async fn capture_stdout(
     stdout: impl AsyncRead + Unpin,
     path: PathBuf,
-) -> Result<CodexTranscript, CodexExecError> {
+) -> Result<HarnessTranscript, HarnessExecError> {
     let mut output = File::create(&path).await?;
     let mut stdout = BufReader::new(stdout);
-    let mut transcript = CodexTranscript::new();
+    let mut transcript = HarnessTranscript::new();
     let mut line_number = 0_u64;
     let mut first_error = None;
     let mut line = Vec::new();
@@ -1402,7 +1341,7 @@ async fn capture_stdout(
         output.write_all(&line).await?;
         tracing::info!(
             target: "nanocodex_eval",
-            content_kind = "codex.exec.event",
+            content_kind = "harness.event",
             content = String::from_utf8_lossy(&line).as_ref(),
             "trace content"
         );
@@ -1415,7 +1354,7 @@ async fn capture_stdout(
                 }
             }
             Err(source) if first_error.is_none() => {
-                first_error = Some(CodexExecError::EventJson {
+                first_error = Some(HarnessExecError::EventJson {
                     line: line_number,
                     source,
                 });
@@ -1432,7 +1371,7 @@ async fn capture_stdout(
 async fn capture_stderr(
     stderr: impl AsyncRead + Unpin,
     path: PathBuf,
-) -> Result<String, CodexExecError> {
+) -> Result<String, HarnessExecError> {
     let mut stderr = BufReader::new(stderr);
     let mut output = File::create(path).await?;
     let mut tail = Vec::with_capacity(STDERR_TAIL_BYTES);
@@ -1446,7 +1385,7 @@ async fn capture_stderr(
         output.write_all(chunk).await?;
         tracing::info!(
             target: "nanocodex_eval",
-            content_kind = "codex.exec.stderr",
+            content_kind = "harness.stderr",
             content = String::from_utf8_lossy(chunk).as_ref(),
             "trace content"
         );
@@ -1461,11 +1400,11 @@ async fn capture_stderr(
     Ok(String::from_utf8_lossy(&tail).into_owned())
 }
 
-async fn write_summary(events_path: &Path, transcript: &CodexTranscript) -> io::Result<()> {
+async fn write_summary(events_path: &Path, transcript: &HarnessTranscript) -> io::Result<()> {
     let summary = events_path
         .parent()
         .and_then(Path::parent)
-        .ok_or_else(|| io::Error::other("Codex events path has no attempt root"))?
+        .ok_or_else(|| io::Error::other("harness events path has no attempt root"))?
         .join(SUMMARY_FILE);
     let mut encoded = serde_json::to_vec_pretty(transcript).map_err(io::Error::other)?;
     encoded.push(b'\n');
@@ -1473,17 +1412,19 @@ async fn write_summary(events_path: &Path, transcript: &CodexTranscript) -> io::
 }
 
 #[cfg(not(test))]
-const fn prepare_auth_home(auth: &CodexAuth) -> Result<Option<tempfile::TempDir>, CodexExecError> {
+const fn prepare_auth_home(
+    auth: &ProcessAuth,
+) -> Result<Option<tempfile::TempDir>, HarnessExecError> {
     match auth {
-        CodexAuth::Inherit => Ok(None),
+        ProcessAuth::Inherit => Ok(None),
     }
 }
 
 #[cfg(test)]
-fn prepare_auth_home(auth: &CodexAuth) -> Result<Option<tempfile::TempDir>, CodexExecError> {
+fn prepare_auth_home(auth: &ProcessAuth) -> Result<Option<tempfile::TempDir>, HarnessExecError> {
     match auth {
-        CodexAuth::Inherit => Ok(None),
-        CodexAuth::ApiKey(_) => {
+        ProcessAuth::Inherit => Ok(None),
+        ProcessAuth::ApiKey(_) => {
             let home = tempfile::Builder::new()
                 .prefix("nanocodex-eval-codex-home-")
                 .tempdir()?;
@@ -1523,9 +1464,9 @@ mod tests {
     use crate::{AgentStatus, AtifSource, BillingCompleteness, MeasurementCompleteness};
 
     use super::{
-        CodexCommandOutput, CodexCommandRunner, CodexCommandRunnerError, CodexCommandStatus,
-        CodexExec, CodexExecError, CodexRunError, CodexToolMode, CodexTranscript, EVENTS_FILE,
-        STDERR_FILE, SUMMARY_FILE, capture_stdout, project_codex_atif,
+        EVENTS_FILE, HarnessCommandOutput, HarnessCommandRunner, HarnessCommandRunnerError,
+        HarnessCommandStatus, HarnessExec, HarnessExecError, HarnessRunError, HarnessTranscript,
+        STDERR_FILE, SUMMARY_FILE, capture_stdout, project_harness_atif,
     };
 
     #[derive(Default)]
@@ -1533,22 +1474,22 @@ mod tests {
         arguments: Mutex<Vec<String>>,
     }
 
-    impl CodexCommandRunner for StaticCommandRunner {
+    impl HarnessCommandRunner for StaticCommandRunner {
         fn run<'a>(
             &'a self,
             arguments: Vec<String>,
             _timeout: Duration,
         ) -> Pin<
             Box<
-                dyn Future<Output = Result<CodexCommandOutput, CodexCommandRunnerError>>
+                dyn Future<Output = Result<HarnessCommandOutput, HarnessCommandRunnerError>>
                     + Send
                     + 'a,
             >,
         > {
             Box::pin(async move {
                 *self.arguments.lock().unwrap() = arguments;
-                Ok(CodexCommandOutput {
-                    status: CodexCommandStatus::Exited(0),
+                Ok(HarnessCommandOutput {
+                    status: HarnessCommandStatus::Exited(0),
                     stdout: concat!(
                         "{\"type\":\"thread.started\",\"thread_id\":\"thread-runner\"}\n",
                         "{\"type\":\"item.completed\",\"item\":{\"id\":\"message-1\",\"type\":\"agent_message\",\"text\":\"done in guest\"}}\n",
@@ -1564,7 +1505,7 @@ mod tests {
 
     #[test]
     fn transcript_extracts_terminal_usage_message_and_tool_shape() {
-        let mut transcript = CodexTranscript::new();
+        let mut transcript = HarnessTranscript::new();
         transcript
             .observe(
                 1,
@@ -1633,7 +1574,7 @@ mod tests {
     #[test]
     fn terminal_safety_refusal_retains_a_failed_result_and_empty_atif() {
         let temporary = tempdir().unwrap();
-        let events = temporary.path().join("codex-events.jsonl");
+        let events = temporary.path().join("harness-events.jsonl");
         let message = "This request has been flagged for possible cybersecurity risk.";
         let input = format!(
             "{{\"type\":\"thread.started\",\"thread_id\":\"thread-refusal\"}}\n\
@@ -1643,7 +1584,7 @@ mod tests {
             serde_json::to_string(message).unwrap(),
         );
         fs::write(&events, &input).unwrap();
-        let mut transcript = CodexTranscript::new();
+        let mut transcript = HarnessTranscript::new();
         for (index, line) in input.lines().enumerate() {
             transcript
                 .observe(
@@ -1655,10 +1596,10 @@ mod tests {
 
         assert!(matches!(
             transcript.failure(),
-            Some(CodexExecError::SafetyRefusal(error)) if error == message
+            Some(HarnessExecError::SafetyRefusal(error)) if error == message
         ));
         let config =
-            CodexExec::new(std::env::current_exe().unwrap(), "gpt-5.6-sol", "medium").unwrap();
+            HarnessExec::new(std::env::current_exe().unwrap(), "gpt-5.6-sol", "medium").unwrap();
         let result = transcript
             .agent_result(
                 &config,
@@ -1667,8 +1608,14 @@ mod tests {
                 BillingCompleteness::Unknown,
             )
             .unwrap();
-        let trajectory =
-            project_codex_atif(&events, "inspect the program", &result, "codex-cli-test").unwrap();
+        let trajectory = project_harness_atif(
+            &events,
+            "inspect the program",
+            &result,
+            "codex",
+            "codex-cli-test",
+        )
+        .unwrap();
 
         assert_eq!(trajectory.session_id, "thread-refusal");
         assert_eq!(trajectory.steps.len(), 2);
@@ -1687,7 +1634,7 @@ mod tests {
     #[test]
     fn codex_jsonl_projects_complete_ordered_items_into_atif() {
         let temporary = tempdir().unwrap();
-        let events = temporary.path().join("codex-events.jsonl");
+        let events = temporary.path().join("harness-events.jsonl");
         let input = concat!(
             "{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}\n",
             "{\"type\":\"turn.started\"}\n",
@@ -1702,7 +1649,7 @@ mod tests {
             "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"cached_input_tokens\":3,\"cache_write_input_tokens\":1,\"output_tokens\":8,\"reasoning_output_tokens\":2}}\n",
         );
         fs::write(&events, input).unwrap();
-        let mut transcript = CodexTranscript::new();
+        let mut transcript = HarnessTranscript::new();
         for (index, line) in input.lines().enumerate() {
             transcript
                 .observe(
@@ -1712,7 +1659,7 @@ mod tests {
                 .unwrap();
         }
         let config =
-            CodexExec::new(std::env::current_exe().unwrap(), "gpt-5.6-sol", "medium").unwrap();
+            HarnessExec::new(std::env::current_exe().unwrap(), "gpt-5.6-sol", "medium").unwrap();
         let result = transcript
             .agent_result(
                 &config,
@@ -1722,8 +1669,14 @@ mod tests {
             )
             .unwrap();
 
-        let trajectory =
-            project_codex_atif(&events, "complete the task", &result, "codex-cli-test").unwrap();
+        let trajectory = project_harness_atif(
+            &events,
+            "complete the task",
+            &result,
+            "codex",
+            "codex-cli-test",
+        )
+        .unwrap();
 
         assert_eq!(trajectory.session_id, "thread-1");
         assert_eq!(trajectory.agent.name, "codex");
@@ -1794,20 +1747,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evaluator_owned_runner_uses_the_exact_exec_arguments_and_retains_streams() {
+    async fn evaluator_owned_runner_uses_configured_arguments_and_retains_streams() {
         let temporary = tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
         let attempt = temporary.path().join("attempt");
         fs::create_dir(&workspace).unwrap();
         fs::create_dir(&attempt).unwrap();
         let runner = Arc::new(StaticCommandRunner::default());
-        let codex = CodexExec::new(std::env::current_exe().unwrap(), "gpt-5.6-sol", "medium")
+        let harness = HarnessExec::new(std::env::current_exe().unwrap(), "gpt-5.6-sol", "medium")
             .unwrap()
             .web_search(true)
-            .tool_mode(CodexToolMode::CodeModeOnly)
+            .arguments(vec![
+                "run".to_owned(),
+                "--model={model}".to_owned(),
+                "--thinking={thinking}".to_owned(),
+                "--search={web_search}".to_owned(),
+                "{prompt}".to_owned(),
+            ])
             .command_runner(runner.clone());
 
-        let execution = codex
+        let execution = harness
             .run(
                 &workspace,
                 &attempt,
@@ -1821,53 +1780,15 @@ mod tests {
         assert_eq!(result.final_message, "done in guest");
         assert_eq!(result.usage.total_tokens, 5);
         let arguments = runner.arguments.lock().unwrap();
-        assert_eq!(arguments.first().map(String::as_str), Some("exec"));
-        assert!(arguments.iter().any(|argument| argument == "--ephemeral"));
-        assert!(
-            arguments
-                .iter()
-                .any(|argument| argument == "web_search=\"live\"")
-        );
-        assert!(
-            arguments
-                .iter()
-                .any(|argument| argument == "features.code_mode_only=true")
-        );
-        assert!(
-            arguments
-                .iter()
-                .any(|argument| argument == "agents.enabled=false")
-        );
-        for disabled_feature in [
-            "features.apps=false",
-            "features.plugins=false",
-            "features.tool_suggest=false",
-            "skills.include_instructions=false",
-            "skills.bundled.enabled=false",
-        ] {
-            assert!(
-                arguments
-                    .iter()
-                    .any(|argument| argument == disabled_feature)
-            );
-        }
-        assert!(
-            arguments
-                .iter()
-                .any(|argument| argument == "tools.experimental_request_user_input.enabled=false")
-        );
-        assert!(
-            arguments
-                .iter()
-                .any(|argument| argument == "model_reasoning_summary=\"auto\"")
-        );
         assert_eq!(
-            codex.model_tool_mode(),
-            Some(("gpt-5.6-sol", CodexToolMode::CodeModeOnly))
-        );
-        assert_eq!(
-            arguments.last().map(String::as_str),
-            Some("finish the benchmark")
+            arguments.as_slice(),
+            [
+                "run",
+                "--model=gpt-5.6-sol",
+                "--thinking=medium",
+                "--search=true",
+                "finish the benchmark",
+            ]
         );
         assert!(
             fs::read_to_string(attempt.join(EVENTS_FILE))
@@ -1882,26 +1803,30 @@ mod tests {
     }
 
     #[test]
-    fn normal_code_mode_explicitly_disables_code_mode_only() {
-        let codex = CodexExec::new(std::env::current_exe().unwrap(), "gpt-5.6-sol", "medium")
+    fn configured_harness_arguments_expand_coordinate_placeholders() {
+        let harness = HarnessExec::new(std::env::current_exe().unwrap(), "gpt-5.6-luna", "high")
             .unwrap()
-            .tool_mode(CodexToolMode::CodeMode);
+            .web_search(true)
+            .api_base_url("http://192.168.127.1:1234")
+            .arguments(vec![
+                "run".to_owned(),
+                "--model={model}".to_owned(),
+                "--thinking={thinking}".to_owned(),
+                "--search={web_search}".to_owned(),
+                "--api={api_base_url}".to_owned(),
+                "{prompt}".to_owned(),
+            ]);
 
-        let arguments = codex.command_arguments("test");
-
-        assert!(
-            arguments
-                .iter()
-                .any(|argument| argument == "features.code_mode=true")
-        );
-        assert!(
-            arguments
-                .iter()
-                .any(|argument| argument == "features.code_mode_only=false")
-        );
         assert_eq!(
-            codex.model_tool_mode(),
-            Some(("gpt-5.6-sol", CodexToolMode::CodeMode))
+            harness.command_arguments("do the task"),
+            [
+                "run",
+                "--model=gpt-5.6-luna",
+                "--thinking=high",
+                "--search=true",
+                "--api=http://192.168.127.1:1234",
+                "do the task",
+            ]
         );
     }
 
@@ -1914,7 +1839,7 @@ mod tests {
         fs::create_dir(&attempt).unwrap();
         let marker = temporary.path().join("descendant-survived");
         let binary = write_timeout_codex(temporary.path(), &marker);
-        let codex = CodexExec::new(binary, "gpt-5.6-sol", "medium")
+        let codex = HarnessExec::new(binary, "gpt-5.6-sol", "medium")
             .unwrap()
             .api_key("test");
 
@@ -1929,15 +1854,15 @@ mod tests {
 
         assert!(matches!(
             execution.error,
-            Some(CodexRunError::Timeout(timeout)) if timeout == Duration::from_millis(50)
+            Some(HarnessRunError::Timeout(timeout)) if timeout == Duration::from_millis(50)
         ));
         sleep(Duration::from_millis(700)).await;
         assert!(
             !marker.exists(),
             "a process descended from timed-out Codex survived cleanup"
         );
-        assert!(attempt.join("agent/codex-events.jsonl").is_file());
-        assert!(attempt.join("agent/codex-stderr.log").is_file());
+        assert!(attempt.join("agent/harness-events.jsonl").is_file());
+        assert!(attempt.join("agent/harness-stderr.log").is_file());
     }
 
     #[tokio::test]
@@ -1949,7 +1874,7 @@ mod tests {
         fs::create_dir(&attempt).unwrap();
         let marker = temporary.path().join("descendant-survived-success");
         let binary = write_success_with_descendant_codex(temporary.path(), &marker);
-        let codex = CodexExec::new(binary, "gpt-5.6-sol", "medium")
+        let codex = HarnessExec::new(binary, "gpt-5.6-sol", "medium")
             .unwrap()
             .api_key("test");
 
@@ -1970,16 +1895,16 @@ mod tests {
         let temporary = tempdir().unwrap();
         let agent = temporary.path().join("attempt/agent");
         fs::create_dir_all(&agent).unwrap();
-        let events = agent.join("codex-events.jsonl");
+        let events = agent.join("harness-events.jsonl");
         let input = b"not-json\r\n{\"type\":\"thread.started\",\"thread_id\":\"later\"}";
 
         let error = capture_stdout(&input[..], events.clone())
             .await
             .unwrap_err();
 
-        assert!(matches!(error, CodexExecError::EventJson { line: 1, .. }));
+        assert!(matches!(error, HarnessExecError::EventJson { line: 1, .. }));
         assert_eq!(fs::read(&events).unwrap(), input);
-        let summary = fs::read_to_string(agent.join("codex-summary.json")).unwrap();
+        let summary = fs::read_to_string(agent.join("harness-summary.json")).unwrap();
         assert!(summary.contains("\"thread_id\": \"later\""));
     }
 

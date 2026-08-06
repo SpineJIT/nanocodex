@@ -23,7 +23,7 @@ The desired amount of work is defined only by `{config}`. Never add an ad-hoc ta
 
     nanocodex eval status{profile_argument} --config {config_argument}{state_argument}{coordinator_argument} --json
 
-You own execution strategy. Read the family records, choose an exact pending task and treatment, and invoke one repetition with `nanocodex eval run{profile_argument} --config {config_argument}{state_argument}{coordinator_argument} --task <exact-profile-selector>` plus any model, thinking, or tool-mode selectors required to disambiguate that profile family. The CLI allocates the internal repetition; never pass or invent a trial number.
+You own execution strategy. Read the family records, choose an exact pending task and harness treatment, and invoke one repetition with `nanocodex eval run{profile_argument} --config {config_argument}{state_argument}{coordinator_argument} --task <exact-profile-selector>` plus `--harness`, model, or thinking selectors required to identify that profile family. Omit `--harness` for built-in Nanocodex. The CLI allocates the internal repetition; never pass or invent a trial number.
 
 Decide how many run processes to launch concurrently and which tasks to prioritize. You may adjust fan-out based on memory, preparation contention, failures, and observed throughput. There is deliberately no run-all command, next-work command, scheduler, or host-saturation loop in the evaluator.
 
@@ -51,7 +51,8 @@ mod tests {
             None,
         );
 
-        assert!(prompt.contains("choose an exact pending task and treatment"));
+        assert!(prompt.contains("choose an exact pending task and harness treatment"));
+        assert!(prompt.contains("Omit `--harness` for built-in Nanocodex"));
         assert!(prompt.contains("Decide how many run processes to launch concurrently"));
         assert!(prompt.contains("never pass or invent a trial number"));
         assert!(prompt.contains("--state-dir '/mnt/evals'"));

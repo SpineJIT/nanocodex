@@ -3,17 +3,15 @@ use std::{
     time::Duration,
 };
 
-use clap::{Args, ValueEnum};
+use clap::Args;
 use eyre::{Result, WrapErr as _, eyre};
 use nanocodex::Model;
 use nanocodex_eval::{
     EvalAttemptOutcome, EvalEventKind, EvalEventStream, EvalOutcome, Evaluation, EvaluationClaim,
-    EvaluationMode, EvaluationSelection, EvaluationSelector, Evaluator, Task,
+    EvaluationSelection, EvaluationSelector, Evaluator, ResolvedHarness, Task,
     atif::AtifBuilder,
     coordinator::{CoordinatorClient, RemoteClaim, RemoteLease},
-    differential::{
-        CodexAuth, CodexToolMode, DifferentialEvaluator, ExecutableIdentity, NanocodexToolMode,
-    },
+    harness::{Harness, HarnessAuth},
     vm::{CachePolicy, VmResources},
 };
 use serde::Serialize;
@@ -28,7 +26,6 @@ use crate::{
 const CONFIG_FILE: &str = "nanocodex.toml";
 const LEASE_DURATION: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_INITIAL_GUEST_MEMORY_MB: u64 = 512;
-const MEMORY_PROFILE_FILE: &str = "differential-memory-profiles.json";
 
 #[derive(Clone, Debug, Args)]
 pub(super) struct ProfileTarget {
@@ -73,13 +70,9 @@ pub(super) struct Run {
     #[arg(long)]
     model: Option<Model>,
 
-    /// Select one Nanocodex tool treatment from the profile.
-    #[arg(long, value_enum)]
-    nanocodex_tool_mode: Option<ToolMode>,
-
-    /// Select one stock-Codex tool treatment from the profile.
-    #[arg(long, value_enum)]
-    codex_tool_mode: Option<ToolMode>,
+    /// Select one configured external harness. Omission uses Nanocodex.
+    #[arg(long, value_name = "NAME")]
+    harness: Option<String>,
 
     /// Advisory stable name used for coordinator task affinity and status.
     #[arg(long, env = "NANOCODEX_WORKER_NAME", value_name = "NAME")]
@@ -88,7 +81,7 @@ pub(super) struct Run {
     #[command(flatten)]
     vm: VmPreparationArgs,
 
-    /// Initial eval-only guest RAM allocated to each differential arm.
+    /// Guest RAM allocated to an external harness sandbox.
     #[arg(
         long,
         value_name = "MIB",
@@ -102,14 +95,6 @@ pub(super) struct Run {
 
     #[command(flatten)]
     agent: EvalAgentArgs,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum ToolMode {
-    #[value(alias = "code_mode")]
-    CodeMode,
-    #[value(alias = "code_mode_only")]
-    CodeModeOnly,
 }
 
 #[derive(Serialize)]
@@ -181,10 +166,9 @@ impl Run {
         let _observability = self.observability.install(false, Path::new("."))?;
         let requested_thinking = self.agent.thinking();
         let selector = EvaluationSelector::new(&self.task)
+            .harness(self.harness)
             .model(self.model)
-            .thinking(requested_thinking)
-            .nanocodex_tool_mode(self.nanocodex_tool_mode.map(NanocodexToolMode::from))
-            .codex_tool_mode(self.codex_tool_mode.map(CodexToolMode::from));
+            .thinking(requested_thinking);
         if let Some(coordinator) = &self.target.coordinator {
             let selection = EvaluationSelection::load(
                 &self.target.config,
@@ -234,12 +218,11 @@ impl Run {
                             claim.task().clone(),
                             claim.treatment().clone(),
                             claim.web_search(),
-                            claim.codex_command().map(Path::to_path_buf),
+                            claim.harness().cloned(),
                             claim.output_directory().to_path_buf(),
                             resources,
                             self.guest_memory_mb,
                             self.agent,
-                            &self.vm,
                         )
                         .await
                     }
@@ -339,12 +322,11 @@ async fn run_remote(
                         selection.task().clone(),
                         selection.treatment().clone(),
                         selection.web_search(),
-                        selection.codex_command().map(Path::to_path_buf),
+                        selection.harness().cloned(),
                         output.path().to_path_buf(),
                         resources,
                         guest_memory_mb,
                         agent,
-                        vm,
                     )
                     .await
                 }
@@ -479,16 +461,15 @@ async fn execute_coordinate(
     task: Task,
     treatment: nanocodex_eval::EvaluationTreatment,
     web_search: bool,
-    codex_command: Option<PathBuf>,
+    harness: Option<ResolvedHarness>,
     output: PathBuf,
     resources: VmResources,
     guest_memory_mb: u64,
     agent: EvalAgentArgs,
-    vm: &VmPreparationArgs,
 ) -> Result<ExecutionResult> {
     std::fs::create_dir_all(&output)?;
-    match treatment.mode {
-        EvaluationMode::Nanocodex => {
+    match treatment.harness.as_str() {
+        "nanocodex" => {
             let backend = resources.backend().await?;
             let nanocodex = agent.builder(treatment.model, treatment.thinking, web_search)?;
             let evaluator = Evaluator::builder(nanocodex, backend)
@@ -505,40 +486,45 @@ async fn execute_coordinate(
                 Ok(ExecutionResult::Accepted(evidence))
             }
         }
-        EvaluationMode::Differential => {
+        _ => {
             let (nanocodex, auth) =
                 agent.shared_builder(treatment.model, treatment.thinking, web_search)?;
-            let codex_auth = match auth {
-                SharedAuth::ApiKey(api_key) => CodexAuth::api_key(api_key),
-                SharedAuth::AuthFile(path) => CodexAuth::auth_file(path),
+            let harness_auth = match auth {
+                SharedAuth::ApiKey(api_key) => HarnessAuth::api_key(api_key),
+                SharedAuth::AuthFile(path) => HarnessAuth::auth_file(path),
             };
-            let executable = std::env::current_exe()?;
-            let codex = codex_command
-                .as_deref()
-                .ok_or_else(|| eyre!("differential profile lost its Codex command"))?;
-            let evaluator = DifferentialEvaluator::builder(nanocodex)
-                .codex(codex, codex_auth)
-                .vm(resources)
-                .output_directory(&output)
-                .thinking(treatment.thinking)
-                .web_search(web_search)
-                .nanocodex_tool_mode(treatment.nanocodex_tool_mode)
-                .codex_tool_mode(treatment.codex_tool_mode)
-                .nanocodex_executable(
-                    ExecutableIdentity::new(executable, env!("NANOCODEX_SEMVER_VERSION"))
-                        .git_sha(env!("VERGEN_GIT_SHA"))
-                        .built_at(env!("VERGEN_BUILD_TIMESTAMP")),
-                )
-                .initial_guest_memory_mb(guest_memory_mb)
-                .memory_profile_path(vm.vm_cache.join(MEMORY_PROFILE_FILE))
-                .prepare()
-                .await?;
-            let report = evaluator.task(task).await?;
-            let evidence = report.comparison_path().to_path_buf();
-            if report.has_infrastructure_failure() || report.has_operational_error() {
+            let configured =
+                harness.ok_or_else(|| eyre!("external harness lost its resolved configuration"))?;
+            let harness = Harness::new(
+                nanocodex,
+                task.clone(),
+                &configured.command,
+                harness_auth,
+                resources,
+            )
+            .model(treatment.model)
+            .output_directory(&output)
+            .thinking(treatment.thinking)
+            .web_search(web_search)
+            .guest_memory_mb(guest_memory_mb)
+            .arguments(configured.arguments)
+            .environment(configured.environment.into_iter().collect())
+            .credentials(
+                configured.home,
+                configured.auth_file,
+                configured.api_key_environment,
+            )
+            .api_upstream(configured.api_upstream)
+            .version(configured.version)
+            .name(configured.name)
+            .prepare()
+            .await?;
+            let outcome = run_native(harness.evaluator(), task).await?;
+            harness.retain_trajectory(&outcome).await?;
+            let evidence = harness.directory().to_path_buf();
+            if outcome.outcome() == EvalOutcome::InfrastructureError {
                 Ok(ExecutionResult::Retryable {
-                    error: "differential pair retained infrastructure or operational failure"
-                        .to_owned(),
+                    error: "external harness retained an infrastructure failure".to_owned(),
                     evidence,
                 })
             } else {
@@ -671,24 +657,6 @@ fn write_json(value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-impl From<ToolMode> for NanocodexToolMode {
-    fn from(value: ToolMode) -> Self {
-        match value {
-            ToolMode::CodeMode => Self::CodeMode,
-            ToolMode::CodeModeOnly => Self::CodeModeOnly,
-        }
-    }
-}
-
-impl From<ToolMode> for CodexToolMode {
-    fn from(value: ToolMode) -> Self {
-        match value {
-            ToolMode::CodeMode => Self::CodeMode,
-            ToolMode::CodeModeOnly => Self::CodeModeOnly,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -721,6 +689,30 @@ mod tests {
         };
         assert_eq!(run.task, "terminal/fix-git");
         assert_eq!(run.worker.as_deref(), Some("dev-one"));
+    }
+
+    #[test]
+    fn run_accepts_one_optional_external_harness() {
+        let cli = Cli::try_parse_from([
+            "nanocodex",
+            "eval",
+            "run",
+            "release",
+            "--task",
+            "terminal/fix-git",
+            "--harness",
+            "codex",
+            "--api-key",
+            "test-key",
+        ])
+        .unwrap();
+        let Some(Command::Eval(eval)) = cli.command else {
+            panic!("expected eval command");
+        };
+        let EvalCommand::Run(run) = eval.command else {
+            panic!("expected profile run");
+        };
+        assert_eq!(run.harness.as_deref(), Some("codex"));
     }
 
     #[test]

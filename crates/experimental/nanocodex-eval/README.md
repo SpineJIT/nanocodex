@@ -59,13 +59,12 @@ tasks = ["tasks/write-greeting"]
 trials = 3
 model = ["sol"]
 thinking = ["low"]
-mode = "nanocodex"
 ```
 
 `Evaluation::open` resolves task packages, fingerprints their complete
 execution inputs, and materializes every desired repetition in SQLite before
-execution begins. Differential profiles also fingerprint the pinned
-stock-Codex executable.
+execution begins. Profiles selecting an external harness also fingerprint its
+semantic configuration and pinned executable release.
 
 ```text
 profile -> exact task/treatment families -> k=1..N SQLite coordinates
@@ -83,12 +82,59 @@ exactly-once model spending after a worker becomes unreachable. Heartbeats and
 conservative expiry reduce duplicate spending; generation fencing prevents a
 stale result from being committed.
 
-## Differential evaluation
+## External harnesses
 
-Detailed matched-pair APIs live under `nanocodex_eval::differential`; VM APIs
-live under `nanocodex_eval::vm`. One differential coordinate runs its
-Nanocodex and pinned stock-Codex arms concurrently, retains both trajectories
-and verifier evidence, and publishes one atomic `comparison.json`.
+An omitted harness means the built-in Nanocodex library runner. External
+harnesses are ordinary independent coordinates:
+
+```toml
+[harness.codex]
+command = "harness/codex"
+version = "0.145.0"
+arguments = [
+  "exec", "--json", "--ephemeral",
+  "--dangerously-bypass-approvals-and-sandbox",
+  "--skip-git-repo-check",
+  "--model", "{model}",
+  "--config", "model_reasoning_effort=\"{thinking}\"",
+  "--config", "openai_base_url=\"{api_base_url}\"",
+  "--", "{prompt}",
+]
+environment = { CODEX_HOME = "/run/nanocodex-harness-home" }
+# Optional defaults shown explicitly; other CLIs can choose their own paths.
+home = "/run/nanocodex-harness-home"
+auth_file = "/run/nanocodex-harness-home/auth.json"
+api_key_environment = "OPENAI_API_KEY"
+
+[profiles.compare]
+tasks = ["tasks/write-greeting"]
+trials = 5
+harness = ["nanocodex", "codex"]
+model = ["sol", "luna"]
+thinking = ["medium", "high"]
+```
+
+The evaluator stages the configured command at
+`/run/nanocodex-harness/command` inside the task VM and routes its
+OpenAI-compatible traffic through the same capture proxy. The command path,
+`arguments`, `environment`, credential paths, API-key environment name, and
+`api_upstream` are profile data; argument
+templates support `{prompt}`, `{model}`, `{thinking}`, `{web_search}`, and
+`{api_base_url}`. Environment values additionally support `{api_base_url}`,
+`{harness_home}`, and `{auth_file}`. Authentication is exposed at the neutral
+`NANOCODEX_HARNESS_AUTH_FILE` and `NANOCODEX_HARNESS_HOME` paths, so an
+agent-specific home variable such as `CODEX_HOME` is only configuration.
+
+An external binary must emit the harness JSONL contract on stdout. The current
+contract is the small event vocabulary emitted by `codex exec --json`
+(`thread.started`, item events, and one terminal turn event), so Codex works
+directly and another CLI can use a thin output wrapper. Rust contains no Codex
+binary path, command line, or execution mode.
+
+There is no matched-pair runner or comparison state machine. Each harness emits
+its own result JSON, raw JSONL, trajectory, verifier evidence, and ledger row.
+Differential reports are ordinary offline queries joining matching coordinate
+dimensions.
 
 Prepared task images and memory observations remain content-addressed cache
 inputs. Each arm still receives a fresh writable overlay, so filesystem and
@@ -103,6 +149,10 @@ nanocodex eval status local-smoke --json
 # Execute one SQLite-assigned repetition from an exact profile task.
 nanocodex eval run local-smoke --task tasks/write-greeting
 
+# Execute the matching configured external-harness coordinate.
+nanocodex eval run compare --task tasks/write-greeting --harness codex \
+  --model luna --thinking high
+
 # Let an agent inspect the ledger and choose task order and process fan-out.
 nanocodex eval benchmark local-smoke
 # Equivalent interactive workflow:
@@ -113,7 +163,7 @@ nanocodex
 `--state-dir` overrides the default `~/.nanocodex/evals`. There is no trial
 argument: `trials` is profile-owned desired work, and SQLite assigns a
 fungible repetition inside the exact family selected by `--task` and any
-needed model, thinking, or tool-mode selectors.
+needed harness, model, or thinking selectors.
 
 Set `NANOCODEX_BIN` and `NANOCODEX_VM_RUNTIME` when the default development
 paths do not apply.

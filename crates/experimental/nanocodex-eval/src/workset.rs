@@ -783,9 +783,9 @@ mod tests {
                 digest: "task-digest".to_owned(),
             }],
             families: vec![WorksetFamily {
-                key: "terminal/fix-git|high|diff".to_owned(),
+                key: "terminal/fix-git|harness|high".to_owned(),
                 task_selector: "terminal/fix-git".to_owned(),
-                treatment: "high differential".to_owned(),
+                treatment: "codex high".to_owned(),
                 trials,
             }],
         }
@@ -795,7 +795,7 @@ mod tests {
         let workset =
             Workset::ensure(directory.join("state.sqlite3"), &spec(directory, trials)).unwrap();
         let BeginCoordinate::Prepare(preparation) = workset
-            .begin("terminal/fix-git|high|diff", Duration::from_secs(30))
+            .begin("terminal/fix-git|harness|high", Duration::from_secs(30))
             .unwrap()
         else {
             panic!("first request must own preparation");
@@ -824,13 +824,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let workset = prepared_workset(directory.path(), 2);
         let BeginCoordinate::Execute(first) = workset
-            .begin("terminal/fix-git|high|diff", Duration::from_secs(30))
+            .begin("terminal/fix-git|harness|high", Duration::from_secs(30))
             .unwrap()
         else {
             panic!("first coordinate should execute");
         };
         let BeginCoordinate::Execute(second) = workset
-            .begin("terminal/fix-git|high|diff", Duration::from_secs(30))
+            .begin("terminal/fix-git|harness|high", Duration::from_secs(30))
             .unwrap()
         else {
             panic!("second coordinate should execute");
@@ -839,7 +839,7 @@ mod tests {
         assert_ne!(first.repetition, second.repetition);
         assert!(matches!(
             workset
-                .begin("terminal/fix-git|high|diff", Duration::from_secs(30))
+                .begin("terminal/fix-git|harness|high", Duration::from_secs(30))
                 .unwrap(),
             BeginCoordinate::Busy(WorksetBusy {
                 reason: "coordinates_running",
@@ -858,7 +858,7 @@ mod tests {
         .unwrap();
         let BeginCoordinate::Prepare(preparation) = workset
             .begin_for_host(
-                "terminal/fix-git|high|diff",
+                "terminal/fix-git|harness|high",
                 "100.64.0.1",
                 Duration::from_secs(30),
             )
@@ -869,7 +869,7 @@ mod tests {
         assert!(matches!(
             workset
                 .begin_for_host(
-                    "terminal/fix-git|high|diff",
+                    "terminal/fix-git|harness|high",
                     "100.64.0.2",
                     Duration::from_secs(30),
                 )
@@ -882,7 +882,7 @@ mod tests {
         workset.complete_preparation(&preparation).unwrap();
         let BeginCoordinate::Execute(_) = workset
             .begin_for_host(
-                "terminal/fix-git|high|diff",
+                "terminal/fix-git|harness|high",
                 "100.64.0.1",
                 Duration::from_secs(30),
             )
@@ -907,7 +907,7 @@ mod tests {
         )
         .unwrap();
         let BeginCoordinate::Prepare(stale) = workset
-            .begin("terminal/fix-git|high|diff", Duration::ZERO)
+            .begin("terminal/fix-git|harness|high", Duration::ZERO)
             .unwrap()
         else {
             panic!("first request should prepare");
@@ -917,7 +917,7 @@ mod tests {
         assert_eq!(status.preparation.running, 0);
 
         let BeginCoordinate::Prepare(replacement) = workset
-            .begin("terminal/fix-git|high|diff", Duration::from_secs(30))
+            .begin("terminal/fix-git|harness|high", Duration::from_secs(30))
             .unwrap()
         else {
             panic!("expired preparation should be reclaimed");
@@ -936,7 +936,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let workset = prepared_workset(directory.path(), 1);
         let BeginCoordinate::Execute(stale) = workset
-            .begin("terminal/fix-git|high|diff", Duration::ZERO)
+            .begin("terminal/fix-git|harness|high", Duration::ZERO)
             .unwrap()
         else {
             panic!("coordinate should execute");
@@ -945,7 +945,7 @@ mod tests {
         assert_eq!(status.coordinates.pending, 1);
         assert_eq!(status.coordinates.running, 0);
         let BeginCoordinate::Execute(replacement) = workset
-            .begin("terminal/fix-git|high|diff", Duration::from_secs(30))
+            .begin("terminal/fix-git|harness|high", Duration::from_secs(30))
             .unwrap()
         else {
             panic!("expired coordinate should be reclaimed");
@@ -975,14 +975,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let workset = prepared_workset(directory.path(), 1);
         let BeginCoordinate::Execute(first) = workset
-            .begin("terminal/fix-git|high|diff", Duration::from_secs(30))
+            .begin("terminal/fix-git|harness|high", Duration::from_secs(30))
             .unwrap()
         else {
             panic!("coordinate should execute");
         };
         workset.retry_coordinate(&first, "host rebooted").unwrap();
         let BeginCoordinate::Execute(second) = workset
-            .begin("terminal/fix-git|high|diff", Duration::from_secs(30))
+            .begin("terminal/fix-git|harness|high", Duration::from_secs(30))
             .unwrap()
         else {
             panic!("retry should execute");
@@ -1064,7 +1064,7 @@ mod tests {
         let workset = Workset::ensure(&path, &spec(directory.path(), 1)).unwrap();
         let BeginCoordinate::Prepare(preparation) = workset
             .begin_for_host(
-                "terminal/fix-git|high|diff",
+                "terminal/fix-git|harness|high",
                 "127.0.0.1",
                 Duration::from_secs(30),
             )

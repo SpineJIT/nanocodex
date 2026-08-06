@@ -11,12 +11,9 @@ use nanocodex_oai_api::{Model, Thinking};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-#[cfg(any(
-    all(target_os = "linux", not(target_env = "musl")),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
-use crate::differential::{CodexToolMode, NanocodexToolMode};
 use crate::{Task, TaskLoadError, workset::WorksetSpec};
+
+const BUILTIN_HARNESS: &str = "nanocodex";
 
 /// Repository-level native evaluation configuration.
 #[derive(Clone, Debug, Deserialize)]
@@ -37,6 +34,22 @@ pub struct Harness {
     ///
     /// When omitted, legacy manifests continue to pin the exact command bytes.
     version: Option<String>,
+    /// Complete guest argument template for the harness JSONL contract.
+    arguments: Vec<String>,
+    /// Harness-specific guest environment variables.
+    #[serde(default)]
+    environment: BTreeMap<String, String>,
+    /// Guest home exposed to the harness and available as a template value.
+    #[serde(default = "default_harness_home")]
+    home: String,
+    /// Guest destination for file-based credentials.
+    #[serde(default = "default_harness_auth_file")]
+    auth_file: String,
+    /// Guest environment variable receiving API-key credentials.
+    #[serde(default = "default_harness_api_key_environment")]
+    api_key_environment: String,
+    /// OpenAI-compatible upstream reached through the capture proxy.
+    api_upstream: Option<String>,
 }
 
 /// One closed desired bundle of native task coordinates.
@@ -48,6 +61,8 @@ pub struct Profile {
     #[serde(default)]
     suites: Vec<PathBuf>,
     trials: u16,
+    #[serde(default = "default_harnesses")]
+    harness: Vec<String>,
     #[serde(default = "default_models")]
     model: Vec<Model>,
     #[serde(
@@ -58,31 +73,6 @@ pub struct Profile {
     thinking: Vec<Thinking>,
     #[serde(default)]
     web_search: bool,
-    #[serde(default)]
-    mode: EvaluationMode,
-    #[cfg(any(
-        all(target_os = "linux", not(target_env = "musl")),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
-    #[serde(default = "default_nanocodex_tool_modes")]
-    nanocodex_tool_mode: Vec<NanocodexToolMode>,
-    #[cfg(any(
-        all(target_os = "linux", not(target_env = "musl")),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
-    #[serde(default = "default_codex_tool_modes")]
-    codex_tool_mode: Vec<CodexToolMode>,
-}
-
-/// Execution semantics of one profile treatment.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum EvaluationMode {
-    /// Run only the native Nanocodex evaluator and Harbor verifier.
-    #[default]
-    Nanocodex,
-    /// Run one matched native-Nanocodex versus stock-Codex pair.
-    Differential,
 }
 
 /// Parsed and content-pinned profile revision.
@@ -98,8 +88,8 @@ pub struct ResolvedProfile {
     pub tasks: Vec<ResolvedTask>,
     /// Exact task/treatment families, excluding fungible repetitions.
     pub families: Vec<ResolvedFamily>,
-    /// Optional pinned stock-Codex command required by differential families.
-    pub codex_command: Option<PathBuf>,
+    /// Pinned external harness commands selected by this revision.
+    pub harnesses: BTreeMap<String, ResolvedHarness>,
     /// Whether model-facing web search is enabled.
     pub web_search: bool,
     /// Number of desired repetitions for every family.
@@ -115,6 +105,29 @@ pub struct ResolvedTask {
     pub task: Task,
 }
 
+/// One content-pinned external harness selected by a profile.
+#[derive(Clone, Debug)]
+pub struct ResolvedHarness {
+    /// Profile-visible harness name.
+    pub name: String,
+    /// Architecture-local executable.
+    pub command: PathBuf,
+    /// Guest argument template.
+    pub arguments: Vec<String>,
+    /// Guest environment additions.
+    pub environment: BTreeMap<String, String>,
+    /// Generic writable home staged for this harness.
+    pub home: String,
+    /// Guest destination for file-based credentials.
+    pub auth_file: String,
+    /// Guest environment variable receiving API-key credentials.
+    pub api_key_environment: String,
+    /// Capture-proxy upstream override.
+    pub api_upstream: Option<String>,
+    /// Semantic version retained in evidence.
+    pub version: String,
+}
+
 /// One exact semantic treatment family.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ResolvedFamily {
@@ -122,25 +135,13 @@ pub struct ResolvedFamily {
     pub key: String,
     /// Task selector owned by this family.
     pub task: String,
-    /// Execution semantics.
-    pub mode: EvaluationMode,
+    /// Built-in or configured harness used for this coordinate.
+    pub harness: String,
     /// Supported model selection.
     pub model: Model,
     /// Reasoning effort.
     #[serde(serialize_with = "serialize_one_thinking")]
     pub thinking: Thinking,
-    /// Nanocodex tool exposure in a matched differential.
-    #[cfg(any(
-        all(target_os = "linux", not(target_env = "musl")),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
-    pub nanocodex_tool_mode: NanocodexToolMode,
-    /// Stock-Codex tool exposure in a matched differential.
-    #[cfg(any(
-        all(target_os = "linux", not(target_env = "musl")),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
-    pub codex_tool_mode: CodexToolMode,
 }
 
 /// Profile parsing or resolution failure.
@@ -182,6 +183,14 @@ pub enum ProfileError {
         /// Empty semantic dimension.
         dimension: &'static str,
     },
+    /// A profile repeated one harness name.
+    #[error("evaluation profile `{profile}` contains duplicate harness `{harness}`")]
+    DuplicateHarness {
+        /// Invalid profile.
+        profile: String,
+        /// Repeated harness name.
+        harness: String,
+    },
     /// A suite had no immediate task children.
     #[error("suite contains no immediate task directories: {0}")]
     EmptySuite(PathBuf),
@@ -194,9 +203,14 @@ pub enum ProfileError {
     /// A task package failed to load.
     #[error(transparent)]
     Task(#[from] TaskLoadError),
-    /// Differential execution requires a pinned stock-Codex harness.
-    #[error("differential profile `{0}` requires [harness.codex].command")]
-    MissingCodex(String),
+    /// A profile selected an external harness without configuring it.
+    #[error("evaluation profile `{profile}` selects unknown harness `{harness}`")]
+    UnknownHarness {
+        /// Invalid profile.
+        profile: String,
+        /// Missing top-level harness configuration.
+        harness: String,
+    },
     /// A semantic harness version was present but empty.
     #[error("evaluation harness `{0}` has an empty version")]
     EmptyHarnessVersion(String),
@@ -242,8 +256,7 @@ pub enum ProfileSelectionError {
     },
     /// Omitted semantic knobs did not identify one family.
     #[error(
-        "task `{task}` has multiple treatments in profile `{profile}`; select model, thinking, \
-         and/or tool mode"
+        "task `{task}` has multiple treatments in profile `{profile}`; select model and/or thinking"
     )]
     Ambiguous {
         /// Selected profile.
@@ -259,7 +272,7 @@ struct ProfileIdentity<'a> {
     name: &'a str,
     profile: &'a Profile,
     tasks: Vec<TaskIdentity<'a>>,
-    codex_digest: Option<&'a str>,
+    harness_digests: &'a BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -311,26 +324,53 @@ impl EvaluationManifest {
             .parent()
             .expect("a canonical manifest path has a parent");
         let tasks = load_tasks(root, profile)?;
-        let (codex_command, codex_digest) = if profile.mode == EvaluationMode::Differential {
-            let harness = self
-                .harness
-                .get("codex")
-                .ok_or_else(|| ProfileError::MissingCodex(name.clone()))?;
+        let mut harnesses = BTreeMap::new();
+        let mut harness_digests = BTreeMap::new();
+        for harness_name in &profile.harness {
+            if harness_name == BUILTIN_HARNESS {
+                continue;
+            }
+            let harness =
+                self.harness
+                    .get(harness_name)
+                    .ok_or_else(|| ProfileError::UnknownHarness {
+                        profile: name.clone(),
+                        harness: harness_name.clone(),
+                    })?;
             let command = resolve_path(root, &harness.command)?;
-            let digest = match harness.version.as_deref() {
+            let command_identity = match harness.version.as_deref() {
                 Some(version) if version.trim().is_empty() => {
-                    return Err(ProfileError::EmptyHarnessVersion("codex".to_owned()));
+                    return Err(ProfileError::EmptyHarnessVersion(harness_name.clone()));
                 }
                 Some(version) => format!("version:{version}"),
                 None => harness_digest(&command)?,
             };
-            (Some(command), Some(digest))
-        } else {
-            (None, None)
-        };
+            let digest = hex::encode(Sha256::digest(serde_json::to_vec(&(
+                harness,
+                &command_identity,
+            ))?));
+            harnesses.insert(
+                harness_name.clone(),
+                ResolvedHarness {
+                    name: harness_name.clone(),
+                    command,
+                    arguments: harness.arguments.clone(),
+                    environment: harness.environment.clone(),
+                    home: harness.home.clone(),
+                    auth_file: harness.auth_file.clone(),
+                    api_key_environment: harness.api_key_environment.clone(),
+                    api_upstream: harness.api_upstream.clone(),
+                    version: harness
+                        .version
+                        .clone()
+                        .unwrap_or_else(|| command_identity.clone()),
+                },
+            );
+            harness_digests.insert(harness_name.clone(), digest);
+        }
         let families = expand_families(profile, &tasks);
         let identity = ProfileIdentity {
-            schema: 2,
+            schema: 3,
             name: &name,
             profile,
             tasks: tasks
@@ -340,7 +380,7 @@ impl EvaluationManifest {
                     digest: task.task.package_digest(),
                 })
                 .collect(),
-            codex_digest: codex_digest.as_deref(),
+            harness_digests: &harness_digests,
         };
         let digest = hex::encode(Sha256::digest(serde_json::to_vec(&identity)?));
         Ok(ResolvedProfile {
@@ -349,7 +389,7 @@ impl EvaluationManifest {
             config_path,
             tasks,
             families,
-            codex_command,
+            harnesses,
             web_search: profile.web_search,
             trials: profile.trials,
         })
@@ -403,29 +443,20 @@ impl ResolvedProfile {
     pub fn family(
         &self,
         task: &str,
+        harness: Option<&str>,
         model: Option<Model>,
         thinking: Option<Thinking>,
-        #[cfg(any(
-            all(target_os = "linux", not(target_env = "musl")),
-            all(target_os = "macos", target_arch = "aarch64")
-        ))]
-        nanocodex_tool_mode: Option<NanocodexToolMode>,
-        #[cfg(any(
-            all(target_os = "linux", not(target_env = "musl")),
-            all(target_os = "macos", target_arch = "aarch64")
-        ))]
-        codex_tool_mode: Option<CodexToolMode>,
     ) -> Result<&ResolvedFamily, ProfileSelectionError> {
         self.task(task)?;
+        let harness = harness.unwrap_or(BUILTIN_HARNESS);
         let matching = self
             .families
             .iter()
             .filter(|family| {
                 family.task == task
+                    && family.harness == harness
                     && model.is_none_or(|model| family.model == model)
                     && thinking.is_none_or(|thinking| family.thinking == thinking)
-                    && nanocodex_tool_mode.is_none_or(|mode| family.nanocodex_tool_mode == mode)
-                    && codex_tool_mode.is_none_or(|mode| family.codex_tool_mode == mode)
             })
             .collect::<Vec<_>>();
         match matching.as_slice() {
@@ -439,6 +470,11 @@ impl ResolvedProfile {
                 task: task.to_owned(),
             }),
         }
+    }
+
+    /// Returns the pinned command for an external harness.
+    pub fn harness(&self, harness: &str) -> Option<&ResolvedHarness> {
+        self.harnesses.get(harness)
     }
 }
 
@@ -457,6 +493,7 @@ fn validate_profile(name: &str, profile: &Profile) -> Result<(), ProfileError> {
         return Err(ProfileError::EmptyProfile(name.to_owned()));
     }
     for (values, dimension) in [
+        (profile.harness.len(), "harness"),
         (profile.model.len(), "model"),
         (profile.thinking.len(), "thinking"),
     ] {
@@ -464,6 +501,15 @@ fn validate_profile(name: &str, profile: &Profile) -> Result<(), ProfileError> {
             return Err(ProfileError::EmptyDimension {
                 profile: name.to_owned(),
                 dimension,
+            });
+        }
+    }
+    let mut harnesses = BTreeSet::new();
+    for harness in &profile.harness {
+        if !harnesses.insert(harness) {
+            return Err(ProfileError::DuplicateHarness {
+                profile: name.to_owned(),
+                harness: harness.clone(),
             });
         }
     }
@@ -534,58 +580,31 @@ fn load_tasks(root: &Path, profile: &Profile) -> Result<Vec<ResolvedTask>, Profi
         .collect()
 }
 
-#[cfg(any(
-    all(target_os = "linux", not(target_env = "musl")),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 fn expand_families(profile: &Profile, tasks: &[ResolvedTask]) -> Vec<ResolvedFamily> {
     let mut families = Vec::new();
     for task in tasks {
-        for model in &profile.model {
-            for thinking in &profile.thinking {
-                for nanocodex_tool_mode in &profile.nanocodex_tool_mode {
-                    for codex_tool_mode in &profile.codex_tool_mode {
-                        let key = format!(
-                            "{}|{}|{}|{}|{}|{}",
-                            task.selector,
-                            profile.mode.as_str(),
-                            model.as_str(),
-                            thinking.as_str(),
-                            nanocodex_tool_mode.as_str(),
-                            codex_tool_mode.as_str()
-                        );
-                        families.push(ResolvedFamily {
-                            key,
-                            task: task.selector.clone(),
-                            mode: profile.mode,
-                            model: *model,
-                            thinking: *thinking,
-                            nanocodex_tool_mode: *nanocodex_tool_mode,
-                            codex_tool_mode: *codex_tool_mode,
-                        });
-                    }
+        for harness in &profile.harness {
+            for model in &profile.model {
+                for thinking in &profile.thinking {
+                    let key = format!(
+                        "{}|{}|{}|{}",
+                        task.selector,
+                        harness,
+                        model.as_str(),
+                        thinking.as_str(),
+                    );
+                    families.push(ResolvedFamily {
+                        key,
+                        task: task.selector.clone(),
+                        harness: harness.clone(),
+                        model: *model,
+                        thinking: *thinking,
+                    });
                 }
             }
         }
     }
     families
-}
-
-#[cfg(not(any(
-    all(target_os = "linux", not(target_env = "musl")),
-    all(target_os = "macos", target_arch = "aarch64")
-)))]
-fn expand_families(_profile: &Profile, _tasks: &[ResolvedTask]) -> Vec<ResolvedFamily> {
-    Vec::new()
-}
-
-impl EvaluationMode {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Nanocodex => "nanocodex",
-            Self::Differential => "differential",
-        }
-    }
 }
 
 fn resolve_path(root: &Path, path: &Path) -> Result<PathBuf, ProfileError> {
@@ -628,6 +647,22 @@ fn default_models() -> Vec<Model> {
     vec![Model::default()]
 }
 
+fn default_harnesses() -> Vec<String> {
+    vec![BUILTIN_HARNESS.to_owned()]
+}
+
+fn default_harness_home() -> String {
+    "/run/nanocodex-harness-home".to_owned()
+}
+
+fn default_harness_auth_file() -> String {
+    "/run/nanocodex-harness-home/auth.json".to_owned()
+}
+
+fn default_harness_api_key_environment() -> String {
+    "OPENAI_API_KEY".to_owned()
+}
+
 fn default_thinking() -> Vec<Thinking> {
     vec![Thinking::default()]
 }
@@ -659,22 +694,6 @@ where
     S: serde::Serializer,
 {
     serializer.serialize_str(value.as_str())
-}
-
-#[cfg(any(
-    all(target_os = "linux", not(target_env = "musl")),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
-fn default_nanocodex_tool_modes() -> Vec<NanocodexToolMode> {
-    vec![NanocodexToolMode::default()]
-}
-
-#[cfg(any(
-    all(target_os = "linux", not(target_env = "musl")),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
-fn default_codex_tool_modes() -> Vec<CodexToolMode> {
-    vec![CodexToolMode::CodeModeOnly]
 }
 
 #[cfg(test)]
@@ -759,7 +778,7 @@ trials = 1
     }
 
     #[test]
-    fn differential_profile_revision_pins_the_harness_bytes() {
+    fn external_harness_revision_pins_the_command_bytes() {
         let directory = tempfile::tempdir().unwrap();
         write_task(directory.path(), "one");
         let codex = directory.path().join("codex");
@@ -769,16 +788,29 @@ trials = 1
             &config,
             r#"[harness.codex]
 command = "codex"
+arguments = ["{prompt}"]
 
 [profiles.release]
 tasks = ["one"]
 trials = 1
-mode = "differential"
+harness = ["nanocodex", "codex"]
 "#,
         )
         .unwrap();
 
         let first = EvaluationManifest::load_profile(&config, Some("release")).unwrap();
+        assert_eq!(first.families.len(), 2);
+        assert_eq!(
+            first.family("one", None, None, None).unwrap().harness,
+            "nanocodex"
+        );
+        assert_eq!(
+            first
+                .family("one", Some("codex"), None, None)
+                .unwrap()
+                .harness,
+            "codex"
+        );
         fs::write(&codex, "second build").unwrap();
         let second = EvaluationManifest::load_profile(&config, Some("release")).unwrap();
 
@@ -786,7 +818,7 @@ mode = "differential"
     }
 
     #[test]
-    fn differential_profile_can_pin_one_version_across_architecture_builds() {
+    fn external_harness_can_pin_one_version_across_architecture_builds() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
         for (directory, command) in [(&first, "aarch64 build"), (&second, "x86_64 build")] {
@@ -797,11 +829,12 @@ mode = "differential"
                 r#"[harness.codex]
 command = "codex"
 version = "0.145.0"
+arguments = ["{prompt}"]
 
 [profiles.release]
 tasks = ["one"]
 trials = 1
-mode = "differential"
+harness = ["nanocodex", "codex"]
 "#,
             )
             .unwrap();

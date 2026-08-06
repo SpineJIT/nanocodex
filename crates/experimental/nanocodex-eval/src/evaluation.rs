@@ -12,14 +12,9 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tokio::task::JoinHandle;
 
-#[cfg(any(
-    all(target_os = "linux", not(target_env = "musl")),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
-use crate::differential::{CodexToolMode, NanocodexToolMode};
 use crate::{
     Task,
-    profile::{EvaluationManifest, EvaluationMode, ResolvedFamily, ResolvedProfile},
+    profile::{EvaluationManifest, ResolvedFamily, ResolvedHarness, ResolvedProfile},
     workset::{BeginCoordinate, CoordinateLease, PreparationLease, Workset, WorksetBusy},
 };
 
@@ -37,18 +32,9 @@ pub struct Evaluation {
 #[derive(Clone, Debug)]
 pub struct EvaluationSelector {
     task: String,
+    harness: Option<String>,
     model: Option<Model>,
     thinking: Option<Thinking>,
-    #[cfg(any(
-        all(target_os = "linux", not(target_env = "musl")),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
-    nanocodex_tool_mode: Option<NanocodexToolMode>,
-    #[cfg(any(
-        all(target_os = "linux", not(target_env = "musl")),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
-    codex_tool_mode: Option<CodexToolMode>,
 }
 
 /// One exact profile family resolved locally without opening a ledger.
@@ -60,7 +46,7 @@ pub struct EvaluationSelection {
     task: Task,
     treatment: EvaluationTreatment,
     web_search: bool,
-    codex_command: Option<PathBuf>,
+    harness: Option<ResolvedHarness>,
 }
 
 /// The next durable action for one profile family.
@@ -93,7 +79,7 @@ pub struct CoordinateClaim {
     task: Task,
     treatment: EvaluationTreatment,
     web_search: bool,
-    codex_command: Option<PathBuf>,
+    harness: Option<ResolvedHarness>,
     output_directory: PathBuf,
     heartbeat: JoinHandle<()>,
 }
@@ -101,25 +87,13 @@ pub struct CoordinateClaim {
 /// Semantic knobs fixed by one profile family.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EvaluationTreatment {
-    /// Native-only or matched differential execution.
-    pub mode: EvaluationMode,
+    /// Built-in or configured harness used for this coordinate.
+    pub harness: String,
     /// Model fixed by the profile.
     pub model: Model,
     /// Reasoning effort fixed by the profile.
     #[serde(serialize_with = "crate::profile::serialize_one_thinking")]
     pub thinking: Thinking,
-    /// Nanocodex tool exposure in a matched differential.
-    #[cfg(any(
-        all(target_os = "linux", not(target_env = "musl")),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
-    pub nanocodex_tool_mode: NanocodexToolMode,
-    /// Stock-Codex tool exposure in a matched differential.
-    #[cfg(any(
-        all(target_os = "linux", not(target_env = "musl")),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
-    pub codex_tool_mode: CodexToolMode,
 }
 
 /// Temporary inability to claim the selected family.
@@ -320,10 +294,9 @@ impl Evaluation {
         self.profile
             .family(
                 &selector.task,
+                selector.harness.as_deref(),
                 selector.model,
                 selector.thinking,
-                selector.nanocodex_tool_mode,
-                selector.codex_tool_mode,
             )
             .map_err(error)
     }
@@ -366,7 +339,7 @@ impl Evaluation {
                     task,
                     treatment: family.into(),
                     web_search: self.profile.web_search,
-                    codex_command: self.profile.codex_command.clone(),
+                    harness: self.profile.harness(&family.harness).cloned(),
                     output_directory,
                     heartbeat,
                 }))
@@ -388,14 +361,14 @@ impl EvaluationSelection {
         let family = profile
             .family(
                 &selector.task,
+                selector.harness.as_deref(),
                 selector.model,
                 selector.thinking,
-                selector.nanocodex_tool_mode,
-                selector.codex_tool_mode,
             )
             .map_err(error)?
             .clone();
         let task = profile.task(&family.task).map_err(error)?.task.clone();
+        let harness = profile.harness(&family.harness).cloned();
         Ok(Self {
             profile: profile.name,
             profile_digest: profile.digest,
@@ -403,7 +376,7 @@ impl EvaluationSelection {
             task,
             treatment: (&family).into(),
             web_search: profile.web_search,
-            codex_command: profile.codex_command,
+            harness,
         })
     }
 
@@ -443,10 +416,10 @@ impl EvaluationSelection {
         self.web_search
     }
 
-    /// Pinned stock-Codex command for a differential treatment.
+    /// Resolved configuration for the selected external harness.
     #[must_use]
-    pub fn codex_command(&self) -> Option<&Path> {
-        self.codex_command.as_deref()
+    pub const fn harness(&self) -> Option<&ResolvedHarness> {
+        self.harness.as_ref()
     }
 }
 
@@ -456,19 +429,17 @@ impl EvaluationSelector {
     pub fn new(task: impl Into<String>) -> Self {
         Self {
             task: task.into(),
+            harness: None,
             model: None,
             thinking: None,
-            #[cfg(any(
-                all(target_os = "linux", not(target_env = "musl")),
-                all(target_os = "macos", target_arch = "aarch64")
-            ))]
-            nanocodex_tool_mode: None,
-            #[cfg(any(
-                all(target_os = "linux", not(target_env = "musl")),
-                all(target_os = "macos", target_arch = "aarch64")
-            ))]
-            codex_tool_mode: None,
         }
+    }
+
+    /// Selects one configured external harness. Omission selects Nanocodex.
+    #[must_use]
+    pub fn harness(mut self, harness: Option<impl Into<String>>) -> Self {
+        self.harness = harness.map(Into::into);
+        self
     }
 
     /// Narrows the task to one profile-owned model treatment.
@@ -482,28 +453,6 @@ impl EvaluationSelector {
     #[must_use]
     pub const fn thinking(mut self, thinking: Option<Thinking>) -> Self {
         self.thinking = thinking;
-        self
-    }
-
-    /// Narrows the task to one Nanocodex tool treatment.
-    #[cfg(any(
-        all(target_os = "linux", not(target_env = "musl")),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
-    #[must_use]
-    pub const fn nanocodex_tool_mode(mut self, mode: Option<NanocodexToolMode>) -> Self {
-        self.nanocodex_tool_mode = mode;
-        self
-    }
-
-    /// Narrows the task to one stock-Codex tool treatment.
-    #[cfg(any(
-        all(target_os = "linux", not(target_env = "musl")),
-        all(target_os = "macos", target_arch = "aarch64")
-    ))]
-    #[must_use]
-    pub const fn codex_tool_mode(mut self, mode: Option<CodexToolMode>) -> Self {
-        self.codex_tool_mode = mode;
         self
     }
 }
@@ -557,10 +506,10 @@ impl CoordinateClaim {
         self.web_search
     }
 
-    /// Pinned stock-Codex command for a differential treatment.
+    /// Resolved configuration for the selected external harness.
     #[must_use]
-    pub fn codex_command(&self) -> Option<&Path> {
-        self.codex_command.as_deref()
+    pub const fn harness(&self) -> Option<&ResolvedHarness> {
+        self.harness.as_ref()
     }
 
     /// Unique retained-artifact directory for this profile trial.
@@ -589,19 +538,9 @@ impl CoordinateClaim {
 impl From<&ResolvedFamily> for EvaluationTreatment {
     fn from(family: &ResolvedFamily) -> Self {
         Self {
-            mode: family.mode,
+            harness: family.harness.clone(),
             model: family.model,
             thinking: family.thinking,
-            #[cfg(any(
-                all(target_os = "linux", not(target_env = "musl")),
-                all(target_os = "macos", target_arch = "aarch64")
-            ))]
-            nanocodex_tool_mode: family.nanocodex_tool_mode,
-            #[cfg(any(
-                all(target_os = "linux", not(target_env = "musl")),
-                all(target_os = "macos", target_arch = "aarch64")
-            ))]
-            codex_tool_mode: family.codex_tool_mode,
         }
     }
 }
@@ -762,7 +701,7 @@ thinking = ["high"]
         let status = evaluation.status().unwrap();
         assert_eq!(status.coordinates.pending, 2);
         assert_eq!(status.families[0].desired, 2);
-        assert_eq!(status.families[0].treatment.mode, EvaluationMode::Nanocodex);
+        assert_eq!(status.families[0].treatment.harness, "nanocodex");
 
         let EvaluationClaim::Prepare(preparation) = evaluation
             .claim(&selector, Duration::from_secs(30))

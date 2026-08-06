@@ -472,7 +472,6 @@ fn verifier_with_launch_root(root: VmLaunchRoot, retain_failed_rootfs: bool) -> 
         retain_passed_rootfs: false,
         retain_failed_rootfs,
         root_disks_finalized: false,
-        memory: VmAttemptMemory::default(),
         _network: None,
     }
 }
@@ -783,7 +782,6 @@ done
         retain_passed_rootfs: false,
         retain_failed_rootfs: true,
         root_disks_finalized: false,
-        memory: VmAttemptMemory::default(),
         _network: None,
     };
 
