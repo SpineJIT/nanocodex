@@ -71,6 +71,14 @@ mod tests {
             ],
             vec!["nanocodex", "eval", "status", "local-smoke"],
             vec!["nanocodex", "eval", "benchmark", "local-smoke"],
+            vec![
+                "nanocodex",
+                "eval",
+                "coordinator",
+                "local-smoke",
+                "--bind",
+                "100.64.0.1",
+            ],
         ] {
             Cli::try_parse_from(arguments).expect("supported eval command must parse");
         }

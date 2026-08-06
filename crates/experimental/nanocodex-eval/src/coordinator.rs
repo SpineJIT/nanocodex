@@ -175,11 +175,12 @@ impl CoordinatorServer {
         }
     }
 
-    /// Serves the coordinator on a loopback listener until shutdown.
+    /// Serves the coordinator on a loopback or Tailscale listener until shutdown.
     pub async fn serve(self, listener: TcpListener) -> Result<(), CoordinatorError> {
-        if !listener.local_addr()?.ip().is_loopback() {
+        let bind = listener.local_addr()?.ip();
+        if !bind.is_loopback() && !is_tailnet_address(bind) {
             return Err(CoordinatorError::InvalidUrl(
-                "the first coordinator slice is loopback-only".to_owned(),
+                "coordinators may bind only to loopback or a Tailscale address".to_owned(),
             ));
         }
         let reaper = spawn_reaper(self.state.active.clone(), self.worker_timeout);
@@ -201,19 +202,23 @@ impl CoordinatorServer {
 }
 
 impl CoordinatorClient {
-    /// Connects to a coordinator. Plain HTTP is accepted only on loopback.
+    /// Connects to a coordinator. Plain HTTP is accepted on loopback or Tailscale.
     pub fn new(base: &str) -> Result<Self, CoordinatorError> {
         let mut base =
             Url::parse(base).map_err(|error| CoordinatorError::InvalidUrl(error.to_string()))?;
         let secure = base.scheme() == "https";
-        let loopback = base
+        let local_transport = base
             .host_str()
-            .and_then(|host| host.parse::<IpAddr>().ok())
-            .is_some_and(|ip| ip.is_loopback())
+            .and_then(|host| {
+                host.trim_matches(|character| character == '[' || character == ']')
+                    .parse::<IpAddr>()
+                    .ok()
+            })
+            .is_some_and(|ip| ip.is_loopback() || is_tailnet_address(ip))
             || base.host_str() == Some("localhost");
-        if !secure && !(base.scheme() == "http" && loopback) {
+        if !secure && !(base.scheme() == "http" && local_transport) {
             return Err(CoordinatorError::InvalidUrl(
-                "use HTTPS, or HTTP on loopback for local development".to_owned(),
+                "use HTTPS, or HTTP with a numeric loopback or Tailscale address".to_owned(),
             ));
         }
         if !base.path().ends_with('/') {
@@ -350,6 +355,16 @@ impl CoordinatorClient {
                 .await?,
         )
         .await
+    }
+}
+
+fn is_tailnet_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            octets[0] == 100 && (64..=127).contains(&octets[1])
+        }
+        IpAddr::V6(address) => address.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
     }
 }
 
@@ -818,9 +833,14 @@ thinking = ["high"]
     }
 
     #[test]
-    fn plain_http_is_loopback_only() {
+    fn plain_http_is_limited_to_loopback_and_tailnet_addresses() {
         assert!(CoordinatorClient::new("http://192.0.2.1:8789").is_err());
+        assert!(CoordinatorClient::new("http://100.63.255.255:8789").is_err());
+        assert!(CoordinatorClient::new("http://100.128.0.1:8789").is_err());
         assert!(CoordinatorClient::new("http://127.0.0.1:8789").is_ok());
+        assert!(CoordinatorClient::new("http://100.64.0.1:8789").is_ok());
+        assert!(CoordinatorClient::new("http://100.127.255.255:8789").is_ok());
+        assert!(CoordinatorClient::new("http://[fd7a:115c:a1e0::1]:8789").is_ok());
         assert!(CoordinatorClient::new("https://evals.example").is_ok());
     }
 }
