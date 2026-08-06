@@ -85,10 +85,6 @@ pub struct PreparationLease {
     task_id: i64,
     generation: i64,
     owner: String,
-    /// Profile-visible selector for the task being prepared.
-    pub selector: String,
-    /// Canonical task package root.
-    pub root: PathBuf,
 }
 
 /// Fenced ownership of one internal profile repetition.
@@ -98,12 +94,8 @@ pub struct CoordinateLease {
     execution_id: i64,
     generation: i64,
     owner: String,
-    /// Exact coordinate-family identity selected by the caller.
-    pub family_key: String,
     /// Internal fungible repetition allocated by SQLite.
     pub repetition: u16,
-    /// Canonical task package root.
-    pub task_root: PathBuf,
 }
 
 /// Temporary inability to progress an explicitly selected family.
@@ -290,7 +282,7 @@ impl Workset {
         })
     }
 
-    /// SQLite database path backing this workset.
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -307,16 +299,15 @@ impl Workset {
         let expires = lease_expiry(now, lease_duration)?;
         let mut connection = open_connection(&self.path)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let family: Option<(i64, String, String)> = transaction
+        let task_id: Option<i64> = transaction
             .query_row(
-                "SELECT c.task_id, t.selector, t.root \
-                 FROM coordinates c JOIN tasks t ON t.id = c.task_id \
+                "SELECT c.task_id FROM coordinates c \
                  WHERE c.workset_id = ?1 AND c.family_key = ?2 LIMIT 1",
                 params![self.id, family_key],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| row.get(0),
             )
             .optional()?;
-        let Some((task_id, selector, task_root)) = family else {
+        let Some(task_id) = task_id else {
             return Err(WorksetError::UnknownFamily(family_key.to_owned()));
         };
         let preparation: (String, i64, Option<i64>) = transaction.query_row(
@@ -351,8 +342,6 @@ impl Workset {
                 task_id,
                 generation,
                 owner,
-                selector,
-                root: PathBuf::from(task_root),
             }));
         }
 
@@ -393,9 +382,7 @@ impl Workset {
                 execution_id,
                 generation,
                 owner,
-                family_key: family_key.to_owned(),
                 repetition,
-                task_root: PathBuf::from(task_root),
             }));
         }
         let (running, terminal): (i64, i64) = transaction.query_row(

@@ -390,42 +390,6 @@ pub(super) fn expected_nanocodex_visible_tools(
     tools
 }
 
-pub(super) fn retained_nanocodex_tool_mode(
-    comparison: &serde_json::Value,
-) -> InternalResult<NanocodexToolMode> {
-    match comparison
-        .pointer("/policy/nanocodex_tool_mode")
-        .and_then(serde_json::Value::as_str)
-    {
-        Some("code_mode") => Ok(NanocodexToolMode::CodeMode),
-        Some("code_mode_only") => Ok(NanocodexToolMode::CodeModeOnly),
-        Some(tool_mode) => Err(diff_error!(
-            "retained comparison has unsupported Nanocodex tool mode {tool_mode:?}"
-        )),
-        None => Err(diff_error!(
-            "retained comparison has no /policy/nanocodex_tool_mode"
-        )),
-    }
-}
-
-pub(super) fn retained_codex_tool_mode(
-    comparison: &serde_json::Value,
-) -> InternalResult<CodexToolMode> {
-    match comparison
-        .pointer("/policy/codex_tool_mode")
-        .and_then(serde_json::Value::as_str)
-    {
-        Some("code_mode") => Ok(CodexToolMode::CodeMode),
-        Some("code_mode_only") => Ok(CodexToolMode::CodeModeOnly),
-        Some(tool_mode) => Err(diff_error!(
-            "retained comparison has unsupported stock Codex tool mode {tool_mode:?}"
-        )),
-        None => Err(diff_error!(
-            "retained comparison has no /policy/codex_tool_mode"
-        )),
-    }
-}
-
 pub(super) fn compare_api_exchanges(
     path: &Path,
     nanocodex_path: Option<&Path>,

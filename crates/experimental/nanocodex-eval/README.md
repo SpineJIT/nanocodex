@@ -13,44 +13,41 @@ Every benchmark attempt runs tools and verification in a microVM. Native host
 execution exists only inside focused crate tests. Harbor JSONL and ATIF are
 output formats, not alternate runners.
 
-## One task
+## Durable API
 
 ```rust,no_run
-use nanocodex_agent::{Nanocodex, OpenAi};
-use nanocodex_eval::{Evaluator, Task, VmResources};
+use std::time::Duration;
+use nanocodex_eval::{Evaluation, EvaluationClaim, EvaluationSelector};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let task = Task::load("tasks/write-greeting")?;
-let resources = VmResources::builder("nanocodex", "runtime.ext4")
-    .task(task.clone())
-    .prepare()
-    .await?;
-let evaluator = Evaluator::builder(
-    Nanocodex::builder(OpenAi::new(std::env::var("OPENAI_API_KEY")?)?),
-    resources.backend().await?,
-)
-.output_directory(".nanocodex/evals")
-.build()?;
-
-let run = evaluator.task(task);
-let mut events = run.events().subscribe();
-let observer = tokio::spawn(async move {
-    while let Some(event) = events.recv().await? {
-        println!("{} {:?}", event.sequence, event.kind);
+let evaluation = Evaluation::open(
+    "nanocodex.toml",
+    Some("local-smoke"),
+    ".nanocodex/evals",
+)?;
+let selector = EvaluationSelector::new("tasks/write-greeting");
+match evaluation.claim(&selector, Duration::from_secs(300))? {
+    EvaluationClaim::Prepare(claim) => {
+        // Prepare `claim.task()`, then atomically accept or retry the lease.
+        claim.complete()?;
     }
-    Ok::<_, nanocodex_eval::EvalEventStreamError>(())
-});
-let outcome = run.await?;
-observer.await??;
-println!("{:?}", outcome.outcome());
+    EvaluationClaim::Run(claim) => {
+        // Execute `claim.task()` with `claim.treatment()` and retain output in
+        // `claim.output_directory()`, then accept or retry the result.
+        let evidence = claim.output_directory().to_path_buf();
+        claim.complete(&evidence)?;
+    }
+    EvaluationClaim::Busy(_) | EvaluationClaim::Complete => {}
+}
 # Ok(())
 # }
 ```
 
-`EvalRun<T>` is independently awaitable and owns an optional event stream.
-Every invocation emits one terminal event, including cancellation.
+Claims own lease heartbeats and fenced completion. Raw SQLite worksets, lease
+generations, and artifact-coordinate construction are private implementation
+details.
 
-## Durable profiles
+## Profiles
 
 The repository manifest is `nanocodex.toml`:
 
@@ -65,10 +62,10 @@ thinking = ["low"]
 mode = "nanocodex"
 ```
 
-`EvaluationManifest::load_profile` resolves task packages and fingerprints
-their complete execution inputs. Differential profiles also fingerprint the
-pinned stock-Codex executable. `Workset::ensure` then materializes every
-desired repetition in SQLite before execution begins.
+`Evaluation::open` resolves task packages, fingerprints their complete
+execution inputs, and materializes every desired repetition in SQLite before
+execution begins. Differential profiles also fingerprint the pinned
+stock-Codex executable.
 
 ```text
 profile -> exact task/treatment families -> k=1..N SQLite coordinates
@@ -117,11 +114,6 @@ nanocodex
 argument: `trials` is profile-owned desired work, and SQLite assigns a
 fungible repetition inside the exact family selected by `--task` and any
 needed model, thinking, or tool-mode selectors.
-
-Compiled examples retain only the per-coordinate boundaries:
-
-- `eval-task`: one VM attempt and its independent event stream.
-- `eval-differential`: one matched Nanocodex-versus-Codex pair.
 
 Set `NANOCODEX_BIN` and `NANOCODEX_VM_RUNTIME` when the default development
 paths do not apply.

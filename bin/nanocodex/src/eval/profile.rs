@@ -7,17 +7,14 @@ use clap::{Args, ValueEnum};
 use eyre::{Result, WrapErr as _, eyre};
 use nanocodex::Model;
 use nanocodex_eval::{
-    EvalOutcome, Evaluator, Task,
+    CoordinateClaim, EvalOutcome, Evaluation, EvaluationClaim, EvaluationMode, EvaluationSelector,
+    Evaluator, Task,
     differential::{
         CodexAuth, CodexToolMode, DifferentialEvaluator, ExecutableIdentity, NanocodexToolMode,
     },
-    profile::{EvaluationManifest, EvaluationMode, ResolvedFamily, ResolvedProfile},
     vm::{CachePolicy, VmResources},
-    workset::{BeginCoordinate, CoordinateLease, PreparationLease, Workset},
 };
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
-use tokio::task::JoinHandle;
 
 use super::{args::VmPreparationArgs, run};
 use crate::{
@@ -26,9 +23,7 @@ use crate::{
 };
 
 const CONFIG_FILE: &str = "nanocodex.toml";
-const LEDGER_FILE: &str = "state.sqlite3";
 const LEASE_DURATION: Duration = Duration::from_secs(5 * 60);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_INITIAL_GUEST_MEMORY_MB: u64 = 512;
 const MEMORY_PROFILE_FILE: &str = "differential-memory-profiles.json";
 
@@ -129,8 +124,8 @@ enum RunOutput<'a> {
 
 impl Status {
     pub(super) fn run(self) -> Result<()> {
-        let (_, workset, _) = self.target.open()?;
-        let status = workset.status()?;
+        let evaluation = self.target.open()?;
+        let status = evaluation.status()?;
         if self.json {
             serde_json::to_writer_pretty(std::io::stdout().lock(), &status)?;
             println!();
@@ -143,16 +138,16 @@ impl Status {
                 status.preparation.pending
                     + status.preparation.running
                     + status.preparation.complete,
-                status.coordinates.terminal,
+                status.coordinates.complete,
                 status.coordinates.pending
                     + status.coordinates.running
-                    + status.coordinates.terminal,
+                    + status.coordinates.complete,
                 status.coordinates.running,
             );
             for family in status.families {
                 println!(
                     "  {} · {}/{} terminal · {} running · {} pending",
-                    family.task, family.terminal, family.desired, family.running, family.pending
+                    family.task, family.complete, family.desired, family.running, family.pending
                 );
             }
         }
@@ -163,61 +158,49 @@ impl Status {
 impl Run {
     pub(super) async fn run(self) -> Result<()> {
         let _observability = self.observability.install(false, Path::new("."))?;
-        let (profile, workset, state_dir) = self.target.open()?;
+        let evaluation = self.target.open()?;
         let requested_thinking = self.agent.thinking();
         if self
             .agent
             .web_search()
-            .is_some_and(|requested| requested != profile.web_search)
+            .is_some_and(|requested| requested != evaluation.web_search())
         {
             return Err(eyre!(
                 "--web-search cannot override profile `{}`; the profile fixes web_search={}",
-                profile.name,
-                profile.web_search
+                evaluation.name(),
+                evaluation.web_search()
             ));
         }
-        let family = profile
-            .family(
-                &self.task,
-                self.model,
-                requested_thinking,
-                self.nanocodex_tool_mode.map(NanocodexToolMode::from),
-                self.codex_tool_mode.map(CodexToolMode::from),
-            )?
-            .clone();
-        let task = profile.task(&self.task)?.task.clone();
+        let selector = EvaluationSelector::new(&self.task)
+            .model(self.model)
+            .thinking(requested_thinking)
+            .nanocodex_tool_mode(self.nanocodex_tool_mode.map(NanocodexToolMode::from))
+            .codex_tool_mode(self.codex_tool_mode.map(CodexToolMode::from));
         let mut prepared = None;
         loop {
-            match workset.begin(&family.key, LEASE_DURATION)? {
-                BeginCoordinate::Prepare(lease) => {
-                    let heartbeat = preparation_heartbeat(workset.clone(), lease.clone());
-                    let result = prepare_resources(&task, &self.vm).await;
-                    heartbeat.abort();
+            match evaluation.claim(&selector, LEASE_DURATION)? {
+                EvaluationClaim::Prepare(claim) => {
+                    let result = prepare_resources(claim.task(), &self.vm).await;
                     match result {
                         Ok(resources) => {
-                            workset.complete_preparation(&lease)?;
+                            claim.complete()?;
                             prepared = Some(resources);
                         }
                         Err(error) => {
-                            workset.retry_preparation(&lease, &format!("{error:#}"))?;
+                            claim.retry(&format!("{error:#}"))?;
                             return Err(error).wrap_err("task preparation remains retryable");
                         }
                     }
                 }
-                BeginCoordinate::Execute(lease) => {
-                    let output = coordinate_output(&state_dir, &profile, &family, &lease);
-                    let heartbeat = coordinate_heartbeat(workset.clone(), lease.clone());
+                EvaluationClaim::Run(claim) => {
                     let result = async {
                         let resources = match prepared.take() {
                             Some(resources) => resources,
-                            None => prepare_resources(&task, &self.vm).await?,
+                            None => prepare_resources(claim.task(), &self.vm).await?,
                         };
                         execute_coordinate(
-                            &profile,
-                            &family,
-                            task.clone(),
+                            &claim,
                             resources,
-                            &output,
                             self.guest_memory_mb,
                             self.agent,
                             &self.vm,
@@ -225,34 +208,34 @@ impl Run {
                         .await
                     }
                     .await;
-                    heartbeat.abort();
                     match result {
                         Ok(ExecutionResult::Accepted(evidence)) => {
-                            workset.complete_coordinate(&lease, &evidence)?;
+                            let repetition = claim.repetition();
+                            claim.complete(&evidence)?;
                             write_json(&RunOutput::Completed {
-                                profile: &profile.name,
+                                profile: evaluation.name(),
                                 task: &self.task,
-                                repetition: lease.repetition,
+                                repetition,
                                 evidence: &evidence,
                             })?;
                             return Ok(());
                         }
                         Ok(ExecutionResult::Retryable { error, evidence }) => {
-                            workset.retry_coordinate(&lease, &error)?;
+                            claim.retry(&error)?;
                             return Err(eyre!(
                                 "coordinate remains retryable; evidence retained at {}: {error}",
                                 evidence.display()
                             ));
                         }
                         Err(error) => {
-                            workset.retry_coordinate(&lease, &format!("{error:#}"))?;
+                            claim.retry(&format!("{error:#}"))?;
                             return Err(error).wrap_err("coordinate remains retryable");
                         }
                     }
                 }
-                BeginCoordinate::Busy(busy) => {
+                EvaluationClaim::Busy(busy) => {
                     write_json(&RunOutput::TemporarilyUnavailable {
-                        profile: &profile.name,
+                        profile: evaluation.name(),
                         task: &self.task,
                         reason: busy.reason,
                         retry_after_ms: busy.retry_after_ms,
@@ -263,9 +246,9 @@ impl Run {
                         busy.retry_after_ms
                     ));
                 }
-                BeginCoordinate::Complete => {
+                EvaluationClaim::Complete => {
                     write_json(&RunOutput::AlreadyComplete {
-                        profile: &profile.name,
+                        profile: evaluation.name(),
                         task: &self.task,
                     })?;
                     return Ok(());
@@ -276,11 +259,13 @@ impl Run {
 }
 
 impl ProfileTarget {
-    fn open(&self) -> Result<(ResolvedProfile, Workset, PathBuf)> {
-        let profile = EvaluationManifest::load_profile(&self.config, self.profile.as_deref())?;
-        let state_dir = self.state_dir.clone().map_or_else(default_state_dir, Ok)?;
-        let workset = Workset::ensure(state_dir.join(LEDGER_FILE), &profile.workset_spec())?;
-        Ok((profile, workset, state_dir))
+    fn open(&self) -> Result<Evaluation> {
+        let state_directory = self.state_dir.clone().map_or_else(default_state_dir, Ok)?;
+        Ok(Evaluation::open(
+            &self.config,
+            self.profile.as_deref(),
+            state_directory,
+        )?)
     }
 }
 
@@ -308,20 +293,21 @@ async fn prepare_resources(task: &Task, vm: &VmPreparationArgs) -> Result<VmReso
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_coordinate(
-    profile: &ResolvedProfile,
-    family: &ResolvedFamily,
-    task: Task,
+    claim: &CoordinateClaim,
     resources: VmResources,
-    output: &Path,
     guest_memory_mb: u64,
     agent: EvalAgentArgs,
     vm: &VmPreparationArgs,
 ) -> Result<ExecutionResult> {
+    let treatment = claim.treatment();
+    let task = claim.task().clone();
+    let output = claim.output_directory();
     std::fs::create_dir_all(output)?;
-    match family.mode {
+    match treatment.mode {
         EvaluationMode::Nanocodex => {
             let backend = resources.backend().await?;
-            let nanocodex = agent.builder(family.model, family.thinking, profile.web_search)?;
+            let nanocodex =
+                agent.builder(treatment.model, treatment.thinking, claim.web_search())?;
             let evaluator = Evaluator::builder(nanocodex, backend)
                 .output_directory(output)
                 .build()?;
@@ -338,24 +324,23 @@ async fn execute_coordinate(
         }
         EvaluationMode::Differential => {
             let (nanocodex, auth) =
-                agent.shared_builder(family.model, family.thinking, profile.web_search)?;
+                agent.shared_builder(treatment.model, treatment.thinking, claim.web_search())?;
             let codex_auth = match auth {
                 SharedAuth::ApiKey(api_key) => CodexAuth::api_key(api_key),
                 SharedAuth::AuthFile(path) => CodexAuth::auth_file(path),
             };
             let executable = std::env::current_exe()?;
-            let codex = profile
-                .codex_command
-                .as_ref()
+            let codex = claim
+                .codex_command()
                 .ok_or_else(|| eyre!("differential profile lost its Codex command"))?;
             let evaluator = DifferentialEvaluator::builder(nanocodex)
                 .codex(codex, codex_auth)
                 .vm(resources)
                 .output_directory(output)
-                .thinking(family.thinking)
-                .web_search(profile.web_search)
-                .nanocodex_tool_mode(family.nanocodex_tool_mode)
-                .codex_tool_mode(family.codex_tool_mode)
+                .thinking(treatment.thinking)
+                .web_search(claim.web_search())
+                .nanocodex_tool_mode(treatment.nanocodex_tool_mode)
+                .codex_tool_mode(treatment.codex_tool_mode)
                 .nanocodex_executable(
                     ExecutableIdentity::new(executable, env!("NANOCODEX_SEMVER_VERSION"))
                         .git_sha(env!("VERGEN_GIT_SHA"))
@@ -380,20 +365,6 @@ async fn execute_coordinate(
     }
 }
 
-fn coordinate_output(
-    state_dir: &Path,
-    profile: &ResolvedProfile,
-    family: &ResolvedFamily,
-    lease: &CoordinateLease,
-) -> PathBuf {
-    let family_digest = hex::encode(Sha256::digest(family.key.as_bytes()));
-    state_dir
-        .join("artifacts")
-        .join(&profile.digest)
-        .join(family_digest)
-        .join(format!("k-{}", lease.repetition))
-}
-
 fn default_state_dir() -> Result<PathBuf> {
     if let Some(home) = std::env::var_os("NANOCODEX_HOME") {
         return Ok(PathBuf::from(home).join("evals"));
@@ -401,38 +372,6 @@ fn default_state_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| eyre!("HOME is not set; pass --state-dir for durable eval state"))?;
     Ok(PathBuf::from(home).join(".nanocodex/evals"))
-}
-
-fn preparation_heartbeat(workset: Workset, lease: PreparationLease) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            if workset
-                .heartbeat_preparation(&lease, LEASE_DURATION)
-                .is_err()
-            {
-                return;
-            }
-        }
-    })
-}
-
-fn coordinate_heartbeat(workset: Workset, lease: CoordinateLease) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            if workset
-                .heartbeat_coordinate(&lease, LEASE_DURATION)
-                .is_err()
-            {
-                return;
-            }
-        }
-    })
 }
 
 fn write_json(value: &impl Serialize) -> Result<()> {

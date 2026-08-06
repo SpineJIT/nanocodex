@@ -24,9 +24,8 @@ use super::{
     TrajectoryProjection, build_event_loop_trace, capture_proxy_vm_base_url, compare_api_exchanges,
     create_durable_comparison_directory_with_sync, detected_code_mode_empty_stdin_calls,
     detected_polling_turn, diff_json, event_loop_difference_categories, heartbeat_needed,
-    heartbeat_summary, inspect_api_exchanges, newly_completed_lines,
-    normalize_retained_arm_tool_calls, read_api_request_payloads,
-    read_optional_codex_cloud_config_cache, reanalyze, run_arm, stage_diff_codex_ca_bundle,
+    heartbeat_summary, inspect_api_exchanges, newly_completed_lines, read_api_request_payloads,
+    read_optional_codex_cloud_config_cache, run_arm, stage_diff_codex_ca_bundle,
     summarize_nanocodex, validate_differential_profile, write_json_atomic_with_sync,
 };
 
@@ -65,52 +64,6 @@ fn differential_completion_syncs_each_published_directory_entry() {
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&fs::read(report).unwrap()).unwrap(),
         serde_json::json!({"complete": true})
-    );
-}
-
-#[test]
-fn reanalysis_keeps_missing_refusal_trajectories_unavailable() {
-    let directory = tempdir().unwrap();
-    fs::write(
-        directory.path().join("comparison.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "schema_version": 1,
-            "model": "gpt-5.6-sol",
-            "thinking": "medium",
-            "nanocodex": {
-                "trajectory": null
-            },
-            "codex": {
-                "trajectory": null
-            },
-            "artifacts": {}
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
-    let rebuilt = reanalyze(directory.path()).unwrap();
-
-    assert_eq!(
-        rebuilt
-            .comparison()
-            .pointer("/trajectory_comparison/comparable"),
-        Some(&serde_json::json!(false))
-    );
-    assert_eq!(
-        rebuilt
-            .comparison()
-            .pointer("/nanocodex/trajectory_summary"),
-        Some(&serde_json::Value::Null)
-    );
-    assert_eq!(
-        rebuilt.comparison().pointer("/codex/trajectory_summary"),
-        Some(&serde_json::Value::Null)
-    );
-    assert!(
-        rebuilt
-            .human_summary()
-            .contains("codex trajectory: unavailable")
     );
 }
 
@@ -970,14 +923,6 @@ fn event_loop_summary_compares_model_visible_tool_sequences() {
     arm.apply_model_visible_tool_calls(Some(&left.summary));
     assert_eq!(arm.tool_calls, Some(1));
     assert_eq!(arm.observed_tool_events, Some(7));
-    let mut retained = serde_json::json!({"summary": {"tool_calls": 7}});
-    normalize_retained_arm_tool_calls(retained.as_object_mut().unwrap(), Some(&left.summary));
-    assert_eq!(retained["summary"]["tool_calls"], 1);
-    assert_eq!(retained["summary"]["observed_tool_events"], 7);
-    assert_eq!(
-        retained["summary"]["tool_call_measurement"],
-        super::MODEL_VISIBLE_TOOL_CALL_MEASUREMENT
-    );
 }
 
 #[test]

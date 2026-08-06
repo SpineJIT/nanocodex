@@ -647,7 +647,7 @@ where
         .serialize(serializer)
 }
 
-fn serialize_one_thinking<S>(value: &Thinking, serializer: S) -> Result<S::Ok, S::Error>
+pub(crate) fn serialize_one_thinking<S>(value: &Thinking, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {

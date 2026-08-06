@@ -5,46 +5,36 @@
 //! coordinate family; SQLite allocates its internal repetition and fences the
 //! accepted completion.
 //!
-//! # Run one task
+//! # Open a durable profile
 //!
 //! ```no_run
-//! use nanocodex_agent::{Nanocodex, OpenAi, Thinking};
-//! use nanocodex_eval::{Evaluator, Task, VmResources};
+//! use std::time::Duration;
+//! use nanocodex_eval::{Evaluation, EvaluationClaim, EvaluationSelector};
 //!
 //! # async fn evaluate() -> Result<(), Box<dyn std::error::Error>> {
-//! let task = Task::load("tasks/write-greeting")?;
-//! let resources = VmResources::builder("target/debug/nanocodex", ".cache/vm/runtime.ext4")
-//!     .task(task.clone())
-//!     .prepare()
-//!     .await?;
-//! let backend = resources.backend().await?;
-//! let agent = Nanocodex::builder(OpenAi::new(std::env::var("OPENAI_API_KEY")?)?)
-//!     .instructions(
-//!         "Work directly in the provided workspace. Complete the requested \
-//!          task, verify your changes, and keep the final answer concise.",
-//!     )
-//!     .thinking(Thinking::Medium);
-//! let evaluator = Evaluator::builder(agent, backend)
-//!     .output_directory(".nanocodex/evals")
-//!     .build()?;
-//! let run = evaluator.task(task);
-//! let mut stream = run.events().subscribe();
-//! let event_task = tokio::spawn(async move {
-//!     while let Some(event) = stream.recv().await? {
-//!         println!("{} {:?}", event.sequence, event.kind);
+//! let evaluation = Evaluation::open(
+//!     "nanocodex.toml",
+//!     Some("local-smoke"),
+//!     ".nanocodex/evals",
+//! )?;
+//! let selector = EvaluationSelector::new("tasks/write-greeting");
+//! match evaluation.claim(&selector, Duration::from_secs(300))? {
+//!     EvaluationClaim::Prepare(claim) => {
+//!         // Prepare the immutable package exposed by `claim.task()`.
+//!         claim.complete()?;
 //!     }
-//!     Ok::<_, nanocodex_eval::EvalEventStreamError>(())
-//! });
-//!
-//! let results = run.await?;
-//! println!("outcome: {:?}", results.outcome());
-//! event_task.await??;
+//!     EvaluationClaim::Run(claim) => {
+//!         // Execute exactly this profile treatment and retain its evidence.
+//!         let evidence = claim.output_directory().to_path_buf();
+//!         claim.complete(&evidence)?;
+//!     }
+//!     EvaluationClaim::Busy(_) | EvaluationClaim::Complete => {}
+//! }
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! Every accepted attempt receives a fresh session and workspace. Results are
-//! independently awaitable from the optional event stream.
+//! Claims renew their own lease and expose only fenced completion or retry.
 
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 // Retained-data readers remain portable; VM execution internals become
@@ -68,6 +58,7 @@ mod codex;
 /// Matched Nanocodex-versus-Codex execution and retained comparison reports.
 pub mod differential;
 mod digest;
+mod evaluation;
 mod evaluator;
 mod event;
 mod job;
@@ -76,8 +67,7 @@ mod native;
     all(target_os = "linux", not(target_env = "musl")),
     all(target_os = "macos", target_arch = "aarch64")
 ))]
-/// Closed, declarative evaluation profiles over native task packages.
-pub mod profile;
+mod profile;
 mod result;
 mod task;
 #[cfg(any(
@@ -85,8 +75,7 @@ mod task;
     all(target_os = "macos", target_arch = "aarch64")
 ))]
 pub mod vm;
-/// Durable SQLite ledger for agent-selected evaluation coordinates.
-pub mod workset;
+mod workset;
 
 pub(crate) use atif::{
     AtifAgent, AtifAgentExtra, AtifBuilder, AtifObservation, AtifObservationExtra,
@@ -99,10 +88,16 @@ pub(crate) use codex::{
     CodexCommandOutput, CodexCommandRunner, CodexCommandRunnerError, CodexCommandStatus, CodexExec,
     CodexExecError, project_codex_atif,
 };
+pub use evaluation::{
+    CoordinateClaim, Evaluation, EvaluationBusy, EvaluationClaim, EvaluationCounts,
+    EvaluationError, EvaluationFamilyStatus, EvaluationSelector, EvaluationStatus,
+    EvaluationTreatment, PreparationClaim,
+};
 pub use evaluator::{EvalError, EvalRun, Evaluator, EvaluatorBuilder};
 pub use event::{
     EvalEvent, EvalEventAttempt, EvalEventKind, EvalEventStream, EvalEventStreamError, EvalEvents,
 };
+pub use profile::EvaluationMode;
 pub use result::{
     AgentMetadata, AgentResult, AgentStatus, BillingCompleteness, CleanupDiagnostic, CleanupPhase,
     CleanupStatus, EvalArtifacts, EvalAttemptOutcome, EvalCleanup, EvalEnvironment, EvalException,

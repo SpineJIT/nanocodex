@@ -5173,7 +5173,6 @@ dependencies = [
  "nanocodex",
  "nanocodex-browser",
  "nanocodex-egress",
- "nanocodex-eval",
  "nanocodex-vm",
  "nanocodex-voice",
  "reflink-copy",
