@@ -51,6 +51,7 @@
 pub mod atif;
 mod capture_proxy;
 mod codex;
+pub mod coordinator;
 #[cfg(any(
     all(target_os = "linux", not(target_env = "musl")),
     all(target_os = "macos", target_arch = "aarch64")
@@ -90,8 +91,8 @@ pub(crate) use codex::{
 };
 pub use evaluation::{
     CoordinateClaim, Evaluation, EvaluationBusy, EvaluationClaim, EvaluationCounts,
-    EvaluationError, EvaluationFamilyStatus, EvaluationSelector, EvaluationStatus,
-    EvaluationTreatment, PreparationClaim,
+    EvaluationError, EvaluationFamilyStatus, EvaluationSelection, EvaluationSelector,
+    EvaluationStatus, EvaluationTreatment, PreparationClaim,
 };
 pub use evaluator::{EvalError, EvalRun, Evaluator, EvaluatorBuilder};
 pub use event::{

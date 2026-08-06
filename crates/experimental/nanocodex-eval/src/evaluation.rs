@@ -51,6 +51,18 @@ pub struct EvaluationSelector {
     codex_tool_mode: Option<CodexToolMode>,
 }
 
+/// One exact profile family resolved locally without opening a ledger.
+#[derive(Clone, Debug)]
+pub struct EvaluationSelection {
+    profile: String,
+    profile_digest: String,
+    family_key: String,
+    task: Task,
+    treatment: EvaluationTreatment,
+    web_search: bool,
+    codex_command: Option<PathBuf>,
+}
+
 /// The next durable action for one profile family.
 #[derive(Debug)]
 pub enum EvaluationClaim {
@@ -152,6 +164,8 @@ pub struct EvaluationFamilyStatus {
     pub id: String,
     /// Profile-visible task selector.
     pub task: String,
+    /// Host currently assigned to prepare and execute this task.
+    pub assigned_host: Option<String>,
     /// Semantic treatment fixed by the profile.
     pub treatment: EvaluationTreatment,
     /// Desired fungible trial count.
@@ -221,6 +235,7 @@ impl Evaluation {
                 Ok(EvaluationFamilyStatus {
                     id: status.key,
                     task: status.task,
+                    assigned_host: status.assigned_host,
                     treatment: family.into(),
                     desired: status.desired,
                     pending: status.pending,
@@ -255,8 +270,54 @@ impl Evaluation {
         selector: &EvaluationSelector,
         lease_duration: Duration,
     ) -> Result<EvaluationClaim, EvaluationError> {
+        self.claim_for_host(selector, "local", lease_duration)
+    }
+
+    /// Claims one family for the network host chosen by the coordinator.
+    pub(crate) fn claim_for_host(
+        &self,
+        selector: &EvaluationSelector,
+        host: &str,
+        lease_duration: Duration,
+    ) -> Result<EvaluationClaim, EvaluationError> {
+        let family = self.resolve_family(selector)?.clone();
+        self.claim_resolved(&family, host, lease_duration)
+    }
+
+    /// Claims a locally resolved family after verifying its immutable profile digest.
+    pub(crate) fn claim_family_for_host(
+        &self,
+        profile_digest: &str,
+        family_key: &str,
+        host: &str,
+        lease_duration: Duration,
+    ) -> Result<EvaluationClaim, EvaluationError> {
+        if profile_digest != self.profile.digest {
+            return Err(error(std::io::Error::other(format!(
+                "coordinator profile digest is {}; worker requested {profile_digest}",
+                self.profile.digest
+            ))));
+        }
         let family = self
             .profile
+            .families
+            .iter()
+            .find(|family| family.key == family_key)
+            .ok_or_else(|| {
+                error(std::io::Error::other(format!(
+                    "family `{family_key}` is not part of profile `{}`",
+                    self.profile.name
+                )))
+            })?
+            .clone();
+        self.claim_resolved(&family, host, lease_duration)
+    }
+
+    fn resolve_family(
+        &self,
+        selector: &EvaluationSelector,
+    ) -> Result<&ResolvedFamily, EvaluationError> {
+        self.profile
             .family(
                 &selector.task,
                 selector.model,
@@ -264,17 +325,19 @@ impl Evaluation {
                 selector.nanocodex_tool_mode,
                 selector.codex_tool_mode,
             )
-            .map_err(error)?
-            .clone();
-        let task = self
-            .profile
-            .task(&selector.task)
-            .map_err(error)?
-            .task
-            .clone();
+            .map_err(error)
+    }
+
+    fn claim_resolved(
+        &self,
+        family: &ResolvedFamily,
+        host: &str,
+        lease_duration: Duration,
+    ) -> Result<EvaluationClaim, EvaluationError> {
+        let task = self.profile.task(&family.task).map_err(error)?.task.clone();
         match self
             .workset
-            .begin(&family.key, lease_duration)
+            .begin_for_host(&family.key, host, lease_duration)
             .map_err(error)?
         {
             BeginCoordinate::Prepare(lease) => {
@@ -293,6 +356,7 @@ impl Evaluation {
                     &self.profile.digest,
                     &family.key,
                     lease.repetition,
+                    lease.generation,
                 );
                 let heartbeat =
                     coordinate_heartbeat(self.workset.clone(), lease.clone(), lease_duration);
@@ -300,7 +364,7 @@ impl Evaluation {
                     workset: self.workset.clone(),
                     lease,
                     task,
-                    treatment: (&family).into(),
+                    treatment: family.into(),
                     web_search: self.profile.web_search,
                     codex_command: self.profile.codex_command.clone(),
                     output_directory,
@@ -310,6 +374,79 @@ impl Evaluation {
             BeginCoordinate::Busy(busy) => Ok(EvaluationClaim::Busy(busy.into())),
             BeginCoordinate::Complete => Ok(EvaluationClaim::Complete),
         }
+    }
+}
+
+impl EvaluationSelection {
+    /// Resolves one exact family from a local immutable profile without touching SQLite.
+    pub fn load(
+        config: impl AsRef<Path>,
+        profile: Option<&str>,
+        selector: &EvaluationSelector,
+    ) -> Result<Self, EvaluationError> {
+        let profile = EvaluationManifest::load_profile(config, profile).map_err(error)?;
+        let family = profile
+            .family(
+                &selector.task,
+                selector.model,
+                selector.thinking,
+                selector.nanocodex_tool_mode,
+                selector.codex_tool_mode,
+            )
+            .map_err(error)?
+            .clone();
+        let task = profile.task(&family.task).map_err(error)?.task.clone();
+        Ok(Self {
+            profile: profile.name,
+            profile_digest: profile.digest,
+            family_key: family.key.clone(),
+            task,
+            treatment: (&family).into(),
+            web_search: profile.web_search,
+            codex_command: profile.codex_command,
+        })
+    }
+
+    /// Selected profile name.
+    #[must_use]
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    /// Stable digest of every resolved profile input.
+    #[must_use]
+    pub fn profile_digest(&self) -> &str {
+        &self.profile_digest
+    }
+
+    /// Stable family key sent to the coordinator.
+    #[must_use]
+    pub fn family_key(&self) -> &str {
+        &self.family_key
+    }
+
+    /// Immutable task package executed by this worker.
+    #[must_use]
+    pub const fn task(&self) -> &Task {
+        &self.task
+    }
+
+    /// Exact semantic treatment fixed by the profile.
+    #[must_use]
+    pub const fn treatment(&self) -> &EvaluationTreatment {
+        &self.treatment
+    }
+
+    /// Whether model-facing web search is enabled.
+    #[must_use]
+    pub const fn web_search(&self) -> bool {
+        self.web_search
+    }
+
+    /// Pinned stock-Codex command for a differential treatment.
+    #[must_use]
+    pub fn codex_command(&self) -> Option<&Path> {
+        self.codex_command.as_deref()
     }
 }
 
@@ -501,6 +638,7 @@ fn coordinate_output(
     profile_digest: &str,
     family_key: &str,
     repetition: u16,
+    generation: i64,
 ) -> PathBuf {
     let family_digest = hex::encode(Sha256::digest(family_key.as_bytes()));
     state_directory
@@ -508,6 +646,7 @@ fn coordinate_output(
         .join(profile_digest)
         .join(family_digest)
         .join(format!("k-{repetition}"))
+        .join(format!("attempt-{generation}"))
 }
 
 fn heartbeat_interval(lease_duration: Duration) -> Duration {

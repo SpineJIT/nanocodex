@@ -1,5 +1,6 @@
 mod args;
 mod benchmark;
+mod coordinator;
 mod profile;
 mod run;
 
@@ -16,6 +17,9 @@ pub(crate) struct Eval {
 enum EvalCommand {
     /// Launch the agent-owned benchmark workflow in the TUI or headlessly.
     Benchmark(benchmark::Benchmark),
+
+    /// Own one SQLite ledger for pull workers on this machine.
+    Coordinator(coordinator::Coordinator),
 
     /// Inspect one immutable profile revision and its durable progress.
     Status(profile::Status),
@@ -39,7 +43,8 @@ fn enable_paint() {
 async fn run(eval: Eval) -> Result<()> {
     match eval.command {
         EvalCommand::Benchmark(command) => command.run().await?,
-        EvalCommand::Status(command) => command.run()?,
+        EvalCommand::Coordinator(command) => command.run().await?,
+        EvalCommand::Status(command) => command.run().await?,
         EvalCommand::Run(command) => command.run().await?,
     }
     Ok(())

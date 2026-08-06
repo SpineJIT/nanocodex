@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde::Serialize;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Complete immutable definition of one profile revision.
@@ -92,7 +92,7 @@ pub struct PreparationLease {
 pub struct CoordinateLease {
     coordinate_id: i64,
     execution_id: i64,
-    generation: i64,
+    pub(crate) generation: i64,
     owner: String,
     /// Internal fungible repetition allocated by SQLite.
     pub repetition: u16,
@@ -151,6 +151,8 @@ pub struct FamilyStatus {
     pub key: String,
     /// Profile-visible task selector.
     pub task: String,
+    /// Network identity of the host that owns preparation and execution.
+    pub assigned_host: Option<String>,
     /// Stable serialized treatment description.
     pub treatment: String,
     /// Desired repetition count.
@@ -203,7 +205,7 @@ impl Workset {
     pub fn ensure(path: impl Into<PathBuf>, spec: &WorksetSpec) -> Result<Self, WorksetError> {
         let path = path.into();
         let mut connection = open_connection(&path)?;
-        initialize_schema(&connection)?;
+        initialize_schema(&mut connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT OR IGNORE INTO worksets(profile, digest, config_path, created_at_ms) \
@@ -289,9 +291,20 @@ impl Workset {
 
     /// Atomically begins preparation or one available repetition from the
     /// exact caller-selected family.
-    pub fn begin(
+    #[cfg(test)]
+    fn begin(
         &self,
         family_key: &str,
+        lease_duration: Duration,
+    ) -> Result<BeginCoordinate, WorksetError> {
+        self.begin_for_host(family_key, "local", lease_duration)
+    }
+
+    /// Atomically begins work for one family on its assigned host.
+    pub fn begin_for_host(
+        &self,
+        family_key: &str,
+        host: &str,
         lease_duration: Duration,
     ) -> Result<BeginCoordinate, WorksetError> {
         let owner = Uuid::now_v7().to_string();
@@ -310,12 +323,29 @@ impl Workset {
         let Some(task_id) = task_id else {
             return Err(WorksetError::UnknownFamily(family_key.to_owned()));
         };
-        let preparation: (String, i64, Option<i64>) = transaction.query_row(
-            "SELECT preparation_state, preparation_generation, preparation_expires_at_ms \
+        let preparation: (String, i64, Option<i64>, Option<String>) = transaction.query_row(
+            "SELECT preparation_state, preparation_generation, preparation_expires_at_ms, \
+                    assigned_host \
              FROM tasks WHERE id = ?1",
             [task_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
+        match preparation.3.as_deref() {
+            None => {
+                transaction.execute(
+                    "UPDATE tasks SET assigned_host = ?1 WHERE id = ?2 AND assigned_host IS NULL",
+                    params![host, task_id],
+                )?;
+            }
+            Some(assigned) if assigned == host => {}
+            Some(_) => {
+                transaction.commit()?;
+                return Ok(BeginCoordinate::Busy(WorksetBusy {
+                    reason: "task_assigned_elsewhere",
+                    retry_after_ms: 30_000,
+                }));
+            }
+        }
         if preparation.0 != "ready" {
             let reclaimable = preparation.0 == "pending"
                 || (preparation.0 == "preparing"
@@ -507,25 +537,27 @@ impl Workset {
         )?;
         let coordinates = coordinate_counts(&connection, self.id, now)?;
         let mut statement = connection.prepare(
-            "SELECT c.family_key, t.selector, c.treatment, COUNT(*), \
+            "SELECT c.family_key, t.selector, t.assigned_host, c.treatment, COUNT(*), \
                 COALESCE(SUM(c.state = 'pending' OR \
                     (c.state = 'running' AND c.lease_expires_at_ms <= ?2)), 0), \
                 COALESCE(SUM(c.state = 'running' AND c.lease_expires_at_ms > ?2), 0), \
                 COALESCE(SUM(c.state = 'terminal'), 0) \
              FROM coordinates c JOIN tasks t ON t.id = c.task_id \
              WHERE c.workset_id = ?1 \
-             GROUP BY c.family_key, t.selector, c.treatment ORDER BY t.selector, c.family_key",
+             GROUP BY c.family_key, t.selector, t.assigned_host, c.treatment \
+             ORDER BY t.selector, c.family_key",
         )?;
         let families = statement
             .query_map(params![self.id, now], |row| {
                 Ok(FamilyStatus {
                     key: row.get(0)?,
                     task: row.get(1)?,
-                    treatment: row.get(2)?,
-                    desired: row.get(3)?,
-                    pending: row.get(4)?,
-                    running: row.get(5)?,
-                    terminal: row.get(6)?,
+                    assigned_host: row.get(2)?,
+                    treatment: row.get(3)?,
+                    desired: row.get(4)?,
+                    pending: row.get(5)?,
+                    running: row.get(6)?,
+                    terminal: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -612,9 +644,9 @@ fn open_connection(path: &Path) -> Result<Connection, WorksetError> {
     Ok(connection)
 }
 
-fn initialize_schema(connection: &Connection) -> Result<(), WorksetError> {
+fn initialize_schema(connection: &mut Connection) -> Result<(), WorksetError> {
     let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version != 0 && version != SCHEMA_VERSION {
+    if version > SCHEMA_VERSION {
         return Err(WorksetError::DefinitionConflict(format!(
             "schema {version}; expected {SCHEMA_VERSION}"
         )));
@@ -640,6 +672,7 @@ fn initialize_schema(connection: &Connection) -> Result<(), WorksetError> {
             preparation_owner TEXT,
             preparation_expires_at_ms INTEGER,
             preparation_error TEXT,
+            assigned_host TEXT,
             UNIQUE(workset_id, selector)
          );
          CREATE TABLE IF NOT EXISTS coordinates(
@@ -670,7 +703,14 @@ fn initialize_schema(connection: &Connection) -> Result<(), WorksetError> {
             UNIQUE(coordinate_id, generation)
          );",
     )?;
-    connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    if version == 1 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("ALTER TABLE tasks ADD COLUMN assigned_host TEXT", [])?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.commit()?;
+    } else {
+        connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
     Ok(())
 }
 
@@ -809,6 +849,56 @@ mod tests {
     }
 
     #[test]
+    fn one_host_owns_task_preparation_and_every_coordinate() {
+        let directory = tempfile::tempdir().unwrap();
+        let workset = Workset::ensure(
+            directory.path().join("state.sqlite3"),
+            &spec(directory.path(), 1),
+        )
+        .unwrap();
+        let BeginCoordinate::Prepare(preparation) = workset
+            .begin_for_host(
+                "terminal/fix-git|high|diff",
+                "100.64.0.1",
+                Duration::from_secs(30),
+            )
+            .unwrap()
+        else {
+            panic!("first host should own preparation");
+        };
+        assert!(matches!(
+            workset
+                .begin_for_host(
+                    "terminal/fix-git|high|diff",
+                    "100.64.0.2",
+                    Duration::from_secs(30),
+                )
+                .unwrap(),
+            BeginCoordinate::Busy(WorksetBusy {
+                reason: "task_assigned_elsewhere",
+                ..
+            })
+        ));
+        workset.complete_preparation(&preparation).unwrap();
+        let BeginCoordinate::Execute(_) = workset
+            .begin_for_host(
+                "terminal/fix-git|high|diff",
+                "100.64.0.1",
+                Duration::from_secs(30),
+            )
+            .unwrap()
+        else {
+            panic!("assigned host should execute");
+        };
+        assert_eq!(
+            workset.status().unwrap().families[0]
+                .assigned_host
+                .as_deref(),
+            Some("100.64.0.1")
+        );
+    }
+
+    #[test]
     fn expired_preparation_is_reported_pending_and_fenced_on_reclamation() {
         let directory = tempfile::tempdir().unwrap();
         let workset = Workset::ensure(
@@ -935,5 +1025,64 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, 99);
+    }
+
+    #[test]
+    fn version_one_ledgers_gain_host_assignment_without_losing_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE worksets(
+                    id INTEGER PRIMARY KEY,
+                    profile TEXT NOT NULL,
+                    digest TEXT NOT NULL,
+                    config_path TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    UNIQUE(profile, digest)
+                 );
+                 CREATE TABLE tasks(
+                    id INTEGER PRIMARY KEY,
+                    workset_id INTEGER NOT NULL REFERENCES worksets(id),
+                    selector TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    root TEXT NOT NULL,
+                    digest TEXT NOT NULL,
+                    preparation_state TEXT NOT NULL,
+                    preparation_generation INTEGER NOT NULL,
+                    preparation_owner TEXT,
+                    preparation_expires_at_ms INTEGER,
+                    preparation_error TEXT,
+                    UNIQUE(workset_id, selector)
+                 );
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let workset = Workset::ensure(&path, &spec(directory.path(), 1)).unwrap();
+        let BeginCoordinate::Prepare(preparation) = workset
+            .begin_for_host(
+                "terminal/fix-git|high|diff",
+                "127.0.0.1",
+                Duration::from_secs(30),
+            )
+            .unwrap()
+        else {
+            panic!("migrated task should remain claimable");
+        };
+        workset.complete_preparation(&preparation).unwrap();
+        assert_eq!(
+            workset.status().unwrap().families[0]
+                .assigned_host
+                .as_deref(),
+            Some("127.0.0.1")
+        );
+        let connection = Connection::open(path).unwrap();
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 }

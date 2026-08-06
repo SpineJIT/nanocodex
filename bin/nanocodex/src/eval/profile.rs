@@ -7,8 +7,9 @@ use clap::{Args, ValueEnum};
 use eyre::{Result, WrapErr as _, eyre};
 use nanocodex::Model;
 use nanocodex_eval::{
-    CoordinateClaim, EvalOutcome, Evaluation, EvaluationClaim, EvaluationMode, EvaluationSelector,
-    Evaluator, Task,
+    EvalOutcome, Evaluation, EvaluationClaim, EvaluationMode, EvaluationSelection,
+    EvaluationSelector, Evaluator, Task,
+    coordinator::{CoordinatorClient, RemoteClaim, RemoteLease},
     differential::{
         CodexAuth, CodexToolMode, DifferentialEvaluator, ExecutableIdentity, NanocodexToolMode,
     },
@@ -41,6 +42,10 @@ pub(super) struct ProfileTarget {
     /// Defaults to ~/.nanocodex/evals.
     #[arg(long, value_name = "DIRECTORY")]
     state_dir: Option<PathBuf>,
+
+    /// Pull claims from a remote coordinator instead of opening SQLite directly.
+    #[arg(long, value_name = "URL", conflicts_with = "state_dir")]
+    coordinator: Option<String>,
 }
 
 #[derive(Args)]
@@ -108,7 +113,7 @@ enum RunOutput<'a> {
         profile: &'a str,
         task: &'a str,
         repetition: u16,
-        evidence: &'a Path,
+        evidence: &'a str,
     },
     AlreadyComplete {
         profile: &'a str,
@@ -123,7 +128,17 @@ enum RunOutput<'a> {
 }
 
 impl Status {
-    pub(super) fn run(self) -> Result<()> {
+    pub(super) async fn run(self) -> Result<()> {
+        if let Some(coordinator) = &self.target.coordinator {
+            let status = CoordinatorClient::new(coordinator)?.status().await?;
+            if self.json {
+                serde_json::to_writer_pretty(std::io::stdout().lock(), &status)?;
+                println!();
+            } else {
+                print_remote_status(&status);
+            }
+            return Ok(());
+        }
         let evaluation = self.target.open()?;
         let status = evaluation.status()?;
         if self.json {
@@ -158,24 +173,31 @@ impl Status {
 impl Run {
     pub(super) async fn run(self) -> Result<()> {
         let _observability = self.observability.install(false, Path::new("."))?;
-        let evaluation = self.target.open()?;
         let requested_thinking = self.agent.thinking();
-        if self
-            .agent
-            .web_search()
-            .is_some_and(|requested| requested != evaluation.web_search())
-        {
-            return Err(eyre!(
-                "--web-search cannot override profile `{}`; the profile fixes web_search={}",
-                evaluation.name(),
-                evaluation.web_search()
-            ));
-        }
         let selector = EvaluationSelector::new(&self.task)
             .model(self.model)
             .thinking(requested_thinking)
             .nanocodex_tool_mode(self.nanocodex_tool_mode.map(NanocodexToolMode::from))
             .codex_tool_mode(self.codex_tool_mode.map(CodexToolMode::from));
+        if let Some(coordinator) = &self.target.coordinator {
+            let selection = EvaluationSelection::load(
+                &self.target.config,
+                self.target.profile.as_deref(),
+                &selector,
+            )?;
+            validate_web_search(&self.agent, selection.profile(), selection.web_search())?;
+            return run_remote(
+                CoordinatorClient::new(coordinator)?,
+                selection,
+                &self.task,
+                self.guest_memory_mb,
+                self.agent,
+                &self.vm,
+            )
+            .await;
+        }
+        let evaluation = self.target.open()?;
+        validate_web_search(&self.agent, evaluation.name(), evaluation.web_search())?;
         let mut prepared = None;
         loop {
             match evaluation.claim(&selector, LEASE_DURATION)? {
@@ -199,7 +221,11 @@ impl Run {
                             None => prepare_resources(claim.task(), &self.vm).await?,
                         };
                         execute_coordinate(
-                            &claim,
+                            claim.task().clone(),
+                            claim.treatment().clone(),
+                            claim.web_search(),
+                            claim.codex_command().map(Path::to_path_buf),
+                            claim.output_directory().to_path_buf(),
                             resources,
                             self.guest_memory_mb,
                             self.agent,
@@ -212,6 +238,7 @@ impl Run {
                         Ok(ExecutionResult::Accepted(evidence)) => {
                             let repetition = claim.repetition();
                             claim.complete(&evidence)?;
+                            let evidence = evidence.to_string_lossy();
                             write_json(&RunOutput::Completed {
                                 profile: evaluation.name(),
                                 task: &self.task,
@@ -258,6 +285,148 @@ impl Run {
     }
 }
 
+async fn run_remote(
+    coordinator: CoordinatorClient,
+    selection: EvaluationSelection,
+    task_selector: &str,
+    guest_memory_mb: u64,
+    agent: EvalAgentArgs,
+    vm: &VmPreparationArgs,
+) -> Result<()> {
+    let mut prepared = None;
+    loop {
+        match coordinator.claim(&selection).await? {
+            RemoteClaim::Prepare(lease) => {
+                let heartbeat = remote_heartbeat(coordinator.clone(), lease.clone());
+                let result = prepare_resources(selection.task(), vm).await;
+                match result {
+                    Ok(resources) => {
+                        let finish = coordinator.prepared(&lease).await;
+                        heartbeat.abort();
+                        finish?;
+                        prepared = Some(resources);
+                    }
+                    Err(error) => {
+                        let finish = coordinator.retry(&lease, &format!("{error:#}")).await;
+                        heartbeat.abort();
+                        finish?;
+                        return Err(error).wrap_err("remote task preparation remains retryable");
+                    }
+                }
+            }
+            RemoteClaim::Run { lease, repetition } => {
+                std::fs::create_dir_all(&vm.vm_cache)?;
+                let output = tempfile::Builder::new()
+                    .prefix("nanocodex-eval-worker-")
+                    .tempdir_in(&vm.vm_cache)?;
+                let heartbeat = remote_heartbeat(coordinator.clone(), lease.clone());
+                let result = async {
+                    let resources = match prepared.take() {
+                        Some(resources) => resources,
+                        None => prepare_resources(selection.task(), vm).await?,
+                    };
+                    execute_coordinate(
+                        selection.task().clone(),
+                        selection.treatment().clone(),
+                        selection.web_search(),
+                        selection.codex_command().map(Path::to_path_buf),
+                        output.path().to_path_buf(),
+                        resources,
+                        guest_memory_mb,
+                        agent,
+                        vm,
+                    )
+                    .await
+                }
+                .await;
+                match result {
+                    Ok(ExecutionResult::Accepted(evidence)) => {
+                        let finish = coordinator.complete(&lease, output.path(), &evidence).await;
+                        heartbeat.abort();
+                        finish?;
+                        write_json(&RunOutput::Completed {
+                            profile: selection.profile(),
+                            task: task_selector,
+                            repetition,
+                            evidence: "coordinator",
+                        })?;
+                        return Ok(());
+                    }
+                    Ok(ExecutionResult::Retryable { error, .. }) => {
+                        let finish = async {
+                            coordinator.upload(&lease, output.path()).await?;
+                            coordinator.retry(&lease, &error).await
+                        }
+                        .await;
+                        heartbeat.abort();
+                        finish?;
+                        return Err(eyre!("remote coordinate remains retryable: {error}"));
+                    }
+                    Err(error) => {
+                        let finish = async {
+                            coordinator.upload(&lease, output.path()).await?;
+                            coordinator.retry(&lease, &format!("{error:#}")).await
+                        }
+                        .await;
+                        heartbeat.abort();
+                        finish?;
+                        return Err(error).wrap_err("remote coordinate remains retryable");
+                    }
+                }
+            }
+            RemoteClaim::Busy {
+                reason,
+                retry_after_ms,
+            } => {
+                write_json(&RunOutput::TemporarilyUnavailable {
+                    profile: selection.profile(),
+                    task: task_selector,
+                    reason: &reason,
+                    retry_after_ms,
+                })?;
+                return Err(eyre!(
+                    "temporarily unavailable: {reason}; retry after {retry_after_ms} ms"
+                ));
+            }
+            RemoteClaim::Complete => {
+                write_json(&RunOutput::AlreadyComplete {
+                    profile: selection.profile(),
+                    task: task_selector,
+                })?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn remote_heartbeat(
+    coordinator: CoordinatorClient,
+    lease: RemoteLease,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(20));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if coordinator.heartbeat(&lease).await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+fn validate_web_search(agent: &EvalAgentArgs, profile: &str, web_search: bool) -> Result<()> {
+    if agent
+        .web_search()
+        .is_some_and(|requested| requested != web_search)
+    {
+        return Err(eyre!(
+            "--web-search cannot override profile `{profile}`; the profile fixes web_search={web_search}"
+        ));
+    }
+    Ok(())
+}
+
 impl ProfileTarget {
     fn open(&self) -> Result<Evaluation> {
         let state_directory = self.state_dir.clone().map_or_else(default_state_dir, Ok)?;
@@ -297,23 +466,23 @@ async fn prepare_resources(task: &Task, vm: &VmPreparationArgs) -> Result<VmReso
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_coordinate(
-    claim: &CoordinateClaim,
+    task: Task,
+    treatment: nanocodex_eval::EvaluationTreatment,
+    web_search: bool,
+    codex_command: Option<PathBuf>,
+    output: PathBuf,
     resources: VmResources,
     guest_memory_mb: u64,
     agent: EvalAgentArgs,
     vm: &VmPreparationArgs,
 ) -> Result<ExecutionResult> {
-    let treatment = claim.treatment();
-    let task = claim.task().clone();
-    let output = claim.output_directory();
-    std::fs::create_dir_all(output)?;
+    std::fs::create_dir_all(&output)?;
     match treatment.mode {
         EvaluationMode::Nanocodex => {
             let backend = resources.backend().await?;
-            let nanocodex =
-                agent.builder(treatment.model, treatment.thinking, claim.web_search())?;
+            let nanocodex = agent.builder(treatment.model, treatment.thinking, web_search)?;
             let evaluator = Evaluator::builder(nanocodex, backend)
-                .output_directory(output)
+                .output_directory(&output)
                 .build()?;
             let outcome = evaluator.task(task).await?;
             let evidence = evaluator.directory().to_path_buf();
@@ -328,21 +497,21 @@ async fn execute_coordinate(
         }
         EvaluationMode::Differential => {
             let (nanocodex, auth) =
-                agent.shared_builder(treatment.model, treatment.thinking, claim.web_search())?;
+                agent.shared_builder(treatment.model, treatment.thinking, web_search)?;
             let codex_auth = match auth {
                 SharedAuth::ApiKey(api_key) => CodexAuth::api_key(api_key),
                 SharedAuth::AuthFile(path) => CodexAuth::auth_file(path),
             };
             let executable = std::env::current_exe()?;
-            let codex = claim
-                .codex_command()
+            let codex = codex_command
+                .as_deref()
                 .ok_or_else(|| eyre!("differential profile lost its Codex command"))?;
             let evaluator = DifferentialEvaluator::builder(nanocodex)
                 .codex(codex, codex_auth)
                 .vm(resources)
-                .output_directory(output)
+                .output_directory(&output)
                 .thinking(treatment.thinking)
-                .web_search(claim.web_search())
+                .web_search(web_search)
                 .nanocodex_tool_mode(treatment.nanocodex_tool_mode)
                 .codex_tool_mode(treatment.codex_tool_mode)
                 .nanocodex_executable(
@@ -369,13 +538,47 @@ async fn execute_coordinate(
     }
 }
 
-fn default_state_dir() -> Result<PathBuf> {
+pub(super) fn default_state_dir() -> Result<PathBuf> {
     if let Some(home) = std::env::var_os("NANOCODEX_HOME") {
         return Ok(PathBuf::from(home).join("evals"));
     }
     let home = std::env::var_os("HOME")
         .ok_or_else(|| eyre!("HOME is not set; pass --state-dir for durable eval state"))?;
     Ok(PathBuf::from(home).join(".nanocodex/evals"))
+}
+
+fn print_remote_status(status: &serde_json::Value) {
+    let profile = status["profile"].as_str().unwrap_or("unknown");
+    let digest = status["digest"].as_str().unwrap_or("unknown");
+    let preparation = &status["preparation"];
+    let coordinates = &status["coordinates"];
+    println!(
+        "{} {} · preparation {}/{} ready · coordinates {}/{} terminal, {} running",
+        profile,
+        &digest[..digest.len().min(12)],
+        preparation["complete"].as_u64().unwrap_or(0),
+        count_total(preparation),
+        coordinates["complete"].as_u64().unwrap_or(0),
+        count_total(coordinates),
+        coordinates["running"].as_u64().unwrap_or(0),
+    );
+    for family in status["families"].as_array().into_iter().flatten() {
+        println!(
+            "  {} · {}/{} terminal · {} running · {} pending",
+            family["task"].as_str().unwrap_or("unknown"),
+            family["complete"].as_u64().unwrap_or(0),
+            family["desired"].as_u64().unwrap_or(0),
+            family["running"].as_u64().unwrap_or(0),
+            family["pending"].as_u64().unwrap_or(0),
+        );
+    }
+}
+
+fn count_total(counts: &serde_json::Value) -> u64 {
+    ["pending", "running", "complete"]
+        .into_iter()
+        .map(|key| counts[key].as_u64().unwrap_or(0))
+        .sum()
 }
 
 fn write_json(value: &impl Serialize) -> Result<()> {

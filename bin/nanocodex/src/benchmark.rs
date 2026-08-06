@@ -1,11 +1,19 @@
 use std::path::Path;
 
-pub(crate) fn prompt(profile: Option<&str>, config: &Path, state_dir: Option<&Path>) -> String {
+pub(crate) fn prompt(
+    profile: Option<&str>,
+    config: &Path,
+    state_dir: Option<&Path>,
+    coordinator: Option<&str>,
+) -> String {
     let selected = profile.unwrap_or("the manifest default profile");
     let profile_argument =
         profile.map_or_else(String::new, |profile| format!(" {}", shell_quote(profile)));
     let state_argument = state_dir.map_or_else(String::new, |directory| {
         format!(" --state-dir {}", shell_quote(&directory.to_string_lossy()))
+    });
+    let coordinator_argument = coordinator.map_or_else(String::new, |coordinator| {
+        format!(" --coordinator {}", shell_quote(coordinator))
     });
     let config_argument = shell_quote(&config.to_string_lossy());
     format!(
@@ -13,9 +21,9 @@ pub(crate) fn prompt(profile: Option<&str>, config: &Path, state_dir: Option<&Pa
 
 The desired amount of work is defined only by `{config}`. Never add an ad-hoc task, treatment, model, reasoning effort, or trial. Materialize and inspect its durable SQLite ledger with:
 
-    nanocodex eval status{profile_argument} --config {config_argument}{state_argument} --json
+    nanocodex eval status{profile_argument} --config {config_argument}{state_argument}{coordinator_argument} --json
 
-You own execution strategy. Read the family records, choose an exact pending task and treatment, and invoke one repetition with `nanocodex eval run{profile_argument} --config {config_argument}{state_argument} --task <exact-profile-selector>` plus any model, thinking, or tool-mode selectors required to disambiguate that profile family. The CLI allocates the internal repetition; never pass or invent a trial number.
+You own execution strategy. Read the family records, choose an exact pending task and treatment, and invoke one repetition with `nanocodex eval run{profile_argument} --config {config_argument}{state_argument}{coordinator_argument} --task <exact-profile-selector>` plus any model, thinking, or tool-mode selectors required to disambiguate that profile family. The CLI allocates the internal repetition; never pass or invent a trial number.
 
 Decide how many run processes to launch concurrently and which tasks to prioritize. You may adjust fan-out based on memory, preparation contention, failures, and observed throughput. There is deliberately no run-all command, next-work command, scheduler, or host-saturation loop in the evaluator.
 
@@ -40,6 +48,7 @@ mod tests {
             Some("release"),
             Path::new("nanocodex.toml"),
             Some(Path::new("/mnt/evals")),
+            None,
         );
 
         assert!(prompt.contains("choose an exact pending task and treatment"));
@@ -55,9 +64,28 @@ mod tests {
             Some("release candidate"),
             Path::new("configs/eval profile.toml"),
             Some(Path::new("/mnt/eval state")),
+            None,
         );
 
         assert!(prompt.contains("status 'release candidate' --config 'configs/eval profile.toml'"));
         assert!(prompt.contains("--state-dir '/mnt/eval state'"));
+    }
+
+    #[test]
+    fn workflow_can_point_every_run_at_a_coordinator() {
+        let prompt = prompt(
+            Some("release"),
+            Path::new("nanocodex.toml"),
+            None,
+            Some("http://127.0.0.1:8789"),
+        );
+
+        assert!(prompt.contains(
+            "status 'release' --config 'nanocodex.toml' --coordinator 'http://127.0.0.1:8789'"
+        ));
+        assert!(prompt.contains(
+            "run 'release' --config 'nanocodex.toml' --coordinator 'http://127.0.0.1:8789' --task"
+        ));
+        assert!(!prompt.contains("--state-dir"));
     }
 }

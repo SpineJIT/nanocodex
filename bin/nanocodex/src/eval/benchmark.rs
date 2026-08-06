@@ -20,6 +20,10 @@ pub(super) struct Benchmark {
     #[arg(long, value_name = "DIRECTORY")]
     state_dir: Option<PathBuf>,
 
+    /// Pull all status and execution claims from this coordinator.
+    #[arg(long, value_name = "URL", conflicts_with = "state_dir")]
+    coordinator: Option<String>,
+
     /// Run the same benchmark workflow as flushed JSONL without a TUI.
     #[arg(long)]
     headless: bool,
@@ -40,6 +44,7 @@ impl Benchmark {
             self.profile.as_deref(),
             &self.config,
             self.state_dir.as_deref(),
+            self.coordinator.as_deref(),
         );
         if self.headless {
             let _observability = self.observability.install(false, self.agent.cwd())?;
