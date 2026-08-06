@@ -81,6 +81,10 @@ pub(super) struct Run {
     #[arg(long, value_enum)]
     codex_tool_mode: Option<ToolMode>,
 
+    /// Advisory stable name used for coordinator task affinity and status.
+    #[arg(long, env = "NANOCODEX_WORKER_NAME", value_name = "NAME")]
+    worker: Option<String>,
+
     #[command(flatten)]
     vm: VmPreparationArgs,
 
@@ -188,8 +192,12 @@ impl Run {
                 &selector,
             )?;
             validate_web_search(&self.agent, selection.profile(), selection.web_search())?;
+            let mut coordinator = CoordinatorClient::new(coordinator)?;
+            if let Some(worker) = self.worker {
+                coordinator = coordinator.worker(worker);
+            }
             return run_remote(
-                CoordinatorClient::new(coordinator)?,
+                coordinator,
                 selection,
                 &self.task,
                 self.guest_memory_mb,
@@ -699,6 +707,8 @@ mod tests {
             "release",
             "--task",
             "terminal/fix-git",
+            "--worker",
+            "dev-one",
             "--api-key",
             "test-key",
         ])
@@ -710,6 +720,7 @@ mod tests {
             panic!("expected profile run");
         };
         assert_eq!(run.task, "terminal/fix-git");
+        assert_eq!(run.worker.as_deref(), Some("dev-one"));
     }
 
     #[test]

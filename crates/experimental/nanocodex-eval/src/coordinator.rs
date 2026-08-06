@@ -38,6 +38,7 @@ pub struct CoordinatorServer {
 pub struct CoordinatorClient {
     base: Url,
     http: reqwest::Client,
+    worker: Option<String>,
 }
 
 /// One action atomically allocated by the coordinator.
@@ -118,6 +119,7 @@ enum HeldClaim {
 struct ClaimRequest {
     profile_digest: String,
     family_key: String,
+    worker: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -229,7 +231,18 @@ impl CoordinatorClient {
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
+            worker: None,
         })
+    }
+
+    /// Attaches an advisory worker name to future claims.
+    ///
+    /// Names provide stable task affinity and observability only. Lease tokens
+    /// and generations remain the authority for every state transition.
+    #[must_use]
+    pub fn worker(mut self, name: impl Into<String>) -> Self {
+        self.worker = Some(name.into());
+        self
     }
 
     /// Reads the coordinator's complete structured ledger snapshot.
@@ -249,6 +262,7 @@ impl CoordinatorClient {
                 .json(&serde_json::json!({
                     "profile_digest": selection.profile_digest(),
                     "family_key": selection.family_key(),
+                    "worker": self.worker,
                 }))
                 .send()
                 .await?,
@@ -382,7 +396,10 @@ async fn claim(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(request): Json<ClaimRequest>,
 ) -> Result<Json<ClaimResponse>, ApiError> {
-    let host = peer.ip().to_string();
+    let host = request
+        .worker
+        .filter(|worker| !worker.trim().is_empty())
+        .unwrap_or_else(|| peer.ip().to_string());
     let claim = state
         .evaluation
         .claim_family_for_host(
@@ -753,6 +770,7 @@ thinking = ["high"]
     #[tokio::test]
     async fn workers_prepare_claim_upload_and_converge_through_the_coordinator() {
         let (directory, client, selection, server) = fixture().await;
+        let client = client.worker("worker-one");
         let RemoteClaim::Prepare(preparation) = client.claim(&selection).await.unwrap() else {
             panic!("first worker should prepare");
         };
@@ -797,7 +815,7 @@ thinking = ["high"]
         let status = client.status().await.unwrap();
         assert_eq!(status["coordinates"]["complete"], 2);
         assert_eq!(status["coordinates"]["pending"], 0);
-        assert_eq!(status["families"][0]["assigned_host"], "127.0.0.1");
+        assert_eq!(status["families"][0]["assigned_host"], "worker-one");
         let artifacts = directory.path().join("state/artifacts");
         assert_eq!(count_named_files(&artifacts, "events.jsonl"), 2);
         assert_eq!(count_named_files(&artifacts, "trajectory.json"), 2);
