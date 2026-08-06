@@ -185,8 +185,8 @@ VmProcessConfig::read(config_path)?.run()?;
 On macOS, the VMM executable must be signed with the
 `com.apple.security.hypervisor` entitlement. Ad-hoc signing is sufficient for
 local development; distribution uses the application's normal signing
-identity. `nanocodex-vm.entitlements` and `scripts/codesign-runner` provide the
-repository build path.
+identity. `just build-eval-host` uses `nanocodex-vm.entitlements` to produce the
+prepared repository build; runtime execution only validates the entitlement.
 
 Linux uses the same Rust API and needs no code signing. Running VMs requires
 `/dev/kvm` and `libkrunfw.so.5`. The supported x86_64 static guest build uses a

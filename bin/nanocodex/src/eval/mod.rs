@@ -1,4 +1,3 @@
-mod args;
 mod benchmark;
 mod coordinator;
 mod profile;
@@ -66,24 +65,55 @@ mod tests {
                 "local-smoke",
                 "--task",
                 "tasks/write-greeting",
-                "--vm-cache",
-                "/var/cache/nanocodex-vm",
             ],
             vec!["nanocodex", "eval", "status", "local-smoke"],
             vec!["nanocodex", "eval", "benchmark", "local-smoke"],
-            vec![
-                "nanocodex",
-                "eval",
-                "coordinator",
-                "local-smoke",
-                "--bind",
-                "100.64.0.1",
-            ],
+            vec!["nanocodex", "eval", "coordinator", "local-smoke"],
         ] {
             Cli::try_parse_from(arguments).expect("supported eval command must parse");
         }
 
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("eval"));
+    }
+
+    #[test]
+    fn eval_run_does_not_expose_host_substrate_overrides() {
+        for argument in [
+            "--vm-cache",
+            "--vm-guest-runtime",
+            "--vm-refresh",
+            "--guest-memory-mb",
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "nanocodex",
+                    "eval",
+                    "run",
+                    "local-smoke",
+                    "--task",
+                    "tasks/write-greeting",
+                    argument,
+                    "override",
+                ])
+                .is_err(),
+                "eval run unexpectedly accepted {argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn eval_coordinator_does_not_expose_a_bind_address() {
+        assert!(
+            Cli::try_parse_from([
+                "nanocodex",
+                "eval",
+                "coordinator",
+                "local-smoke",
+                "--bind",
+                "100.64.0.1",
+            ])
+            .is_err()
+        );
     }
 }

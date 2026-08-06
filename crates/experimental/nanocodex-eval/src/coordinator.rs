@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    io::Write,
     net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -20,12 +21,18 @@ use futures_util::StreamExt as _;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncWriteExt as _, net::TcpListener, sync::Mutex, task::JoinHandle};
-use tokio_util::io::ReaderStream;
+use tokio_util::io::{ReaderStream, SyncIoBridge};
 use uuid::Uuid;
 
 use crate::{CoordinateClaim, Evaluation, EvaluationClaim, EvaluationSelection, PreparationClaim};
 
-const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_COMPRESSED_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_EXTRACTED_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const ARCHIVE_BUFFER_BYTES: usize = 64 * 1024;
+const ARCHIVE_CONTENT_TYPE: &str = "application/x-tar+zstd";
+const EVIDENCE_EXTENSIONS: [&str; 2] = ["json", "jsonl"];
+const VERIFIER_EVIDENCE: [&str; 3] = ["reward.txt", "test-stdout.txt", "test-stderr.txt"];
+const EXCLUDED_EVIDENCE_DIRECTORIES: [&str; 3] = ["tests", "vm", "workspace"];
 
 /// Loopback HTTP coordinator backed by one durable evaluation ledger.
 pub struct CoordinatorServer {
@@ -177,12 +184,12 @@ impl CoordinatorServer {
         }
     }
 
-    /// Serves the coordinator on a loopback or Tailscale listener until shutdown.
+    /// Serves the coordinator on a loopback listener until shutdown.
     pub async fn serve(self, listener: TcpListener) -> Result<(), CoordinatorError> {
         let bind = listener.local_addr()?.ip();
-        if !bind.is_loopback() && !is_tailnet_address(bind) {
+        if !bind.is_loopback() {
             return Err(CoordinatorError::InvalidUrl(
-                "coordinators may bind only to loopback or a Tailscale address".to_owned(),
+                "coordinators may bind only to loopback".to_owned(),
             ));
         }
         let reaper = spawn_reaper(self.state.active.clone(), self.worker_timeout);
@@ -204,7 +211,7 @@ impl CoordinatorServer {
 }
 
 impl CoordinatorClient {
-    /// Connects to a coordinator. Plain HTTP is accepted on loopback or Tailscale.
+    /// Connects to a coordinator. Plain HTTP is accepted only on loopback.
     pub fn new(base: &str) -> Result<Self, CoordinatorError> {
         let mut base =
             Url::parse(base).map_err(|error| CoordinatorError::InvalidUrl(error.to_string()))?;
@@ -216,11 +223,11 @@ impl CoordinatorClient {
                     .parse::<IpAddr>()
                     .ok()
             })
-            .is_some_and(|ip| ip.is_loopback() || is_tailnet_address(ip))
+            .is_some_and(|ip| ip.is_loopback())
             || base.host_str() == Some("localhost");
         if !secure && !(base.scheme() == "http" && local_transport) {
             return Err(CoordinatorError::InvalidUrl(
-                "use HTTPS, or HTTP with a numeric loopback or Tailscale address".to_owned(),
+                "use HTTPS, or HTTP with a loopback address".to_owned(),
             ));
         }
         if !base.path().ends_with('/') {
@@ -311,7 +318,7 @@ impl CoordinatorClient {
         .await
     }
 
-    /// Uploads the complete attempt directory and atomically accepts its evidence.
+    /// Uploads canonical attempt evidence and atomically accepts its result.
     pub async fn complete(
         &self,
         lease: &RemoteLease,
@@ -332,22 +339,26 @@ impl CoordinatorClient {
         .await
     }
 
-    /// Uploads retained attempt evidence without accepting a terminal result.
+    /// Uploads retained canonical evidence without accepting a terminal result.
     pub async fn upload(
         &self,
         lease: &RemoteLease,
         output_directory: &Path,
     ) -> Result<(), CoordinatorError> {
-        let archive = build_archive(output_directory).await?;
-        let file = tokio::fs::File::open(archive.path()).await?;
-        accepted(
-            self.http
-                .put(self.endpoint(&format!("v1/claims/{}/artifacts", lease.token))?)
-                .body(reqwest::Body::wrap_stream(ReaderStream::new(file)))
-                .send()
-                .await?,
-        )
-        .await
+        let (writer, reader) = tokio::io::duplex(ARCHIVE_BUFFER_BYTES);
+        let directory = output_directory.to_path_buf();
+        let archive = tokio::task::spawn_blocking(move || {
+            write_evidence_archive(&directory, SyncIoBridge::new(writer))
+        });
+        let response = self
+            .http
+            .put(self.endpoint(&format!("v1/claims/{}/artifacts", lease.token))?)
+            .header(reqwest::header::CONTENT_TYPE, ARCHIVE_CONTENT_TYPE)
+            .body(reqwest::Body::wrap_stream(ReaderStream::new(reader)))
+            .send()
+            .await;
+        archive.await??;
+        accepted(response?).await
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, CoordinatorError> {
@@ -369,16 +380,6 @@ impl CoordinatorClient {
                 .await?,
         )
         .await
-    }
-}
-
-fn is_tailnet_address(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => {
-            let octets = address.octets();
-            octets[0] == 100 && (64..=127).contains(&octets[1])
-        }
-        IpAddr::V6(address) => address.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
     }
 }
 
@@ -537,7 +538,9 @@ async fn receive_archive(body: Body, output: &Path, token: &str) -> Result<(), A
     tokio::fs::create_dir_all(parent)
         .await
         .map_err(ApiError::internal)?;
-    let upload = parent.join(format!(".{token}.tar"));
+    remove_stale_uploads(parent).await?;
+    let upload = parent.join(format!(".{token}.tar.zst"));
+    let staging = parent.join(format!(".{token}.staging"));
     let mut file = tokio::fs::File::create(&upload)
         .await
         .map_err(ApiError::internal)?;
@@ -548,7 +551,9 @@ async fn receive_archive(body: Body, output: &Path, token: &str) -> Result<(), A
         received = received
             .checked_add(u64::try_from(chunk.len()).map_err(ApiError::internal)?)
             .ok_or_else(|| ApiError::bad_request("artifact upload is too large"))?;
-        if received > MAX_ARTIFACT_BYTES {
+        if received > MAX_COMPRESSED_ARTIFACT_BYTES {
+            drop(file);
+            let _ = tokio::fs::remove_file(&upload).await;
             return Err(ApiError::bad_request("artifact upload is too large"));
         }
         file.write_all(&chunk).await.map_err(ApiError::internal)?;
@@ -557,41 +562,139 @@ async fn receive_archive(body: Body, output: &Path, token: &str) -> Result<(), A
     drop(file);
     let upload_for_task = upload.clone();
     let output = output.to_path_buf();
-    tokio::task::spawn_blocking(move || extract_archive(&upload_for_task, &output))
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(ApiError::internal)?;
-    tokio::fs::remove_file(upload)
-        .await
-        .map_err(ApiError::internal)?;
+    let staging_for_task = staging.clone();
+    let extraction = tokio::task::spawn_blocking(move || {
+        extract_evidence_archive(&upload_for_task, &staging_for_task, &output)
+    })
+    .await
+    .map_err(ApiError::internal)?;
+    let _ = tokio::fs::remove_file(&upload).await;
+    if let Err(error) = extraction {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        return Err(ApiError::bad_request(error));
+    }
     Ok(())
 }
 
-fn extract_archive(archive: &Path, output: &Path) -> std::io::Result<()> {
-    std::fs::create_dir(output)?;
-    let file = std::fs::File::open(archive)?;
-    let mut archive = tar::Archive::new(file);
-    for entry in archive.entries()? {
-        if !entry?.unpack_in(output)? {
-            return Err(std::io::Error::other(
-                "artifact archive escaped its output directory",
-            ));
+async fn remove_stale_uploads(parent: &Path) -> Result<(), ApiError> {
+    let mut entries = tokio::fs::read_dir(parent)
+        .await
+        .map_err(ApiError::internal)?;
+    while let Some(entry) = entries.next_entry().await.map_err(ApiError::internal)? {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if name.ends_with(".tar") || name.ends_with(".tar.zst") {
+            tokio::fs::remove_file(path)
+                .await
+                .map_err(ApiError::internal)?;
+        } else if name.ends_with(".staging") {
+            tokio::fs::remove_dir_all(path)
+                .await
+                .map_err(ApiError::internal)?;
         }
     }
     Ok(())
 }
 
-async fn build_archive(directory: &Path) -> Result<tempfile::NamedTempFile, CoordinatorError> {
-    let archive = tempfile::NamedTempFile::new()?;
-    let file = archive.reopen()?;
-    let directory = directory.to_path_buf();
-    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        let mut builder = tar::Builder::new(file);
-        builder.append_dir_all(".", directory)?;
-        builder.into_inner()?.sync_all()
+fn extract_evidence_archive(archive: &Path, staging: &Path, output: &Path) -> std::io::Result<()> {
+    if output.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "artifact output already exists",
+        ));
+    }
+    std::fs::create_dir(staging)?;
+    let file = std::fs::File::open(archive)?;
+    let decoder = zstd::Decoder::new(file)?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut extracted = 0_u64;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        if !entry.header().entry_type().is_file() || !is_evidence_path(&path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "artifact archive contained unsupported evidence: {}",
+                    path.display()
+                ),
+            ));
+        }
+        extracted = extracted
+            .checked_add(entry.size())
+            .ok_or_else(|| std::io::Error::other("extracted evidence is too large"))?;
+        if extracted > MAX_EXTRACTED_ARTIFACT_BYTES {
+            return Err(std::io::Error::other("extracted evidence is too large"));
+        }
+        if !entry.unpack_in(staging)? {
+            return Err(std::io::Error::other(
+                "artifact archive escaped its output directory",
+            ));
+        }
+    }
+    std::fs::rename(staging, output)?;
+    Ok(())
+}
+
+fn write_evidence_archive<W: Write>(directory: &Path, writer: W) -> std::io::Result<()> {
+    let encoder = zstd::Encoder::new(writer, 3)?;
+    let mut archive = tar::Builder::new(encoder);
+    append_evidence(&mut archive, directory, directory)?;
+    let encoder = archive.into_inner()?;
+    encoder.finish()?.flush()
+}
+
+fn append_evidence<W: Write>(
+    archive: &mut tar::Builder<W>,
+    root: &Path,
+    directory: &Path,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| std::io::Error::other("evidence path escaped its output directory"))?;
+        if file_type.is_dir() {
+            if !is_excluded_evidence_directory(relative) {
+                append_evidence(archive, root, &path)?;
+            }
+        } else if file_type.is_file() && is_evidence_path(relative) {
+            archive.append_path_with_name(&path, relative)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_evidence_path(path: &Path) -> bool {
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        && !is_excluded_evidence_directory(path)
+        && (path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| EVIDENCE_EXTENSIONS.contains(&extension))
+            || path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| VERIFIER_EVIDENCE.contains(&name)))
+}
+
+fn is_excluded_evidence_directory(path: &Path) -> bool {
+    path.components().any(|component| {
+        let Component::Normal(name) = component else {
+            return false;
+        };
+        name.to_str()
+            .is_some_and(|name| EXCLUDED_EVIDENCE_DIRECTORIES.contains(&name))
     })
-    .await??;
-    Ok(archive)
 }
 
 fn safe_evidence(output: &Path, relative: &str) -> Result<PathBuf, ApiError> {
@@ -797,6 +900,10 @@ thinking = ["high"]
         for (lease, name) in [(&first_lease, "first"), (&second_lease, "second")] {
             let output = directory.path().join(format!("worker-{name}"));
             fs::create_dir_all(output.join("agent")).unwrap();
+            fs::create_dir_all(output.join("verifier")).unwrap();
+            fs::create_dir_all(output.join("workspace")).unwrap();
+            fs::create_dir_all(output.join("tests")).unwrap();
+            fs::create_dir_all(output.join("vm")).unwrap();
             let evidence = output.join("comparison.json");
             fs::write(&evidence, format!("{{\"worker\":\"{name}\"}}\n")).unwrap();
             fs::write(
@@ -809,6 +916,11 @@ thinking = ["high"]
                 format!("{{\"worker\":\"{name}\"}}\n"),
             )
             .unwrap();
+            fs::write(output.join("verifier/reward.txt"), "1\n").unwrap();
+            fs::write(output.join("rootfs.ext4"), vec![0_u8; 1024 * 1024]).unwrap();
+            fs::write(output.join("workspace/result.json"), "{}\n").unwrap();
+            fs::write(output.join("tests/fixture.json"), "{}\n").unwrap();
+            fs::write(output.join("vm/config.json"), "{}\n").unwrap();
             client.complete(lease, &output, &evidence).await.unwrap();
         }
 
@@ -819,6 +931,13 @@ thinking = ["high"]
         let artifacts = directory.path().join("state/artifacts");
         assert_eq!(count_named_files(&artifacts, "events.jsonl"), 2);
         assert_eq!(count_named_files(&artifacts, "trajectory.json"), 2);
+        assert_eq!(count_named_files(&artifacts, "reward.txt"), 2);
+        assert_eq!(count_named_files(&artifacts, "rootfs.ext4"), 0);
+        assert_eq!(count_named_files(&artifacts, "result.json"), 0);
+        assert_eq!(count_named_files(&artifacts, "fixture.json"), 0);
+        assert_eq!(count_named_files(&artifacts, "config.json"), 0);
+        assert_eq!(count_files_with_suffix(&artifacts, ".tar"), 0);
+        assert_eq!(count_files_with_suffix(&artifacts, ".tar.zst"), 0);
         assert!(matches!(
             client.claim(&selection).await.unwrap(),
             RemoteClaim::Complete
@@ -835,6 +954,20 @@ thinking = ["high"]
                     count_named_files(&path, name)
                 } else {
                     usize::from(path.file_name().is_some_and(|file| file == name))
+                }
+            })
+            .sum()
+    }
+
+    fn count_files_with_suffix(directory: &Path, suffix: &str) -> usize {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .map(|path| {
+                if path.is_dir() {
+                    count_files_with_suffix(&path, suffix)
+                } else {
+                    usize::from(path.to_string_lossy().ends_with(suffix))
                 }
             })
             .sum()
@@ -878,14 +1011,13 @@ thinking = ["high"]
     }
 
     #[test]
-    fn plain_http_is_limited_to_loopback_and_tailnet_addresses() {
+    fn plain_http_is_limited_to_loopback_addresses() {
         assert!(CoordinatorClient::new("http://192.0.2.1:8789").is_err());
-        assert!(CoordinatorClient::new("http://100.63.255.255:8789").is_err());
-        assert!(CoordinatorClient::new("http://100.128.0.1:8789").is_err());
+        assert!(CoordinatorClient::new("http://100.64.0.1:8789").is_err());
+        assert!(CoordinatorClient::new("http://100.127.255.255:8789").is_err());
         assert!(CoordinatorClient::new("http://127.0.0.1:8789").is_ok());
-        assert!(CoordinatorClient::new("http://100.64.0.1:8789").is_ok());
-        assert!(CoordinatorClient::new("http://100.127.255.255:8789").is_ok());
-        assert!(CoordinatorClient::new("http://[fd7a:115c:a1e0::1]:8789").is_ok());
+        assert!(CoordinatorClient::new("http://[::1]:8789").is_ok());
+        assert!(CoordinatorClient::new("http://localhost:8789").is_ok());
         assert!(CoordinatorClient::new("https://evals.example").is_ok());
     }
 }

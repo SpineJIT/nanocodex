@@ -12,12 +12,12 @@ use nanocodex_eval::{
     atif::AtifBuilder,
     coordinator::{CoordinatorClient, RemoteClaim, RemoteLease},
     harness::{Harness, HarnessAuth},
-    vm::{CachePolicy, VmResources},
+    vm::{CachePolicy, VmBackend, VmResources},
 };
 use serde::Serialize;
 use tokio::io::AsyncWriteExt as _;
 
-use super::{args::VmPreparationArgs, run};
+use super::run;
 use crate::{
     config::{EvalAgentArgs, SharedAuth},
     observability::ObservabilityArgs,
@@ -25,7 +25,6 @@ use crate::{
 
 const CONFIG_FILE: &str = "nanocodex.toml";
 const LEASE_DURATION: Duration = Duration::from_secs(5 * 60);
-const DEFAULT_INITIAL_GUEST_MEMORY_MB: u64 = 512;
 
 #[derive(Clone, Debug, Args)]
 pub(super) struct ProfileTarget {
@@ -77,18 +76,6 @@ pub(super) struct Run {
     /// Advisory stable name used for coordinator task affinity and status.
     #[arg(long, env = "NANOCODEX_WORKER_NAME", value_name = "NAME")]
     worker: Option<String>,
-
-    #[command(flatten)]
-    vm: VmPreparationArgs,
-
-    /// Guest RAM allocated to an external harness sandbox.
-    #[arg(
-        long,
-        value_name = "MIB",
-        default_value_t = DEFAULT_INITIAL_GUEST_MEMORY_MB,
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
-    guest_memory_mb: u64,
 
     #[command(flatten)]
     observability: ObservabilityArgs,
@@ -180,15 +167,7 @@ impl Run {
             if let Some(worker) = self.worker {
                 coordinator = coordinator.worker(worker);
             }
-            return run_remote(
-                coordinator,
-                selection,
-                &self.task,
-                self.guest_memory_mb,
-                self.agent,
-                &self.vm,
-            )
-            .await;
+            return run_remote(coordinator, selection, &self.task, self.agent).await;
         }
         let evaluation = self.target.open()?;
         validate_web_search(&self.agent, evaluation.name(), evaluation.web_search())?;
@@ -196,7 +175,7 @@ impl Run {
         loop {
             match evaluation.claim(&selector, LEASE_DURATION)? {
                 EvaluationClaim::Prepare(claim) => {
-                    let result = prepare_resources(claim.task(), claim.harnesses(), &self.vm).await;
+                    let result = prepare_resources(claim.task(), claim.harnesses()).await;
                     match result {
                         Ok(resources) => {
                             claim.complete()?;
@@ -212,9 +191,7 @@ impl Run {
                     let result = async {
                         let resources = match prepared.take() {
                             Some(resources) => resources,
-                            None => {
-                                prepare_resources(claim.task(), claim.harnesses(), &self.vm).await?
-                            }
+                            None => prepare_resources(claim.task(), claim.harnesses()).await?,
                         };
                         execute_coordinate(
                             claim.task().clone(),
@@ -223,7 +200,6 @@ impl Run {
                             claim.harness().cloned(),
                             claim.output_directory().to_path_buf(),
                             resources,
-                            self.guest_memory_mb,
                             self.agent,
                         )
                         .await
@@ -284,16 +260,14 @@ async fn run_remote(
     coordinator: CoordinatorClient,
     selection: EvaluationSelection,
     task_selector: &str,
-    guest_memory_mb: u64,
     agent: EvalAgentArgs,
-    vm: &VmPreparationArgs,
 ) -> Result<()> {
     let mut prepared = None;
     loop {
         match coordinator.claim(&selection).await? {
             RemoteClaim::Prepare(lease) => {
                 let heartbeat = remote_heartbeat(coordinator.clone(), lease.clone());
-                let result = prepare_resources(selection.task(), selection.harnesses(), vm).await;
+                let result = prepare_resources(selection.task(), selection.harnesses()).await;
                 match result {
                     Ok(resources) => {
                         let finish = coordinator.prepared(&lease).await;
@@ -310,16 +284,17 @@ async fn run_remote(
                 }
             }
             RemoteClaim::Run { lease, repetition } => {
-                std::fs::create_dir_all(&vm.vm_cache)?;
+                let host = run::PreparedVmHost::open()?;
                 let output = tempfile::Builder::new()
                     .prefix("nanocodex-eval-worker-")
-                    .tempdir_in(&vm.vm_cache)?;
+                    .tempdir_in(host.cache())?;
                 let heartbeat = remote_heartbeat(coordinator.clone(), lease.clone());
                 let result = async {
                     let resources = match prepared.take() {
                         Some(resources) => resources,
                         None => {
-                            prepare_resources(selection.task(), selection.harnesses(), vm).await?
+                            prepare_resources_from(selection.task(), selection.harnesses(), &host)
+                                .await?
                         }
                     };
                     execute_coordinate(
@@ -329,7 +304,6 @@ async fn run_remote(
                         selection.harness().cloned(),
                         output.path().to_path_buf(),
                         resources,
-                        guest_memory_mb,
                         agent,
                     )
                     .await
@@ -439,22 +413,20 @@ enum ExecutionResult {
     Retryable { error: String, evidence: PathBuf },
 }
 
-async fn prepare_resources(
+async fn prepare_resources(task: &Task, harnesses: &[ResolvedHarness]) -> Result<VmResources> {
+    let host = run::PreparedVmHost::open()?;
+    prepare_resources_from(task, harnesses, &host).await
+}
+
+async fn prepare_resources_from(
     task: &Task,
     harnesses: &[ResolvedHarness],
-    vm: &VmPreparationArgs,
+    host: &run::PreparedVmHost,
 ) -> Result<VmResources> {
-    let current_executable = std::env::current_exe()?;
-    let runtime_image =
-        run::prepare_vm_guest_runtime_from(vm.vm_guest_runtime.as_deref(), &vm.vm_cache).await?;
-    let mut builder = VmResources::builder(&current_executable, runtime_image)
+    let mut builder = VmResources::builder(host.vmm(), host.runtime_image())
         .task(task.clone())
-        .cache_directory(&vm.vm_cache)
-        .cache_policy(if vm.vm_refresh {
-            CachePolicy::Refresh
-        } else {
-            CachePolicy::Reuse
-        })
+        .cache_directory(host.cache())
+        .cache_policy(CachePolicy::Reuse)
         .image_preparation_concurrency(1);
     for harness in harnesses {
         builder = builder.guest_executable(&harness.command, &harness.guest_command);
@@ -466,7 +438,6 @@ async fn prepare_resources(
     Ok(resources)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn execute_coordinate(
     task: Task,
     treatment: nanocodex_eval::EvaluationTreatment,
@@ -474,13 +445,18 @@ async fn execute_coordinate(
     harness: Option<ResolvedHarness>,
     output: PathBuf,
     resources: VmResources,
-    guest_memory_mb: u64,
     agent: EvalAgentArgs,
 ) -> Result<ExecutionResult> {
     std::fs::create_dir_all(&output)?;
     match treatment.harness.as_str() {
         "nanocodex" => {
-            let backend = resources.backend().await?;
+            let backend = resources
+                .backend_with(
+                    VmBackend::builder()
+                        .retain_passed_rootfs(false)
+                        .retain_failed_rootfs(false),
+                )
+                .await?;
             let nanocodex = agent.builder(treatment.model, treatment.thinking, web_search)?;
             let evaluator = Evaluator::builder(nanocodex, backend)
                 .output_directory(&output)
@@ -517,7 +493,7 @@ async fn execute_coordinate(
             .output_directory(&output)
             .thinking(treatment.thinking)
             .web_search(web_search)
-            .guest_memory_mb(guest_memory_mb)
+            .guest_memory_mb(task.resources().memory_mb)
             .arguments(configured.arguments)
             .environment(configured.environment.into_iter().collect())
             .credentials(

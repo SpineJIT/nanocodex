@@ -119,6 +119,28 @@ build-vm-guest:
     cargo build -p nanocodex-vm --bin nanocodex-vm-guest \
       --no-default-features --features guest-runtime --target "$target"
 
+# Produce the complete prepared-host installation used by VM-backed evals.
+# Runtime execution validates this installation but never builds or signs it.
+build-eval-host: build-vm-guest
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "$(uname -m)" in
+      arm64|aarch64) target=aarch64-unknown-linux-musl ;;
+      x86_64|amd64) target=x86_64-unknown-linux-musl ;;
+      *) echo "unsupported eval host architecture: $(uname -m)" >&2; exit 2 ;;
+    esac
+    cargo build -p nanocodex-bin --bin nanocodex
+    install -m 0755 \
+      "target/$target/debug/nanocodex-vm-guest" \
+      target/debug/nanocodex-vm-guest
+    if [ "$(uname -s)" = Darwin ]; then
+      codesign \
+        --entitlements nanocodex-vm.entitlements \
+        --force \
+        --sign - \
+        target/debug/nanocodex
+    fi
+
 build-vm-example:
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \
     CC_aarch64_unknown_linux_musl="{{justfile_directory()}}/scripts/aarch64-unknown-linux-musl-linker" \

@@ -115,9 +115,10 @@ model = ["sol", "luna"]
 thinking = ["medium", "high"]
 ```
 
-The evaluator stages the configured command at
-`/run/nanocodex-harness/command` inside the task VM and routes its
-OpenAI-compatible traffic through the same capture proxy. The command path,
+Durable task preparation installs the configured command at `guest_command`
+inside the immutable task image. Every coordinate receives a fresh writable
+overlay and routes the harness's OpenAI-compatible traffic through the same
+capture proxy. The command path,
 `arguments`, `environment`, credential paths, API-key environment name, and
 `api_upstream` are profile data; argument
 templates support `{prompt}`, `{model}`, `{thinking}`, `{web_search}`, and
@@ -154,6 +155,12 @@ nanocodex eval run local-smoke --task tasks/write-greeting
 nanocodex eval run compare --task tasks/write-greeting --harness codex \
   --model luna --thinking high
 
+# Coordinate workers through one SQLite owner. Remote hosts reach this
+# loopback listener through an SSH reverse tunnel and run the same command.
+nanocodex eval coordinator compare --port 8789
+nanocodex eval run compare --coordinator http://127.0.0.1:8789 \
+  --task tasks/write-greeting --harness codex --model luna --thinking high
+
 # Let an agent inspect the ledger and choose task order and process fan-out.
 nanocodex eval benchmark local-smoke
 # Equivalent interactive workflow:
@@ -166,5 +173,17 @@ argument: `trials` is profile-owned desired work, and SQLite assigns a
 fungible repetition inside the exact family selected by `--task` and any
 needed harness, model, or thinking selectors.
 
-Set `NANOCODEX_BIN` and `NANOCODEX_VM_RUNTIME` when the default development
-paths do not apply.
+Remote workers send only retained evaluation evidence: JSON/JSONL trajectories,
+events, API exchanges and summaries, plus verifier reward/stdout/stderr. VM
+disks, workspaces, task fixtures, caches, and runtime logs remain host-local and
+failed writable roots are disposable. Evidence is streamed as a zstd-compressed
+tar, validated against the same allowlist by the coordinator, extracted into a
+staging directory, and atomically renamed before fenced SQLite completion.
+
+VM-backed evals consume a prepared host installation. The matching static
+`nanocodex-vm-guest` must be installed beside the `nanocodex` executable; VM
+state is cached under `~/.cache/nanocodex/vm` (or
+`$NANOCODEX_HOME/cache/vm`). Runtime execution never builds, signs, discovers,
+or repairs that substrate. Source checkouts can produce the complete local
+installation with `just build-eval-host`; an incomplete installation fails
+before task preparation.

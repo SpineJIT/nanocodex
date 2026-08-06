@@ -36,11 +36,12 @@ tempfile.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
-tokio-util = { workspace = true, features = ["io"] }
+tokio-util = { workspace = true, features = ["io", "io-util"] }
 tokio-tungstenite.workspace = true
 toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+zstd.workspace = true
 
 [target.'cfg(any(all(target_os = "linux", not(target_env = "musl")), all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
 nanocodex-vm.workspace = true

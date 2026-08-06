@@ -1,4 +1,4 @@
-use std::{net::IpAddr, path::PathBuf};
+use std::{net::Ipv4Addr, path::PathBuf};
 
 use clap::Args;
 use eyre::{Result, WrapErr as _};
@@ -20,10 +20,6 @@ pub(super) struct Coordinator {
     #[arg(long, value_name = "DIRECTORY")]
     state_dir: Option<PathBuf>,
 
-    /// Loopback or Tailscale address to listen on.
-    #[arg(long, default_value = "127.0.0.1")]
-    bind: IpAddr,
-
     /// Listen port. Use zero to allocate an available port.
     #[arg(long, default_value_t = 8789)]
     port: u16,
@@ -33,7 +29,7 @@ impl Coordinator {
     pub(super) async fn run(self) -> Result<()> {
         let state = self.state_dir.map_or_else(default_state_dir, Ok)?;
         let evaluation = Evaluation::open(&self.config, self.profile.as_deref(), state)?;
-        let listener = TcpListener::bind((self.bind, self.port))
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, self.port))
             .await
             .wrap_err("failed to bind the evaluation coordinator")?;
         let address = listener.local_addr()?;
