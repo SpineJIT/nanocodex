@@ -596,9 +596,6 @@ async fn retain_native_trajectory(
 }
 
 pub(super) fn default_state_dir() -> Result<PathBuf> {
-    if let Some(home) = std::env::var_os("NANOCODEX_HOME") {
-        return Ok(PathBuf::from(home).join("evals"));
-    }
     let home = std::env::var_os("HOME")
         .ok_or_else(|| eyre!("HOME is not set; pass --state-dir for durable eval state"))?;
     Ok(PathBuf::from(home).join(".nanocodex/evals"))
@@ -726,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn nanocodex_home_owns_the_default_eval_directory() {
+    fn home_owns_the_default_eval_directory() {
         let path = default_state_dir().unwrap();
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),

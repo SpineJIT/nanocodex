@@ -8,6 +8,15 @@ use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
 #[tokio::test]
 async fn interrupt_after_completion_still_flushes_one_terminal_event() -> Result<()> {
+    assert_signal_after_completion("INT").await
+}
+
+#[tokio::test]
+async fn terminate_after_completion_still_returns_failure() -> Result<()> {
+    assert_signal_after_completion("TERM").await
+}
+
+async fn assert_signal_after_completion(signal_name: &str) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
     let (completed_tx, completed_rx) = oneshot::channel();
@@ -47,10 +56,10 @@ async fn interrupt_after_completion_still_flushes_one_terminal_event() -> Result
     tokio::time::sleep(Duration::from_millis(250)).await;
     let pid = child.id().ok_or_else(|| eyre!("CLI had no process ID"))?;
     let signal = Command::new("kill")
-        .args(["-INT", &pid.to_string()])
+        .args([format!("-{signal_name}"), pid.to_string()])
         .status()
         .await?;
-    assert!(signal.success(), "failed to send SIGINT to CLI");
+    assert!(signal.success(), "failed to send SIG{signal_name} to CLI");
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let output = timeout(Duration::from_secs(10), child.wait_with_output())
@@ -72,7 +81,7 @@ async fn interrupt_after_completion_still_flushes_one_terminal_event() -> Result
 
     assert!(
         !output.status.success(),
-        "SIGINT unexpectedly returned success"
+        "SIG{signal_name} unexpectedly returned success"
     );
     assert_eq!(
         terminals, 1,

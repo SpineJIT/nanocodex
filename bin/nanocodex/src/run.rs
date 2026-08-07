@@ -35,7 +35,7 @@ impl Run {
                 tokio::pin!(completion);
                 tokio::select! {
                     result = &mut completion => result?,
-                    signal = tokio::signal::ctrl_c() => {
+                    signal = interrupt_signal() => {
                         signal?;
                         // The driver may have completed while JSONL was still
                         // backpressured. A late cancellation rejection must not
@@ -76,6 +76,28 @@ impl Run {
         browser_shutdown_result?;
         vm_shutdown_result?;
         shutdown_result
+    }
+}
+
+async fn interrupt_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            signal = terminate.recv() => {
+                if signal.is_none() {
+                    return Err(eyre!("SIGTERM listener closed"));
+                }
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok(())
     }
 }
 

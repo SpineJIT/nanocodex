@@ -1,9 +1,15 @@
 use std::path::PathBuf;
 
 use clap::Args;
-use eyre::Result;
+use eyre::{Result, WrapErr as _};
+use nanocodex_eval::{Evaluation, EvaluationStatus, coordinator::CoordinatorClient};
+use serde::Deserialize;
 
-use crate::{benchmark, config::AgentArgs, observability::ObservabilityArgs, run, tui, vm::VmArgs};
+use super::{profile::default_state_dir, systemd};
+use crate::{
+    RetryableProcessExit, benchmark, config::AgentArgs, observability::ObservabilityArgs, run, tui,
+    vm::VmArgs,
+};
 
 #[derive(Args)]
 pub(super) struct Benchmark {
@@ -28,6 +34,10 @@ pub(super) struct Benchmark {
     #[arg(long)]
     headless: bool,
 
+    /// Install and start this benchmark as a durable user systemd service.
+    #[arg(long, conflicts_with = "coordinator")]
+    systemd: bool,
+
     #[command(flatten)]
     agent: AgentArgs,
 
@@ -40,28 +50,226 @@ pub(super) struct Benchmark {
 
 impl Benchmark {
     pub(super) async fn run(self) -> Result<()> {
+        let Self {
+            profile,
+            config,
+            state_dir,
+            coordinator,
+            headless,
+            systemd,
+            agent,
+            observability,
+            vm,
+        } = self;
+        if systemd {
+            return systemd::install(profile.as_deref(), &config, state_dir.as_deref());
+        }
         let prompt = benchmark::prompt(
-            self.profile.as_deref(),
-            &self.config,
-            self.state_dir.as_deref(),
-            self.coordinator.as_deref(),
+            profile.as_deref(),
+            &config,
+            state_dir.as_deref(),
+            coordinator.as_deref(),
         );
-        if self.headless {
-            let _observability = self.observability.install(false, self.agent.cwd())?;
-            run::run_prompt(prompt, self.agent, self.vm).await
+        let initial = BoardStatus::load(
+            profile.as_deref(),
+            &config,
+            state_dir.as_deref(),
+            coordinator.as_deref(),
+        )
+        .await?;
+        if initial.is_complete() {
+            return Ok(());
+        }
+        let workflow = if headless {
+            let _observability = observability.install(false, agent.cwd())?;
+            run::run_prompt(prompt, agent, vm).await
         } else {
-            let _observability = self.observability.install(true, self.agent.cwd())?;
-            let display = self.profile.as_ref().map_or_else(
+            let _observability = observability.install(true, agent.cwd())?;
+            let display = profile.as_ref().map_or_else(
                 || "/benchmark".to_owned(),
                 |profile| format!("/benchmark {profile}"),
             );
             tui::run(
-                self.agent,
-                self.vm,
+                agent,
+                vm,
                 Some(tui::InitialPrompt::workflow(display, prompt)),
                 None,
             )
             .await
+        };
+        let board = BoardStatus::load(
+            profile.as_deref(),
+            &config,
+            state_dir.as_deref(),
+            coordinator.as_deref(),
+        )
+        .await?;
+        board.require_complete(workflow.as_ref().err())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+struct BoardCounts {
+    pending: i64,
+    running: i64,
+    complete: i64,
+}
+
+impl BoardCounts {
+    const fn total(self) -> i64 {
+        self.pending + self.running + self.complete
+    }
+
+    const fn is_complete(self) -> bool {
+        self.pending == 0 && self.running == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+struct BoardStatus {
+    preparation: BoardCounts,
+    coordinates: BoardCounts,
+}
+
+impl BoardStatus {
+    async fn load(
+        profile: Option<&str>,
+        config: &std::path::Path,
+        state_dir: Option<&std::path::Path>,
+        coordinator: Option<&str>,
+    ) -> Result<Self> {
+        if let Some(coordinator) = coordinator {
+            let status = CoordinatorClient::new(coordinator)?.status().await?;
+            return serde_json::from_value(status)
+                .wrap_err("coordinator returned an invalid benchmark board status");
         }
+        let state_dir = state_dir.map_or_else(default_state_dir, |path| Ok(path.to_path_buf()))?;
+        let evaluation = Evaluation::open(config, profile, state_dir)?;
+        Ok(evaluation.status()?.into())
+    }
+
+    const fn is_complete(self) -> bool {
+        self.preparation.is_complete() && self.coordinates.is_complete()
+    }
+
+    fn require_complete(self, workflow_error: Option<&eyre::Report>) -> Result<()> {
+        if self.is_complete() {
+            return Ok(());
+        }
+        let workflow_error = workflow_error.map_or_else(String::new, |error| {
+            format!("; agent workflow ended with: {error:#}")
+        });
+        Err(RetryableProcessExit::new(format!(
+            "benchmark board remains incomplete: preparation {}/{} ready ({} pending, {} running); coordinates {}/{} terminal ({} pending, {} running){workflow_error}",
+            self.preparation.complete,
+            self.preparation.total(),
+            self.preparation.pending,
+            self.preparation.running,
+            self.coordinates.complete,
+            self.coordinates.total(),
+            self.coordinates.pending,
+            self.coordinates.running,
+        ))
+        .into())
+    }
+}
+
+impl From<EvaluationStatus> for BoardStatus {
+    fn from(status: EvaluationStatus) -> Self {
+        Self {
+            preparation: BoardCounts {
+                pending: status.preparation.pending,
+                running: status.preparation.running,
+                complete: status.preparation.complete,
+            },
+            coordinates: BoardCounts {
+                pending: status.coordinates.pending,
+                running: status.coordinates.running,
+                complete: status.coordinates.complete,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BoardCounts, BoardStatus};
+    use crate::{RETRYABLE_EXIT_CODE, process_exit_code};
+
+    #[test]
+    fn benchmark_succeeds_only_when_the_entire_board_is_terminal() {
+        let complete = BoardStatus {
+            preparation: BoardCounts {
+                pending: 0,
+                running: 0,
+                complete: 3,
+            },
+            coordinates: BoardCounts {
+                pending: 0,
+                running: 0,
+                complete: 30,
+            },
+        };
+        assert!(complete.require_complete(None).is_ok());
+
+        for incomplete in [
+            BoardStatus {
+                coordinates: BoardCounts {
+                    pending: 1,
+                    ..complete.coordinates
+                },
+                ..complete
+            },
+            BoardStatus {
+                coordinates: BoardCounts {
+                    running: 1,
+                    ..complete.coordinates
+                },
+                ..complete
+            },
+            BoardStatus {
+                preparation: BoardCounts {
+                    running: 1,
+                    ..complete.preparation
+                },
+                ..complete
+            },
+        ] {
+            let error = incomplete.require_complete(None).unwrap_err();
+            assert_eq!(process_exit_code(&error), RETRYABLE_EXIT_CODE);
+        }
+    }
+
+    #[test]
+    fn remote_status_uses_the_same_completion_contract() {
+        let board: BoardStatus = serde_json::from_value(serde_json::json!({
+            "profile": "release",
+            "digest": "abc",
+            "preparation": { "pending": 0, "running": 0, "complete": 2 },
+            "coordinates": { "pending": 0, "running": 0, "complete": 20 },
+            "families": [],
+        }))
+        .unwrap();
+        assert!(board.require_complete(None).is_ok());
+    }
+
+    #[test]
+    fn agent_failure_is_retryable_while_the_board_remains_incomplete() {
+        let board = BoardStatus {
+            preparation: BoardCounts {
+                pending: 0,
+                running: 0,
+                complete: 2,
+            },
+            coordinates: BoardCounts {
+                pending: 1,
+                running: 0,
+                complete: 19,
+            },
+        };
+        let workflow_error = eyre::eyre!("connection closed");
+        let error = board.require_complete(Some(&workflow_error)).unwrap_err();
+        assert_eq!(process_exit_code(&error), RETRYABLE_EXIT_CODE);
+        assert!(error.to_string().contains("connection closed"));
     }
 }
