@@ -46,17 +46,13 @@ pub struct WorksetFamily {
     pub trials: u16,
 }
 
-/// Complete work definition read back from SQLite.
+#[cfg(test)]
 #[derive(Clone, Debug)]
-pub struct WorksetDefinition {
-    /// User-visible name of the durable board.
-    pub name: String,
-    /// Stable identifier of this board generation.
-    pub generation: String,
-    /// Task packages retained by the board.
-    pub tasks: Vec<WorksetTask>,
-    /// Exact treatments and desired repetition counts retained by the board.
-    pub families: Vec<WorksetFamily>,
+struct WorksetDefinition {
+    name: String,
+    generation: String,
+    tasks: Vec<WorksetTask>,
+    families: Vec<WorksetFamily>,
 }
 
 /// Durable SQLite workset ledger.
@@ -261,8 +257,58 @@ impl Workset {
         Ok(())
     }
 
-    /// Reads the concrete task and coordinate definitions retained in SQLite.
-    pub fn definition(&self) -> Result<WorksetDefinition, WorksetError> {
+    pub(crate) fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    pub(crate) fn selected_definition(
+        &self,
+        selector: &str,
+    ) -> Result<Option<(WorksetTask, Vec<WorksetFamily>)>, WorksetError> {
+        let connection = open_connection(&self.path)?;
+        let task = connection
+            .query_row(
+                "SELECT id, name, root, digest FROM tasks \
+                 WHERE workset_id = ?1 AND selector = ?2",
+                params![self.id, selector],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        WorksetTask {
+                            selector: selector.to_owned(),
+                            name: row.get(1)?,
+                            root: PathBuf::from(row.get::<_, String>(2)?),
+                            digest: row.get(3)?,
+                        },
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((task_id, task)) = task else {
+            return Ok(None);
+        };
+        let mut statement = connection.prepare(
+            "SELECT family_key, treatment, COUNT(*) FROM coordinates \
+             WHERE workset_id = ?1 AND task_id = ?2 \
+             GROUP BY family_key, treatment ORDER BY family_key",
+        )?;
+        let families = statement
+            .query_map(params![self.id, task_id], |row| {
+                let trials: i64 = row.get(2)?;
+                Ok(WorksetFamily {
+                    key: row.get(0)?,
+                    task_selector: selector.to_owned(),
+                    treatment: row.get(1)?,
+                    trials: u16::try_from(trials)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, trials))?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some((task, families)))
+    }
+
+    #[cfg(test)]
+    fn definition(&self) -> Result<WorksetDefinition, WorksetError> {
         let connection = open_connection(&self.path)?;
         let mut tasks = connection.prepare(
             "SELECT selector, name, root, digest FROM tasks \

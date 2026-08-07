@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 
 use crate::{
     Task,
-    profile::{EvaluationManifest, ResolvedFamily, ResolvedHarness, ResolvedTask},
+    profile::{EvaluationManifest, ResolvedFamily, ResolvedHarness},
     workset::{
         BeginCoordinate, CoordinateLease, PreparationLease, Workset, WorksetBusy, WorksetError,
         WorksetFamily, WorksetTask,
@@ -27,10 +27,6 @@ const LEDGER_FILE: &str = "state.sqlite3";
 #[derive(Clone, Debug)]
 pub struct Evaluation {
     name: String,
-    generation: String,
-    tasks: Vec<ResolvedTask>,
-    families: Vec<ResolvedFamily>,
-    workset: Workset,
     state_directory: PathBuf,
     config: PathBuf,
 }
@@ -275,41 +271,9 @@ impl Evaluation {
         state_directory: impl Into<PathBuf>,
     ) -> Result<Self, EvaluationError> {
         let state_directory = state_directory.into();
-        let workset =
-            Workset::open(state_directory.join(LEDGER_FILE), workset_name).map_err(error)?;
-        let definition = workset.definition().map_err(error)?;
-        let mut tasks = Vec::with_capacity(definition.tasks.len());
-        for retained in definition.tasks {
-            let task = Task::load(&retained.root).map_err(error)?;
-            if task.name() != retained.name || task.package_digest() != retained.digest {
-                return Err(error(std::io::Error::other(format!(
-                    "retained task `{}` no longer matches SQLite content digest {}",
-                    retained.selector, retained.digest
-                ))));
-            }
-            tasks.push(ResolvedTask {
-                selector: retained.selector,
-                task,
-            });
-        }
-        let mut families = Vec::with_capacity(definition.families.len());
-        for retained in definition.families {
-            let family: ResolvedFamily =
-                serde_json::from_str(&retained.treatment).map_err(error)?;
-            if family.key != retained.key || family.task != retained.task_selector {
-                return Err(error(std::io::Error::other(format!(
-                    "invalid SQLite treatment for family `{}`",
-                    retained.key
-                ))));
-            }
-            families.push(family);
-        }
+        Workset::open(state_directory.join(LEDGER_FILE), workset_name).map_err(error)?;
         Ok(Self {
-            name: definition.name,
-            generation: definition.generation,
-            tasks,
-            families,
-            workset,
+            name: workset_name.to_owned(),
             state_directory,
             config: config.as_ref().to_path_buf(),
         })
@@ -327,26 +291,24 @@ impl Evaluation {
 
     /// Reads a structured snapshot from SQLite.
     pub fn status(&self) -> Result<EvaluationStatus, EvaluationError> {
-        let status = self.workset.status().map_err(error)?;
+        let status = self.workset()?.status().map_err(error)?;
         let families = status
             .families
             .into_iter()
             .map(|status| -> Result<_, EvaluationError> {
-                let family = self
-                    .families
-                    .iter()
-                    .find(|family| family.key == status.key)
-                    .ok_or_else(|| {
-                        error(std::io::Error::other(format!(
-                            "SQLite contains unknown workset family `{}`",
-                            status.key
-                        )))
-                    })?;
+                let family: ResolvedFamily =
+                    serde_json::from_str(&status.treatment).map_err(error)?;
+                if family.key != status.key || family.task != status.task {
+                    return Err(error(std::io::Error::other(format!(
+                        "invalid SQLite treatment for family `{}`",
+                        status.key
+                    ))));
+                }
                 Ok(EvaluationFamilyStatus {
                     id: status.key,
                     task: status.task,
                     assigned_host: status.assigned_host,
-                    treatment: family.into(),
+                    treatment: (&family).into(),
                     desired: status.desired,
                     pending: status.pending,
                     running: status.running,
@@ -380,8 +342,9 @@ impl Evaluation {
         selector: &EvaluationSelector,
         lease_duration: Duration,
     ) -> Result<EvaluationClaim, EvaluationError> {
-        let family = self.resolve_family(selector)?.clone();
-        self.claim_resolved(&family, "local", lease_duration, true)
+        let workset = self.workset()?;
+        let (task, family) = self.resolve_selection(&workset, selector)?;
+        self.claim_resolved(workset, task, family, "local", lease_duration, true)
     }
 
     /// Claims one family for the network host chosen by the coordinator.
@@ -391,22 +354,44 @@ impl Evaluation {
         host: &str,
         lease_duration: Duration,
     ) -> Result<EvaluationClaim, EvaluationError> {
-        let family = self.resolve_family(selector)?.clone();
-        self.claim_resolved(&family, host, lease_duration, false)
+        let workset = self.workset()?;
+        let (task, family) = self.resolve_selection(&workset, selector)?;
+        self.claim_resolved(workset, task, family, host, lease_duration, false)
     }
 
-    fn resolve_family(
+    fn resolve_selection(
         &self,
+        workset: &Workset,
         selector: &EvaluationSelector,
-    ) -> Result<&ResolvedFamily, EvaluationError> {
-        self.task(&selector.task)?;
+    ) -> Result<(Task, ResolvedFamily), EvaluationError> {
+        let Some((retained_task, retained_families)) =
+            workset.selected_definition(&selector.task).map_err(error)?
+        else {
+            return Err(error(std::io::Error::other(format!(
+                "task `{}` is not part of profile `{}`",
+                selector.task, self.name
+            ))));
+        };
+        let families = retained_families
+            .into_iter()
+            .map(|retained| {
+                let family: ResolvedFamily =
+                    serde_json::from_str(&retained.treatment).map_err(error)?;
+                if family.key != retained.key || family.task != retained.task_selector {
+                    return Err(error(std::io::Error::other(format!(
+                        "invalid SQLite treatment for family `{}`",
+                        retained.key
+                    ))));
+                }
+                Ok(family)
+            })
+            .collect::<Result<Vec<_>, EvaluationError>>()?;
         let harness = selector
             .harness
             .as_deref()
             .unwrap_or(crate::profile::BUILTIN_HARNESS);
-        let matching = self
-            .families
-            .iter()
+        let matching = families
+            .into_iter()
             .filter(|family| {
                 family.task == selector.task
                     && family.harness == harness
@@ -419,46 +404,54 @@ impl Evaluation {
                         .is_none_or(|web_search| family.web_search == web_search)
             })
             .collect::<Vec<_>>();
-        match matching.as_slice() {
-            [family] => Ok(family),
+        let family = match matching.as_slice() {
+            [family] => family.clone(),
             [] => Err(error(std::io::Error::other(format!(
                 "no treatment in profile `{}` matches task `{}` and the requested knobs",
                 self.name, selector.task
-            )))),
+            ))))?,
             _ => Err(error(std::io::Error::other(format!(
                 "task `{}` has multiple treatments in profile `{}`; select model and/or thinking",
                 selector.task, self.name
-            )))),
+            ))))?,
+        };
+        let task = Task::load(&retained_task.root).map_err(error)?;
+        if task.name() != retained_task.name || task.package_digest() != retained_task.digest {
+            return Err(error(std::io::Error::other(format!(
+                "retained task `{}` no longer matches SQLite content digest {}",
+                retained_task.selector, retained_task.digest
+            ))));
         }
+        Ok((task, family))
     }
 
     fn claim_resolved(
         &self,
-        family: &ResolvedFamily,
+        workset: Workset,
+        task: Task,
+        family: ResolvedFamily,
         host: &str,
         lease_duration: Duration,
         resolve_harness: bool,
     ) -> Result<EvaluationClaim, EvaluationError> {
-        let task = self.task(&family.task)?.task.clone();
         let harness = if resolve_harness {
             EvaluationManifest::load_harness(&self.config, &family.harness).map_err(error)?
         } else {
             None
         };
         let harnesses = harness.iter().cloned().collect::<Vec<_>>();
-        match self
-            .workset
+        match workset
             .begin_for_host(&family.key, host, lease_duration)
             .map_err(error)?
         {
             BeginCoordinate::Prepare(lease) => {
                 let heartbeat =
-                    preparation_heartbeat(self.workset.clone(), lease.clone(), lease_duration);
+                    preparation_heartbeat(workset.clone(), lease.clone(), lease_duration);
                 Ok(EvaluationClaim::Prepare(PreparationClaim {
-                    workset: self.workset.clone(),
+                    workset,
                     lease,
                     task,
-                    treatment: family.into(),
+                    treatment: (&family).into(),
                     harnesses,
                     heartbeat,
                 }))
@@ -466,18 +459,18 @@ impl Evaluation {
             BeginCoordinate::Execute(lease) => {
                 let output_directory = coordinate_output(
                     &self.state_directory,
-                    &self.generation,
+                    workset.generation(),
                     &family.key,
                     lease.repetition,
                     lease.generation,
                 );
                 let heartbeat =
-                    coordinate_heartbeat(self.workset.clone(), lease.clone(), lease_duration);
+                    coordinate_heartbeat(workset.clone(), lease.clone(), lease_duration);
                 Ok(EvaluationClaim::Run(CoordinateClaim {
-                    workset: self.workset.clone(),
+                    workset,
                     lease,
                     task,
-                    treatment: family.into(),
+                    treatment: (&family).into(),
                     harness,
                     harnesses,
                     output_directory,
@@ -489,16 +482,8 @@ impl Evaluation {
         }
     }
 
-    fn task(&self, selector: &str) -> Result<&ResolvedTask, EvaluationError> {
-        self.tasks
-            .iter()
-            .find(|task| task.selector == selector)
-            .ok_or_else(|| {
-                error(std::io::Error::other(format!(
-                    "task `{selector}` is not part of profile `{}`",
-                    self.name
-                )))
-            })
+    fn workset(&self) -> Result<Workset, EvaluationError> {
+        Workset::open(self.state_directory.join(LEDGER_FILE), &self.name).map_err(error)
     }
 }
 
@@ -847,14 +832,19 @@ mod tests {
     use super::*;
 
     fn write_task(root: &Path) {
-        let task = root.join("one");
+        write_named_task(root, "one");
+    }
+
+    fn write_named_task(root: &Path, name: &str) {
+        let task = root.join(name);
         fs::create_dir_all(task.join("environment")).unwrap();
         fs::create_dir_all(task.join("tests")).unwrap();
         fs::write(
             task.join("task.toml"),
-            r#"schema_version = "1.1"
+            format!(
+                r#"schema_version = "1.1"
 [task]
-name = "one"
+name = "{name}"
 description = "test"
 [agent]
 timeout_sec = 1.0
@@ -867,12 +857,59 @@ memory_mb = 128
 storage_mb = 128
 gpus = 0
 allow_internet = false
-"#,
+"#
+            ),
         )
         .unwrap();
         fs::write(task.join("instruction.md"), "do it").unwrap();
         fs::write(task.join("environment/Dockerfile"), "FROM scratch").unwrap();
         fs::write(task.join("tests/test.sh"), "#!/bin/sh\n").unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_handle_reads_hot_appends_and_new_generations_from_sqlite() {
+        let directory = tempfile::tempdir().unwrap();
+        write_named_task(directory.path(), "one");
+        write_named_task(directory.path(), "two");
+        let state = directory.path().join("state");
+        let config = directory.path().join("nanocodex.toml");
+        let one = Task::load(directory.path().join("one")).unwrap();
+        let two = Task::load(directory.path().join("two")).unwrap();
+
+        Evaluation::add(
+            &state,
+            "release",
+            &[EvaluationWork::new("one", one.clone())],
+            false,
+        )
+        .unwrap();
+        let evaluation = Evaluation::open(&config, "release", &state).unwrap();
+        let first = evaluation.status().unwrap();
+        assert_eq!(first.coordinates.pending, 1);
+
+        Evaluation::add(&state, "release", &[EvaluationWork::new("two", two)], false).unwrap();
+        let extended = evaluation.status().unwrap();
+        assert_eq!(extended.coordinates.pending, 2);
+        assert_eq!(extended.families.len(), 2);
+        let EvaluationClaim::Prepare(preparation) = evaluation
+            .claim(&EvaluationSelector::new("two"), Duration::from_secs(30))
+            .unwrap()
+        else {
+            panic!("the already-open handle must claim newly appended work");
+        };
+        preparation.complete().unwrap();
+
+        Evaluation::add(
+            &state,
+            "release",
+            &[EvaluationWork::new("one", one).trials(3)],
+            true,
+        )
+        .unwrap();
+        let replaced = evaluation.status().unwrap();
+        assert_ne!(replaced.generation, first.generation);
+        assert_eq!(replaced.coordinates.pending, 3);
+        assert_eq!(replaced.families.len(), 1);
     }
 
     #[tokio::test]
