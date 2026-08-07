@@ -1,4 +1,4 @@
-//! Closed evaluation profiles over native Terminal-Bench task packages.
+//! Optional workset recipes and runtime harness helpers.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -11,9 +11,9 @@ use nanocodex_oai_api::{Model, Thinking};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::{Task, TaskLoadError, workset::WorksetSpec};
+use crate::{Task, TaskLoadError, workset::WorksetDefinition};
 
-const BUILTIN_HARNESS: &str = "nanocodex";
+pub(crate) const BUILTIN_HARNESS: &str = "nanocodex";
 
 /// Repository-level native evaluation configuration.
 #[derive(Clone, Debug, Deserialize)]
@@ -22,6 +22,7 @@ pub struct EvaluationManifest {
     default: Option<String>,
     #[serde(default)]
     harness: BTreeMap<String, Harness>,
+    #[serde(default)]
     profiles: BTreeMap<String, Profile>,
 }
 
@@ -54,7 +55,7 @@ pub struct Harness {
     api_upstream: Option<String>,
 }
 
-/// One closed desired bundle of native task coordinates.
+/// One convenience recipe expanded into SQLite by `eval add`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -77,23 +78,17 @@ pub struct Profile {
     web_search: bool,
 }
 
-/// Parsed and content-pinned profile revision.
+/// Parsed profile recipe ready to materialize into SQLite.
 #[derive(Clone, Debug)]
 pub struct ResolvedProfile {
     /// Selected profile name.
     pub name: String,
-    /// Stable digest of all resolved profile inputs.
+    /// Stable digest of the recipe and task inputs.
     pub digest: String,
-    /// Canonical source manifest path.
-    pub config_path: PathBuf,
     /// Loaded immutable task packages.
     pub tasks: Vec<ResolvedTask>,
     /// Exact task/treatment families, excluding fungible repetitions.
     pub families: Vec<ResolvedFamily>,
-    /// Pinned external harness commands selected by this revision.
-    pub harnesses: BTreeMap<String, ResolvedHarness>,
-    /// Whether model-facing web search is enabled.
-    pub web_search: bool,
     /// Number of desired repetitions for every family.
     pub trials: u16,
 }
@@ -133,7 +128,7 @@ pub struct ResolvedHarness {
 }
 
 /// One exact semantic treatment family.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ResolvedFamily {
     /// Stable identity excluding fungible repetition.
     pub key: String,
@@ -144,8 +139,14 @@ pub struct ResolvedFamily {
     /// Supported model selection.
     pub model: Model,
     /// Reasoning effort.
-    #[serde(serialize_with = "serialize_one_thinking")]
+    #[serde(
+        deserialize_with = "deserialize_one_thinking",
+        serialize_with = "serialize_one_thinking"
+    )]
     pub thinking: Thinking,
+    /// Whether model-facing web search is enabled for this treatment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub web_search: bool,
 }
 
 /// Profile parsing or resolution failure.
@@ -207,14 +208,9 @@ pub enum ProfileError {
     /// A task package failed to load.
     #[error(transparent)]
     Task(#[from] TaskLoadError),
-    /// A profile selected an external harness without configuring it.
-    #[error("evaluation profile `{profile}` selects unknown harness `{harness}`")]
-    UnknownHarness {
-        /// Invalid profile.
-        profile: String,
-        /// Missing top-level harness configuration.
-        harness: String,
-    },
+    /// A selected external harness has no current runtime helper.
+    #[error("evaluation harness helper `{0}` is not configured")]
+    UnknownHarness(String),
     /// A semantic harness version was present but empty.
     #[error("evaluation harness `{0}` has an empty version")]
     EmptyHarnessVersion(String),
@@ -245,6 +241,17 @@ pub enum ProfileError {
     /// Stable identity serialization failed.
     #[error("failed to serialize resolved profile identity: {0}")]
     Identity(#[from] serde_json::Error),
+    /// A retained task package no longer matches the content recorded in SQLite.
+    #[error("retained task `{selector}` no longer matches SQLite digest {digest}")]
+    TaskChanged {
+        /// SQLite task selector.
+        selector: String,
+        /// Content digest retained by SQLite.
+        digest: String,
+    },
+    /// A coordinate treatment retained in SQLite disagrees with its family row.
+    #[error("invalid SQLite treatment for family `{0}`")]
+    InvalidTreatment(String),
 }
 
 /// Closed-profile selector failure.
@@ -284,7 +291,6 @@ struct ProfileIdentity<'a> {
     name: &'a str,
     profile: &'a Profile,
     tasks: Vec<TaskIdentity<'a>>,
-    harness_digests: &'a BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -294,7 +300,7 @@ struct TaskIdentity<'a> {
 }
 
 impl EvaluationManifest {
-    /// Loads a manifest and resolves one immutable profile revision.
+    /// Loads and expands one optional profile recipe.
     pub fn load_profile(
         path: impl AsRef<Path>,
         requested: Option<&str>,
@@ -318,6 +324,45 @@ impl EvaluationManifest {
         manifest.resolve(config_path, requested)
     }
 
+    /// Resolves one named external harness from the current helper config.
+    /// Built-in Nanocodex execution requires no helper entry.
+    pub fn load_harness(
+        path: impl AsRef<Path>,
+        name: &str,
+    ) -> Result<Option<ResolvedHarness>, ProfileError> {
+        if name == BUILTIN_HARNESS {
+            return Ok(None);
+        }
+        let requested_path = path.as_ref();
+        let text = fs::read_to_string(requested_path).map_err(|source| ProfileError::Read {
+            path: requested_path.to_path_buf(),
+            source,
+        })?;
+        let manifest: Self = toml::from_str(&text).map_err(|source| ProfileError::Parse {
+            path: requested_path.to_path_buf(),
+            source,
+        })?;
+        let config_path =
+            requested_path
+                .canonicalize()
+                .map_err(|source| ProfileError::ResolvePath {
+                    path: requested_path.to_path_buf(),
+                    source,
+                })?;
+        let harness = manifest
+            .harness
+            .get(name)
+            .ok_or_else(|| ProfileError::UnknownHarness(name.to_owned()))?;
+        resolve_harness(
+            config_path
+                .parent()
+                .expect("a canonical config path has a parent"),
+            name,
+            harness,
+        )
+        .map(Some)
+    }
+
     fn resolve(
         self,
         config_path: PathBuf,
@@ -336,67 +381,6 @@ impl EvaluationManifest {
             .parent()
             .expect("a canonical manifest path has a parent");
         let tasks = load_tasks(root, profile)?;
-        let mut harnesses = BTreeMap::new();
-        let mut harness_digests = BTreeMap::new();
-        for harness_name in &profile.harness {
-            if harness_name == BUILTIN_HARNESS {
-                continue;
-            }
-            let harness =
-                self.harness
-                    .get(harness_name)
-                    .ok_or_else(|| ProfileError::UnknownHarness {
-                        profile: name.clone(),
-                        harness: harness_name.clone(),
-                    })?;
-            if !Path::new(&harness.guest_command).is_absolute()
-                || harness.guest_command.chars().any(char::is_whitespace)
-                || !Path::new(&harness.guest_command)
-                    .components()
-                    .all(|component| {
-                        matches!(
-                            component,
-                            std::path::Component::RootDir | std::path::Component::Normal(_)
-                        )
-                    })
-            {
-                return Err(ProfileError::InvalidHarnessGuestCommand {
-                    harness: harness_name.clone(),
-                    path: harness.guest_command.clone(),
-                });
-            }
-            let command = resolve_path(root, &harness.command)?;
-            let command_identity = match harness.version.as_deref() {
-                Some(version) if version.trim().is_empty() => {
-                    return Err(ProfileError::EmptyHarnessVersion(harness_name.clone()));
-                }
-                Some(version) => format!("version:{version}"),
-                None => harness_digest(&command)?,
-            };
-            let digest = hex::encode(Sha256::digest(serde_json::to_vec(&(
-                harness,
-                &command_identity,
-            ))?));
-            harnesses.insert(
-                harness_name.clone(),
-                ResolvedHarness {
-                    name: harness_name.clone(),
-                    command,
-                    guest_command: harness.guest_command.clone(),
-                    arguments: harness.arguments.clone(),
-                    environment: harness.environment.clone(),
-                    home: harness.home.clone(),
-                    auth_file: harness.auth_file.clone(),
-                    api_key_environment: harness.api_key_environment.clone(),
-                    api_upstream: harness.api_upstream.clone(),
-                    version: harness
-                        .version
-                        .clone()
-                        .unwrap_or_else(|| command_identity.clone()),
-                },
-            );
-            harness_digests.insert(harness_name.clone(), digest);
-        }
         let families = expand_families(profile, &tasks);
         let identity = ProfileIdentity {
             schema: 3,
@@ -409,51 +393,51 @@ impl EvaluationManifest {
                     digest: task.task.package_digest(),
                 })
                 .collect(),
-            harness_digests: &harness_digests,
         };
         let digest = hex::encode(Sha256::digest(serde_json::to_vec(&identity)?));
         Ok(ResolvedProfile {
             name,
             digest,
-            config_path,
             tasks,
             families,
-            harnesses,
-            web_search: profile.web_search,
             trials: profile.trials,
         })
     }
 }
 
 impl ResolvedProfile {
-    /// Converts this immutable revision into the complete SQLite workset
-    /// definition before any execution begins.
-    pub fn workset_spec(&self) -> WorksetSpec {
-        WorksetSpec {
-            profile: self.name.clone(),
-            digest: self.digest.clone(),
-            config_path: self.config_path.clone(),
-            tasks: self
-                .tasks
-                .iter()
-                .map(|resolved| crate::workset::WorksetTask {
-                    selector: resolved.selector.clone(),
-                    name: resolved.task.name().to_owned(),
-                    root: resolved.task.root().to_path_buf(),
-                    digest: resolved.task.package_digest().to_owned(),
-                })
-                .collect(),
-            families: self
-                .families
-                .iter()
-                .map(|family| crate::workset::WorksetFamily {
-                    key: family.key.clone(),
-                    task_selector: family.task.clone(),
-                    treatment: family.treatment(),
-                    trials: self.trials,
-                })
-                .collect(),
+    pub(crate) fn from_workset(definition: WorksetDefinition) -> Result<Self, ProfileError> {
+        let mut tasks = Vec::with_capacity(definition.tasks.len());
+        for retained in definition.tasks {
+            let task = Task::load(&retained.root)?;
+            if task.name() != retained.name || task.package_digest() != retained.digest {
+                return Err(ProfileError::TaskChanged {
+                    selector: retained.selector,
+                    digest: retained.digest,
+                });
+            }
+            tasks.push(ResolvedTask {
+                selector: retained.selector,
+                task,
+            });
         }
+        let mut families = Vec::with_capacity(definition.families.len());
+        let mut trials = 0;
+        for retained in definition.families {
+            let family: ResolvedFamily = serde_json::from_str(&retained.treatment)?;
+            if family.key != retained.key || family.task != retained.task_selector {
+                return Err(ProfileError::InvalidTreatment(retained.key));
+            }
+            trials = trials.max(retained.trials);
+            families.push(family);
+        }
+        Ok(Self {
+            name: definition.profile,
+            digest: definition.digest,
+            tasks,
+            families,
+            trials,
+        })
     }
 
     /// Resolves one exact task selector without permitting ad-hoc expansion.
@@ -475,6 +459,7 @@ impl ResolvedProfile {
         harness: Option<&str>,
         model: Option<Model>,
         thinking: Option<Thinking>,
+        web_search: Option<bool>,
     ) -> Result<&ResolvedFamily, ProfileSelectionError> {
         self.task(task)?;
         let harness = harness.unwrap_or(BUILTIN_HARNESS);
@@ -486,6 +471,7 @@ impl ResolvedProfile {
                     && family.harness == harness
                     && model.is_none_or(|model| family.model == model)
                     && thinking.is_none_or(|thinking| family.thinking == thinking)
+                    && web_search.is_none_or(|web_search| family.web_search == web_search)
             })
             .collect::<Vec<_>>();
         match matching.as_slice() {
@@ -499,11 +485,6 @@ impl ResolvedProfile {
                 task: task.to_owned(),
             }),
         }
-    }
-
-    /// Returns the pinned command for an external harness.
-    pub fn harness(&self, harness: &str) -> Option<&ResolvedHarness> {
-        self.harnesses.get(harness)
     }
 }
 
@@ -616,11 +597,16 @@ fn expand_families(profile: &Profile, tasks: &[ResolvedTask]) -> Vec<ResolvedFam
             for model in &profile.model {
                 for thinking in &profile.thinking {
                     let key = format!(
-                        "{}|{}|{}|{}",
+                        "{}|{}|{}|{}{}",
                         task.selector,
                         harness,
                         model.as_str(),
                         thinking.as_str(),
+                        if profile.web_search {
+                            "|web-search"
+                        } else {
+                            ""
+                        },
                     );
                     families.push(ResolvedFamily {
                         key,
@@ -628,6 +614,7 @@ fn expand_families(profile: &Profile, tasks: &[ResolvedTask]) -> Vec<ResolvedFam
                         harness: harness.clone(),
                         model: *model,
                         thinking: *thinking,
+                        web_search: profile.web_search,
                     });
                 }
             }
@@ -670,6 +657,49 @@ fn harness_digest(path: &Path) -> Result<String, ProfileError> {
         digest.update(&buffer[..read]);
     }
     Ok(hex::encode(digest.finalize()))
+}
+
+fn resolve_harness(
+    root: &Path,
+    name: &str,
+    harness: &Harness,
+) -> Result<ResolvedHarness, ProfileError> {
+    if !Path::new(&harness.guest_command).is_absolute()
+        || harness.guest_command.chars().any(char::is_whitespace)
+        || !Path::new(&harness.guest_command)
+            .components()
+            .all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+    {
+        return Err(ProfileError::InvalidHarnessGuestCommand {
+            harness: name.to_owned(),
+            path: harness.guest_command.clone(),
+        });
+    }
+    let command = resolve_path(root, &harness.command)?;
+    let command_identity = match harness.version.as_deref() {
+        Some(version) if version.trim().is_empty() => {
+            return Err(ProfileError::EmptyHarnessVersion(name.to_owned()));
+        }
+        Some(version) => format!("version:{version}"),
+        None => harness_digest(&command)?,
+    };
+    Ok(ResolvedHarness {
+        name: name.to_owned(),
+        command,
+        guest_command: harness.guest_command.clone(),
+        arguments: harness.arguments.clone(),
+        environment: harness.environment.clone(),
+        home: harness.home.clone(),
+        auth_file: harness.auth_file.clone(),
+        api_key_environment: harness.api_key_environment.clone(),
+        api_upstream: harness.api_upstream.clone(),
+        version: harness.version.clone().unwrap_or(command_identity),
+    })
 }
 
 fn default_models() -> Vec<Model> {
@@ -723,6 +753,15 @@ where
     S: serde::Serializer,
 {
     serializer.serialize_str(value.as_str())
+}
+
+fn deserialize_one_thinking<'de, D>(deserializer: D) -> Result<Thinking, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer)?
+        .parse()
+        .map_err(serde::de::Error::custom)
 }
 
 #[cfg(test)]
@@ -780,7 +819,7 @@ thinking = ["high"]
         let profile = EvaluationManifest::load_profile(&config, None).unwrap();
         assert_eq!(profile.name, "release");
         assert_eq!(profile.families.len(), 1);
-        assert_eq!(profile.workset_spec().families[0].trials, 3);
+        assert_eq!(profile.trials, 3);
         assert_eq!(profile.task("one").unwrap().task.name(), "one");
     }
 
@@ -807,7 +846,7 @@ trials = 1
     }
 
     #[test]
-    fn external_harness_revision_pins_the_command_bytes() {
+    fn profile_recipe_retains_only_the_harness_name() {
         let directory = tempfile::tempdir().unwrap();
         write_task(directory.path(), "one");
         let codex = directory.path().join("codex");
@@ -831,20 +870,27 @@ harness = ["nanocodex", "codex"]
         let first = EvaluationManifest::load_profile(&config, Some("release")).unwrap();
         assert_eq!(first.families.len(), 2);
         assert_eq!(
-            first.family("one", None, None, None).unwrap().harness,
+            first.family("one", None, None, None, None).unwrap().harness,
             "nanocodex"
         );
         assert_eq!(
             first
-                .family("one", Some("codex"), None, None)
+                .family("one", Some("codex"), None, None, None)
                 .unwrap()
                 .harness,
             "codex"
         );
+        let first_helper = EvaluationManifest::load_harness(&config, "codex")
+            .unwrap()
+            .unwrap();
         fs::write(&codex, "second build").unwrap();
         let second = EvaluationManifest::load_profile(&config, Some("release")).unwrap();
+        let second_helper = EvaluationManifest::load_harness(&config, "codex")
+            .unwrap()
+            .unwrap();
 
-        assert_ne!(first.digest, second.digest);
+        assert_eq!(first.digest, second.digest);
+        assert_ne!(first_helper.version, second_helper.version);
     }
 
     #[test]

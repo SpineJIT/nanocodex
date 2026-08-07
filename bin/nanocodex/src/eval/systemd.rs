@@ -16,17 +16,13 @@ use super::profile::default_state_dir;
 
 const RESTART_DELAY: &str = "30s";
 
-pub(super) fn install(
-    profile: Option<&str>,
-    config: &Path,
-    state_dir: Option<&Path>,
-) -> Result<()> {
+pub(super) fn install(profile: &str, config: &Path, state_dir: Option<&Path>) -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!("--systemd is supported only on Linux");
     }
 
     let working_directory = env::current_dir().wrap_err("failed to resolve current directory")?;
-    let config = absolute_existing(config, &working_directory, "evaluation manifest")?;
+    let config = absolute_existing(config, &working_directory, "runtime helper config")?;
     let state_dir = state_dir.map_or_else(default_state_dir, |path| Ok(path.to_path_buf()))?;
     let state_dir = absolute(&state_dir, &working_directory);
     let evaluation = Evaluation::open(&config, profile, &state_dir)?;

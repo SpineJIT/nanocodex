@@ -1,11 +1,11 @@
 //! Typed, VM-isolated evaluation for Nanocodex agents.
 //!
-//! This crate owns task loading, durable profile worksets, typed events and
-//! outcomes, and VM-isolated execution. Applications choose one exact profile
+//! This crate owns task loading, durable SQLite worksets, typed events and
+//! outcomes, and VM-isolated execution. Applications choose one exact workset
 //! coordinate family; SQLite allocates its internal repetition and fences the
 //! accepted completion.
 //!
-//! # Open a durable profile
+//! # Open a durable workset
 //!
 //! ```no_run
 //! use std::time::Duration;
@@ -14,7 +14,7 @@
 //! # async fn evaluate() -> Result<(), Box<dyn std::error::Error>> {
 //! let evaluation = Evaluation::open(
 //!     "nanocodex.toml",
-//!     Some("local-smoke"),
+//!     "local-smoke",
 //!     ".nanocodex/evals",
 //! )?;
 //! let selector = EvaluationSelector::new("tasks/write-greeting");
@@ -24,7 +24,7 @@
 //!         claim.complete()?;
 //!     }
 //!     EvaluationClaim::Run(claim) => {
-//!         // Execute exactly this profile treatment and retain its evidence.
+//!         // Execute exactly this SQLite treatment and retain its evidence.
 //!         let evidence = claim.output_directory().to_path_buf();
 //!         claim.complete(&evidence)?;
 //!     }
@@ -85,8 +85,8 @@ pub(crate) use atif::{
 pub(crate) use capture_proxy::{ResponsesCaptureProxy, ResponsesCaptureProxyConfig};
 pub use evaluation::{
     CoordinateClaim, Evaluation, EvaluationBusy, EvaluationClaim, EvaluationCounts,
-    EvaluationError, EvaluationFamilyStatus, EvaluationSelection, EvaluationSelector,
-    EvaluationStatus, EvaluationTreatment, PreparationClaim,
+    EvaluationError, EvaluationFamilyStatus, EvaluationSelector, EvaluationStatus,
+    EvaluationTreatment, EvaluationWork, PreparationClaim,
 };
 pub use evaluator::{EvalError, EvalRun, Evaluator, EvaluatorBuilder};
 pub use event::{

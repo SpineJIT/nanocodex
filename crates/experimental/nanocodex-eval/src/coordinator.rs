@@ -24,7 +24,10 @@ use tokio::{io::AsyncWriteExt as _, net::TcpListener, sync::Mutex, task::JoinHan
 use tokio_util::io::{ReaderStream, SyncIoBridge};
 use uuid::Uuid;
 
-use crate::{CoordinateClaim, Evaluation, EvaluationClaim, EvaluationSelection, PreparationClaim};
+use crate::{
+    CoordinateClaim, Evaluation, EvaluationClaim, EvaluationSelector, EvaluationTreatment,
+    PreparationClaim,
+};
 
 const MAX_COMPRESSED_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXTRACTED_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -52,13 +55,20 @@ pub struct CoordinatorClient {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RemoteClaim {
     /// This host must prepare the selected task first.
-    Prepare(RemoteLease),
+    Prepare {
+        /// Opaque lease capability required for all later mutations.
+        lease: RemoteLease,
+        /// Exact treatment resolved by the coordinator from SQLite.
+        treatment: EvaluationTreatment,
+    },
     /// Execute one coordinator-allocated repetition.
     Run {
         /// Opaque lease capability required for all later mutations.
         lease: RemoteLease,
         /// Internal fungible repetition selected by SQLite.
         repetition: u16,
+        /// Exact treatment resolved by the coordinator from SQLite.
+        treatment: EvaluationTreatment,
     },
     /// Matching work is temporarily unavailable.
     Busy {
@@ -103,6 +113,9 @@ pub enum CoordinatorError {
     /// Blocking archive construction or extraction failed.
     #[error("evaluation artifact archive task failed: {0}")]
     ArchiveTask(#[from] tokio::task::JoinError),
+    /// Coordinator returned an invalid retained treatment.
+    #[error("evaluation coordinator returned an invalid treatment: {0}")]
+    InvalidTreatment(String),
 }
 
 #[derive(Clone)]
@@ -124,17 +137,38 @@ enum HeldClaim {
 
 #[derive(Deserialize)]
 struct ClaimRequest {
-    profile_digest: String,
-    family_key: String,
+    task: String,
+    harness: Option<String>,
+    model: Option<String>,
+    thinking: Option<String>,
+    web_search: Option<bool>,
     worker: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireTreatment {
+    harness: String,
+    model: String,
+    thinking: String,
+    web_search: bool,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum ClaimResponse {
-    Prepare { lease: String },
-    Run { lease: String, repetition: u16 },
-    Busy { reason: String, retry_after_ms: u64 },
+    Prepare {
+        lease: String,
+        treatment: WireTreatment,
+    },
+    Run {
+        lease: String,
+        repetition: u16,
+        treatment: WireTreatment,
+    },
+    Busy {
+        reason: String,
+        retry_after_ms: u64,
+    },
     Complete,
 }
 
@@ -258,17 +292,20 @@ impl CoordinatorClient {
         decode(response).await
     }
 
-    /// Claims preparation or one repetition for an exact local profile selection.
+    /// Claims preparation or one repetition matching ordinary task selectors.
     pub async fn claim(
         &self,
-        selection: &EvaluationSelection,
+        selector: &EvaluationSelector,
     ) -> Result<RemoteClaim, CoordinatorError> {
         let response: ClaimResponse = decode(
             self.http
                 .post(self.endpoint("v1/claims")?)
                 .json(&serde_json::json!({
-                    "profile_digest": selection.profile_digest(),
-                    "family_key": selection.family_key(),
+                    "task": selector.task(),
+                    "harness": selector.harness_name(),
+                    "model": selector.model_value().map(|model| model.as_str()),
+                    "thinking": selector.thinking_value().map(|thinking| thinking.as_str()),
+                    "web_search": selector.web_search_value(),
                     "worker": self.worker,
                 }))
                 .send()
@@ -276,10 +313,18 @@ impl CoordinatorClient {
         )
         .await?;
         Ok(match response {
-            ClaimResponse::Prepare { lease } => RemoteClaim::Prepare(RemoteLease { token: lease }),
-            ClaimResponse::Run { lease, repetition } => RemoteClaim::Run {
+            ClaimResponse::Prepare { lease, treatment } => RemoteClaim::Prepare {
+                lease: RemoteLease { token: lease },
+                treatment: treatment.try_into()?,
+            },
+            ClaimResponse::Run {
+                lease,
+                repetition,
+                treatment,
+            } => RemoteClaim::Run {
                 lease: RemoteLease { token: lease },
                 repetition,
+                treatment: treatment.try_into()?,
             },
             ClaimResponse::Busy {
                 reason,
@@ -401,24 +446,38 @@ async fn claim(
         .worker
         .filter(|worker| !worker.trim().is_empty())
         .unwrap_or_else(|| peer.ip().to_string());
+    let model = request
+        .model
+        .map(|model| model.parse().map_err(ApiError::bad_request))
+        .transpose()?;
+    let thinking = request
+        .thinking
+        .map(|thinking| thinking.parse().map_err(ApiError::bad_request))
+        .transpose()?;
+    let selector = EvaluationSelector::new(request.task)
+        .harness(request.harness)
+        .model(model)
+        .thinking(thinking)
+        .web_search(request.web_search);
     let claim = state
         .evaluation
-        .claim_family_for_host(
-            &request.profile_digest,
-            &request.family_key,
-            &host,
-            state.lease_duration,
-        )
+        .claim_for_host(&selector, &host, state.lease_duration)
         .map_err(ApiError::bad_gateway)?;
     let response = match claim {
         EvaluationClaim::Prepare(claim) => {
+            let treatment = claim.treatment().into();
             let lease = insert_claim(&state, HeldClaim::Preparation(claim)).await;
-            ClaimResponse::Prepare { lease }
+            ClaimResponse::Prepare { lease, treatment }
         }
         EvaluationClaim::Run(claim) => {
             let repetition = claim.repetition();
+            let treatment = claim.treatment().into();
             let lease = insert_claim(&state, HeldClaim::Coordinate(claim)).await;
-            ClaimResponse::Run { lease, repetition }
+            ClaimResponse::Run {
+                lease,
+                repetition,
+                treatment,
+            }
         }
         EvaluationClaim::Busy(busy) => ClaimResponse::Busy {
             reason: busy.reason.to_owned(),
@@ -775,6 +834,38 @@ impl ApiError {
     }
 }
 
+impl From<&EvaluationTreatment> for WireTreatment {
+    fn from(treatment: &EvaluationTreatment) -> Self {
+        Self {
+            harness: treatment.harness.clone(),
+            model: treatment.model.as_str().to_owned(),
+            thinking: treatment.thinking.as_str().to_owned(),
+            web_search: treatment.web_search,
+        }
+    }
+}
+
+impl TryFrom<WireTreatment> for EvaluationTreatment {
+    type Error = CoordinatorError;
+
+    fn try_from(treatment: WireTreatment) -> Result<Self, Self::Error> {
+        let model = treatment
+            .model
+            .parse()
+            .map_err(|error| CoordinatorError::InvalidTreatment(format!("model: {error}")))?;
+        let thinking = treatment
+            .thinking
+            .parse()
+            .map_err(|error| CoordinatorError::InvalidTreatment(format!("thinking: {error}")))?;
+        Ok(Self {
+            harness: treatment.harness,
+            model,
+            thinking,
+            web_search: treatment.web_search,
+        })
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = Json(ErrorBody {
@@ -823,7 +914,7 @@ allow_internet = false
     async fn fixture() -> (
         tempfile::TempDir,
         CoordinatorClient,
-        EvaluationSelection,
+        EvaluationSelector,
         JoinHandle<()>,
     ) {
         fixture_with_policy(Duration::from_secs(30), Duration::from_secs(5)).await
@@ -835,7 +926,7 @@ allow_internet = false
     ) -> (
         tempfile::TempDir,
         CoordinatorClient,
-        EvaluationSelection,
+        EvaluationSelector,
         JoinHandle<()>,
     ) {
         let directory = tempfile::tempdir().unwrap();
@@ -851,11 +942,10 @@ thinking = ["high"]
 "#,
         )
         .unwrap();
-        let evaluation =
-            Evaluation::open(&config, Some("release"), directory.path().join("state")).unwrap();
-        let selection =
-            EvaluationSelection::load(&config, Some("release"), &EvaluationSelector::new("one"))
-                .unwrap();
+        let state = directory.path().join("state");
+        Evaluation::add_profile(&config, Some("release"), &state, "release", false).unwrap();
+        let evaluation = Evaluation::open(&config, "release", state).unwrap();
+        let selection = EvaluationSelector::new("one");
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -874,7 +964,10 @@ thinking = ["high"]
     async fn workers_prepare_claim_upload_and_converge_through_the_coordinator() {
         let (directory, client, selection, server) = fixture().await;
         let client = client.worker("worker-one");
-        let RemoteClaim::Prepare(preparation) = client.claim(&selection).await.unwrap() else {
+        let RemoteClaim::Prepare {
+            lease: preparation, ..
+        } = client.claim(&selection).await.unwrap()
+        else {
             panic!("first worker should prepare");
         };
         client.heartbeat(&preparation).await.unwrap();
@@ -884,6 +977,7 @@ thinking = ["high"]
         let RemoteClaim::Run {
             lease: first_lease,
             repetition: first_repetition,
+            ..
         } = first.unwrap()
         else {
             panic!("first worker should run");
@@ -891,6 +985,7 @@ thinking = ["high"]
         let RemoteClaim::Run {
             lease: second_lease,
             repetition: second_repetition,
+            ..
         } = second.unwrap()
         else {
             panic!("second worker should run");
@@ -977,7 +1072,10 @@ thinking = ["high"]
     async fn unreachable_worker_is_reclaimed_and_its_stale_token_is_fenced() {
         let (_directory, client, selection, server) =
             fixture_with_policy(Duration::from_millis(80), Duration::from_millis(20)).await;
-        let RemoteClaim::Prepare(preparation) = client.claim(&selection).await.unwrap() else {
+        let RemoteClaim::Prepare {
+            lease: preparation, ..
+        } = client.claim(&selection).await.unwrap()
+        else {
             panic!("first worker should prepare");
         };
         client.prepared(&preparation).await.unwrap();
@@ -985,6 +1083,7 @@ thinking = ["high"]
         let RemoteClaim::Run {
             lease: stale,
             repetition,
+            ..
         } = client.claim(&selection).await.unwrap()
         else {
             panic!("first worker should run");
@@ -994,6 +1093,7 @@ thinking = ["high"]
         let RemoteClaim::Run {
             lease: replacement,
             repetition: replacement_repetition,
+            ..
         } = client.claim(&selection).await.unwrap()
         else {
             panic!("expired work should be reclaimed");

@@ -13,10 +13,10 @@ use crate::{
 
 #[derive(Args)]
 pub(super) struct Benchmark {
-    /// Evaluation profile. Uses nanocodex.toml's default when omitted.
-    profile: Option<String>,
+    /// Named durable workset to drive to completion.
+    workset: String,
 
-    /// Closed evaluation manifest.
+    /// Runtime harness helper configuration passed to workers.
     #[arg(long, default_value = "nanocodex.toml")]
     config: PathBuf,
 
@@ -51,7 +51,7 @@ pub(super) struct Benchmark {
 impl Benchmark {
     pub(super) async fn run(self) -> Result<()> {
         let Self {
-            profile,
+            workset,
             config,
             state_dir,
             coordinator,
@@ -62,16 +62,16 @@ impl Benchmark {
             vm,
         } = self;
         if systemd {
-            return systemd::install(profile.as_deref(), &config, state_dir.as_deref());
+            return systemd::install(&workset, &config, state_dir.as_deref());
         }
         let prompt = benchmark::prompt(
-            profile.as_deref(),
+            Some(workset.as_str()),
             &config,
             state_dir.as_deref(),
             coordinator.as_deref(),
         );
         let initial = BoardStatus::load(
-            profile.as_deref(),
+            &workset,
             &config,
             state_dir.as_deref(),
             coordinator.as_deref(),
@@ -85,10 +85,7 @@ impl Benchmark {
             run::run_prompt(prompt, agent, vm).await
         } else {
             let _observability = observability.install(true, agent.cwd())?;
-            let display = profile.as_ref().map_or_else(
-                || "/benchmark".to_owned(),
-                |profile| format!("/benchmark {profile}"),
-            );
+            let display = format!("/benchmark {workset}");
             tui::run(
                 agent,
                 vm,
@@ -98,7 +95,7 @@ impl Benchmark {
             .await
         };
         let board = BoardStatus::load(
-            profile.as_deref(),
+            &workset,
             &config,
             state_dir.as_deref(),
             coordinator.as_deref(),
@@ -133,7 +130,7 @@ struct BoardStatus {
 
 impl BoardStatus {
     async fn load(
-        profile: Option<&str>,
+        profile: &str,
         config: &std::path::Path,
         state_dir: Option<&std::path::Path>,
         coordinator: Option<&str>,

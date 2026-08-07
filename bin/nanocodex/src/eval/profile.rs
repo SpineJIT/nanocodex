@@ -5,10 +5,10 @@ use std::{
 
 use clap::Args;
 use eyre::{Result, WrapErr as _, eyre};
-use nanocodex::Model;
+use nanocodex::{Model, Thinking};
 use nanocodex_eval::{
     EvalAttemptOutcome, EvalEventKind, EvalEventStream, EvalOutcome, Evaluation, EvaluationClaim,
-    EvaluationSelection, EvaluationSelector, Evaluator, ResolvedHarness, Task,
+    EvaluationSelector, EvaluationWork, Evaluator, ResolvedHarness, Task,
     atif::AtifBuilder,
     coordinator::{CoordinatorClient, RemoteClaim, RemoteLease},
     harness::{Harness, HarnessAuth},
@@ -27,13 +27,9 @@ const CONFIG_FILE: &str = "nanocodex.toml";
 const LEASE_DURATION: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug, Args)]
-pub(super) struct ProfileTarget {
-    /// Evaluation profile. Uses the manifest's top-level default when omitted.
-    profile: Option<String>,
-
-    /// Evaluation manifest containing the closed desired work bundle.
-    #[arg(long, default_value = CONFIG_FILE)]
-    config: PathBuf,
+pub(super) struct WorksetTarget {
+    /// Named durable workset stored in SQLite.
+    workset: String,
 
     /// Durable SQLite ledger and retained artifacts.
     ///
@@ -47,11 +43,57 @@ pub(super) struct ProfileTarget {
 }
 
 #[derive(Args)]
+pub(super) struct Add {
+    /// Named durable workset to create or extend.
+    workset: String,
+
+    /// Expand this optional nanocodex.toml profile recipe into SQLite.
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
+
+    /// Task package to add. Repeat to add multiple task packages.
+    #[arg(long, value_name = "PATH")]
+    task: Vec<PathBuf>,
+
+    /// Harness name to store. Repeat to create a matrix.
+    #[arg(long, value_name = "NAME")]
+    harness: Vec<String>,
+
+    /// Model to store. Repeat to create a matrix.
+    #[arg(long)]
+    model: Vec<Model>,
+
+    /// Reasoning effort to store. Repeat to create a matrix.
+    #[arg(long)]
+    thinking: Vec<Thinking>,
+
+    /// Desired repetitions for every added treatment.
+    #[arg(long)]
+    trials: Option<u16>,
+
+    /// Enable model-facing web search for the added treatments.
+    #[arg(long)]
+    web_search: bool,
+
+    /// Start a fresh generation instead of extending the newest board.
+    #[arg(long)]
+    new: bool,
+
+    /// Optional profile recipes and runtime harness helpers.
+    #[arg(long, default_value = CONFIG_FILE)]
+    config: PathBuf,
+
+    /// Durable SQLite ledger and retained artifacts.
+    #[arg(long, value_name = "DIRECTORY")]
+    state_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
 pub(super) struct Status {
     #[command(flatten)]
-    target: ProfileTarget,
+    target: WorksetTarget,
 
-    /// Print the complete machine-readable profile ledger.
+    /// Print the complete machine-readable workset ledger.
     #[arg(long)]
     json: bool,
 }
@@ -59,13 +101,17 @@ pub(super) struct Status {
 #[derive(Args)]
 pub(super) struct Run {
     #[command(flatten)]
-    target: ProfileTarget,
+    target: WorksetTarget,
 
-    /// Exact task selector from the configured profile.
+    /// Runtime harness helper configuration.
+    #[arg(long, default_value = CONFIG_FILE)]
+    config: PathBuf,
+
+    /// Exact task selector already stored in the workset.
     #[arg(long, value_name = "TASK", required = true)]
     task: String,
 
-    /// Select one model when the profile contains a model matrix.
+    /// Select one model when the workset contains a model matrix.
     #[arg(long)]
     model: Option<Model>,
 
@@ -82,6 +128,74 @@ pub(super) struct Run {
 
     #[command(flatten)]
     agent: EvalAgentArgs,
+}
+
+impl Add {
+    pub(super) async fn run(self) -> Result<()> {
+        let state = self.state_dir.map_or_else(default_state_dir, Ok)?;
+        if let Some(recipe) = self.profile.as_deref() {
+            if !self.task.is_empty()
+                || !self.harness.is_empty()
+                || !self.model.is_empty()
+                || !self.thinking.is_empty()
+                || self.trials.is_some()
+                || self.web_search
+            {
+                return Err(eyre!(
+                    "--profile is a complete recipe; use either --profile or explicit work knobs"
+                ));
+            }
+            Evaluation::add_profile(&self.config, Some(recipe), &state, &self.workset, self.new)?;
+        } else {
+            if self.task.is_empty() {
+                return Err(eyre!("at least one --task or --profile is required"));
+            }
+            let trials = self.trials.unwrap_or(1);
+            let harnesses = if self.harness.is_empty() {
+                vec!["nanocodex".to_owned()]
+            } else {
+                self.harness
+            };
+            let models = if self.model.is_empty() {
+                vec![Model::default()]
+            } else {
+                self.model
+            };
+            let thinking = if self.thinking.is_empty() {
+                vec![Thinking::default()]
+            } else {
+                self.thinking
+            };
+            let mut work = Vec::new();
+            for path in self.task {
+                let selector = path.to_string_lossy().into_owned();
+                let task = Task::load(&path)?;
+                for harness in &harnesses {
+                    for model in &models {
+                        for thinking in &thinking {
+                            work.push(
+                                EvaluationWork::new(&selector, task.clone())
+                                    .harness(harness)
+                                    .model(*model)
+                                    .thinking(*thinking)
+                                    .web_search(self.web_search)
+                                    .trials(trials),
+                            );
+                        }
+                    }
+                }
+            }
+            Evaluation::add(&state, &self.workset, &work, self.new)?;
+        }
+        let status = Evaluation::open(&self.config, &self.workset, state)?.status()?;
+        println!(
+            "{} · {} tasks · {} coordinate(s)",
+            status.profile,
+            status.preparation.pending + status.preparation.running + status.preparation.complete,
+            status.coordinates.pending + status.coordinates.running + status.coordinates.complete,
+        );
+        Ok(())
+    }
 }
 
 #[derive(Serialize)]
@@ -117,7 +231,7 @@ impl Status {
             }
             return Ok(());
         }
-        let evaluation = self.target.open()?;
+        let evaluation = self.target.open(Path::new(CONFIG_FILE))?;
         let status = evaluation.status()?;
         if self.json {
             serde_json::to_writer_pretty(std::io::stdout().lock(), &status)?;
@@ -155,22 +269,26 @@ impl Run {
         let selector = EvaluationSelector::new(&self.task)
             .harness(self.harness)
             .model(self.model)
-            .thinking(requested_thinking);
+            .thinking(requested_thinking)
+            .web_search(self.agent.web_search());
         if let Some(coordinator) = &self.target.coordinator {
-            let selection = EvaluationSelection::load(
-                &self.target.config,
-                self.target.profile.as_deref(),
-                &selector,
-            )?;
-            validate_web_search(&self.agent, selection.profile(), selection.web_search())?;
+            let task = Task::load(&self.task)?;
             let mut coordinator = CoordinatorClient::new(coordinator)?;
             if let Some(worker) = self.worker {
                 coordinator = coordinator.worker(worker);
             }
-            return run_remote(coordinator, selection, &self.task, self.agent).await;
+            return run_remote(
+                coordinator,
+                selector,
+                &self.target.workset,
+                task,
+                &self.config,
+                &self.task,
+                self.agent,
+            )
+            .await;
         }
-        let evaluation = self.target.open()?;
-        validate_web_search(&self.agent, evaluation.name(), evaluation.web_search())?;
+        let evaluation = self.target.open(&self.config)?;
         let mut prepared = None;
         loop {
             match evaluation.claim(&selector, LEASE_DURATION)? {
@@ -258,16 +376,21 @@ impl Run {
 
 async fn run_remote(
     coordinator: CoordinatorClient,
-    selection: EvaluationSelection,
+    selector: EvaluationSelector,
+    workset: &str,
+    task: Task,
+    config: &Path,
     task_selector: &str,
     agent: EvalAgentArgs,
 ) -> Result<()> {
     let mut prepared = None;
     loop {
-        match coordinator.claim(&selection).await? {
-            RemoteClaim::Prepare(lease) => {
+        match coordinator.claim(&selector).await? {
+            RemoteClaim::Prepare { lease, treatment } => {
+                let harness = Evaluation::resolve_harness(config, &treatment.harness)?;
+                let harnesses = harness.iter().cloned().collect::<Vec<_>>();
                 let heartbeat = remote_heartbeat(coordinator.clone(), lease.clone());
-                let result = prepare_resources(selection.task(), selection.harnesses()).await;
+                let result = prepare_resources(&task, &harnesses).await;
                 match result {
                     Ok(resources) => {
                         let finish = coordinator.prepared(&lease).await;
@@ -283,7 +406,13 @@ async fn run_remote(
                     }
                 }
             }
-            RemoteClaim::Run { lease, repetition } => {
+            RemoteClaim::Run {
+                lease,
+                repetition,
+                treatment,
+            } => {
+                let harness = Evaluation::resolve_harness(config, &treatment.harness)?;
+                let harnesses = harness.iter().cloned().collect::<Vec<_>>();
                 let host = run::PreparedVmHost::open()?;
                 let output = tempfile::Builder::new()
                     .prefix("nanocodex-eval-worker-")
@@ -292,16 +421,13 @@ async fn run_remote(
                 let result = async {
                     let resources = match prepared.take() {
                         Some(resources) => resources,
-                        None => {
-                            prepare_resources_from(selection.task(), selection.harnesses(), &host)
-                                .await?
-                        }
+                        None => prepare_resources_from(&task, &harnesses, &host).await?,
                     };
                     execute_coordinate(
-                        selection.task().clone(),
-                        selection.treatment().clone(),
-                        selection.web_search(),
-                        selection.harness().cloned(),
+                        task.clone(),
+                        treatment.clone(),
+                        treatment.web_search,
+                        harness,
                         output.path().to_path_buf(),
                         resources,
                         agent,
@@ -315,7 +441,7 @@ async fn run_remote(
                         heartbeat.abort();
                         finish?;
                         write_json(&RunOutput::Completed {
-                            profile: selection.profile(),
+                            profile: workset,
                             task: task_selector,
                             repetition,
                             evidence: "coordinator",
@@ -349,7 +475,7 @@ async fn run_remote(
                 retry_after_ms,
             } => {
                 write_json(&RunOutput::TemporarilyUnavailable {
-                    profile: selection.profile(),
+                    profile: workset,
                     task: task_selector,
                     reason: &reason,
                     retry_after_ms,
@@ -360,7 +486,7 @@ async fn run_remote(
             }
             RemoteClaim::Complete => {
                 write_json(&RunOutput::AlreadyComplete {
-                    profile: selection.profile(),
+                    profile: workset,
                     task: task_selector,
                 })?;
                 return Ok(());
@@ -385,26 +511,10 @@ fn remote_heartbeat(
     })
 }
 
-fn validate_web_search(agent: &EvalAgentArgs, profile: &str, web_search: bool) -> Result<()> {
-    if agent
-        .web_search()
-        .is_some_and(|requested| requested != web_search)
-    {
-        return Err(eyre!(
-            "--web-search cannot override profile `{profile}`; the profile fixes web_search={web_search}"
-        ));
-    }
-    Ok(())
-}
-
-impl ProfileTarget {
-    fn open(&self) -> Result<Evaluation> {
+impl WorksetTarget {
+    fn open(&self, config: &Path) -> Result<Evaluation> {
         let state_directory = self.state_dir.clone().map_or_else(default_state_dir, Ok)?;
-        Ok(Evaluation::open(
-            &self.config,
-            self.profile.as_deref(),
-            state_directory,
-        )?)
+        Ok(Evaluation::open(config, &self.workset, state_directory)?)
     }
 }
 

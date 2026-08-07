@@ -1,4 +1,4 @@
-//! Profile-level durable execution API.
+//! SQLite-native durable evaluation API.
 
 use std::{
     error::Error,
@@ -15,17 +15,21 @@ use tokio::task::JoinHandle;
 use crate::{
     Task,
     profile::{EvaluationManifest, ResolvedFamily, ResolvedHarness, ResolvedProfile},
-    workset::{BeginCoordinate, CoordinateLease, PreparationLease, Workset, WorksetBusy},
+    workset::{
+        BeginCoordinate, CoordinateLease, PreparationLease, Workset, WorksetBusy, WorksetError,
+        WorksetFamily, WorksetTask,
+    },
 };
 
 const LEDGER_FILE: &str = "state.sqlite3";
 
-/// One initialized profile revision and its durable SQLite ledger.
+/// One named durable SQLite workset.
 #[derive(Clone, Debug)]
 pub struct Evaluation {
     profile: ResolvedProfile,
     workset: Workset,
     state_directory: PathBuf,
+    config: PathBuf,
 }
 
 /// Optional knobs selecting one exact family already present in a profile.
@@ -35,22 +39,22 @@ pub struct EvaluationSelector {
     harness: Option<String>,
     model: Option<Model>,
     thinking: Option<Thinking>,
+    web_search: Option<bool>,
 }
 
-/// One exact profile family resolved locally without opening a ledger.
+/// One concrete task treatment to append to a durable SQLite workset.
 #[derive(Clone, Debug)]
-pub struct EvaluationSelection {
-    profile: String,
-    profile_digest: String,
-    family_key: String,
+pub struct EvaluationWork {
+    selector: String,
     task: Task,
-    treatment: EvaluationTreatment,
+    harness: String,
+    model: Model,
+    thinking: Thinking,
     web_search: bool,
-    harness: Option<ResolvedHarness>,
-    harnesses: Vec<ResolvedHarness>,
+    trials: u16,
 }
 
-/// The next durable action for one profile family.
+/// The next durable action for one workset family.
 #[derive(Debug)]
 pub enum EvaluationClaim {
     /// Prepare immutable resources shared by every trial of this task.
@@ -69,6 +73,7 @@ pub struct PreparationClaim {
     workset: Workset,
     lease: PreparationLease,
     task: Task,
+    treatment: EvaluationTreatment,
     harnesses: Vec<ResolvedHarness>,
     heartbeat: JoinHandle<()>,
 }
@@ -80,14 +85,13 @@ pub struct CoordinateClaim {
     lease: CoordinateLease,
     task: Task,
     treatment: EvaluationTreatment,
-    web_search: bool,
     harness: Option<ResolvedHarness>,
     harnesses: Vec<ResolvedHarness>,
     output_directory: PathBuf,
     heartbeat: JoinHandle<()>,
 }
 
-/// Semantic knobs fixed by one profile family.
+/// Semantic knobs fixed by one SQLite family.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EvaluationTreatment {
     /// Built-in or configured harness used for this coordinate.
@@ -97,6 +101,8 @@ pub struct EvaluationTreatment {
     /// Reasoning effort fixed by the profile.
     #[serde(serialize_with = "crate::profile::serialize_one_thinking")]
     pub thinking: Thinking,
+    /// Whether model-facing web search is enabled for this coordinate.
+    pub web_search: bool,
 }
 
 /// Temporary inability to claim the selected family.
@@ -108,7 +114,7 @@ pub struct EvaluationBusy {
     pub retry_after_ms: u64,
 }
 
-/// Complete durable status of one immutable profile revision.
+/// Complete durable status of one named workset generation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EvaluationStatus {
     /// Selected profile name.
@@ -162,20 +168,114 @@ pub struct EvaluationError {
 }
 
 impl Evaluation {
-    /// Resolves a profile, initializes its complete workset, and opens it.
+    /// Appends concrete work to a named SQLite board, creating it when absent.
+    /// `new_generation` starts a fresh board under the same user-visible name.
+    pub fn add(
+        state_directory: impl Into<PathBuf>,
+        profile: &str,
+        work: &[EvaluationWork],
+        new_generation: bool,
+    ) -> Result<(), EvaluationError> {
+        if work.is_empty() {
+            return Err(error(std::io::Error::other(
+                "at least one concrete evaluation treatment is required",
+            )));
+        }
+        let path = state_directory.into().join(LEDGER_FILE);
+        let workset = if new_generation {
+            Workset::create(&path, profile)
+        } else {
+            match Workset::open(&path, profile) {
+                Ok(workset) => Ok(workset),
+                Err(WorksetError::UnknownWorkset(_)) => Workset::create(&path, profile),
+                Err(error) => Err(error),
+            }
+        }
+        .map_err(error)?;
+        let mut tasks = std::collections::BTreeMap::new();
+        let mut families = Vec::with_capacity(work.len());
+        for item in work {
+            if item.trials == 0 {
+                return Err(error(std::io::Error::other(
+                    "evaluation treatments must request at least one trial",
+                )));
+            }
+            tasks
+                .entry(item.selector.clone())
+                .or_insert_with(|| WorksetTask {
+                    selector: item.selector.clone(),
+                    name: item.task.name().to_owned(),
+                    root: item.task.root().to_path_buf(),
+                    digest: item.task.package_digest().to_owned(),
+                });
+            let family = item.family();
+            families.push(WorksetFamily {
+                key: family.key.clone(),
+                task_selector: family.task.clone(),
+                treatment: family.treatment(),
+                trials: item.trials,
+            });
+        }
+        workset
+            .append(&tasks.into_values().collect::<Vec<_>>(), &families)
+            .map_err(error)
+    }
+
+    /// Expands one optional TOML profile recipe into a concrete SQLite board.
+    pub fn add_profile(
+        config: impl AsRef<Path>,
+        recipe: Option<&str>,
+        state_directory: impl Into<PathBuf>,
+        profile: &str,
+        new_generation: bool,
+    ) -> Result<(), EvaluationError> {
+        let recipe = EvaluationManifest::load_profile(config, recipe).map_err(error)?;
+        let work = recipe
+            .families
+            .iter()
+            .map(|family| {
+                Ok(EvaluationWork {
+                    selector: family.task.clone(),
+                    task: recipe.task(&family.task).map_err(error)?.task.clone(),
+                    harness: family.harness.clone(),
+                    model: family.model,
+                    thinking: family.thinking,
+                    web_search: family.web_search,
+                    trials: recipe.trials,
+                })
+            })
+            .collect::<Result<Vec<_>, EvaluationError>>()?;
+        Self::add(state_directory, profile, &work, new_generation)
+    }
+
+    /// Resolves one current runtime harness helper without consulting workset
+    /// definitions.
+    pub fn resolve_harness(
+        config: impl AsRef<Path>,
+        harness: &str,
+    ) -> Result<Option<ResolvedHarness>, EvaluationError> {
+        EvaluationManifest::load_harness(config, harness).map_err(error)
+    }
+
+    /// Opens the newest SQLite generation of a named workset.
+    ///
+    /// `config` is retained only to resolve a selected external harness when a
+    /// coordinate is claimed. Status and work definition come entirely from
+    /// SQLite.
     pub fn open(
         config: impl AsRef<Path>,
-        profile: Option<&str>,
+        profile: &str,
         state_directory: impl Into<PathBuf>,
     ) -> Result<Self, EvaluationError> {
-        let profile = EvaluationManifest::load_profile(config, profile).map_err(error)?;
         let state_directory = state_directory.into();
-        let workset = Workset::ensure(state_directory.join(LEDGER_FILE), &profile.workset_spec())
-            .map_err(error)?;
+        let workset = Workset::open(state_directory.join(LEDGER_FILE), profile).map_err(error)?;
+        let profile =
+            ResolvedProfile::from_workset(workset.definition().map_err(error)?).map_err(error)?;
         Ok(Self {
             profile,
             workset,
             state_directory,
+            config: config.as_ref().to_path_buf(),
         })
     }
 
@@ -183,12 +283,6 @@ impl Evaluation {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.profile.name
-    }
-
-    /// Whether model-facing web search is enabled by the profile.
-    #[must_use]
-    pub const fn web_search(&self) -> bool {
-        self.profile.web_search
     }
 
     /// Reads a structured snapshot from SQLite.
@@ -238,7 +332,7 @@ impl Evaluation {
         })
     }
 
-    /// Claims the next action for one exact profile-owned family.
+    /// Claims the next action for one exact SQLite-owned family.
     ///
     /// Active claims renew their lease automatically until completed, retried,
     /// or dropped.
@@ -247,7 +341,8 @@ impl Evaluation {
         selector: &EvaluationSelector,
         lease_duration: Duration,
     ) -> Result<EvaluationClaim, EvaluationError> {
-        self.claim_for_host(selector, "local", lease_duration)
+        let family = self.resolve_family(selector)?.clone();
+        self.claim_resolved(&family, "local", lease_duration, true)
     }
 
     /// Claims one family for the network host chosen by the coordinator.
@@ -258,36 +353,7 @@ impl Evaluation {
         lease_duration: Duration,
     ) -> Result<EvaluationClaim, EvaluationError> {
         let family = self.resolve_family(selector)?.clone();
-        self.claim_resolved(&family, host, lease_duration)
-    }
-
-    /// Claims a locally resolved family after verifying its immutable profile digest.
-    pub(crate) fn claim_family_for_host(
-        &self,
-        profile_digest: &str,
-        family_key: &str,
-        host: &str,
-        lease_duration: Duration,
-    ) -> Result<EvaluationClaim, EvaluationError> {
-        if profile_digest != self.profile.digest {
-            return Err(error(std::io::Error::other(format!(
-                "coordinator profile digest is {}; worker requested {profile_digest}",
-                self.profile.digest
-            ))));
-        }
-        let family = self
-            .profile
-            .families
-            .iter()
-            .find(|family| family.key == family_key)
-            .ok_or_else(|| {
-                error(std::io::Error::other(format!(
-                    "family `{family_key}` is not part of profile `{}`",
-                    self.profile.name
-                )))
-            })?
-            .clone();
-        self.claim_resolved(&family, host, lease_duration)
+        self.claim_resolved(&family, host, lease_duration, false)
     }
 
     fn resolve_family(
@@ -300,6 +366,7 @@ impl Evaluation {
                 selector.harness.as_deref(),
                 selector.model,
                 selector.thinking,
+                selector.web_search,
             )
             .map_err(error)
     }
@@ -309,8 +376,15 @@ impl Evaluation {
         family: &ResolvedFamily,
         host: &str,
         lease_duration: Duration,
+        resolve_harness: bool,
     ) -> Result<EvaluationClaim, EvaluationError> {
         let task = self.profile.task(&family.task).map_err(error)?.task.clone();
+        let harness = if resolve_harness {
+            EvaluationManifest::load_harness(&self.config, &family.harness).map_err(error)?
+        } else {
+            None
+        };
+        let harnesses = harness.iter().cloned().collect::<Vec<_>>();
         match self
             .workset
             .begin_for_host(&family.key, host, lease_duration)
@@ -323,7 +397,8 @@ impl Evaluation {
                     workset: self.workset.clone(),
                     lease,
                     task,
-                    harnesses: self.profile.harnesses.values().cloned().collect(),
+                    treatment: family.into(),
+                    harnesses,
                     heartbeat,
                 }))
             }
@@ -342,9 +417,8 @@ impl Evaluation {
                     lease,
                     task,
                     treatment: family.into(),
-                    web_search: self.profile.web_search,
-                    harness: self.profile.harness(&family.harness).cloned(),
-                    harnesses: self.profile.harnesses.values().cloned().collect(),
+                    harness,
+                    harnesses,
                     output_directory,
                     heartbeat,
                 }))
@@ -355,89 +429,78 @@ impl Evaluation {
     }
 }
 
-impl EvaluationSelection {
-    /// Resolves one exact family from a local immutable profile without touching SQLite.
-    pub fn load(
-        config: impl AsRef<Path>,
-        profile: Option<&str>,
-        selector: &EvaluationSelector,
-    ) -> Result<Self, EvaluationError> {
-        let profile = EvaluationManifest::load_profile(config, profile).map_err(error)?;
-        let family = profile
-            .family(
-                &selector.task,
-                selector.harness.as_deref(),
-                selector.model,
-                selector.thinking,
-            )
-            .map_err(error)?
-            .clone();
-        let task = profile.task(&family.task).map_err(error)?.task.clone();
-        let harness = profile.harness(&family.harness).cloned();
-        let harnesses = profile.harnesses.values().cloned().collect();
-        Ok(Self {
-            profile: profile.name,
-            profile_digest: profile.digest,
-            family_key: family.key.clone(),
+impl EvaluationWork {
+    /// Creates one built-in Nanocodex treatment with default model policy.
+    #[must_use]
+    pub fn new(selector: impl Into<String>, task: Task) -> Self {
+        Self {
+            selector: selector.into(),
             task,
-            treatment: (&family).into(),
-            web_search: profile.web_search,
-            harness,
-            harnesses,
-        })
+            harness: crate::profile::BUILTIN_HARNESS.to_owned(),
+            model: Model::default(),
+            thinking: Thinking::default(),
+            web_search: false,
+            trials: 1,
+        }
     }
 
-    /// Selected profile name.
+    /// Selects the built-in or configured harness name stored in SQLite.
     #[must_use]
-    pub fn profile(&self) -> &str {
-        &self.profile
+    pub fn harness(mut self, harness: impl Into<String>) -> Self {
+        self.harness = harness.into();
+        self
     }
 
-    /// Stable digest of every resolved profile input.
+    /// Selects the model stored in SQLite.
     #[must_use]
-    pub fn profile_digest(&self) -> &str {
-        &self.profile_digest
+    pub const fn model(mut self, model: Model) -> Self {
+        self.model = model;
+        self
     }
 
-    /// Stable family key sent to the coordinator.
+    /// Selects the reasoning effort stored in SQLite.
     #[must_use]
-    pub fn family_key(&self) -> &str {
-        &self.family_key
+    pub const fn thinking(mut self, thinking: Thinking) -> Self {
+        self.thinking = thinking;
+        self
     }
 
-    /// Immutable task package executed by this worker.
+    /// Selects model-facing web-search policy stored in SQLite.
     #[must_use]
-    pub const fn task(&self) -> &Task {
-        &self.task
+    pub const fn web_search(mut self, web_search: bool) -> Self {
+        self.web_search = web_search;
+        self
     }
 
-    /// Exact semantic treatment fixed by the profile.
+    /// Selects the desired fungible repetition count stored in SQLite.
     #[must_use]
-    pub const fn treatment(&self) -> &EvaluationTreatment {
-        &self.treatment
+    pub const fn trials(mut self, trials: u16) -> Self {
+        self.trials = trials;
+        self
     }
 
-    /// Whether model-facing web search is enabled.
-    #[must_use]
-    pub const fn web_search(&self) -> bool {
-        self.web_search
-    }
-
-    /// Resolved configuration for the selected external harness.
-    #[must_use]
-    pub const fn harness(&self) -> Option<&ResolvedHarness> {
-        self.harness.as_ref()
-    }
-
-    /// External harnesses installed during this task's durable preparation.
-    #[must_use]
-    pub fn harnesses(&self) -> &[ResolvedHarness] {
-        &self.harnesses
+    fn family(&self) -> ResolvedFamily {
+        let key = format!(
+            "{}|{}|{}|{}{}",
+            self.selector,
+            self.harness,
+            self.model.as_str(),
+            self.thinking.as_str(),
+            if self.web_search { "|web-search" } else { "" },
+        );
+        ResolvedFamily {
+            key,
+            task: self.selector.clone(),
+            harness: self.harness.clone(),
+            model: self.model,
+            thinking: self.thinking,
+            web_search: self.web_search,
+        }
     }
 }
 
 impl EvaluationSelector {
-    /// Selects a task from the closed profile.
+    /// Selects a task already present in the workset.
     #[must_use]
     pub fn new(task: impl Into<String>) -> Self {
         Self {
@@ -445,6 +508,7 @@ impl EvaluationSelector {
             harness: None,
             model: None,
             thinking: None,
+            web_search: None,
         }
     }
 
@@ -455,18 +519,45 @@ impl EvaluationSelector {
         self
     }
 
-    /// Narrows the task to one profile-owned model treatment.
+    /// Narrows the task to one SQLite-owned model treatment.
     #[must_use]
     pub const fn model(mut self, model: Option<Model>) -> Self {
         self.model = model;
         self
     }
 
-    /// Narrows the task to one profile-owned reasoning treatment.
+    /// Narrows the task to one SQLite-owned reasoning treatment.
     #[must_use]
     pub const fn thinking(mut self, thinking: Option<Thinking>) -> Self {
         self.thinking = thinking;
         self
+    }
+
+    /// Narrows the task to one SQLite-owned web-search policy.
+    #[must_use]
+    pub const fn web_search(mut self, web_search: Option<bool>) -> Self {
+        self.web_search = web_search;
+        self
+    }
+
+    pub(crate) fn task(&self) -> &str {
+        &self.task
+    }
+
+    pub(crate) fn harness_name(&self) -> Option<&str> {
+        self.harness.as_deref()
+    }
+
+    pub(crate) const fn model_value(&self) -> Option<Model> {
+        self.model
+    }
+
+    pub(crate) const fn thinking_value(&self) -> Option<Thinking> {
+        self.thinking
+    }
+
+    pub(crate) const fn web_search_value(&self) -> Option<bool> {
+        self.web_search
     }
 }
 
@@ -475,6 +566,12 @@ impl PreparationClaim {
     #[must_use]
     pub const fn task(&self) -> &Task {
         &self.task
+    }
+
+    /// Semantic treatment whose resources are being prepared.
+    #[must_use]
+    pub const fn treatment(&self) -> &EvaluationTreatment {
+        &self.treatment
     }
 
     /// External harnesses installed into the immutable task image.
@@ -522,7 +619,7 @@ impl CoordinateClaim {
     /// Whether model-facing web search is enabled by the profile.
     #[must_use]
     pub const fn web_search(&self) -> bool {
-        self.web_search
+        self.treatment.web_search
     }
 
     /// Resolved configuration for the selected external harness.
@@ -566,6 +663,7 @@ impl From<&ResolvedFamily> for EvaluationTreatment {
             harness: family.harness.clone(),
             model: family.model,
             thinking: family.thinking,
+            web_search: family.web_search,
         }
     }
 }
@@ -720,7 +818,8 @@ thinking = ["high"]
         )
         .unwrap();
         let state = directory.path().join("state");
-        let evaluation = Evaluation::open(&config, Some("release"), &state).unwrap();
+        Evaluation::add_profile(&config, Some("release"), &state, "release", false).unwrap();
+        let evaluation = Evaluation::open(&config, "release", &state).unwrap();
         let selector = EvaluationSelector::new("one");
 
         let status = evaluation.status().unwrap();
@@ -769,12 +868,55 @@ trials = 1
 "#,
         )
         .unwrap();
-        let evaluation =
-            Evaluation::open(&config, Some("release"), directory.path().join("state")).unwrap();
+        let state = directory.path().join("state");
+        Evaluation::add_profile(&config, Some("release"), &state, "release", false).unwrap();
+        let evaluation = Evaluation::open(&config, "release", state).unwrap();
 
         let failure = evaluation
             .claim(&EvaluationSelector::new("outside"), Duration::from_secs(30))
             .unwrap_err();
         assert!(failure.to_string().contains("is not part of profile"));
+    }
+
+    #[test]
+    fn sqlite_board_survives_recipe_and_harness_config_removal() {
+        let directory = tempfile::tempdir().unwrap();
+        write_task(directory.path());
+        let config = directory.path().join("nanocodex.toml");
+        fs::write(
+            &config,
+            r#"[profiles.release]
+tasks = ["one"]
+trials = 3
+harness = ["codex"]
+model = ["sol"]
+thinking = ["high"]
+"#,
+        )
+        .unwrap();
+        let state = directory.path().join("state");
+
+        Evaluation::add_profile(&config, Some("release"), &state, "board", false).unwrap();
+        fs::remove_file(&config).unwrap();
+        let evaluation = Evaluation::open(&config, "board", &state).unwrap();
+        let status = evaluation.status().unwrap();
+
+        assert_eq!(status.coordinates.pending, 3);
+        assert_eq!(status.families[0].treatment.harness, "codex");
+        assert_eq!(
+            status.families[0].treatment.model,
+            "sol".parse::<Model>().unwrap()
+        );
+        let failure = evaluation
+            .claim(
+                &EvaluationSelector::new("one").harness(Some("codex")),
+                Duration::from_secs(30),
+            )
+            .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("failed to read evaluation manifest")
+        );
     }
 }

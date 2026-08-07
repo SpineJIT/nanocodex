@@ -1,6 +1,6 @@
-//! Durable profile worksets without execution policy.
+//! Durable SQLite worksets without execution policy.
 //!
-//! A workset records the complete desired profile matrix, but never chooses a
+//! A workset records the complete desired coordinate matrix, but never chooses a
 //! task for its caller. Callers select an exact coordinate family and the
 //! ledger atomically allocates one fungible repetition within that family.
 
@@ -9,27 +9,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Complete immutable definition of one profile revision.
-#[derive(Clone, Debug)]
-pub struct WorksetSpec {
-    /// Human-readable profile name.
-    pub profile: String,
-    /// Digest of the resolved profile, task packages, and treatments.
-    pub digest: String,
-    /// Canonical source configuration path.
-    pub config_path: PathBuf,
-    /// Exact task packages included in this revision.
-    pub tasks: Vec<WorksetTask>,
-    /// Exact coordinate families included in this revision.
-    pub families: Vec<WorksetFamily>,
-}
 
 /// One task package included in a workset.
 #[derive(Clone, Debug)]
@@ -44,7 +29,7 @@ pub struct WorksetTask {
     pub digest: String,
 }
 
-/// One exact treatment with a profile-owned repetition count.
+/// One exact treatment with a ledger-owned repetition count.
 #[derive(Clone, Debug)]
 pub struct WorksetFamily {
     /// Stable identity of all semantic knobs except repetition.
@@ -57,7 +42,20 @@ pub struct WorksetFamily {
     pub trials: u16,
 }
 
-/// Durable SQLite profile ledger.
+/// Complete work definition read back from SQLite.
+#[derive(Clone, Debug)]
+pub struct WorksetDefinition {
+    /// User-visible name of the durable board.
+    pub profile: String,
+    /// Stable identifier of this board generation.
+    pub digest: String,
+    /// Task packages retained by the board.
+    pub tasks: Vec<WorksetTask>,
+    /// Exact treatments and desired repetition counts retained by the board.
+    pub families: Vec<WorksetFamily>,
+}
+
+/// Durable SQLite workset ledger.
 #[derive(Clone, Debug)]
 pub struct Workset {
     path: PathBuf,
@@ -87,7 +85,7 @@ pub struct PreparationLease {
     owner: String,
 }
 
-/// Fenced ownership of one internal profile repetition.
+/// Fenced ownership of one internal workset repetition.
 #[derive(Clone, Debug)]
 pub struct CoordinateLease {
     coordinate_id: i64,
@@ -107,7 +105,7 @@ pub struct WorksetBusy {
     pub retry_after_ms: u64,
 }
 
-/// Profile-level durable status.
+/// Workset-level durable status.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WorksetStatus {
     /// Profile name.
@@ -174,10 +172,13 @@ pub enum WorksetError {
     /// SQLite operation failed.
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
-    /// The selected profile family is not part of the initialized workset.
-    #[error("coordinate family `{0}` is not part of this profile revision")]
+    /// No generation exists for the requested workset name.
+    #[error("evaluation workset `{0}` does not exist")]
+    UnknownWorkset(String),
+    /// The selected family is not part of the initialized workset.
+    #[error("coordinate family `{0}` is not part of this workset")]
     UnknownFamily(String),
-    /// A family references a task absent from the same profile revision.
+    /// A family references a task absent from the same workset.
     #[error("coordinate family `{family}` references unknown task `{task}`")]
     UnknownTask {
         /// Family containing the invalid reference.
@@ -185,8 +186,8 @@ pub enum WorksetError {
         /// Missing profile-visible task selector.
         task: String,
     },
-    /// An initialized profile revision disagrees with its immutable definition.
-    #[error("profile revision `{0}` conflicts with its initialized SQLite workset")]
+    /// Appended work disagrees with a definition already retained in SQLite.
+    #[error("workset `{0}` conflicts with its retained SQLite definition")]
     DefinitionConflict(String),
     /// A stale worker attempted to mutate work after losing its lease.
     #[error("stale {kind} lease was fenced before it could commit")]
@@ -200,87 +201,108 @@ pub enum WorksetError {
 }
 
 impl Workset {
-    /// Opens the SQLite file, initializes its schema, and idempotently
-    /// materializes every task and repetition in `spec`.
-    pub fn ensure(path: impl Into<PathBuf>, spec: &WorksetSpec) -> Result<Self, WorksetError> {
+    /// Opens the newest generation of a named durable workset.
+    pub fn open(path: impl Into<PathBuf>, profile: &str) -> Result<Self, WorksetError> {
         let path = path.into();
         let mut connection = open_connection(&path)?;
         initialize_schema(&mut connection)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO worksets(profile, digest, config_path, created_at_ms) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                spec.profile,
-                spec.digest,
-                spec.config_path.to_string_lossy(),
-                now_ms()?
-            ],
-        )?;
-        let id: i64 = transaction.query_row(
-            "SELECT id FROM worksets WHERE profile = ?1 AND digest = ?2",
-            params![spec.profile, spec.digest],
-            |row| row.get(0),
-        )?;
-        for task in &spec.tasks {
-            transaction.execute(
-                "INSERT OR IGNORE INTO tasks( \
-                    workset_id, selector, name, root, digest, preparation_state, preparation_generation \
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0)",
-                params![
-                    id,
-                    task.selector,
-                    task.name,
-                    task.root.to_string_lossy(),
-                    task.digest
-                ],
-            )?;
-            let retained: Option<(String, String, String)> = transaction
-                .query_row(
-                    "SELECT name, root, digest FROM tasks WHERE workset_id = ?1 AND selector = ?2",
-                    params![id, task.selector],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?;
-            if retained.as_ref()
-                != Some(&(
-                    task.name.clone(),
-                    task.root.to_string_lossy().into_owned(),
-                    task.digest.clone(),
-                ))
-            {
-                return Err(WorksetError::DefinitionConflict(spec.digest.clone()));
-            }
-        }
-        for family in &spec.families {
-            let task_id: Option<i64> = transaction
-                .query_row(
-                    "SELECT id FROM tasks WHERE workset_id = ?1 AND selector = ?2",
-                    params![id, family.task_selector],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let Some(task_id) = task_id else {
-                return Err(WorksetError::UnknownTask {
-                    family: family.key.clone(),
-                    task: family.task_selector.clone(),
-                });
-            };
-            for repetition in 1..=family.trials {
-                transaction.execute(
-                    "INSERT OR IGNORE INTO coordinates( \
-                        workset_id, task_id, family_key, treatment, repetition, state, generation \
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0)",
-                    params![id, task_id, family.key, family.treatment, repetition],
-                )?;
-            }
-        }
-        transaction.commit()?;
+        let retained: Option<(i64, String)> = connection
+            .query_row(
+                "SELECT id, digest FROM worksets WHERE profile = ?1 \
+                 ORDER BY created_at_ms DESC, id DESC LIMIT 1",
+                [profile],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((id, digest)) = retained else {
+            return Err(WorksetError::UnknownWorkset(profile.to_owned()));
+        };
         Ok(Self {
             path,
             id,
-            profile: spec.profile.clone(),
-            digest: spec.digest.clone(),
+            profile: profile.to_owned(),
+            digest,
+        })
+    }
+
+    /// Creates a new empty generation of a named workset.
+    pub fn create(path: impl Into<PathBuf>, profile: &str) -> Result<Self, WorksetError> {
+        let path = path.into();
+        let mut connection = open_connection(&path)?;
+        initialize_schema(&mut connection)?;
+        let digest = Uuid::now_v7().simple().to_string();
+        connection.execute(
+            "INSERT INTO worksets(profile, digest, config_path, created_at_ms) \
+             VALUES (?1, ?2, '', ?3)",
+            params![profile, digest, now_ms()?],
+        )?;
+        Ok(Self {
+            path,
+            id: connection.last_insert_rowid(),
+            profile: profile.to_owned(),
+            digest,
+        })
+    }
+
+    /// Idempotently appends tasks, treatments, and any missing repetitions.
+    /// Existing accepted work is never rewritten or removed.
+    pub fn append(
+        &self,
+        tasks: &[WorksetTask],
+        families: &[WorksetFamily],
+    ) -> Result<(), WorksetError> {
+        let mut connection = open_connection(&self.path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        append_definition(&transaction, self.id, &self.digest, tasks, families)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Reads the concrete task and coordinate definitions retained in SQLite.
+    pub fn definition(&self) -> Result<WorksetDefinition, WorksetError> {
+        let connection = open_connection(&self.path)?;
+        let mut tasks = connection.prepare(
+            "SELECT selector, name, root, digest FROM tasks \
+             WHERE workset_id = ?1 ORDER BY selector",
+        )?;
+        let tasks = tasks
+            .query_map([self.id], |row| {
+                Ok(WorksetTask {
+                    selector: row.get(0)?,
+                    name: row.get(1)?,
+                    root: PathBuf::from(row.get::<_, String>(2)?),
+                    digest: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut families = connection.prepare(
+            "SELECT c.family_key, t.selector, c.treatment, COUNT(*) \
+             FROM coordinates c JOIN tasks t ON t.id = c.task_id \
+             WHERE c.workset_id = ?1 \
+             GROUP BY c.family_key, t.selector, c.treatment \
+             ORDER BY t.selector, c.family_key",
+        )?;
+        let families = families
+            .query_map([self.id], |row| {
+                let trials: i64 = row.get(3)?;
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, trials))
+            })?
+            .map(|row| {
+                let (key, task_selector, treatment, trials) = row?;
+                Ok(WorksetFamily {
+                    key,
+                    task_selector,
+                    treatment,
+                    trials: u16::try_from(trials)
+                        .map_err(|_| WorksetError::OutOfRange("family trials"))?,
+                })
+            })
+            .collect::<Result<Vec<_>, WorksetError>>()?;
+        Ok(WorksetDefinition {
+            profile: self.profile.clone(),
+            digest: self.digest.clone(),
+            tasks,
+            families,
         })
     }
 
@@ -514,7 +536,7 @@ impl Workset {
         self.finish_coordinate(lease, "pending", None, Some(error))
     }
 
-    /// Reads a complete profile and family status snapshot.
+    /// Reads a complete workset and family status snapshot.
     pub fn status(&self) -> Result<WorksetStatus, WorksetError> {
         let connection = open_connection(&self.path)?;
         let now = now_ms()?;
@@ -631,6 +653,89 @@ impl Workset {
         transaction.commit()?;
         Ok(())
     }
+}
+
+fn append_definition(
+    transaction: &Transaction<'_>,
+    workset_id: i64,
+    workset_digest: &str,
+    tasks: &[WorksetTask],
+    families: &[WorksetFamily],
+) -> Result<(), WorksetError> {
+    for task in tasks {
+        transaction.execute(
+            "INSERT OR IGNORE INTO tasks( \
+                workset_id, selector, name, root, digest, preparation_state, preparation_generation \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0)",
+            params![
+                workset_id,
+                task.selector,
+                task.name,
+                task.root.to_string_lossy(),
+                task.digest
+            ],
+        )?;
+        let retained: Option<(String, String, String)> = transaction
+            .query_row(
+                "SELECT name, root, digest FROM tasks WHERE workset_id = ?1 AND selector = ?2",
+                params![workset_id, task.selector],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if retained.as_ref()
+            != Some(&(
+                task.name.clone(),
+                task.root.to_string_lossy().into_owned(),
+                task.digest.clone(),
+            ))
+        {
+            return Err(WorksetError::DefinitionConflict(workset_digest.to_owned()));
+        }
+    }
+    for family in families {
+        let task_id: Option<i64> = transaction
+            .query_row(
+                "SELECT id FROM tasks WHERE workset_id = ?1 AND selector = ?2",
+                params![workset_id, family.task_selector],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(task_id) = task_id else {
+            return Err(WorksetError::UnknownTask {
+                family: family.key.clone(),
+                task: family.task_selector.clone(),
+            });
+        };
+        let retained: Option<(i64, String)> = transaction
+            .query_row(
+                "SELECT task_id, treatment FROM coordinates \
+                 WHERE workset_id = ?1 AND family_key = ?2 LIMIT 1",
+                params![workset_id, family.key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if retained
+            .as_ref()
+            .is_some_and(|retained| retained != &(task_id, family.treatment.clone()))
+        {
+            return Err(WorksetError::DefinitionConflict(workset_digest.to_owned()));
+        }
+        for repetition in 1..=family.trials {
+            transaction.execute(
+                "INSERT OR IGNORE INTO coordinates( \
+                    workset_id, task_id, family_key, treatment, repetition, state, generation \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0)",
+                params![
+                    workset_id,
+                    task_id,
+                    family.key,
+                    family.treatment,
+                    repetition
+                ],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn open_connection(path: &Path) -> Result<Connection, WorksetError> {
@@ -771,29 +876,32 @@ const fn fenced(changed: usize, kind: &'static str) -> Result<(), WorksetError> 
 mod tests {
     use super::*;
 
-    fn spec(root: &Path, trials: u16) -> WorksetSpec {
-        WorksetSpec {
-            profile: "release".to_owned(),
-            digest: "profile-digest".to_owned(),
-            config_path: root.join("nanocodex.toml"),
-            tasks: vec![WorksetTask {
+    fn definition(root: &Path, trials: u16) -> (Vec<WorksetTask>, Vec<WorksetFamily>) {
+        (
+            vec![WorksetTask {
                 selector: "terminal/fix-git".to_owned(),
                 name: "fix-git".to_owned(),
                 root: root.join("fix-git"),
                 digest: "task-digest".to_owned(),
             }],
-            families: vec![WorksetFamily {
+            vec![WorksetFamily {
                 key: "terminal/fix-git|harness|high".to_owned(),
                 task_selector: "terminal/fix-git".to_owned(),
                 treatment: "codex high".to_owned(),
                 trials,
             }],
-        }
+        )
+    }
+
+    fn workset(directory: &Path, trials: u16) -> Workset {
+        let workset = Workset::create(directory.join("state.sqlite3"), "release").unwrap();
+        let (tasks, families) = definition(directory, trials);
+        workset.append(&tasks, &families).unwrap();
+        workset
     }
 
     fn prepared_workset(directory: &Path, trials: u16) -> Workset {
-        let workset =
-            Workset::ensure(directory.join("state.sqlite3"), &spec(directory, trials)).unwrap();
+        let workset = workset(directory, trials);
         let BeginCoordinate::Prepare(preparation) = workset
             .begin("terminal/fix-git|harness|high", Duration::from_secs(30))
             .unwrap()
@@ -805,18 +913,53 @@ mod tests {
     }
 
     #[test]
-    fn ensure_materializes_every_repetition_before_execution() {
+    fn append_materializes_every_repetition_before_execution() {
         let directory = tempfile::tempdir().unwrap();
-        let workset = Workset::ensure(
-            directory.path().join("state.sqlite3"),
-            &spec(directory.path(), 3),
-        )
-        .unwrap();
+        let workset = workset(directory.path(), 3);
         let status = workset.status().unwrap();
 
         assert_eq!(status.preparation.pending, 1);
         assert_eq!(status.coordinates.pending, 3);
         assert_eq!(status.families[0].desired, 3);
+    }
+
+    #[test]
+    fn named_workset_can_be_reopened_and_extended_without_a_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let workset = Workset::create(&path, "release").unwrap();
+        let (tasks, families) = definition(directory.path(), 2);
+        workset.append(&tasks, &families).unwrap();
+        let reopened = Workset::open(&path, "release").unwrap();
+        let retained = reopened.definition().unwrap();
+
+        assert_eq!(retained.profile, "release");
+        assert_eq!(retained.digest, workset.digest);
+        assert_eq!(retained.tasks.len(), 1);
+        assert_eq!(retained.families[0].trials, 2);
+
+        let (tasks, families) = definition(directory.path(), 5);
+        reopened.append(&tasks, &families).unwrap();
+        assert_eq!(reopened.status().unwrap().coordinates.pending, 5);
+        assert_eq!(reopened.definition().unwrap().families[0].trials, 5);
+    }
+
+    #[test]
+    fn new_generation_does_not_mutate_the_previous_board() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let first = Workset::create(&path, "release").unwrap();
+        let (tasks, families) = definition(directory.path(), 1);
+        first.append(&tasks, &families).unwrap();
+        let second = Workset::create(&path, "release").unwrap();
+
+        assert_ne!(first.digest, second.digest);
+        assert_eq!(
+            Workset::open(&path, "release").unwrap().digest,
+            second.digest
+        );
+        assert!(second.definition().unwrap().tasks.is_empty());
+        assert_eq!(first.definition().unwrap().tasks.len(), 1);
     }
 
     #[test]
@@ -851,11 +994,7 @@ mod tests {
     #[test]
     fn one_host_owns_task_preparation_and_every_coordinate() {
         let directory = tempfile::tempdir().unwrap();
-        let workset = Workset::ensure(
-            directory.path().join("state.sqlite3"),
-            &spec(directory.path(), 1),
-        )
-        .unwrap();
+        let workset = workset(directory.path(), 1);
         let BeginCoordinate::Prepare(preparation) = workset
             .begin_for_host(
                 "terminal/fix-git|harness|high",
@@ -901,11 +1040,7 @@ mod tests {
     #[test]
     fn expired_preparation_is_reported_pending_and_fenced_on_reclamation() {
         let directory = tempfile::tempdir().unwrap();
-        let workset = Workset::ensure(
-            directory.path().join("state.sqlite3"),
-            &spec(directory.path(), 1),
-        )
-        .unwrap();
+        let workset = workset(directory.path(), 1);
         let BeginCoordinate::Prepare(stale) = workset
             .begin("terminal/fix-git|harness|high", Duration::ZERO)
             .unwrap()
@@ -995,11 +1130,7 @@ mod tests {
     #[test]
     fn unknown_family_never_expands_the_closed_profile() {
         let directory = tempfile::tempdir().unwrap();
-        let workset = Workset::ensure(
-            directory.path().join("state.sqlite3"),
-            &spec(directory.path(), 1),
-        )
-        .unwrap();
+        let workset = workset(directory.path(), 1);
 
         assert!(matches!(
             workset.begin("not-in-profile", Duration::from_secs(30)),
@@ -1017,7 +1148,7 @@ mod tests {
         drop(connection);
 
         assert!(matches!(
-            Workset::ensure(&path, &spec(directory.path(), 1)),
+            Workset::open(&path, "release"),
             Err(WorksetError::DefinitionConflict(message)) if message.contains("schema 99")
         ));
         let connection = Connection::open(path).unwrap();
@@ -1061,7 +1192,9 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let workset = Workset::ensure(&path, &spec(directory.path(), 1)).unwrap();
+        let workset = Workset::create(&path, "release").unwrap();
+        let (tasks, families) = definition(directory.path(), 1);
+        workset.append(&tasks, &families).unwrap();
         let BeginCoordinate::Prepare(preparation) = workset
             .begin_for_host(
                 "terminal/fix-git|harness|high",

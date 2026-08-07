@@ -6,7 +6,7 @@ pub(crate) fn prompt(
     state_dir: Option<&Path>,
     coordinator: Option<&str>,
 ) -> String {
-    let selected = profile.unwrap_or("the manifest default profile");
+    let selected = profile.unwrap_or("the selected SQLite workset");
     let profile_argument =
         profile.map_or_else(String::new, |profile| format!(" {}", shell_quote(profile)));
     let state_argument = state_dir.map_or_else(String::new, |directory| {
@@ -17,11 +17,11 @@ pub(crate) fn prompt(
     });
     let config_argument = shell_quote(&config.to_string_lossy());
     format!(
-        r#"Drive the closed Nanocodex evaluation profile {selected} to durable completion.
+        r#"Drive the Nanocodex SQLite workset {selected} to durable completion.
 
-The desired amount of work is defined only by `{config}`. Never add an ad-hoc task, treatment, model, reasoning effort, or trial. Materialize and inspect its durable SQLite ledger with:
+The desired amount of work is already materialized in SQLite. Do not infer it from `{config}` or add ad-hoc work during this workflow. Inspect the durable ledger with:
 
-    nanocodex eval status{profile_argument} --config {config_argument}{state_argument}{coordinator_argument} --json
+    nanocodex eval status{profile_argument}{state_argument}{coordinator_argument} --json
 
 You own execution strategy. Read the family records, choose an exact pending task and harness treatment, and invoke one repetition with `nanocodex eval run{profile_argument} --config {config_argument}{state_argument}{coordinator_argument} --task <exact-profile-selector>` plus `--harness`, model, or thinking selectors required to identify that profile family. Omit `--harness` for built-in Nanocodex. The CLI allocates the internal repetition; never pass or invent a trial number.
 
@@ -68,7 +68,7 @@ mod tests {
             None,
         );
 
-        assert!(prompt.contains("status 'release candidate' --config 'configs/eval profile.toml'"));
+        assert!(prompt.contains("status 'release candidate' --state-dir '/mnt/eval state'"));
         assert!(prompt.contains("--state-dir '/mnt/eval state'"));
     }
 
@@ -81,9 +81,7 @@ mod tests {
             Some("http://127.0.0.1:8789"),
         );
 
-        assert!(prompt.contains(
-            "status 'release' --config 'nanocodex.toml' --coordinator 'http://127.0.0.1:8789'"
-        ));
+        assert!(prompt.contains("status 'release' --coordinator 'http://127.0.0.1:8789'"));
         assert!(prompt.contains(
             "run 'release' --config 'nanocodex.toml' --coordinator 'http://127.0.0.1:8789' --task"
         ));
