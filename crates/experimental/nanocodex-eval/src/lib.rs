@@ -47,6 +47,7 @@
     allow(dead_code, unused_imports)
 )]
 
+mod api;
 /// Agent Trajectory Interchange Format projection and wire types.
 pub mod atif;
 mod capture_proxy;
