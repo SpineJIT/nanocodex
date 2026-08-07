@@ -76,9 +76,21 @@ Relevant global options:
 --provider.tempo
 --provider.tempo.api-base-url <https-url>  # default https://openai.mpp.tempo.xyz/v1
 --provider.tempo.wallet-store <path>       # default ~/.tempo/wallet/store.json
+--provider.tempo.payment-token <address>   # default NanoUSD
 --provider.tempo.swap-slippage-bps <bps>   # default 100
 --provider.tempo.api-key <key>             # optional gated deployment key
 ```
+
+The payment token is both the preferred challenge currency and the input token
+for automatic swaps when a service charges another supported currency. For
+example, use PathUSD with:
+
+```console
+nanocodex --provider.tempo \
+  --provider.tempo.payment-token 0x20c0000000000000000000000000000000000000
+```
+
+It can also be set with `NANOCODEX_PROVIDER_TEMPO_PAYMENT_TOKEN`.
 
 Tempo selects the HTTPS Responses transport. Explicitly selecting WebSocket
 with `--provider.tempo` is rejected during startup. Direct OpenAI continues to

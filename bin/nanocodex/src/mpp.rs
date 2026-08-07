@@ -10,6 +10,7 @@ mod egress;
 mod resource;
 
 use self::egress::TempoEgress;
+use alloy_primitives::Address;
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Context, Result, eyre};
 use mpp::{
@@ -56,7 +57,7 @@ pub(crate) struct MppArgs {
     )]
     openai: bool,
 
-    /// Pay for HTTPS Responses and tool requests with `NanoUSD` Charge.
+    /// Pay for HTTPS Responses and tool requests with Tempo Charge.
     #[arg(
         long = "provider.tempo",
         id = "tempo",
@@ -86,7 +87,16 @@ pub(crate) struct MppArgs {
     )]
     wallet_store: Option<PathBuf>,
 
-    /// Maximum slippage for automatic swaps from `NanoUSD`, in basis points.
+    /// Preferred payment token and automatic-swap input currency.
+    #[arg(
+        long = "provider.tempo.payment-token",
+        global = true,
+        env = "NANOCODEX_PROVIDER_TEMPO_PAYMENT_TOKEN",
+        default_value_t = NANOUSD_ADDRESS
+    )]
+    payment_token: Address,
+
+    /// Maximum slippage for automatic swaps from the payment token, in basis points.
     #[arg(
         long = "provider.tempo.swap-slippage-bps",
         global = true,
@@ -133,8 +143,11 @@ impl MppArgs {
         )?;
         let provider = provider
             .with_expected_chain_id(TEMPO_MAINNET_CHAIN_ID)
-            .with_preferred_currency(NANOUSD_ADDRESS)
-            .with_autoswap(AutoswapConfig::new(NANOUSD_ADDRESS, self.swap_slippage_bps));
+            .with_preferred_currency(self.payment_token)
+            .with_autoswap(AutoswapConfig::new(
+                self.payment_token,
+                self.swap_slippage_bps,
+            ));
         let egress = EgressProxy::builder()
             .allow_loopback_upstreams(allow_loopback)
             .layer(TempoEgress::new(provider))
@@ -306,6 +319,13 @@ fn responses_payment_headers(api_key: Option<&str>) -> Result<reqwest::header::H
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        mpp: MppArgs,
+    }
 
     fn test_args() -> MppArgs {
         MppArgs {
@@ -313,6 +333,7 @@ mod tests {
             enabled: false,
             api_base_url: DEFAULT_MPP_API_BASE_URL.to_owned(),
             wallet_store: None,
+            payment_token: NANOUSD_ADDRESS,
             swap_slippage_bps: DEFAULT_TEMPO_SWAP_SLIPPAGE_BPS,
             mpp_api_key: None,
         }
@@ -321,6 +342,21 @@ mod tests {
     #[tokio::test]
     async fn mpp_is_opt_in() {
         assert!(test_args().start().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn payment_token_defaults_to_nanousd_and_accepts_pathusd() {
+        let default = TestCli::try_parse_from(["nanocodex"]).unwrap();
+        assert_eq!(default.mpp.payment_token, NANOUSD_ADDRESS);
+
+        let pathusd = alloy_primitives::address!("20c0000000000000000000000000000000000000");
+        let configured = TestCli::try_parse_from([
+            "nanocodex",
+            "--provider.tempo.payment-token",
+            "0x20c0000000000000000000000000000000000000",
+        ])
+        .unwrap();
+        assert_eq!(configured.mpp.payment_token, pathusd);
     }
 
     #[cfg(any(
