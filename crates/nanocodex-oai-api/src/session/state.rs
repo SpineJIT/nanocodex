@@ -347,7 +347,7 @@ mod tests {
     use crate::{FunctionOutputBody, ResponseItem};
 
     #[test]
-    fn resume_accepts_legacy_spine_code_mode_terminal_output() {
+    fn resume_accepts_spine_code_mode_terminal_output() {
         let call: ResponseItem = serde_json::from_str(
             r#"{"type":"custom_tool_call","id":"ctc_source","call_id":"exec","name":"exec","input":"code"}"#,
         )

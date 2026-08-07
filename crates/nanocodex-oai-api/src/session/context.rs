@@ -8,7 +8,7 @@ use crate::{
 use super::compaction;
 
 const TOOL_OUTPUT_TOKEN_LIMIT: usize = 12_000;
-const LEGACY_SPINE_CODE_MODE_OUTPUT_NAME: &str = "spine.code_mode.output.v1";
+const SPINE_CODE_MODE_OUTPUT_NAME: &str = "spine.code_mode.output.v1";
 // Changing this value would change model-visible IDs and invalidate prompt caches.
 const SYNTHETIC_OUTPUT_ID_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
@@ -392,7 +392,7 @@ pub fn has_well_formed_tool_calls(items: &[ResponseItem]) -> bool {
 }
 
 fn is_terminal_custom_tool_output(name: Option<&str>) -> bool {
-    name.is_none() || name == Some(LEGACY_SPINE_CODE_MODE_OUTPUT_NAME)
+    name.is_none() || name == Some(SPINE_CODE_MODE_OUTPUT_NAME)
 }
 
 const fn is_model_generated_item(item: &ResponseItem) -> bool {
