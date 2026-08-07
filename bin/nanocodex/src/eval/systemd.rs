@@ -21,6 +21,7 @@ pub(super) fn install(
     config: &Path,
     state_dir: Option<&Path>,
     coordinator: Option<&str>,
+    runtime_dir: Option<&Path>,
 ) -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!("--systemd is supported only on Linux");
@@ -32,6 +33,24 @@ pub(super) fn install(
     let working_directory = config
         .parent()
         .ok_or_else(|| eyre!("runtime helper config has no parent directory"))?;
+    let runtime_dir = runtime_dir.map_or_else(
+        || working_directory.join(".nanocodex-runtime"),
+        |runtime_dir| absolute(runtime_dir, &invocation_directory),
+    );
+    let temporary_directory = runtime_dir.join("tmp");
+    fs::create_dir_all(&temporary_directory).wrap_err_with(|| {
+        format!(
+            "failed to create benchmark runtime directory {}",
+            temporary_directory.display()
+        )
+    })?;
+    let runtime_dir = runtime_dir.canonicalize().wrap_err_with(|| {
+        format!(
+            "failed to resolve benchmark runtime directory {}",
+            runtime_dir.display()
+        )
+    })?;
+    let temporary_directory = runtime_dir.join("tmp");
     if let Some(coordinator) = coordinator {
         CoordinatorClient::new(coordinator)?;
     }
@@ -52,7 +71,13 @@ pub(super) fn install(
         .or_else(|| state_dir.as_deref().map(Path::as_os_str))
         .ok_or_else(|| eyre!("benchmark service target is absent"))?;
     let unit_name = unit_name(profile, &config, target);
-    let unit = render_unit(&executable, &arguments, working_directory)?;
+    let unit = render_unit(
+        &executable,
+        &arguments,
+        working_directory,
+        &runtime_dir,
+        &temporary_directory,
+    )?;
     let unit_path = user_unit_directory()?.join(&unit_name);
 
     fs::create_dir_all(
@@ -87,6 +112,7 @@ fn normalize_service_arguments(
     state_dir: Option<&Path>,
 ) -> Vec<OsString> {
     arguments.retain(|argument| argument != "--systemd");
+    remove_option(&mut arguments, "--runtime-dir");
     replace_option(&mut arguments, "--config", config.as_os_str());
     if let Some(state_dir) = state_dir {
         replace_option(&mut arguments, "--state-dir", state_dir.as_os_str());
@@ -95,6 +121,28 @@ fn normalize_service_arguments(
         arguments.push(OsString::from("--headless"));
     }
     arguments
+}
+
+fn remove_option(arguments: &mut Vec<OsString>, option: &str) {
+    let with_equals = format!("{option}=");
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == option {
+            arguments.remove(index);
+            if index < arguments.len() {
+                arguments.remove(index);
+            }
+            continue;
+        }
+        if arguments[index]
+            .to_str()
+            .is_some_and(|argument| argument.starts_with(&with_equals))
+        {
+            arguments.remove(index);
+            continue;
+        }
+        index += 1;
+    }
 }
 
 fn replace_option(arguments: &mut Vec<OsString>, option: &str, value: &OsStr) {
@@ -126,6 +174,8 @@ fn render_unit(
     executable: &Path,
     arguments: &[OsString],
     working_directory: &Path,
+    runtime_directory: &Path,
+    temporary_directory: &Path,
 ) -> Result<String> {
     let mut command = quote(executable.as_os_str())?;
     for argument in arguments {
@@ -140,6 +190,8 @@ fn render_unit(
          [Service]\n\
          Type=simple\n\
          WorkingDirectory={}\n\
+         Environment={}\n\
+         Environment={}\n\
          ExecStart={command}\n\
          Restart=on-failure\n\
          RestartSec={RESTART_DELAY}\n\
@@ -148,6 +200,10 @@ fn render_unit(
          [Install]\n\
          WantedBy=default.target\n",
         escape_path(working_directory.as_os_str())?,
+        quote(
+            OsString::from(format!("NANOCODEX_HOME={}", runtime_directory.display())).as_os_str()
+        )?,
+        quote(OsString::from(format!("TMPDIR={}", temporary_directory.display())).as_os_str())?,
     ))
 }
 
@@ -311,12 +367,16 @@ mod tests {
                 OsString::from("--headless"),
             ],
             "/srv/evals".as_ref(),
+            "/mnt/eval-runtime".as_ref(),
+            "/mnt/eval-runtime/tmp".as_ref(),
         )
         .unwrap();
         assert!(unit.contains(
             "ExecStart=\"/opt/nanocodex/bin/nanocodex\" \"eval\" \"benchmark\" \"terminal bench\" \"--headless\""
         ));
         assert!(unit.contains("WorkingDirectory=/srv/evals"));
+        assert!(unit.contains("Environment=\"NANOCODEX_HOME=/mnt/eval-runtime\""));
+        assert!(unit.contains("Environment=\"TMPDIR=/mnt/eval-runtime/tmp\""));
         assert!(unit.contains("Restart=on-failure"));
         assert!(!unit.contains("RestartPreventExitStatus"));
     }
@@ -358,6 +418,7 @@ mod tests {
                 "http://127.0.0.1:8788",
                 "--worker",
                 "dev-georgios-01",
+                "--runtime-dir=/mnt/eval-runtime",
                 "--systemd",
             ]
             .map(OsString::from)
@@ -383,6 +444,11 @@ mod tests {
             .map(OsString::from)
         );
         assert!(!arguments.iter().any(|argument| argument == "--state-dir"));
+        assert!(!arguments.iter().any(|argument| {
+            argument
+                .to_str()
+                .is_some_and(|argument| argument.starts_with("--runtime-dir"))
+        }));
     }
 
     #[test]

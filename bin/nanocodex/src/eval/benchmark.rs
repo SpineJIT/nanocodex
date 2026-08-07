@@ -51,6 +51,14 @@ pub(super) struct Benchmark {
     #[arg(long)]
     systemd: bool,
 
+    /// Host-local cache and temporary workspace for the supervised benchmark.
+    ///
+    /// The systemd unit exports this as `NANOCODEX_HOME` and places `TMPDIR`
+    /// beneath it so VM images and transient build contexts stay off the root
+    /// filesystem.
+    #[arg(long, value_name = "DIRECTORY", requires = "systemd")]
+    runtime_dir: Option<PathBuf>,
+
     #[command(flatten)]
     agent: AgentArgs,
 
@@ -71,6 +79,7 @@ impl Benchmark {
             worker,
             headless,
             systemd,
+            runtime_dir,
             agent,
             observability,
             vm,
@@ -81,6 +90,7 @@ impl Benchmark {
                 &config,
                 state_dir.as_deref(),
                 coordinator.as_deref(),
+                runtime_dir.as_deref(),
             );
         }
         let executable =
