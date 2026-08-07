@@ -86,6 +86,17 @@ mod tests {
             vec!["nanocodex", "eval", "status", "local-smoke"],
             vec!["nanocodex", "eval", "benchmark", "local-smoke"],
             vec!["nanocodex", "eval", "benchmark", "local-smoke", "--systemd"],
+            vec![
+                "nanocodex",
+                "eval",
+                "benchmark",
+                "local-smoke",
+                "--coordinator",
+                "http://127.0.0.1:8788",
+                "--worker",
+                "dev-one",
+                "--systemd",
+            ],
             vec!["nanocodex", "eval", "coordinator", "local-smoke"],
         ] {
             Cli::try_parse_from(arguments).expect("supported eval command must parse");

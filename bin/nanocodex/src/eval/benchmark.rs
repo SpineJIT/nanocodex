@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::Args;
+use clap::{Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr as _};
 use nanocodex_eval::{Evaluation, EvaluationStatus, coordinator::CoordinatorClient};
 use serde::Deserialize;
@@ -30,6 +30,16 @@ pub(super) struct Benchmark {
     #[arg(long, value_name = "URL", conflicts_with = "state_dir")]
     coordinator: Option<String>,
 
+    /// Stable host identity used for coordinator task affinity.
+    #[arg(
+        long,
+        env = "NANOCODEX_WORKER_NAME",
+        value_name = "NAME",
+        value_parser = NonEmptyStringValueParser::new(),
+        requires = "coordinator"
+    )]
+    worker: Option<String>,
+
     /// Run the same benchmark workflow as flushed JSONL without a TUI.
     #[arg(long)]
     headless: bool,
@@ -58,6 +68,7 @@ impl Benchmark {
             config,
             state_dir,
             coordinator,
+            worker,
             headless,
             systemd,
             agent,
@@ -77,6 +88,7 @@ impl Benchmark {
             &config,
             state_dir.as_deref(),
             coordinator.as_deref(),
+            worker.as_deref(),
         );
         let initial = BoardStatus::load(
             &profile,

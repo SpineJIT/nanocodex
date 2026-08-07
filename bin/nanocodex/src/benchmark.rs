@@ -5,6 +5,7 @@ pub(crate) fn prompt(
     config: &Path,
     state_dir: Option<&Path>,
     coordinator: Option<&str>,
+    worker: Option<&str>,
 ) -> String {
     let selected = profile.unwrap_or("the selected SQLite profile");
     let profile_argument =
@@ -14,6 +15,9 @@ pub(crate) fn prompt(
     });
     let coordinator_argument = coordinator.map_or_else(String::new, |coordinator| {
         format!(" --coordinator {}", shell_quote(coordinator))
+    });
+    let worker_argument = worker.map_or_else(String::new, |worker| {
+        format!(" --worker {}", shell_quote(worker))
     });
     let config_argument = shell_quote(&config.to_string_lossy());
     let ledger = if coordinator.is_some() {
@@ -28,7 +32,7 @@ The desired amount of work is already materialized in {ledger}. Do not infer it 
 
     nanocodex eval status{profile_argument}{state_argument}{coordinator_argument} --json
 
-You own execution strategy. Read the family records, choose an exact pending task and harness treatment, and invoke one repetition with `nanocodex eval run{profile_argument} --config {config_argument}{state_argument}{coordinator_argument} --task <exact-profile-selector>` plus `--harness`, model, or thinking selectors required to identify that profile family. Omit `--harness` for built-in Nanocodex. The CLI allocates the internal repetition; never pass or invent a trial number.
+You own execution strategy. Read the family records, choose an exact pending task and harness treatment, and invoke one repetition with `nanocodex eval run{profile_argument} --config {config_argument}{state_argument}{coordinator_argument}{worker_argument} --task <exact-profile-selector>` plus `--harness`, model, or thinking selectors required to identify that profile family. Omit `--harness` for built-in Nanocodex. The CLI allocates the internal repetition; never pass or invent a trial number.
 
 Decide how many run processes to launch concurrently and which tasks to prioritize. You may adjust fan-out based on memory, preparation contention, failures, and observed throughput. There is deliberately no run-all command, next-work command, scheduler, or host-saturation loop in the evaluator.
 
@@ -54,6 +58,7 @@ mod tests {
             Path::new("nanocodex.toml"),
             Some(Path::new("/mnt/evals")),
             None,
+            None,
         );
 
         assert!(prompt.contains("choose an exact pending task and harness treatment"));
@@ -71,6 +76,7 @@ mod tests {
             Path::new("configs/eval profile.toml"),
             Some(Path::new("/mnt/eval state")),
             None,
+            None,
         );
 
         assert!(prompt.contains("status 'release candidate' --state-dir '/mnt/eval state'"));
@@ -84,11 +90,12 @@ mod tests {
             Path::new("nanocodex.toml"),
             None,
             Some("http://127.0.0.1:8789"),
+            Some("dev-georgios-01"),
         );
 
         assert!(prompt.contains("status 'release' --coordinator 'http://127.0.0.1:8789'"));
         assert!(prompt.contains(
-            "run 'release' --config 'nanocodex.toml' --coordinator 'http://127.0.0.1:8789' --task"
+            "run 'release' --config 'nanocodex.toml' --coordinator 'http://127.0.0.1:8789' --worker 'dev-georgios-01' --task"
         ));
         assert!(prompt.contains("do not open SQLite directly"));
         assert!(!prompt.contains("--state-dir"));

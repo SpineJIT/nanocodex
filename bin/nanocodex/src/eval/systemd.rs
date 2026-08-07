@@ -352,6 +352,8 @@ mod tests {
                 "relative.toml",
                 "--coordinator",
                 "http://127.0.0.1:8788",
+                "--worker",
+                "dev-georgios-01",
                 "--systemd",
             ]
             .map(OsString::from)
@@ -370,6 +372,8 @@ mod tests {
                 "/srv/nanocodex.toml",
                 "--coordinator",
                 "http://127.0.0.1:8788",
+                "--worker",
+                "dev-georgios-01",
                 "--headless",
             ]
             .map(OsString::from)

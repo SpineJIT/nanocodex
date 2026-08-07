@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use clap::Args;
+use clap::{Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr as _, eyre};
 use nanocodex::{Model, Thinking};
 use nanocodex_eval::{
@@ -123,7 +123,12 @@ pub(super) struct Run {
     harness: Option<String>,
 
     /// Advisory stable name used for coordinator task affinity and status.
-    #[arg(long, env = "NANOCODEX_WORKER_NAME", value_name = "NAME")]
+    #[arg(
+        long,
+        env = "NANOCODEX_WORKER_NAME",
+        value_name = "NAME",
+        value_parser = NonEmptyStringValueParser::new()
+    )]
     worker: Option<String>,
 
     #[command(flatten)]
