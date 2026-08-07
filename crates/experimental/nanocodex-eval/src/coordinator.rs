@@ -1092,10 +1092,8 @@ allow_internet = false
             fs::write(&evidence, format!("{{\"worker\":\"{name}\"}}\n")).unwrap();
             fs::write(
                 output.join("events.jsonl"),
-                format!(
-                    "{{\"type\":\"attempt_started\",\"payload\":{{\"prompt\":\"do it\"}},\"attempt\":{{\"task_name\":\"one\"}}}}\n\
-                     {{\"type\":\"completed\",\"payload\":{{\"task_name\":\"one\",\"status\":\"passed\",\"outcome\":\"passed\",\"environment\":\"micro_vm\",\"agent\":{{\"model\":\"sol\",\"effort\":\"high\",\"tool_calls\":1,\"usage\":{{\"total_tokens\":10}}}},\"verifier\":{{\"exit_code\":0,\"rewards\":{{\"reward\":1}}}}}}}}\n"
-                ),
+                "{\"type\":\"attempt_started\",\"payload\":{\"prompt\":\"do it\"},\"attempt\":{\"task_name\":\"one\"}}\n\
+                 {\"type\":\"completed\",\"payload\":{\"task_name\":\"one\",\"status\":\"passed\",\"outcome\":\"passed\",\"environment\":\"micro_vm\",\"agent\":{\"model\":\"sol\",\"effort\":\"high\",\"tool_calls\":1,\"usage\":{\"total_tokens\":10}},\"verifier\":{\"exit_code\":0,\"rewards\":{\"reward\":1}}}}\n",
             )
             .unwrap();
             fs::write(
