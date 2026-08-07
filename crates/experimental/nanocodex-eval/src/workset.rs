@@ -13,13 +13,17 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehav
 use serde::Serialize;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One task package included in a workset.
+/// One host-local task reference included in a workset.
+///
+/// SQLite retains the selector, canonical root, task name, and content digest.
+/// The task package itself remains on the assigned host and is loaded from
+/// `root` before preparation or execution.
 #[derive(Clone, Debug)]
 pub struct WorksetTask {
-    /// Profile-visible task selector.
+    /// User-visible task selector.
     pub selector: String,
     /// Loaded task name.
     pub name: String,
@@ -46,9 +50,9 @@ pub struct WorksetFamily {
 #[derive(Clone, Debug)]
 pub struct WorksetDefinition {
     /// User-visible name of the durable board.
-    pub profile: String,
+    pub name: String,
     /// Stable identifier of this board generation.
-    pub digest: String,
+    pub generation: String,
     /// Task packages retained by the board.
     pub tasks: Vec<WorksetTask>,
     /// Exact treatments and desired repetition counts retained by the board.
@@ -60,8 +64,8 @@ pub struct WorksetDefinition {
 pub struct Workset {
     path: PathBuf,
     id: i64,
-    profile: String,
-    digest: String,
+    name: String,
+    generation: String,
 }
 
 /// Result of requesting one repetition from an exact coordinate family.
@@ -108,10 +112,10 @@ pub struct WorksetBusy {
 /// Workset-level durable status.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WorksetStatus {
-    /// Profile name.
-    pub profile: String,
-    /// Immutable resolved-profile digest.
-    pub digest: String,
+    /// Workset name.
+    pub name: String,
+    /// Stable identifier of this workset generation.
+    pub generation: String,
     /// Task-preparation counts.
     pub preparation: StateCounts,
     /// Coordinate execution counts.
@@ -147,7 +151,7 @@ pub struct CoordinateCounts {
 pub struct FamilyStatus {
     /// Stable family identity.
     pub key: String,
-    /// Profile-visible task selector.
+    /// User-visible task selector.
     pub task: String,
     /// Network identity of the host that owns preparation and execution.
     pub assigned_host: Option<String>,
@@ -183,7 +187,7 @@ pub enum WorksetError {
     UnknownTask {
         /// Family containing the invalid reference.
         family: String,
-        /// Missing profile-visible task selector.
+        /// Missing user-visible task selector.
         task: String,
     },
     /// Appended work disagrees with a definition already retained in SQLite.
@@ -202,45 +206,44 @@ pub enum WorksetError {
 
 impl Workset {
     /// Opens the newest generation of a named durable workset.
-    pub fn open(path: impl Into<PathBuf>, profile: &str) -> Result<Self, WorksetError> {
+    pub fn open(path: impl Into<PathBuf>, name: &str) -> Result<Self, WorksetError> {
         let path = path.into();
         let mut connection = open_connection(&path)?;
         initialize_schema(&mut connection)?;
         let retained: Option<(i64, String)> = connection
             .query_row(
-                "SELECT id, digest FROM worksets WHERE profile = ?1 \
+                "SELECT id, generation FROM worksets WHERE name = ?1 \
                  ORDER BY created_at_ms DESC, id DESC LIMIT 1",
-                [profile],
+                [name],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let Some((id, digest)) = retained else {
-            return Err(WorksetError::UnknownWorkset(profile.to_owned()));
+        let Some((id, generation)) = retained else {
+            return Err(WorksetError::UnknownWorkset(name.to_owned()));
         };
         Ok(Self {
             path,
             id,
-            profile: profile.to_owned(),
-            digest,
+            name: name.to_owned(),
+            generation,
         })
     }
 
     /// Creates a new empty generation of a named workset.
-    pub fn create(path: impl Into<PathBuf>, profile: &str) -> Result<Self, WorksetError> {
+    pub fn create(path: impl Into<PathBuf>, name: &str) -> Result<Self, WorksetError> {
         let path = path.into();
         let mut connection = open_connection(&path)?;
         initialize_schema(&mut connection)?;
-        let digest = Uuid::now_v7().simple().to_string();
+        let generation = Uuid::now_v7().simple().to_string();
         connection.execute(
-            "INSERT INTO worksets(profile, digest, config_path, created_at_ms) \
-             VALUES (?1, ?2, '', ?3)",
-            params![profile, digest, now_ms()?],
+            "INSERT INTO worksets(name, generation, created_at_ms) VALUES (?1, ?2, ?3)",
+            params![name, generation, now_ms()?],
         )?;
         Ok(Self {
             path,
             id: connection.last_insert_rowid(),
-            profile: profile.to_owned(),
-            digest,
+            name: name.to_owned(),
+            generation,
         })
     }
 
@@ -253,7 +256,7 @@ impl Workset {
     ) -> Result<(), WorksetError> {
         let mut connection = open_connection(&self.path)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        append_definition(&transaction, self.id, &self.digest, tasks, families)?;
+        append_definition(&transaction, self.id, &self.generation, tasks, families)?;
         transaction.commit()?;
         Ok(())
     }
@@ -299,8 +302,8 @@ impl Workset {
             })
             .collect::<Result<Vec<_>, WorksetError>>()?;
         Ok(WorksetDefinition {
-            profile: self.profile.clone(),
-            digest: self.digest.clone(),
+            name: self.name.clone(),
+            generation: self.generation.clone(),
             tasks,
             families,
         })
@@ -584,8 +587,8 @@ impl Workset {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(WorksetStatus {
-            profile: self.profile.clone(),
-            digest: self.digest.clone(),
+            name: self.name.clone(),
+            generation: self.generation.clone(),
             preparation,
             coordinates,
             families,
@@ -658,7 +661,7 @@ impl Workset {
 fn append_definition(
     transaction: &Transaction<'_>,
     workset_id: i64,
-    workset_digest: &str,
+    workset_generation: &str,
     tasks: &[WorksetTask],
     families: &[WorksetFamily],
 ) -> Result<(), WorksetError> {
@@ -689,7 +692,9 @@ fn append_definition(
                 task.digest.clone(),
             ))
         {
-            return Err(WorksetError::DefinitionConflict(workset_digest.to_owned()));
+            return Err(WorksetError::DefinitionConflict(
+                workset_generation.to_owned(),
+            ));
         }
     }
     for family in families {
@@ -718,7 +723,9 @@ fn append_definition(
             .as_ref()
             .is_some_and(|retained| retained != &(task_id, family.treatment.clone()))
         {
-            return Err(WorksetError::DefinitionConflict(workset_digest.to_owned()));
+            return Err(WorksetError::DefinitionConflict(
+                workset_generation.to_owned(),
+            ));
         }
         for repetition in 1..=family.trials {
             transaction.execute(
@@ -759,11 +766,10 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorksetError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS worksets(
             id INTEGER PRIMARY KEY,
-            profile TEXT NOT NULL,
-            digest TEXT NOT NULL,
-            config_path TEXT NOT NULL,
+            name TEXT NOT NULL,
+            generation TEXT NOT NULL,
             created_at_ms INTEGER NOT NULL,
-            UNIQUE(profile, digest)
+            UNIQUE(name, generation)
          );
          CREATE TABLE IF NOT EXISTS tasks(
             id INTEGER PRIMARY KEY,
@@ -808,9 +814,18 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorksetError> {
             UNIQUE(coordinate_id, generation)
          );",
     )?;
-    if version == 1 {
+    if version != 0 && version < SCHEMA_VERSION {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute("ALTER TABLE tasks ADD COLUMN assigned_host TEXT", [])?;
+        if version == 1 {
+            transaction.execute("ALTER TABLE tasks ADD COLUMN assigned_host TEXT", [])?;
+        }
+        transaction.execute("ALTER TABLE worksets RENAME COLUMN profile TO name", [])?;
+        transaction.execute(
+            "ALTER TABLE worksets RENAME COLUMN digest TO generation",
+            [],
+        )?;
+        transaction.execute("ALTER TABLE worksets DROP COLUMN config_path", [])?;
+        transaction.execute("DROP TABLE IF EXISTS workset_seeds", [])?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
     } else {
@@ -933,8 +948,8 @@ mod tests {
         let reopened = Workset::open(&path, "release").unwrap();
         let retained = reopened.definition().unwrap();
 
-        assert_eq!(retained.profile, "release");
-        assert_eq!(retained.digest, workset.digest);
+        assert_eq!(retained.name, "release");
+        assert_eq!(retained.generation, workset.generation);
         assert_eq!(retained.tasks.len(), 1);
         assert_eq!(retained.families[0].trials, 2);
 
@@ -953,10 +968,10 @@ mod tests {
         first.append(&tasks, &families).unwrap();
         let second = Workset::create(&path, "release").unwrap();
 
-        assert_ne!(first.digest, second.digest);
+        assert_ne!(first.generation, second.generation);
         assert_eq!(
-            Workset::open(&path, "release").unwrap().digest,
-            second.digest
+            Workset::open(&path, "release").unwrap().generation,
+            second.generation
         );
         assert!(second.definition().unwrap().tasks.is_empty());
         assert_eq!(first.definition().unwrap().tasks.len(), 1);
@@ -1159,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn version_one_ledgers_gain_host_assignment_without_losing_work() {
+    fn legacy_ledgers_migrate_without_retaining_profile_columns_or_seed_tables() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.sqlite3");
         let connection = Connection::open(&path).unwrap();
@@ -1186,6 +1201,10 @@ mod tests {
                     preparation_expires_at_ms INTEGER,
                     preparation_error TEXT,
                     UNIQUE(workset_id, selector)
+                 );
+                 CREATE TABLE workset_seeds(
+                    workset_id INTEGER NOT NULL,
+                    config_path TEXT NOT NULL
                  );
                  PRAGMA user_version = 1;",
             )
@@ -1217,5 +1236,21 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+        let columns = connection
+            .prepare("PRAGMA table_info(worksets)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(columns, ["id", "name", "generation", "created_at_ms"]);
+        let seeds: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'workset_seeds'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seeds, 0);
     }
 }

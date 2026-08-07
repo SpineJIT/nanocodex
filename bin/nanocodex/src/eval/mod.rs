@@ -15,7 +15,7 @@ pub(crate) struct Eval {
 
 #[derive(Subcommand)]
 enum EvalCommand {
-    /// Add concrete tasks and treatments to a durable SQLite workset.
+    /// Add concrete tasks and treatments to a durable SQLite profile.
     Add(profile::Add),
 
     /// Launch the agent-owned benchmark workflow in the TUI or headlessly.
@@ -24,10 +24,10 @@ enum EvalCommand {
     /// Own one SQLite ledger for pull workers on this machine.
     Coordinator(coordinator::Coordinator),
 
-    /// Inspect one named SQLite workset and its durable progress.
+    /// Inspect one named SQLite profile and its durable progress.
     Status(profile::Status),
 
-    /// Durably execute one selected task treatment from a SQLite workset.
+    /// Durably execute one selected task treatment from a SQLite profile.
     Run(profile::Run),
 }
 

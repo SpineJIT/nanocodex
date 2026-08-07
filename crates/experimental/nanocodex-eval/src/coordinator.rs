@@ -879,8 +879,10 @@ impl IntoResponse for ApiError {
 mod tests {
     use std::{fs, path::Path};
 
+    use nanocodex_oai_api::{Model, Thinking};
+
     use super::*;
-    use crate::{EvaluationSelector, coordinator::RemoteClaim};
+    use crate::{EvaluationSelector, EvaluationWork, Task, coordinator::RemoteClaim};
 
     fn write_task(root: &Path) {
         let task = root.join("one");
@@ -931,20 +933,15 @@ allow_internet = false
     ) {
         let directory = tempfile::tempdir().unwrap();
         write_task(directory.path());
-        let config = directory.path().join("nanocodex.toml");
-        fs::write(
-            &config,
-            r#"[profiles.release]
-tasks = ["one"]
-trials = 2
-model = ["sol"]
-thinking = ["high"]
-"#,
-        )
-        .unwrap();
         let state = directory.path().join("state");
-        Evaluation::add_profile(&config, Some("release"), &state, "release", false).unwrap();
-        let evaluation = Evaluation::open(&config, "release", state).unwrap();
+        let task = Task::load(directory.path().join("one")).unwrap();
+        let work = EvaluationWork::new("one", task)
+            .model(Model::Sol)
+            .thinking(Thinking::High)
+            .trials(2);
+        Evaluation::add(&state, "release", &[work], false).unwrap();
+        let missing_profile = directory.path().join("profile-is-not-required.toml");
+        let evaluation = Evaluation::open(missing_profile, "release", state).unwrap();
         let selection = EvaluationSelector::new("one");
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await

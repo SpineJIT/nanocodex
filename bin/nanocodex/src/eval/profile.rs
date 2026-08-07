@@ -28,8 +28,8 @@ const LEASE_DURATION: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug, Args)]
 pub(super) struct WorksetTarget {
-    /// Named durable workset stored in SQLite.
-    workset: String,
+    /// Named durable profile stored in SQLite. Uses its latest generation.
+    profile: String,
 
     /// Durable SQLite ledger and retained artifacts.
     ///
@@ -44,12 +44,12 @@ pub(super) struct WorksetTarget {
 
 #[derive(Args)]
 pub(super) struct Add {
-    /// Named durable workset to create or extend.
-    workset: String,
+    /// Named durable profile to create or extend.
+    profile: String,
 
-    /// Expand this optional nanocodex.toml profile recipe into SQLite.
+    /// Expand this optional nanocodex.toml recipe into SQLite.
     #[arg(long, value_name = "NAME")]
-    profile: Option<String>,
+    recipe: Option<String>,
 
     /// Task package to add. Repeat to add multiple task packages.
     #[arg(long, value_name = "PATH")]
@@ -75,7 +75,7 @@ pub(super) struct Add {
     #[arg(long)]
     web_search: bool,
 
-    /// Start a fresh generation instead of extending the newest board.
+    /// Start a new profile generation. By default, extends the latest generation.
     #[arg(long)]
     new: bool,
 
@@ -93,7 +93,7 @@ pub(super) struct Status {
     #[command(flatten)]
     target: WorksetTarget,
 
-    /// Print the complete machine-readable workset ledger.
+    /// Print the complete machine-readable profile ledger.
     #[arg(long)]
     json: bool,
 }
@@ -107,11 +107,14 @@ pub(super) struct Run {
     #[arg(long, default_value = CONFIG_FILE)]
     config: PathBuf,
 
-    /// Exact task selector already stored in the workset.
+    /// Exact SQLite task selector and locally loadable task package path.
+    ///
+    /// Remote workers need this local task package, but never the profile that
+    /// originally added it to the coordinator.
     #[arg(long, value_name = "TASK", required = true)]
     task: String,
 
-    /// Select one model when the workset contains a model matrix.
+    /// Select one model when the profile contains a model matrix.
     #[arg(long)]
     model: Option<Model>,
 
@@ -133,7 +136,7 @@ pub(super) struct Run {
 impl Add {
     pub(super) async fn run(self) -> Result<()> {
         let state = self.state_dir.map_or_else(default_state_dir, Ok)?;
-        if let Some(recipe) = self.profile.as_deref() {
+        if let Some(recipe) = self.recipe.as_deref() {
             if !self.task.is_empty()
                 || !self.harness.is_empty()
                 || !self.model.is_empty()
@@ -142,13 +145,13 @@ impl Add {
                 || self.web_search
             {
                 return Err(eyre!(
-                    "--profile is a complete recipe; use either --profile or explicit work knobs"
+                    "--recipe is complete; use either --recipe or explicit work knobs"
                 ));
             }
-            Evaluation::add_profile(&self.config, Some(recipe), &state, &self.workset, self.new)?;
+            Evaluation::add_profile(&self.config, Some(recipe), &state, &self.profile, self.new)?;
         } else {
             if self.task.is_empty() {
-                return Err(eyre!("at least one --task or --profile is required"));
+                return Err(eyre!("at least one --task or --recipe is required"));
             }
             let trials = self.trials.unwrap_or(1);
             let harnesses = if self.harness.is_empty() {
@@ -185,12 +188,13 @@ impl Add {
                     }
                 }
             }
-            Evaluation::add(&state, &self.workset, &work, self.new)?;
+            Evaluation::add(&state, &self.profile, &work, self.new)?;
         }
-        let status = Evaluation::open(&self.config, &self.workset, state)?.status()?;
+        let status = Evaluation::open(&self.config, &self.profile, state)?.status()?;
         println!(
-            "{} · {} tasks · {} coordinate(s)",
+            "{} {} · {} tasks · {} coordinate(s)",
             status.profile,
+            &status.generation[..12],
             status.preparation.pending + status.preparation.running + status.preparation.complete,
             status.coordinates.pending + status.coordinates.running + status.coordinates.complete,
         );
@@ -240,7 +244,7 @@ impl Status {
             println!(
                 "{} {} · preparation {}/{} ready · coordinates {}/{} terminal, {} running",
                 status.profile,
-                &status.digest[..12],
+                &status.generation[..12],
                 status.preparation.complete,
                 status.preparation.pending
                     + status.preparation.running
@@ -280,7 +284,7 @@ impl Run {
             return run_remote(
                 coordinator,
                 selector,
-                &self.target.workset,
+                &self.target.profile,
                 task,
                 &self.config,
                 &self.task,
@@ -377,7 +381,7 @@ impl Run {
 async fn run_remote(
     coordinator: CoordinatorClient,
     selector: EvaluationSelector,
-    workset: &str,
+    profile: &str,
     task: Task,
     config: &Path,
     task_selector: &str,
@@ -441,7 +445,7 @@ async fn run_remote(
                         heartbeat.abort();
                         finish?;
                         write_json(&RunOutput::Completed {
-                            profile: workset,
+                            profile,
                             task: task_selector,
                             repetition,
                             evidence: "coordinator",
@@ -475,7 +479,7 @@ async fn run_remote(
                 retry_after_ms,
             } => {
                 write_json(&RunOutput::TemporarilyUnavailable {
-                    profile: workset,
+                    profile,
                     task: task_selector,
                     reason: &reason,
                     retry_after_ms,
@@ -486,7 +490,7 @@ async fn run_remote(
             }
             RemoteClaim::Complete => {
                 write_json(&RunOutput::AlreadyComplete {
-                    profile: workset,
+                    profile,
                     task: task_selector,
                 })?;
                 return Ok(());
@@ -514,7 +518,7 @@ fn remote_heartbeat(
 impl WorksetTarget {
     fn open(&self, config: &Path) -> Result<Evaluation> {
         let state_directory = self.state_dir.clone().map_or_else(default_state_dir, Ok)?;
-        Ok(Evaluation::open(config, &self.workset, state_directory)?)
+        Ok(Evaluation::open(config, &self.profile, state_directory)?)
     }
 }
 
@@ -713,13 +717,13 @@ pub(super) fn default_state_dir() -> Result<PathBuf> {
 
 fn print_remote_status(status: &serde_json::Value) {
     let profile = status["profile"].as_str().unwrap_or("unknown");
-    let digest = status["digest"].as_str().unwrap_or("unknown");
+    let generation = status["generation"].as_str().unwrap_or("unknown");
     let preparation = &status["preparation"];
     let coordinates = &status["coordinates"];
     println!(
         "{} {} · preparation {}/{} ready · coordinates {}/{} terminal, {} running",
         profile,
-        &digest[..digest.len().min(12)],
+        &generation[..generation.len().min(12)],
         preparation["complete"].as_u64().unwrap_or(0),
         count_total(preparation),
         coordinates["complete"].as_u64().unwrap_or(0),

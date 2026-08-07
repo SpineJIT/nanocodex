@@ -11,7 +11,7 @@ use nanocodex_oai_api::{Model, Thinking};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::{Task, TaskLoadError, workset::WorksetDefinition};
+use crate::{Task, TaskLoadError};
 
 pub(crate) const BUILTIN_HARNESS: &str = "nanocodex";
 
@@ -26,8 +26,8 @@ pub struct EvaluationManifest {
     profiles: BTreeMap<String, Profile>,
 }
 
-/// One pinned external evaluation harness.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// One configured external evaluation harness helper.
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Harness {
     command: PathBuf,
@@ -56,7 +56,7 @@ pub struct Harness {
 }
 
 /// One convenience recipe expanded into SQLite by `eval add`.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     #[serde(default)]
@@ -70,8 +70,7 @@ pub struct Profile {
     model: Vec<Model>,
     #[serde(
         default = "default_thinking",
-        deserialize_with = "deserialize_thinking",
-        serialize_with = "serialize_thinking"
+        deserialize_with = "deserialize_thinking"
     )]
     thinking: Vec<Thinking>,
     #[serde(default)]
@@ -81,10 +80,6 @@ pub struct Profile {
 /// Parsed profile recipe ready to materialize into SQLite.
 #[derive(Clone, Debug)]
 pub struct ResolvedProfile {
-    /// Selected profile name.
-    pub name: String,
-    /// Stable digest of the recipe and task inputs.
-    pub digest: String,
     /// Loaded immutable task packages.
     pub tasks: Vec<ResolvedTask>,
     /// Exact task/treatment families, excluding fungible repetitions.
@@ -102,7 +97,7 @@ pub struct ResolvedTask {
     pub task: Task,
 }
 
-/// One content-pinned external harness selected by a profile.
+/// One external harness helper resolved from the current runtime config.
 #[derive(Clone, Debug)]
 pub struct ResolvedHarness {
     /// Profile-visible harness name.
@@ -238,65 +233,6 @@ pub enum ProfileError {
         /// Filesystem failure.
         source: std::io::Error,
     },
-    /// Stable identity serialization failed.
-    #[error("failed to serialize resolved profile identity: {0}")]
-    Identity(#[from] serde_json::Error),
-    /// A retained task package no longer matches the content recorded in SQLite.
-    #[error("retained task `{selector}` no longer matches SQLite digest {digest}")]
-    TaskChanged {
-        /// SQLite task selector.
-        selector: String,
-        /// Content digest retained by SQLite.
-        digest: String,
-    },
-    /// A coordinate treatment retained in SQLite disagrees with its family row.
-    #[error("invalid SQLite treatment for family `{0}`")]
-    InvalidTreatment(String),
-}
-
-/// Closed-profile selector failure.
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum ProfileSelectionError {
-    /// Requested task is outside the profile.
-    #[error("task `{selector}` is not part of profile `{profile}`")]
-    Task {
-        /// Selected profile.
-        profile: String,
-        /// Rejected selector.
-        selector: String,
-    },
-    /// No treatment matched explicit selectors.
-    #[error("no treatment in profile `{profile}` matches task `{task}` and the requested knobs")]
-    Treatment {
-        /// Selected profile.
-        profile: String,
-        /// Selected task.
-        task: String,
-    },
-    /// Omitted semantic knobs did not identify one family.
-    #[error(
-        "task `{task}` has multiple treatments in profile `{profile}`; select model and/or thinking"
-    )]
-    Ambiguous {
-        /// Selected profile.
-        profile: String,
-        /// Selected task.
-        task: String,
-    },
-}
-
-#[derive(Serialize)]
-struct ProfileIdentity<'a> {
-    schema: u32,
-    name: &'a str,
-    profile: &'a Profile,
-    tasks: Vec<TaskIdentity<'a>>,
-}
-
-#[derive(Serialize)]
-struct TaskIdentity<'a> {
-    selector: &'a str,
-    digest: &'a str,
 }
 
 impl EvaluationManifest {
@@ -382,109 +318,11 @@ impl EvaluationManifest {
             .expect("a canonical manifest path has a parent");
         let tasks = load_tasks(root, profile)?;
         let families = expand_families(profile, &tasks);
-        let identity = ProfileIdentity {
-            schema: 3,
-            name: &name,
-            profile,
-            tasks: tasks
-                .iter()
-                .map(|task| TaskIdentity {
-                    selector: &task.selector,
-                    digest: task.task.package_digest(),
-                })
-                .collect(),
-        };
-        let digest = hex::encode(Sha256::digest(serde_json::to_vec(&identity)?));
         Ok(ResolvedProfile {
-            name,
-            digest,
             tasks,
             families,
             trials: profile.trials,
         })
-    }
-}
-
-impl ResolvedProfile {
-    pub(crate) fn from_workset(definition: WorksetDefinition) -> Result<Self, ProfileError> {
-        let mut tasks = Vec::with_capacity(definition.tasks.len());
-        for retained in definition.tasks {
-            let task = Task::load(&retained.root)?;
-            if task.name() != retained.name || task.package_digest() != retained.digest {
-                return Err(ProfileError::TaskChanged {
-                    selector: retained.selector,
-                    digest: retained.digest,
-                });
-            }
-            tasks.push(ResolvedTask {
-                selector: retained.selector,
-                task,
-            });
-        }
-        let mut families = Vec::with_capacity(definition.families.len());
-        let mut trials = 0;
-        for retained in definition.families {
-            let family: ResolvedFamily = serde_json::from_str(&retained.treatment)?;
-            if family.key != retained.key || family.task != retained.task_selector {
-                return Err(ProfileError::InvalidTreatment(retained.key));
-            }
-            trials = trials.max(retained.trials);
-            families.push(family);
-        }
-        Ok(Self {
-            name: definition.profile,
-            digest: definition.digest,
-            tasks,
-            families,
-            trials,
-        })
-    }
-
-    /// Resolves one exact task selector without permitting ad-hoc expansion.
-    pub fn task(&self, selector: &str) -> Result<&ResolvedTask, ProfileSelectionError> {
-        self.tasks
-            .iter()
-            .find(|task| task.selector == selector)
-            .ok_or_else(|| ProfileSelectionError::Task {
-                profile: self.name.clone(),
-                selector: selector.to_owned(),
-            })
-    }
-
-    /// Resolves an exact task family. Omitted dimensions are accepted only
-    /// when the profile contains one unambiguous matching treatment.
-    pub fn family(
-        &self,
-        task: &str,
-        harness: Option<&str>,
-        model: Option<Model>,
-        thinking: Option<Thinking>,
-        web_search: Option<bool>,
-    ) -> Result<&ResolvedFamily, ProfileSelectionError> {
-        self.task(task)?;
-        let harness = harness.unwrap_or(BUILTIN_HARNESS);
-        let matching = self
-            .families
-            .iter()
-            .filter(|family| {
-                family.task == task
-                    && family.harness == harness
-                    && model.is_none_or(|model| family.model == model)
-                    && thinking.is_none_or(|thinking| family.thinking == thinking)
-                    && web_search.is_none_or(|web_search| family.web_search == web_search)
-            })
-            .collect::<Vec<_>>();
-        match matching.as_slice() {
-            [family] => Ok(family),
-            [] => Err(ProfileSelectionError::Treatment {
-                profile: self.name.clone(),
-                task: task.to_owned(),
-            }),
-            _ => Err(ProfileSelectionError::Ambiguous {
-                profile: self.name.clone(),
-                task: task.to_owned(),
-            }),
-        }
     }
 }
 
@@ -737,17 +575,6 @@ where
         .collect()
 }
 
-fn serialize_thinking<S>(values: &[Thinking], serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    values
-        .iter()
-        .map(|value| value.as_str())
-        .collect::<Vec<_>>()
-        .serialize(serializer)
-}
-
 pub(crate) fn serialize_one_thinking<S>(value: &Thinking, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -817,32 +644,9 @@ thinking = ["high"]
         .unwrap();
 
         let profile = EvaluationManifest::load_profile(&config, None).unwrap();
-        assert_eq!(profile.name, "release");
         assert_eq!(profile.families.len(), 1);
         assert_eq!(profile.trials, 3);
-        assert_eq!(profile.task("one").unwrap().task.name(), "one");
-    }
-
-    #[test]
-    fn task_selector_cannot_expand_the_profile() {
-        let directory = tempfile::tempdir().unwrap();
-        write_task(directory.path(), "included");
-        write_task(directory.path(), "outside");
-        let config = directory.path().join("nanocodex.toml");
-        fs::write(
-            &config,
-            r#"[profiles.release]
-tasks = ["included"]
-trials = 1
-"#,
-        )
-        .unwrap();
-        let profile = EvaluationManifest::load_profile(&config, Some("release")).unwrap();
-
-        assert!(matches!(
-            profile.task("outside"),
-            Err(ProfileSelectionError::Task { selector, .. }) if selector == "outside"
-        ));
+        assert_eq!(profile.tasks[0].task.name(), "one");
     }
 
     #[test]
@@ -867,19 +671,10 @@ harness = ["nanocodex", "codex"]
         )
         .unwrap();
 
-        let first = EvaluationManifest::load_profile(&config, Some("release")).unwrap();
-        assert_eq!(first.families.len(), 2);
-        assert_eq!(
-            first.family("one", None, None, None, None).unwrap().harness,
-            "nanocodex"
-        );
-        assert_eq!(
-            first
-                .family("one", Some("codex"), None, None, None)
-                .unwrap()
-                .harness,
-            "codex"
-        );
+        let profile = EvaluationManifest::load_profile(&config, Some("release")).unwrap();
+        assert_eq!(profile.families.len(), 2);
+        assert_eq!(profile.families[0].harness, "nanocodex");
+        assert_eq!(profile.families[1].harness, "codex");
         let first_helper = EvaluationManifest::load_harness(&config, "codex")
             .unwrap()
             .unwrap();
@@ -889,7 +684,7 @@ harness = ["nanocodex", "codex"]
             .unwrap()
             .unwrap();
 
-        assert_eq!(first.digest, second.digest);
+        assert_eq!(second.families, profile.families);
         assert_ne!(first_helper.version, second_helper.version);
     }
 
@@ -917,41 +712,15 @@ harness = ["nanocodex", "codex"]
             .unwrap();
         }
 
-        let first =
-            EvaluationManifest::load_profile(first.path().join("nanocodex.toml"), Some("release"))
-                .unwrap();
-        let second =
-            EvaluationManifest::load_profile(second.path().join("nanocodex.toml"), Some("release"))
-                .unwrap();
-
-        assert_eq!(first.digest, second.digest);
-    }
-
-    #[test]
-    fn profile_revision_is_independent_of_the_checkout_path() {
-        let first = tempfile::tempdir().unwrap();
-        let second = tempfile::tempdir().unwrap();
-        for directory in [&first, &second] {
-            write_task(directory.path(), "one");
-            fs::write(
-                directory.path().join("nanocodex.toml"),
-                r#"[profiles.release]
-tasks = ["one"]
-trials = 2
-model = ["sol"]
-thinking = ["high"]
-"#,
-            )
+        let first = EvaluationManifest::load_harness(first.path().join("nanocodex.toml"), "codex")
+            .unwrap()
             .unwrap();
-        }
-
-        let first =
-            EvaluationManifest::load_profile(first.path().join("nanocodex.toml"), Some("release"))
-                .unwrap();
         let second =
-            EvaluationManifest::load_profile(second.path().join("nanocodex.toml"), Some("release"))
+            EvaluationManifest::load_harness(second.path().join("nanocodex.toml"), "codex")
+                .unwrap()
                 .unwrap();
 
-        assert_eq!(first.digest, second.digest);
+        assert_eq!(first.version, "0.145.0");
+        assert_eq!(first.version, second.version);
     }
 }

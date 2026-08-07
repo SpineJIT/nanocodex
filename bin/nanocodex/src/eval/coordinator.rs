@@ -9,8 +9,8 @@ use super::profile::default_state_dir;
 
 #[derive(Args)]
 pub(super) struct Coordinator {
-    /// Named durable workset served from SQLite.
-    workset: String,
+    /// Named durable profile served from SQLite.
+    profile: String,
 
     /// Runtime harness helper configuration.
     #[arg(long, default_value = "nanocodex.toml")]
@@ -28,7 +28,7 @@ pub(super) struct Coordinator {
 impl Coordinator {
     pub(super) async fn run(self) -> Result<()> {
         let state = self.state_dir.map_or_else(default_state_dir, Ok)?;
-        let evaluation = Evaluation::open(&self.config, &self.workset, state)?;
+        let evaluation = Evaluation::open(&self.config, &self.profile, state)?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, self.port))
             .await
             .wrap_err("failed to bind the evaluation coordinator")?;

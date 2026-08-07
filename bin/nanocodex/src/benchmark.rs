@@ -6,7 +6,7 @@ pub(crate) fn prompt(
     state_dir: Option<&Path>,
     coordinator: Option<&str>,
 ) -> String {
-    let selected = profile.unwrap_or("the selected SQLite workset");
+    let selected = profile.unwrap_or("the selected SQLite profile");
     let profile_argument =
         profile.map_or_else(String::new, |profile| format!(" {}", shell_quote(profile)));
     let state_argument = state_dir.map_or_else(String::new, |directory| {
@@ -17,7 +17,7 @@ pub(crate) fn prompt(
     });
     let config_argument = shell_quote(&config.to_string_lossy());
     format!(
-        r#"Drive the Nanocodex SQLite workset {selected} to durable completion.
+        r#"Drive the Nanocodex SQLite profile {selected} to durable completion.
 
 The desired amount of work is already materialized in SQLite. Do not infer it from `{config}` or add ad-hoc work during this workflow. Inspect the durable ledger with:
 

@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 
 use crate::{
     Task,
-    profile::{EvaluationManifest, ResolvedFamily, ResolvedHarness, ResolvedProfile},
+    profile::{EvaluationManifest, ResolvedFamily, ResolvedHarness, ResolvedTask},
     workset::{
         BeginCoordinate, CoordinateLease, PreparationLease, Workset, WorksetBusy, WorksetError,
         WorksetFamily, WorksetTask,
@@ -26,13 +26,16 @@ const LEDGER_FILE: &str = "state.sqlite3";
 /// One named durable SQLite workset.
 #[derive(Clone, Debug)]
 pub struct Evaluation {
-    profile: ResolvedProfile,
+    name: String,
+    generation: String,
+    tasks: Vec<ResolvedTask>,
+    families: Vec<ResolvedFamily>,
     workset: Workset,
     state_directory: PathBuf,
     config: PathBuf,
 }
 
-/// Optional knobs selecting one exact family already present in a profile.
+/// Optional knobs selecting one exact family already present in a workset.
 #[derive(Clone, Debug)]
 pub struct EvaluationSelector {
     task: String,
@@ -78,7 +81,7 @@ pub struct PreparationClaim {
     heartbeat: JoinHandle<()>,
 }
 
-/// Leased ownership of one fungible profile trial.
+/// Leased ownership of one fungible workset trial.
 #[derive(Debug)]
 pub struct CoordinateClaim {
     workset: Workset,
@@ -96,9 +99,9 @@ pub struct CoordinateClaim {
 pub struct EvaluationTreatment {
     /// Built-in or configured harness used for this coordinate.
     pub harness: String,
-    /// Model fixed by the profile.
+    /// Model fixed by the workset.
     pub model: Model,
-    /// Reasoning effort fixed by the profile.
+    /// Reasoning effort fixed by the workset.
     #[serde(serialize_with = "crate::profile::serialize_one_thinking")]
     pub thinking: Thinking,
     /// Whether model-facing web search is enabled for this coordinate.
@@ -119,8 +122,8 @@ pub struct EvaluationBusy {
 pub struct EvaluationStatus {
     /// Selected profile name.
     pub profile: String,
-    /// Digest of the profile, tasks, harness, and treatments.
-    pub digest: String,
+    /// Stable identifier of the newest selected generation.
+    pub generation: String,
     /// Shared task-preparation counts.
     pub preparation: EvaluationCounts,
     /// Trial execution counts.
@@ -140,16 +143,16 @@ pub struct EvaluationCounts {
     pub complete: i64,
 }
 
-/// Durable status of one exact profile treatment.
+/// Durable status of one exact workset treatment.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EvaluationFamilyStatus {
     /// Stable family identity.
     pub id: String,
-    /// Profile-visible task selector.
+    /// User-visible task selector.
     pub task: String,
     /// Host currently assigned to prepare and execute this task.
     pub assigned_host: Option<String>,
-    /// Semantic treatment fixed by the profile.
+    /// Semantic treatment fixed by the workset.
     pub treatment: EvaluationTreatment,
     /// Desired fungible trial count.
     pub desired: i64,
@@ -161,7 +164,7 @@ pub struct EvaluationFamilyStatus {
     pub complete: i64,
 }
 
-/// Profile resolution, selection, or durable-ledger failure.
+/// Profile expansion, workset selection, or durable-ledger failure.
 #[derive(Debug)]
 pub struct EvaluationError {
     source: Box<dyn Error + Send + Sync>,
@@ -169,10 +172,11 @@ pub struct EvaluationError {
 
 impl Evaluation {
     /// Appends concrete work to a named SQLite board, creating it when absent.
-    /// `new_generation` starts a fresh board under the same user-visible name.
+    /// By default this extends the latest generation. `new_generation` starts
+    /// a fresh generation under the same user-visible profile name.
     pub fn add(
         state_directory: impl Into<PathBuf>,
-        profile: &str,
+        workset_name: &str,
         work: &[EvaluationWork],
         new_generation: bool,
     ) -> Result<(), EvaluationError> {
@@ -183,11 +187,11 @@ impl Evaluation {
         }
         let path = state_directory.into().join(LEDGER_FILE);
         let workset = if new_generation {
-            Workset::create(&path, profile)
+            Workset::create(&path, workset_name)
         } else {
-            match Workset::open(&path, profile) {
+            match Workset::open(&path, workset_name) {
                 Ok(workset) => Ok(workset),
-                Err(WorksetError::UnknownWorkset(_)) => Workset::create(&path, profile),
+                Err(WorksetError::UnknownWorkset(_)) => Workset::create(&path, workset_name),
                 Err(error) => Err(error),
             }
         }
@@ -226,26 +230,29 @@ impl Evaluation {
         config: impl AsRef<Path>,
         recipe: Option<&str>,
         state_directory: impl Into<PathBuf>,
-        profile: &str,
+        workset_name: &str,
         new_generation: bool,
     ) -> Result<(), EvaluationError> {
         let recipe = EvaluationManifest::load_profile(config, recipe).map_err(error)?;
-        let work = recipe
-            .families
-            .iter()
-            .map(|family| {
-                Ok(EvaluationWork {
+        let mut work = Vec::with_capacity(recipe.families.len());
+        for task in &recipe.tasks {
+            for family in recipe
+                .families
+                .iter()
+                .filter(|family| family.task == task.selector)
+            {
+                work.push(EvaluationWork {
                     selector: family.task.clone(),
-                    task: recipe.task(&family.task).map_err(error)?.task.clone(),
+                    task: task.task.clone(),
                     harness: family.harness.clone(),
                     model: family.model,
                     thinking: family.thinking,
                     web_search: family.web_search,
                     trials: recipe.trials,
-                })
-            })
-            .collect::<Result<Vec<_>, EvaluationError>>()?;
-        Self::add(state_directory, profile, &work, new_generation)
+                });
+            }
+        }
+        Self::add(state_directory, workset_name, &work, new_generation)
     }
 
     /// Resolves one current runtime harness helper without consulting workset
@@ -264,25 +271,54 @@ impl Evaluation {
     /// SQLite.
     pub fn open(
         config: impl AsRef<Path>,
-        profile: &str,
+        workset_name: &str,
         state_directory: impl Into<PathBuf>,
     ) -> Result<Self, EvaluationError> {
         let state_directory = state_directory.into();
-        let workset = Workset::open(state_directory.join(LEDGER_FILE), profile).map_err(error)?;
-        let profile =
-            ResolvedProfile::from_workset(workset.definition().map_err(error)?).map_err(error)?;
+        let workset =
+            Workset::open(state_directory.join(LEDGER_FILE), workset_name).map_err(error)?;
+        let definition = workset.definition().map_err(error)?;
+        let mut tasks = Vec::with_capacity(definition.tasks.len());
+        for retained in definition.tasks {
+            let task = Task::load(&retained.root).map_err(error)?;
+            if task.name() != retained.name || task.package_digest() != retained.digest {
+                return Err(error(std::io::Error::other(format!(
+                    "retained task `{}` no longer matches SQLite content digest {}",
+                    retained.selector, retained.digest
+                ))));
+            }
+            tasks.push(ResolvedTask {
+                selector: retained.selector,
+                task,
+            });
+        }
+        let mut families = Vec::with_capacity(definition.families.len());
+        for retained in definition.families {
+            let family: ResolvedFamily =
+                serde_json::from_str(&retained.treatment).map_err(error)?;
+            if family.key != retained.key || family.task != retained.task_selector {
+                return Err(error(std::io::Error::other(format!(
+                    "invalid SQLite treatment for family `{}`",
+                    retained.key
+                ))));
+            }
+            families.push(family);
+        }
         Ok(Self {
-            profile,
+            name: definition.name,
+            generation: definition.generation,
+            tasks,
+            families,
             workset,
             state_directory,
             config: config.as_ref().to_path_buf(),
         })
     }
 
-    /// Selected profile name.
+    /// Selected workset name.
     #[must_use]
     pub fn name(&self) -> &str {
-        &self.profile.name
+        &self.name
     }
 
     /// Reads a structured snapshot from SQLite.
@@ -293,13 +329,12 @@ impl Evaluation {
             .into_iter()
             .map(|status| -> Result<_, EvaluationError> {
                 let family = self
-                    .profile
                     .families
                     .iter()
                     .find(|family| family.key == status.key)
                     .ok_or_else(|| {
                         error(std::io::Error::other(format!(
-                            "SQLite contains unknown profile family `{}`",
+                            "SQLite contains unknown workset family `{}`",
                             status.key
                         )))
                     })?;
@@ -316,8 +351,8 @@ impl Evaluation {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(EvaluationStatus {
-            profile: status.profile,
-            digest: status.digest,
+            profile: status.name,
+            generation: status.generation,
             preparation: EvaluationCounts {
                 pending: status.preparation.pending,
                 running: status.preparation.running,
@@ -360,15 +395,37 @@ impl Evaluation {
         &self,
         selector: &EvaluationSelector,
     ) -> Result<&ResolvedFamily, EvaluationError> {
-        self.profile
-            .family(
-                &selector.task,
-                selector.harness.as_deref(),
-                selector.model,
-                selector.thinking,
-                selector.web_search,
-            )
-            .map_err(error)
+        self.task(&selector.task)?;
+        let harness = selector
+            .harness
+            .as_deref()
+            .unwrap_or(crate::profile::BUILTIN_HARNESS);
+        let matching = self
+            .families
+            .iter()
+            .filter(|family| {
+                family.task == selector.task
+                    && family.harness == harness
+                    && selector.model.is_none_or(|model| family.model == model)
+                    && selector
+                        .thinking
+                        .is_none_or(|thinking| family.thinking == thinking)
+                    && selector
+                        .web_search
+                        .is_none_or(|web_search| family.web_search == web_search)
+            })
+            .collect::<Vec<_>>();
+        match matching.as_slice() {
+            [family] => Ok(family),
+            [] => Err(error(std::io::Error::other(format!(
+                "no treatment in profile `{}` matches task `{}` and the requested knobs",
+                self.name, selector.task
+            )))),
+            _ => Err(error(std::io::Error::other(format!(
+                "task `{}` has multiple treatments in profile `{}`; select model and/or thinking",
+                selector.task, self.name
+            )))),
+        }
     }
 
     fn claim_resolved(
@@ -378,7 +435,7 @@ impl Evaluation {
         lease_duration: Duration,
         resolve_harness: bool,
     ) -> Result<EvaluationClaim, EvaluationError> {
-        let task = self.profile.task(&family.task).map_err(error)?.task.clone();
+        let task = self.task(&family.task)?.task.clone();
         let harness = if resolve_harness {
             EvaluationManifest::load_harness(&self.config, &family.harness).map_err(error)?
         } else {
@@ -405,7 +462,7 @@ impl Evaluation {
             BeginCoordinate::Execute(lease) => {
                 let output_directory = coordinate_output(
                     &self.state_directory,
-                    &self.profile.digest,
+                    &self.generation,
                     &family.key,
                     lease.repetition,
                     lease.generation,
@@ -426,6 +483,18 @@ impl Evaluation {
             BeginCoordinate::Busy(busy) => Ok(EvaluationClaim::Busy(busy.into())),
             BeginCoordinate::Complete => Ok(EvaluationClaim::Complete),
         }
+    }
+
+    fn task(&self, selector: &str) -> Result<&ResolvedTask, EvaluationError> {
+        self.tasks
+            .iter()
+            .find(|task| task.selector == selector)
+            .ok_or_else(|| {
+                error(std::io::Error::other(format!(
+                    "task `{selector}` is not part of profile `{}`",
+                    self.name
+                )))
+            })
     }
 }
 
@@ -697,7 +766,7 @@ fn error(source: impl Error + Send + Sync + 'static) -> EvaluationError {
 
 fn coordinate_output(
     state_directory: &Path,
-    profile_digest: &str,
+    workset_generation: &str,
     family_key: &str,
     repetition: u16,
     generation: i64,
@@ -705,7 +774,7 @@ fn coordinate_output(
     let family_digest = hex::encode(Sha256::digest(family_key.as_bytes()));
     state_directory
         .join("artifacts")
-        .join(profile_digest)
+        .join(workset_generation)
         .join(family_digest)
         .join(format!("k-{repetition}"))
         .join(format!("attempt-{generation}"))

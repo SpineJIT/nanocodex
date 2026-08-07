@@ -13,8 +13,8 @@ use crate::{
 
 #[derive(Args)]
 pub(super) struct Benchmark {
-    /// Named durable workset to drive to completion.
-    workset: String,
+    /// Named durable profile to drive to completion.
+    profile: String,
 
     /// Runtime harness helper configuration passed to workers.
     #[arg(long, default_value = "nanocodex.toml")]
@@ -51,7 +51,7 @@ pub(super) struct Benchmark {
 impl Benchmark {
     pub(super) async fn run(self) -> Result<()> {
         let Self {
-            workset,
+            profile,
             config,
             state_dir,
             coordinator,
@@ -62,16 +62,16 @@ impl Benchmark {
             vm,
         } = self;
         if systemd {
-            return systemd::install(&workset, &config, state_dir.as_deref());
+            return systemd::install(&profile, &config, state_dir.as_deref());
         }
         let prompt = benchmark::prompt(
-            Some(workset.as_str()),
+            Some(profile.as_str()),
             &config,
             state_dir.as_deref(),
             coordinator.as_deref(),
         );
         let initial = BoardStatus::load(
-            &workset,
+            &profile,
             &config,
             state_dir.as_deref(),
             coordinator.as_deref(),
@@ -85,7 +85,7 @@ impl Benchmark {
             run::run_prompt(prompt, agent, vm).await
         } else {
             let _observability = observability.install(true, agent.cwd())?;
-            let display = format!("/benchmark {workset}");
+            let display = format!("/benchmark {profile}");
             tui::run(
                 agent,
                 vm,
@@ -95,7 +95,7 @@ impl Benchmark {
             .await
         };
         let board = BoardStatus::load(
-            &workset,
+            &profile,
             &config,
             state_dir.as_deref(),
             coordinator.as_deref(),
@@ -241,7 +241,7 @@ mod tests {
     fn remote_status_uses_the_same_completion_contract() {
         let board: BoardStatus = serde_json::from_value(serde_json::json!({
             "profile": "release",
-            "digest": "abc",
+            "generation": "abc",
             "preparation": { "pending": 0, "running": 0, "complete": 2 },
             "coordinates": { "pending": 0, "running": 0, "complete": 20 },
             "families": [],
