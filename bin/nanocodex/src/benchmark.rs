@@ -6,6 +6,7 @@ pub(crate) fn prompt(
     state_dir: Option<&Path>,
     coordinator: Option<&str>,
     worker: Option<&str>,
+    executable: Option<&Path>,
 ) -> String {
     let selected = profile.unwrap_or("the selected SQLite profile");
     let profile_argument =
@@ -20,6 +21,10 @@ pub(crate) fn prompt(
         format!(" --worker {}", shell_quote(worker))
     });
     let config_argument = shell_quote(&config.to_string_lossy());
+    let executable = executable.map_or_else(
+        || "nanocodex".to_owned(),
+        |executable| shell_quote(&executable.to_string_lossy()),
+    );
     let ledger = if coordinator.is_some() {
         "the coordinator-backed SQLite ledger; do not open SQLite directly"
     } else {
@@ -28,11 +33,13 @@ pub(crate) fn prompt(
     format!(
         r#"Drive the Nanocodex evaluation profile {selected} to durable completion.
 
+This is an operations loop, not a software-development task. Do not inspect repository source, plans, documentation, or configuration. Do not edit files. Begin with the status command below, then immediately launch a wave of pending work.
+
 The desired amount of work is already materialized in {ledger}. Do not infer it from `{config}` or add ad-hoc work during this workflow. Inspect the durable ledger with:
 
-    nanocodex eval status{profile_argument}{state_argument}{coordinator_argument} --json
+    {executable} eval status{profile_argument}{state_argument}{coordinator_argument} --json
 
-You own execution strategy. Read the family records, choose an exact pending task and harness treatment, and invoke one repetition with `nanocodex eval run{profile_argument} --config {config_argument}{state_argument}{coordinator_argument}{worker_argument} --task <exact-profile-selector>` plus `--harness`, model, or thinking selectors required to identify that profile family. Omit `--harness` for built-in Nanocodex. The CLI allocates the internal repetition; never pass or invent a trial number.
+You own execution strategy. Read the family records, choose an exact pending task and harness treatment, and invoke one repetition with `{executable} eval run{profile_argument} --config {config_argument}{state_argument}{coordinator_argument}{worker_argument} --task <exact-profile-selector>` plus `--harness`, model, or thinking selectors required to identify that profile family. Omit `--harness` for built-in Nanocodex. The CLI allocates the internal repetition; never pass or invent a trial number.
 
 Decide how many run processes to launch concurrently and which tasks to prioritize. You may adjust fan-out based on memory, preparation contention, failures, and observed throughput. There is deliberately no run-all command, next-work command, scheduler, or host-saturation loop in the evaluator.
 
@@ -59,6 +66,7 @@ mod tests {
             Some(Path::new("/mnt/evals")),
             None,
             None,
+            None,
         );
 
         assert!(prompt.contains("choose an exact pending task and harness treatment"));
@@ -77,6 +85,7 @@ mod tests {
             Some(Path::new("/mnt/eval state")),
             None,
             None,
+            None,
         );
 
         assert!(prompt.contains("status 'release candidate' --state-dir '/mnt/eval state'"));
@@ -91,13 +100,15 @@ mod tests {
             None,
             Some("http://127.0.0.1:8789"),
             Some("dev-georgios-01"),
+            Some(Path::new("/opt/nanocodex/bin/nanocodex")),
         );
 
         assert!(prompt.contains("status 'release' --coordinator 'http://127.0.0.1:8789'"));
         assert!(prompt.contains(
-            "run 'release' --config 'nanocodex.toml' --coordinator 'http://127.0.0.1:8789' --worker 'dev-georgios-01' --task"
+            "'/opt/nanocodex/bin/nanocodex' eval run 'release' --config 'nanocodex.toml' --coordinator 'http://127.0.0.1:8789' --worker 'dev-georgios-01' --task"
         ));
         assert!(prompt.contains("do not open SQLite directly"));
+        assert!(prompt.contains("not a software-development task"));
         assert!(!prompt.contains("--state-dir"));
     }
 }

@@ -83,12 +83,15 @@ impl Benchmark {
                 coordinator.as_deref(),
             );
         }
+        let executable =
+            std::env::current_exe().wrap_err("failed to resolve nanocodex executable")?;
         let prompt = benchmark::prompt(
             Some(profile.as_str()),
             &config,
             state_dir.as_deref(),
             coordinator.as_deref(),
             worker.as_deref(),
+            Some(&executable),
         );
         let initial = BoardStatus::load(
             &profile,

@@ -26,8 +26,12 @@ pub(super) fn install(
         bail!("--systemd is supported only on Linux");
     }
 
-    let working_directory = env::current_dir().wrap_err("failed to resolve current directory")?;
-    let config = absolute_existing(config, &working_directory, "runtime helper config")?;
+    let invocation_directory =
+        env::current_dir().wrap_err("failed to resolve current directory")?;
+    let config = absolute_existing(config, &invocation_directory, "runtime helper config")?;
+    let working_directory = config
+        .parent()
+        .ok_or_else(|| eyre!("runtime helper config has no parent directory"))?;
     if let Some(coordinator) = coordinator {
         CoordinatorClient::new(coordinator)?;
     }
@@ -35,7 +39,7 @@ pub(super) fn install(
         None
     } else {
         let state_dir = state_dir.map_or_else(default_state_dir, |path| Ok(path.to_path_buf()))?;
-        let state_dir = absolute(&state_dir, &working_directory);
+        let state_dir = absolute(&state_dir, &invocation_directory);
         Evaluation::open(&config, profile, &state_dir)?;
         Some(state_dir.canonicalize().wrap_err_with(|| {
             format!("failed to resolve state directory {}", state_dir.display())
@@ -48,7 +52,7 @@ pub(super) fn install(
         .or_else(|| state_dir.as_deref().map(Path::as_os_str))
         .ok_or_else(|| eyre!("benchmark service target is absent"))?;
     let unit_name = unit_name(profile, &config, target);
-    let unit = render_unit(&executable, &arguments, &working_directory)?;
+    let unit = render_unit(&executable, &arguments, working_directory)?;
     let unit_path = user_unit_directory()?.join(&unit_name);
 
     fs::create_dir_all(

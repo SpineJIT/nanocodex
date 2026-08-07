@@ -2791,6 +2791,7 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
             None,
             None,
             None,
+            None,
         );
         input.set_display(display);
         input.set_instruction(instruction);
