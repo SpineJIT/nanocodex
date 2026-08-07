@@ -674,10 +674,31 @@ fn spawn_reaper(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            active
-                .lock()
-                .await
-                .retain(|_, claim| claim.last_seen.elapsed() <= worker_timeout);
+            let expired = {
+                let mut active = active.lock().await;
+                let tokens = active
+                    .iter()
+                    .filter(|(_, claim)| claim.last_seen.elapsed() > worker_timeout)
+                    .map(|(token, _)| token.clone())
+                    .collect::<Vec<_>>();
+                tokens
+                    .into_iter()
+                    .filter_map(|token| active.remove(&token))
+                    .collect::<Vec<_>>()
+            };
+            for expired in expired {
+                let result = match expired.claim {
+                    HeldClaim::Preparation(claim) => {
+                        claim.retry("coordinator worker heartbeat expired")
+                    }
+                    HeldClaim::Coordinate(claim) => {
+                        claim.retry("coordinator worker heartbeat expired")
+                    }
+                };
+                if let Err(error) = result {
+                    tracing::warn!(%error, "failed to release expired coordinator claim");
+                }
+            }
         }
     })
 }
@@ -1336,7 +1357,7 @@ allow_internet = false
     #[tokio::test]
     async fn unreachable_worker_is_reclaimed_and_its_stale_token_is_fenced() {
         let (_directory, client, selection, server) =
-            fixture_with_policy(Duration::from_millis(80), Duration::from_millis(20), 2).await;
+            fixture_with_policy(Duration::from_secs(30), Duration::from_millis(20), 2).await;
         let RemoteClaim::Prepare {
             lease: preparation, ..
         } = client.claim(&selection).await.unwrap()

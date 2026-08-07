@@ -37,7 +37,7 @@ This is an operations loop, not a software-development task. Do not inspect repo
 
 The desired amount of work is already materialized in {ledger}. Do not infer it from `{config}` or add ad-hoc work during this workflow. Inspect the durable ledger with:
 
-    {executable} eval status{profile_argument}{state_argument}{coordinator_argument} --json
+    {executable} eval status{profile_argument}{state_argument}{coordinator_argument} --json --family-limit 32
 
 You own execution strategy. Read the family records, choose an exact pending task and harness treatment, and invoke one repetition with `{executable} eval run{profile_argument} --config {config_argument}{state_argument}{coordinator_argument}{worker_argument} --task <exact-profile-selector>` plus `--harness`, model, or thinking selectors required to identify that profile family. Omit `--harness` for built-in Nanocodex. The CLI allocates the internal repetition; never pass or invent a trial number.
 
@@ -104,6 +104,7 @@ mod tests {
         );
 
         assert!(prompt.contains("status 'release' --coordinator 'http://127.0.0.1:8789'"));
+        assert!(prompt.contains("--json --family-limit 32"));
         assert!(prompt.contains(
             "'/opt/nanocodex/bin/nanocodex' eval run 'release' --config 'nanocodex.toml' --coordinator 'http://127.0.0.1:8789' --worker 'dev-georgios-01' --task"
         ));

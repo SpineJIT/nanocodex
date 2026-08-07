@@ -96,6 +96,10 @@ pub(super) struct Status {
     /// Print the complete machine-readable profile ledger.
     #[arg(long)]
     json: bool,
+
+    /// Return at most this many nonterminal family records while preserving exact totals.
+    #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u16).range(1..))]
+    family_limit: Option<u16>,
 }
 
 #[derive(Args)]
@@ -231,7 +235,8 @@ enum RunOutput<'a> {
 impl Status {
     pub(super) async fn run(self) -> Result<()> {
         if let Some(coordinator) = &self.target.coordinator {
-            let status = CoordinatorClient::new(coordinator)?.status().await?;
+            let mut status = CoordinatorClient::new(coordinator)?.status().await?;
+            limit_remote_families(&mut status, self.family_limit);
             if self.json {
                 serde_json::to_writer_pretty(std::io::stdout().lock(), &status)?;
                 println!();
@@ -241,7 +246,13 @@ impl Status {
             return Ok(());
         }
         let evaluation = self.target.open(Path::new(CONFIG_FILE))?;
-        let status = evaluation.status()?;
+        let mut status = evaluation.status()?;
+        if let Some(limit) = self.family_limit {
+            status
+                .families
+                .retain(|family| family.pending > 0 || family.running > 0);
+            status.families.truncate(usize::from(limit));
+        }
         if self.json {
             serde_json::to_writer_pretty(std::io::stdout().lock(), &status)?;
             println!();
@@ -269,6 +280,23 @@ impl Status {
         }
         Ok(())
     }
+}
+
+fn limit_remote_families(status: &mut serde_json::Value, limit: Option<u16>) {
+    let Some(limit) = limit else {
+        return;
+    };
+    let Some(families) = status
+        .get_mut("families")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    families.retain(|family| {
+        family.get("pending").and_then(serde_json::Value::as_u64) > Some(0)
+            || family.get("running").and_then(serde_json::Value::as_u64) > Some(0)
+    });
+    families.truncate(usize::from(limit));
 }
 
 impl Run {
@@ -766,7 +794,7 @@ mod tests {
 
     use clap::Parser as _;
 
-    use super::default_state_dir;
+    use super::{default_state_dir, limit_remote_families};
     use crate::{Cli, Command, eval::EvalCommand};
 
     #[test]
@@ -792,6 +820,22 @@ mod tests {
         };
         assert_eq!(run.task, "terminal/fix-git");
         assert_eq!(run.worker.as_deref(), Some("dev-one"));
+    }
+
+    #[test]
+    fn status_family_limit_keeps_exact_totals_and_only_nonterminal_rows() {
+        let mut status = serde_json::json!({
+            "coordinates": { "complete": 10, "pending": 20, "running": 2 },
+            "families": [
+                { "id": "done", "pending": 0, "running": 0 },
+                { "id": "one", "pending": 1, "running": 0 },
+                { "id": "two", "pending": 0, "running": 1 },
+            ],
+        });
+        limit_remote_families(&mut status, Some(1));
+        assert_eq!(status["coordinates"]["pending"], 20);
+        assert_eq!(status["families"].as_array().unwrap().len(), 1);
+        assert_eq!(status["families"][0]["id"], "one");
     }
 
     #[test]
