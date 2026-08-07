@@ -976,15 +976,16 @@ mod tests {
     use super::*;
     use crate::{EvaluationSelector, EvaluationWork, Task, coordinator::RemoteClaim};
 
-    fn write_task(root: &Path) {
-        let task = root.join("one");
+    fn write_task(root: &Path, name: &str) {
+        let task = root.join(name);
         fs::create_dir_all(task.join("environment")).unwrap();
         fs::create_dir_all(task.join("tests")).unwrap();
         fs::write(
             task.join("task.toml"),
-            r#"schema_version = "1.1"
+            format!(
+                r#"schema_version = "1.1"
 [task]
-name = "one"
+name = "{name}"
 description = "test"
 [agent]
 timeout_sec = 1.0
@@ -998,6 +999,8 @@ storage_mb = 128
 gpus = 0
 allow_internet = false
 "#,
+                name = name
+            ),
         )
         .unwrap();
         fs::write(task.join("instruction.md"), "do it").unwrap();
@@ -1011,12 +1014,13 @@ allow_internet = false
         EvaluationSelector,
         JoinHandle<()>,
     ) {
-        fixture_with_policy(Duration::from_secs(30), Duration::from_secs(5)).await
+        fixture_with_policy(Duration::from_secs(30), Duration::from_secs(5), 2).await
     }
 
     async fn fixture_with_policy(
         lease_duration: Duration,
         worker_timeout: Duration,
+        trials: u16,
     ) -> (
         tempfile::TempDir,
         CoordinatorClient,
@@ -1024,13 +1028,13 @@ allow_internet = false
         JoinHandle<()>,
     ) {
         let directory = tempfile::tempdir().unwrap();
-        write_task(directory.path());
+        write_task(directory.path(), "one");
         let state = directory.path().join("state");
         let task = Task::load(directory.path().join("one")).unwrap();
         let work = EvaluationWork::new("one", task)
             .model(Model::Sol)
             .thinking(Thinking::High)
-            .trials(2);
+            .trials(trials);
         Evaluation::add(&state, "release", &[work], false).unwrap();
         let missing_profile = directory.path().join("profile-is-not-required.toml");
         let evaluation = Evaluation::open(missing_profile, "release", state).unwrap();
@@ -1047,6 +1051,92 @@ allow_internet = false
         });
         let client = CoordinatorClient::new(&format!("http://{address}")).unwrap();
         (directory, client, selection, server)
+    }
+
+    #[tokio::test]
+    async fn running_coordinator_reads_appends_and_new_generations_from_sqlite() {
+        let (directory, client, _selection, server) = fixture().await;
+        let state = directory.path().join("state");
+        write_task(directory.path(), "two");
+        let two = Task::load(directory.path().join("two")).unwrap();
+        Evaluation::add(
+            &state,
+            "release",
+            &[EvaluationWork::new("two", two)
+                .model(Model::Sol)
+                .thinking(Thinking::High)],
+            false,
+        )
+        .unwrap();
+
+        let appended = client.status().await.unwrap();
+        assert_eq!(appended["coordinates"]["pending"], 3);
+        assert_eq!(appended["families"].as_array().unwrap().len(), 2);
+        let two = EvaluationSelector::new("two");
+        let RemoteClaim::Prepare { lease, .. } = client.claim(&two).await.unwrap() else {
+            panic!("the running coordinator must claim newly appended work");
+        };
+        client.prepared(&lease).await.unwrap();
+        let RemoteClaim::Run { lease, .. } = client.claim(&two).await.unwrap() else {
+            panic!("the appended task must become runnable");
+        };
+        client.retry(&lease, "test cleanup").await.unwrap();
+
+        let previous_generation = appended["generation"].as_str().unwrap().to_owned();
+        let one = Task::load(directory.path().join("one")).unwrap();
+        Evaluation::add(
+            &state,
+            "release",
+            &[EvaluationWork::new("one", one)
+                .model(Model::Sol)
+                .thinking(Thinking::High)
+                .trials(3)],
+            true,
+        )
+        .unwrap();
+
+        let replaced = client.status().await.unwrap();
+        assert_ne!(replaced["generation"], previous_generation);
+        assert_eq!(replaced["coordinates"]["pending"], 3);
+        assert_eq!(replaced["families"].as_array().unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_workers_claim_every_repetition_exactly_once() {
+        const TRIALS: u16 = 32;
+        let (_directory, client, selection, server) =
+            fixture_with_policy(Duration::from_secs(30), Duration::from_secs(5), TRIALS).await;
+        let client = client.worker("saturated-host");
+        let RemoteClaim::Prepare { lease, .. } = client.claim(&selection).await.unwrap() else {
+            panic!("first claim should prepare the task");
+        };
+        client.prepared(&lease).await.unwrap();
+
+        let claims = futures_util::future::join_all((0..TRIALS).map(|_| {
+            let client = client.clone();
+            let selection = selection.clone();
+            async move { client.claim(&selection).await }
+        }))
+        .await;
+        let mut repetitions = Vec::with_capacity(usize::from(TRIALS));
+        let mut leases = Vec::with_capacity(usize::from(TRIALS));
+        for claim in claims {
+            let RemoteClaim::Run {
+                lease, repetition, ..
+            } = claim.unwrap()
+            else {
+                panic!("every available repetition should be claimed");
+            };
+            repetitions.push(repetition);
+            leases.push(lease);
+        }
+        repetitions.sort_unstable();
+        assert_eq!(repetitions, (1..=TRIALS).collect::<Vec<_>>());
+        for lease in leases {
+            client.retry(&lease, "test cleanup").await.unwrap();
+        }
+        server.abort();
     }
 
     #[tokio::test]
@@ -1246,7 +1336,7 @@ allow_internet = false
     #[tokio::test]
     async fn unreachable_worker_is_reclaimed_and_its_stale_token_is_fenced() {
         let (_directory, client, selection, server) =
-            fixture_with_policy(Duration::from_millis(80), Duration::from_millis(20)).await;
+            fixture_with_policy(Duration::from_millis(80), Duration::from_millis(20), 2).await;
         let RemoteClaim::Prepare {
             lease: preparation, ..
         } = client.claim(&selection).await.unwrap()

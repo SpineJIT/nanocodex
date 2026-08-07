@@ -221,7 +221,7 @@ impl EvalApi {
         let mut total = EvalSummary::default();
         let mut overview = Vec::with_capacity(worksets.len());
         for workset in worksets {
-            let coordinates = read_coordinates(&connection, workset.id, None)?;
+            let coordinates = read_coordinates(&connection, workset.id, None, None)?;
             let summary = summarize(&coordinates, now)?;
             add_summary(&mut total, &summary);
             let task_count = u64::try_from(
@@ -257,7 +257,7 @@ impl EvalApi {
             return Ok(None);
         };
         let now = now_ms()?;
-        let coordinates = read_coordinates(&connection, workset.id, None)?;
+        let coordinates = read_coordinates(&connection, workset.id, None, None)?;
         let summary = summarize(&coordinates, now)?;
         let task_count = coordinates
             .iter()
@@ -321,7 +321,7 @@ impl EvalApi {
             return Ok(None);
         };
         let now = now_ms()?;
-        let mut coordinates = read_coordinates(&connection, workset.id, Some(task.id))?;
+        let mut coordinates = read_coordinates(&connection, workset.id, Some(task.id), None)?;
         let mut treatments = Vec::<TreatmentDetail>::new();
         for coordinate in coordinates.drain(..) {
             let treatment = parse_treatment(&coordinate.treatment);
@@ -399,7 +399,7 @@ impl EvalApi {
         let Some(task) = find_task(&connection, workset.id, workset_digest, task_id)? else {
             return Ok(None);
         };
-        let coordinates = read_coordinates(&connection, workset.id, Some(task.id))?
+        let coordinates = read_coordinates(&connection, workset.id, Some(task.id), None)?
             .into_iter()
             .filter(|coordinate| {
                 coordinate.state == "terminal" && result_path(coordinate).is_some()
@@ -429,14 +429,18 @@ impl EvalApi {
 
     pub(crate) fn case(&self, id: &str) -> Result<Option<CaseEvidence>, String> {
         let connection = self.connection()?;
-        for workset in read_worksets(&connection)? {
-            for coordinate in read_coordinates(&connection, workset.id, None)? {
-                if case_id(&workset.digest, coordinate.id) == id {
-                    return self.evidence_for(&coordinate);
-                }
-            }
-        }
-        Ok(None)
+        let Some((workset_digest, coordinate_id)) = parse_case_id(id) else {
+            return Ok(None);
+        };
+        let Some(workset) = find_workset(&connection, workset_digest)? else {
+            return Ok(None);
+        };
+        let coordinate = read_coordinates(&connection, workset.id, None, Some(coordinate_id))?
+            .into_iter()
+            .next();
+        coordinate
+            .as_ref()
+            .map_or(Ok(None), |coordinate| self.evidence_for(coordinate))
     }
 
     fn connection(&self) -> Result<Connection, String> {
@@ -577,6 +581,7 @@ fn read_coordinates(
     connection: &Connection,
     workset_id: i64,
     task_id: Option<i64>,
+    coordinate_id: Option<i64>,
 ) -> Result<Vec<CoordinateRow>, String> {
     let mut statement = connection
         .prepare(
@@ -584,11 +589,12 @@ fn read_coordinates(
                     c.lease_expires_at_ms, c.result_path, t.name, t.digest \
              FROM coordinates c JOIN tasks t ON t.id = c.task_id \
              WHERE c.workset_id = ?1 AND (?2 IS NULL OR c.task_id = ?2) \
+                   AND (?3 IS NULL OR c.id = ?3) \
              ORDER BY t.name, c.family_key, c.repetition",
         )
         .map_err(|error| error.to_string())?;
     let mut coordinates = statement
-        .query_map((workset_id, task_id), |row| {
+        .query_map((workset_id, task_id, coordinate_id), |row| {
             Ok(CoordinateRow {
                 id: row.get(0)?,
                 family_key: row.get(1)?,
@@ -615,11 +621,12 @@ fn read_coordinates(
             "SELECT e.coordinate_id, e.state, e.started_at_ms, e.finished_at_ms, e.result_path \
              FROM executions e JOIN coordinates c ON c.id = e.coordinate_id \
              WHERE c.workset_id = ?1 AND (?2 IS NULL OR c.task_id = ?2) \
+                   AND (?3 IS NULL OR c.id = ?3) \
              ORDER BY e.coordinate_id, e.generation",
         )
         .map_err(|error| error.to_string())?;
     let rows = attempts
-        .query_map((workset_id, task_id), |row| {
+        .query_map((workset_id, task_id, coordinate_id), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 ExecutionRow {
@@ -922,7 +929,15 @@ fn short_name(name: &str) -> &str {
 }
 
 fn case_id(workset_digest: &str, coordinate_id: i64) -> String {
-    public_id(&[workset_digest, &coordinate_id.to_string()])
+    format!("{workset_digest}:{coordinate_id}")
+}
+
+fn parse_case_id(id: &str) -> Option<(&str, i64)> {
+    let (workset_digest, coordinate_id) = id.rsplit_once(':')?;
+    if workset_digest.is_empty() {
+        return None;
+    }
+    Some((workset_digest, coordinate_id.parse().ok()?))
 }
 
 fn public_id(parts: &[&str]) -> String {
