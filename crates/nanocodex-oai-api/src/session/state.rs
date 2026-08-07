@@ -344,6 +344,25 @@ pub enum ManagedSessionStateError {
 #[cfg(test)]
 mod tests {
     use super::{ManagedSessionState, ManagedSessionStateError};
+    use crate::{FunctionOutputBody, ResponseItem};
+
+    #[test]
+    fn resume_accepts_legacy_spine_code_mode_terminal_output() {
+        let call: ResponseItem = serde_json::from_str(
+            r#"{"type":"custom_tool_call","id":"ctc_source","call_id":"exec","name":"exec","input":"code"}"#,
+        )
+        .unwrap();
+        let output = ResponseItem::custom_tool_output(
+            "exec".to_owned(),
+            Some("spine.code_mode.output.v1".to_owned()),
+            FunctionOutputBody::Text(
+                r#"{"schema":"spine.code_mode.output.v1","outer_success":true,"visible_body":"done"}"#
+                    .into(),
+            ),
+        );
+
+        assert!(ManagedSessionState::resume(vec![call, output]).is_ok());
+    }
 
     #[test]
     fn empty_response_id_cannot_commit_an_incremental_checkpoint() {
