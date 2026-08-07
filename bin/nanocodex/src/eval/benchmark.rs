@@ -35,7 +35,10 @@ pub(super) struct Benchmark {
     headless: bool,
 
     /// Install and start this benchmark as a durable user systemd service.
-    #[arg(long, conflicts_with = "coordinator")]
+    ///
+    /// When `--coordinator` is present, the supervised agent and every run it
+    /// launches use that coordinator instead of opening SQLite directly.
+    #[arg(long)]
     systemd: bool,
 
     #[command(flatten)]
@@ -62,7 +65,12 @@ impl Benchmark {
             vm,
         } = self;
         if systemd {
-            return systemd::install(&profile, &config, state_dir.as_deref());
+            return systemd::install(
+                &profile,
+                &config,
+                state_dir.as_deref(),
+                coordinator.as_deref(),
+            );
         }
         let prompt = benchmark::prompt(
             Some(profile.as_str()),

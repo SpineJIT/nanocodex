@@ -16,10 +16,15 @@ pub(crate) fn prompt(
         format!(" --coordinator {}", shell_quote(coordinator))
     });
     let config_argument = shell_quote(&config.to_string_lossy());
+    let ledger = if coordinator.is_some() {
+        "the coordinator-backed SQLite ledger; do not open SQLite directly"
+    } else {
+        "SQLite"
+    };
     format!(
-        r#"Drive the Nanocodex SQLite profile {selected} to durable completion.
+        r#"Drive the Nanocodex evaluation profile {selected} to durable completion.
 
-The desired amount of work is already materialized in SQLite. Do not infer it from `{config}` or add ad-hoc work during this workflow. Inspect the durable ledger with:
+The desired amount of work is already materialized in {ledger}. Do not infer it from `{config}` or add ad-hoc work during this workflow. Inspect the durable ledger with:
 
     nanocodex eval status{profile_argument}{state_argument}{coordinator_argument} --json
 
@@ -85,6 +90,7 @@ mod tests {
         assert!(prompt.contains(
             "run 'release' --config 'nanocodex.toml' --coordinator 'http://127.0.0.1:8789' --task"
         ));
+        assert!(prompt.contains("do not open SQLite directly"));
         assert!(!prompt.contains("--state-dir"));
     }
 }

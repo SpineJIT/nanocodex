@@ -9,29 +9,45 @@ use std::{
 };
 
 use eyre::{Result, WrapErr as _, bail, eyre};
-use nanocodex_eval::Evaluation;
+use nanocodex_eval::{Evaluation, coordinator::CoordinatorClient};
 use sha2::{Digest as _, Sha256};
 
 use super::profile::default_state_dir;
 
 const RESTART_DELAY: &str = "30s";
 
-pub(super) fn install(profile: &str, config: &Path, state_dir: Option<&Path>) -> Result<()> {
+pub(super) fn install(
+    profile: &str,
+    config: &Path,
+    state_dir: Option<&Path>,
+    coordinator: Option<&str>,
+) -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!("--systemd is supported only on Linux");
     }
 
     let working_directory = env::current_dir().wrap_err("failed to resolve current directory")?;
     let config = absolute_existing(config, &working_directory, "runtime helper config")?;
-    let state_dir = state_dir.map_or_else(default_state_dir, |path| Ok(path.to_path_buf()))?;
-    let state_dir = absolute(&state_dir, &working_directory);
-    let evaluation = Evaluation::open(&config, profile, &state_dir)?;
-    let state_dir = state_dir
-        .canonicalize()
-        .wrap_err_with(|| format!("failed to resolve state directory {}", state_dir.display()))?;
+    if let Some(coordinator) = coordinator {
+        CoordinatorClient::new(coordinator)?;
+    }
+    let state_dir = if coordinator.is_some() {
+        None
+    } else {
+        let state_dir = state_dir.map_or_else(default_state_dir, |path| Ok(path.to_path_buf()))?;
+        let state_dir = absolute(&state_dir, &working_directory);
+        Evaluation::open(&config, profile, &state_dir)?;
+        Some(state_dir.canonicalize().wrap_err_with(|| {
+            format!("failed to resolve state directory {}", state_dir.display())
+        })?)
+    };
     let executable = env::current_exe().wrap_err("failed to resolve the nanocodex executable")?;
-    let arguments = service_arguments(&config, &state_dir)?;
-    let unit_name = unit_name(evaluation.name(), &config, &state_dir);
+    let arguments = service_arguments(&config, state_dir.as_deref())?;
+    let target = coordinator
+        .map(OsStr::new)
+        .or_else(|| state_dir.as_deref().map(Path::as_os_str))
+        .ok_or_else(|| eyre!("benchmark service target is absent"))?;
+    let unit_name = unit_name(profile, &config, target);
     let unit = render_unit(&executable, &arguments, &working_directory)?;
     let unit_path = user_unit_directory()?.join(&unit_name);
 
@@ -53,15 +69,28 @@ pub(super) fn install(profile: &str, config: &Path, state_dir: Option<&Path>) ->
     Ok(())
 }
 
-fn service_arguments(config: &Path, state_dir: &Path) -> Result<Vec<OsString>> {
-    let mut arguments = env::args_os().skip(1).collect::<Vec<_>>();
+fn service_arguments(config: &Path, state_dir: Option<&Path>) -> Result<Vec<OsString>> {
+    Ok(normalize_service_arguments(
+        env::args_os().skip(1).collect(),
+        config,
+        state_dir,
+    ))
+}
+
+fn normalize_service_arguments(
+    mut arguments: Vec<OsString>,
+    config: &Path,
+    state_dir: Option<&Path>,
+) -> Vec<OsString> {
     arguments.retain(|argument| argument != "--systemd");
     replace_option(&mut arguments, "--config", config.as_os_str());
-    replace_option(&mut arguments, "--state-dir", state_dir.as_os_str());
+    if let Some(state_dir) = state_dir {
+        replace_option(&mut arguments, "--state-dir", state_dir.as_os_str());
+    }
     if !arguments.iter().any(|argument| argument == "--headless") {
         arguments.push(OsString::from("--headless"));
     }
-    Ok(arguments)
+    arguments
 }
 
 fn replace_option(arguments: &mut Vec<OsString>, option: &str, value: &OsStr) {
@@ -157,11 +186,11 @@ fn quote(value: &OsStr) -> Result<String> {
     Ok(quoted)
 }
 
-fn unit_name(profile: &str, config: &Path, state_dir: &Path) -> String {
+fn unit_name(profile: &str, config: &Path, target: &OsStr) -> String {
     let mut digest = Sha256::new();
     digest.update(config.as_os_str().as_encoded_bytes());
     digest.update([0]);
-    digest.update(state_dir.as_os_str().as_encoded_bytes());
+    digest.update(target.as_encoded_bytes());
     digest.update([0]);
     digest.update(profile.as_bytes());
     let digest = hex::encode(digest.finalize());
@@ -260,9 +289,12 @@ fn print_linger_hint() {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::{
+        ffi::{OsStr, OsString},
+        path::Path,
+    };
 
-    use super::{render_unit, replace_option, unit_name};
+    use super::{normalize_service_arguments, render_unit, replace_option, unit_name};
 
     #[test]
     fn unit_runs_the_plain_headless_benchmark_and_restarts_failures() {
@@ -310,26 +342,75 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_backed_service_keeps_remote_routing_without_sqlite_state() {
+        let arguments = normalize_service_arguments(
+            [
+                "eval",
+                "benchmark",
+                "release",
+                "--config",
+                "relative.toml",
+                "--coordinator",
+                "http://127.0.0.1:8788",
+                "--systemd",
+            ]
+            .map(OsString::from)
+            .into(),
+            Path::new("/srv/nanocodex.toml"),
+            None,
+        );
+
+        assert_eq!(
+            arguments,
+            [
+                "eval",
+                "benchmark",
+                "release",
+                "--config",
+                "/srv/nanocodex.toml",
+                "--coordinator",
+                "http://127.0.0.1:8788",
+                "--headless",
+            ]
+            .map(OsString::from)
+        );
+        assert!(!arguments.iter().any(|argument| argument == "--state-dir"));
+    }
+
+    #[test]
     fn unit_identity_is_stable_and_safe() {
         assert_eq!(
             unit_name(
                 "Terminal Bench / k=5",
                 "/srv/nanocodex.toml".as_ref(),
-                "/srv/state".as_ref(),
+                OsStr::new("/srv/state"),
             ),
             unit_name(
                 "Terminal Bench / k=5",
                 "/srv/nanocodex.toml".as_ref(),
-                "/srv/state".as_ref(),
+                OsStr::new("/srv/state"),
             )
         );
         assert!(
             unit_name(
                 "Terminal Bench / k=5",
                 "/srv/nanocodex.toml".as_ref(),
-                "/srv/state".as_ref(),
+                OsStr::new("/srv/state"),
             )
             .starts_with("nanocodex-benchmark-terminal-bench---k-5-")
+        );
+
+        assert_ne!(
+            unit_name(
+                "Terminal Bench / k=5",
+                "/srv/nanocodex.toml".as_ref(),
+                OsStr::new("/srv/state"),
+            ),
+            unit_name(
+                "Terminal Bench / k=5",
+                "/srv/nanocodex.toml".as_ref(),
+                OsStr::new("http://127.0.0.1:8788"),
+            )
         );
     }
 }
