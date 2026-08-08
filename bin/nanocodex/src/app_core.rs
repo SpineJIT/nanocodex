@@ -10,7 +10,7 @@ use crate::{
     vm::VmArgs,
 };
 
-pub use crate::tui::{VoiceControl, WorkerCommand, WorkerEvent};
+pub use crate::tui::{PaneId, SubmittedPrompt, VoiceControl, WorkerCommand, WorkerEvent};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkerCapability {

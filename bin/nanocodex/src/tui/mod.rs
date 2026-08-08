@@ -45,8 +45,10 @@ use tokio::{
 };
 use tracing::{Instrument, info_span};
 
+pub use self::app::{PaneId, SubmittedPrompt};
+
 use self::{
-    app::{App, EscapeAction, PaneId, ReasoningPickerAction, SubmittedPrompt},
+    app::{App, EscapeAction, ReasoningPickerAction},
     notification::Notifier,
     scheduler::{ANIMATION_TICK_INTERVAL, RenderScheduler, RenderScope, STREAM_FRAME_INTERVAL},
     telemetry::{StreamTelemetry, ViewTelemetry},
@@ -54,7 +56,9 @@ use self::{
     transcript::TranscriptItem,
 };
 use crate::{
-    app_core::{StandardWorkerFactory, WorkerCapabilities, WorkerCapability, WorkerFactory},
+    app_core::{
+        StandardWorkerFactory, WorkerCapabilities, WorkerCapability, WorkerFactory, WorkerHandle,
+    },
     config::AgentArgs,
 };
 
@@ -700,23 +704,37 @@ where
 {
     let mut worker = factory.start();
     if !worker.capabilities().supports(WorkerCapability::Prompt) {
-        worker.shutdown().await?;
-        return Err(eyre::eyre!(
-            "the selected application worker cannot accept prompts"
-        ));
+        return finish_worker(
+            worker,
+            Err(eyre::eyre!(
+                "the selected application worker cannot accept prompts"
+            )),
+        )
+        .await;
     }
     let capabilities = worker.capabilities();
     let root_session_id = Arc::<str>::from(worker.session_id());
 
-    let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
+    let mut terminal = match TerminalSession::enter().wrap_err("failed to initialize the terminal")
+    {
+        Ok(terminal) => terminal,
+        Err(error) => return finish_worker(worker, Err(error)).await,
+    };
     let terminal_profile = TerminalProfile::query(Duration::from_millis(750));
     let (math_update_tx, mut math_update_rx) = mpsc::channel(1);
-    let math_renderer = Ratatex::builder(terminal_profile)
+    let math_renderer = match Ratatex::builder(terminal_profile)
         .on_update(move || {
             let _ = math_update_tx.try_send(());
         })
         .build()
-        .wrap_err("failed to initialize the display-math renderer")?;
+        .wrap_err("failed to initialize the display-math renderer")
+    {
+        Ok(math_renderer) => math_renderer,
+        Err(error) => {
+            drop(terminal);
+            return finish_worker(worker, Err(error)).await;
+        }
+    };
     let availability = math_renderer.availability();
     tracing::debug!(
         graphics = availability.graphics,
@@ -821,6 +839,15 @@ where
     math_renderer.shutdown();
     let shutdown_result = worker.shutdown().await;
     loop_result?;
+    shutdown_result
+}
+
+async fn finish_worker(
+    worker: WorkerHandle<WorkerCommand, WorkerEvent>,
+    run_result: Result<()>,
+) -> Result<()> {
+    let shutdown_result = worker.shutdown().await;
+    run_result?;
     shutdown_result
 }
 
@@ -2531,6 +2558,12 @@ fn handle_escape_key(
     {
         return Ok(());
     }
+    if app.is_running(target)
+        && app.pending_steers(target)
+        && !require_worker_capability(app, capabilities, WorkerCapability::Cancel)
+    {
+        return Ok(());
+    }
     match app.handle_escape(Instant::now()) {
         Some(EscapeAction::Cancel(target)) => {
             if !require_worker_capability(app, capabilities, WorkerCapability::Cancel) {
@@ -2708,6 +2741,9 @@ fn request_historical_edit(
         return Ok(());
     }
     let cancel_source = app.main.running || app.main.pending_turns > 0;
+    if cancel_source && !require_worker_capability(app, capabilities, WorkerCapability::Cancel) {
+        return Ok(());
+    }
     let Some(request) = app.commit_historical_edit() else {
         return Ok(());
     };
@@ -3156,6 +3192,7 @@ mod tests {
     };
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+    use eyre::Result;
     use futures_util::{SinkExt, StreamExt};
     use nanocodex::{
         Nanocodex, OpenAi, Thinking,
@@ -3164,15 +3201,19 @@ mod tests {
     };
     use nanocodex_voice::RealtimeVoice;
     use serde_json::{Value, json};
-    use tokio::{net::TcpListener, sync::mpsc, time::timeout};
+    use tokio::{
+        net::TcpListener,
+        sync::{mpsc, oneshot},
+        time::timeout,
+    };
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
     use super::{
         BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
-        UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, active_session_id,
-        apply_worker_event_batch, classify_submission, handle_key, handle_worker_update,
-        paste_clipboard_image, prepare_btw_prompt, report_cancel_outcome, session_trace_url,
-        spawn_agent_worker,
+        UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, WorkerHandle, active_session_id,
+        apply_worker_event_batch, classify_submission, finish_worker, handle_key,
+        handle_worker_update, paste_clipboard_image, prepare_btw_prompt, report_cancel_outcome,
+        session_trace_url, spawn_agent_worker,
     };
     use crate::tui::{
         app::App,
@@ -4153,6 +4194,96 @@ mod tests {
         ));
         assert_eq!(app.input, "preserved draft");
         assert!(worker.try_recv().is_err());
+    }
+
+    #[test]
+    fn steer_only_workers_do_not_interrupt_pending_steers() {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        app.main.running = true;
+        app.queue_steer(PaneId::Main, "first correction".to_owned())
+            .unwrap();
+        let mut ui = UiModel::with_capabilities(
+            app,
+            Arc::from("main-session"),
+            crate::app_core::WorkerCapabilities::empty()
+                .with(crate::app_core::WorkerCapability::Prompt)
+                .with(crate::app_core::WorkerCapability::Steer),
+        );
+
+        let update = ui
+            .update(
+                UiAction::Terminal(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+                &commands,
+            )
+            .unwrap();
+
+        assert_eq!(update, UiUpdate::Redraw(RedrawPriority::Immediate));
+        assert!(worker.try_recv().is_err());
+        assert!(ui.app.main.running);
+        assert!(ui.app.pending_steers(PaneId::Main));
+    }
+
+    #[test]
+    fn historical_edit_of_an_active_turn_requires_cancel_capability() {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        app.main
+            .transcript
+            .push_editable_user("message with typo".to_owned(), 1);
+        app.main.running = true;
+        app.move_up();
+        assert!(app.start_historical_edit());
+        app.replace_input("message without typo".to_owned());
+        let mut ui = UiModel::with_capabilities(
+            app,
+            Arc::from("main-session"),
+            crate::app_core::WorkerCapabilities::empty()
+                .with(crate::app_core::WorkerCapability::Prompt)
+                .with(crate::app_core::WorkerCapability::HistoricalEdit),
+        );
+
+        let update = ui
+            .update(
+                UiAction::Terminal(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                ))),
+                &commands,
+            )
+            .unwrap();
+
+        assert_eq!(update, UiUpdate::Redraw(RedrawPriority::Immediate));
+        assert!(worker.try_recv().is_err());
+        assert!(ui.app.main.running);
+        assert!(ui.app.historical_editor_active());
+        assert_eq!(ui.app.input, "message without typo");
+    }
+
+    #[tokio::test]
+    async fn shuts_down_a_worker_after_setup_fails() -> Result<()> {
+        let (commands, mut command_rx) = mpsc::unbounded_channel::<WorkerCommand>();
+        let (_updates, events) = mpsc::unbounded_channel::<WorkerEvent>();
+        let (cleaned_tx, cleaned_rx) = oneshot::channel();
+        let worker = WorkerHandle::new(
+            commands,
+            events,
+            Arc::from("test-session"),
+            crate::app_core::WorkerCapabilities::standard(),
+            async move {
+                assert!(command_rx.recv().await.is_none());
+                cleaned_tx.send(()).unwrap();
+                Ok(())
+            },
+        );
+
+        let error = finish_worker(worker, Err(eyre::eyre!("setup failed")))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "setup failed");
+        cleaned_rx.await?;
+        Ok(())
     }
 
     #[test]

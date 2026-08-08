@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use eyre::Result;
 use nanocodex_bin::app_core::{
-    VoiceControl, WorkerCapabilities, WorkerCapability, WorkerCommand, WorkerEvent, WorkerFactory,
-    WorkerHandle,
+    PaneId, SubmittedPrompt, VoiceControl, WorkerCapabilities, WorkerCapability, WorkerCommand,
+    WorkerEvent, WorkerFactory, WorkerHandle,
 };
 use tokio::sync::mpsc;
 
@@ -11,6 +11,14 @@ struct TestWorkerFactory;
 
 const fn voice_command(control: VoiceControl) -> WorkerCommand {
     WorkerCommand::Voice(control)
+}
+
+const fn prompt_command(prompt: SubmittedPrompt) -> WorkerCommand {
+    WorkerCommand::Prompt {
+        target: PaneId::Main,
+        prompt_id: 1,
+        prompt,
+    }
 }
 
 impl WorkerFactory for TestWorkerFactory {
@@ -36,5 +44,6 @@ async fn external_worker_factory_uses_the_app_core_contract() -> Result<()> {
 
     assert!(worker.capabilities().supports(WorkerCapability::Prompt));
     let _ = voice_command(VoiceControl::List);
+    let _ = prompt_command(SubmittedPrompt::text("inspect the cache".to_owned()));
     worker.shutdown().await
 }
