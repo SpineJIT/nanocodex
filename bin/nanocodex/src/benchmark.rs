@@ -39,13 +39,13 @@ The desired amount of work is already materialized in {ledger}. Do not infer it 
 
     {executable} eval status{profile_argument}{state_argument}{coordinator_argument} --json --family-limit 32
 
-You own execution strategy. Read the family records, choose an exact pending task and harness treatment, and invoke one repetition with `{executable} eval run{profile_argument} --config {config_argument}{state_argument}{coordinator_argument}{worker_argument} --task <exact-profile-selector>` plus `--harness`, model, or thinking selectors required to identify that profile family. Omit `--harness` for built-in Nanocodex. The CLI allocates the internal repetition; never pass or invent a trial number.
+You own task and treatment priority. Read the family records, choose exact pending task and harness treatments, and invoke one repetition with `{executable} eval run{profile_argument} --config {config_argument}{state_argument}{coordinator_argument}{worker_argument} --task <exact-profile-selector>` plus `--harness`, model, or thinking selectors required to identify that profile family. Omit `--harness` for built-in Nanocodex. The CLI atomically allocates the internal repetition; never pass or invent a trial number.
 
-Decide how many run processes to launch concurrently and which tasks to prioritize. You may adjust fan-out based on memory, preparation contention, failures, and observed throughput. There is deliberately no run-all command, next-work command, scheduler, or host-saturation loop in the evaluator.
+Drive the host aggressively. Immediately launch 32 concurrent run processes in the first wave; do not begin with a one- or two-run probe. Keep 32 run slots occupied while pending work remains, replacing each process as soon as it exits instead of waiting for the rest of its wave. Spread the initial slots across already-prepared tasks and independent treatments so one preparation lock or failing family cannot stall the host. Reduce fan-out only after concrete host pressure such as an OOM kill, sustained swapping, or repeated VM allocation failure. A model failure, verifier failure, or one broken harness treatment is not evidence that unrelated slots should be idled.
 
 Task preparation is part of each task's durable state. One run process may prepare a task while another receives a temporary-unavailable result. Retry temporary contention after its suggested delay. Retry durable infrastructure failures, but treat accepted model and verifier outcomes as terminal even when the benchmark failed.
 
-After each wave, inspect the ledger again. Continue until every desired coordinate is terminal or a concrete non-retryable blocker is established. Inspect retained evidence for infrastructure failures and representative accepted results. Do not modify Nanocodex source, benchmark tasks, verifier code, or expected outputs in this workflow. Finish with exact completed/running/pending counts, evidence locations, failures, exclusions, and any remaining blocker."#,
+Re-read the bounded ledger whenever a slot needs replacement and periodically while long runs are active. Continue until every desired coordinate is terminal or a concrete non-retryable blocker is established. Inspect retained evidence for infrastructure failures and representative accepted results. Do not modify Nanocodex source, benchmark tasks, verifier code, or expected outputs in this workflow. Finish with exact completed/running/pending counts, evidence locations, failures, exclusions, and any remaining blocker."#,
         config = config.display(),
     )
 }
@@ -59,7 +59,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workflow_leaves_task_choice_and_parallelism_to_the_agent() {
+    fn workflow_leaves_task_choice_to_the_agent_and_demands_aggressive_saturation() {
         let prompt = prompt(
             Some("release"),
             Path::new("nanocodex.toml"),
@@ -69,9 +69,13 @@ mod tests {
             None,
         );
 
-        assert!(prompt.contains("choose an exact pending task and harness treatment"));
+        assert!(prompt.contains("choose exact pending task and harness treatments"));
         assert!(prompt.contains("Omit `--harness` for built-in Nanocodex"));
-        assert!(prompt.contains("Decide how many run processes to launch concurrently"));
+        assert!(prompt.contains("Immediately launch 32 concurrent run processes"));
+        assert!(prompt.contains("do not begin with a one- or two-run probe"));
+        assert!(prompt.contains("Keep 32 run slots occupied"));
+        assert!(prompt.contains("replacing each process as soon as it exits"));
+        assert!(prompt.contains("Reduce fan-out only after concrete host pressure"));
         assert!(prompt.contains("never pass or invent a trial number"));
         assert!(prompt.contains("--state-dir '/mnt/evals'"));
         assert!(!prompt.contains("eval work"));
