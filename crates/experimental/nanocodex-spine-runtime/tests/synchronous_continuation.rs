@@ -8,7 +8,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use codex_spine_core::NodeStatus;
+use codex_spine_core::{MemorySlot, NodeStatus};
 use nanocodex::oai::{
     ResponseError,
     responses::{ContentItem, MessageRole, ResponseItem, Usage, WarmupResponse},
@@ -18,7 +18,9 @@ use nanocodex::oai::{
     },
 };
 use nanocodex::{Nanocodex, OpenAi, Thinking, Tools};
-use nanocodex_spine_runtime::{SpineRuntime, SpineRuntimeLimits, with_spine_tools};
+use nanocodex_spine_runtime::{
+    SpineRuntime, SpineRuntimeLimits, SpineTreeNodeStatus, with_spine_tools,
+};
 use tokio::{
     sync::{Notify, mpsc},
     time::Duration,
@@ -229,6 +231,66 @@ async fn cancelling_an_open_continuation_restores_the_parent_logical_tree() {
 }
 
 #[tokio::test]
+async fn cancelling_after_an_open_handoff_keeps_the_completed_child_scope() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let service_calls = Arc::clone(&calls);
+    let openai = OpenAi::builder("test-key")
+        .service(move || ScriptedService {
+            calls: Arc::clone(&service_calls),
+            script: Script::CancelAfterOpen,
+        })
+        .build()
+        .unwrap();
+    let runtime = Arc::new(SpineRuntime::new(SpineRuntimeLimits::default()));
+    let (tree_updates, mut received_tree_updates) = mpsc::unbounded_channel();
+    runtime
+        .set_tree_observer(Arc::new(move |snapshot| {
+            tree_updates.send(snapshot).unwrap();
+        }))
+        .unwrap();
+    let initial_tree = received_tree_updates.recv().await.unwrap();
+    assert_eq!(initial_tree.active_node_id, "1");
+    let tools = Tools::builder().without_defaults().build().unwrap();
+    let runtime_for_tools = Arc::clone(&runtime);
+    let (agent, events) = Nanocodex::builder(openai)
+        .thinking(Thinking::Low)
+        .workspace(".")
+        .tools_factory(move |agent| {
+            with_spine_tools(tools.clone(), agent, Arc::clone(&runtime_for_tools))
+        })
+        .build()
+        .unwrap();
+
+    let turn = agent
+        .prompt("Use a focused continuation to inspect the parser.")
+        .await
+        .unwrap();
+    let opened_tree = received_tree_updates.recv().await.unwrap();
+    assert_eq!(opened_tree.active_node_id, "1.1");
+    let closed_tree = received_tree_updates.recv().await.unwrap();
+    assert_eq!(closed_tree.active_node_id, "1");
+    assert_eq!(closed_tree.nodes.len(), 2);
+    assert_eq!(closed_tree.nodes[1].status, SpineTreeNodeStatus::Closed);
+
+    turn.cancel().await.unwrap();
+    assert!(matches!(
+        turn.result().await,
+        Err(nanocodex::NanocodexError::TurnCancelled)
+    ));
+    let projection = runtime.projection().unwrap();
+    assert_eq!(projection.cursor.to_string(), "1");
+    assert_eq!(projection.nodes.len(), 2);
+    assert_eq!(projection.nodes[1].status, NodeStatus::Closed);
+    assert!(matches!(
+        projection.nodes[1].memory.as_ref().unwrap().as_slice(),
+        [MemorySlot::Summary { body, .. }] if body == "parser accepts one token too eagerly"
+    ));
+
+    agent.shutdown().await.unwrap();
+    drop(events);
+}
+
+#[tokio::test]
 async fn nested_opens_return_memory_one_scope_at_a_time() {
     let calls = Arc::new(AtomicU32::new(0));
     let service_calls = Arc::clone(&calls);
@@ -345,6 +407,7 @@ enum Script {
     Close,
     Next,
     ChildMessage,
+    CancelAfterOpen,
     Nested,
     TwoCells,
 }
@@ -414,6 +477,11 @@ impl Service<ResponsesAttempt> for ScriptedService {
                 "call-root-first-exec",
                 "try {\n  await tools.spine__open({summary: 'first scope'});\n  await tools.spine__open({summary: 'second scope'});\n} catch (error) {\n  text(error);\n}",
             ),
+            (Script::CancelAfterOpen, 1, ResponsesAttemptKind::Generation) => code_generation(
+                "resp-root-open",
+                "call-root-exec",
+                "await tools.spine__open({summary: 'inspect the parser'}); await new Promise(() => {});",
+            ),
             (_, 1, ResponsesAttemptKind::Generation) => code_generation(
                 "resp-root-open",
                 "call-root-exec",
@@ -422,6 +490,14 @@ impl Service<ResponsesAttempt> for ScriptedService {
             (Script::Close, 2, ResponsesAttemptKind::Generation) => {
                 assert_input_contains(&request, "Scope:\\ninspect the parser");
                 assert_input_contains(&request, "tools.spine__close");
+                code_generation(
+                    "resp-child-close",
+                    "call-child-exec",
+                    "await tools.spine__close({memory: 'parser accepts one token too eagerly'});",
+                )
+            }
+            (Script::CancelAfterOpen, 2, ResponsesAttemptKind::Generation) => {
+                assert_input_contains(&request, "Scope:\\ninspect the parser");
                 code_generation(
                     "resp-child-close",
                     "call-child-exec",

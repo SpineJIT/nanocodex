@@ -157,6 +157,13 @@ mod tests {
         assert!(cli.is_ok());
     }
 
+    #[test]
+    fn spine_cli_rejects_session_resume() {
+        let cli = Cli::try_parse_from(["nanocodex-spine", "resume"]);
+
+        assert!(cli.is_err());
+    }
+
     #[tokio::test]
     async fn spine_cli_rejects_legacy_subagents_before_startup() {
         let cli = Cli::try_parse_from(["nanocodex-spine", "--subagents", "true"]).unwrap();
