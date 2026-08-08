@@ -88,7 +88,7 @@ struct PendingPaste {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct SubmittedPrompt {
+pub struct SubmittedPrompt {
     display: String,
     instruction: Option<String>,
     local_images: Vec<PathBuf>,
@@ -103,11 +103,11 @@ impl SubmittedPrompt {
         }
     }
 
-    pub(super) const fn text(text: String) -> Self {
+    pub const fn text(text: String) -> Self {
         Self::new(text, Vec::new())
     }
 
-    pub(super) fn display(&self) -> &str {
+    pub fn display(&self) -> &str {
         &self.display
     }
 
@@ -157,7 +157,7 @@ impl SubmittedPrompt {
         self.local_images.append(&mut other.local_images);
     }
 
-    pub(super) fn into_prompt(self) -> Prompt {
+    pub fn into_prompt(self) -> Prompt {
         let instruction = self.instruction.unwrap_or(self.display);
         if self.local_images.is_empty() {
             return Prompt::new(instruction);
@@ -208,7 +208,7 @@ struct PendingScrollAnchor {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) enum PaneId {
+pub enum PaneId {
     Main,
     Btw(u64),
 }
@@ -2324,6 +2324,11 @@ impl App {
     pub(super) fn is_running(&self, target: PaneId) -> bool {
         self.conversation(target)
             .is_some_and(|conversation| conversation.running)
+    }
+
+    pub(super) fn pending_steers(&self, target: PaneId) -> bool {
+        self.conversation(target)
+            .is_some_and(|conversation| !conversation.pending_steers.is_empty())
     }
 
     pub(super) fn has_input(&self) -> bool {

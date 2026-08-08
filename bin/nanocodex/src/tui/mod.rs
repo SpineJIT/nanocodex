@@ -27,10 +27,10 @@ use crossterm::event::{
 use eyre::{Result, WrapErr};
 use futures_util::StreamExt;
 use nanocodex::{
-    AgentEvents, Nanocodex, NanocodexError, OpenAi, Thinking, TurnControl, TurnResult,
+    AgentEvents, Model, Nanocodex, NanocodexError, OpenAi, Thinking, TurnControl, TurnResult,
     agent::{
         events::{AgentEvent, TimedAgentEvent},
-        rollout::DurableSession,
+        rollout::{DurableSession, RolloutTranscriptItem},
     },
     tools::mcp::McpHandle,
 };
@@ -45,15 +45,22 @@ use tokio::{
 };
 use tracing::{Instrument, info_span};
 
+pub use self::app::{PaneId, SubmittedPrompt};
+
 use self::{
-    app::{App, EscapeAction, PaneId, ReasoningPickerAction, SubmittedPrompt},
+    app::{App, EscapeAction, ReasoningPickerAction},
     notification::Notifier,
     scheduler::{ANIMATION_TICK_INTERVAL, RenderScheduler, RenderScope, STREAM_FRAME_INTERVAL},
     telemetry::{StreamTelemetry, ViewTelemetry},
     terminal::TerminalSession,
     transcript::TranscriptItem,
 };
-use crate::config::AgentArgs;
+use crate::{
+    app_core::{
+        StandardWorkerFactory, WorkerCapabilities, WorkerCapability, WorkerFactory, WorkerHandle,
+    },
+    config::AgentArgs,
+};
 
 pub(crate) use resume_picker::select_resume_session;
 
@@ -90,7 +97,7 @@ impl InitialPrompt {
     }
 }
 
-enum WorkerCommand {
+pub enum WorkerCommand {
     Prompt {
         target: PaneId,
         prompt_id: u64,
@@ -142,7 +149,27 @@ enum WorkerCommand {
     Voice(VoiceControl),
 }
 
-enum WorkerEvent {
+impl WorkerCommand {
+    pub fn root_prompt(prompt_id: u64, prompt: String) -> Self {
+        Self::Prompt {
+            target: PaneId::Main,
+            prompt_id,
+            prompt: prompt.into(),
+        }
+    }
+
+    pub const fn root_cancel() -> Self {
+        Self::Cancel {
+            target: PaneId::Main,
+        }
+    }
+}
+
+pub enum WorkerEvent {
+    RootAgentEvent {
+        event: TimedAgentEvent,
+    },
+    RootEventStreamClosed,
     TurnTraceStarted {
         target: PaneId,
         id: u64,
@@ -271,6 +298,25 @@ enum WorkerEvent {
     VoiceStopped,
 }
 
+impl WorkerEvent {
+    #[cfg(test)]
+    pub(crate) const fn root_turn_trace_rejected(id: u64) -> Self {
+        Self::TurnTraceRejected {
+            target: PaneId::Main,
+            id,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn root_turn_finished(error: Option<String>) -> Self {
+        Self::TurnFinished {
+            target: PaneId::Main,
+            main_branch_id: Some(0),
+            error,
+        }
+    }
+}
+
 struct MainWorkerBranch {
     id: u64,
     request_id: Arc<str>,
@@ -358,7 +404,7 @@ enum UiUpdate {
 struct UiModel {
     app: App,
     root_session_id: Arc<str>,
-    agent_events_open: bool,
+    capabilities: WorkerCapabilities,
     worker_updates_open: bool,
     voice_observing: bool,
     terminal_focused: bool,
@@ -405,11 +451,20 @@ impl MouseScrollBurst {
 }
 
 impl UiModel {
+    #[cfg(test)]
     const fn new(app: App, root_session_id: Arc<str>) -> Self {
+        Self::with_capabilities(app, root_session_id, WorkerCapabilities::standard())
+    }
+
+    const fn with_capabilities(
+        app: App,
+        root_session_id: Arc<str>,
+        capabilities: WorkerCapabilities,
+    ) -> Self {
         Self {
             app,
             root_session_id,
-            agent_events_open: true,
+            capabilities,
             worker_updates_open: true,
             voice_observing: false,
             terminal_focused: true,
@@ -474,8 +529,13 @@ impl UiModel {
                     }
                     _ => {}
                 }
-                match handle_terminal_event(event, &mut self.app, &self.root_session_id, commands)?
-                {
+                match handle_terminal_event(
+                    event,
+                    &mut self.app,
+                    &self.root_session_id,
+                    self.capabilities,
+                    commands,
+                )? {
                     TerminalAction::Redraw => Ok(UiUpdate::Redraw(RedrawPriority::Immediate)),
                     TerminalAction::Ignore => Ok(UiUpdate::Ignore),
                     TerminalAction::Quit => Ok(UiUpdate::Quit),
@@ -483,11 +543,11 @@ impl UiModel {
                 }
             }
             UiAction::Agent(event) => {
-                if self.voice_observing {
+                if self.voice_observing && self.capabilities.supports(WorkerCapability::Voice) {
                     drop(commands.send(WorkerCommand::VoiceAgentEvent(event.clone())));
                 }
                 let updated = self.app.on_main_agent_event(0, &event);
-                request_navigated_branch_switch(&mut self.app, commands)?;
+                request_navigated_branch_switch(&mut self.app, self.capabilities, commands)?;
                 if updated {
                     Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
                 } else {
@@ -496,8 +556,13 @@ impl UiModel {
             }
             UiAction::AgentStreamClosed => {
                 self.app.main_branch_event_stream_closed(0);
-                self.agent_events_open = false;
                 Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
+            }
+            UiAction::Worker(WorkerEvent::RootAgentEvent { event }) => {
+                self.update(UiAction::Agent(event.event), commands)
+            }
+            UiAction::Worker(WorkerEvent::RootEventStreamClosed) => {
+                self.update(UiAction::AgentStreamClosed, commands)
             }
             UiAction::Worker(update) => {
                 match &update {
@@ -523,7 +588,12 @@ impl UiModel {
                         format!("{scope} finished")
                     });
                 }
-                handle_worker_update(&mut self.app, update, commands)?;
+                handle_worker_update_with_capabilities(
+                    &mut self.app,
+                    update,
+                    self.capabilities,
+                    commands,
+                )?;
                 Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
             }
             UiAction::WorkerStopped => {
@@ -569,7 +639,7 @@ enum Submission {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VoiceControl {
+pub enum VoiceControl {
     Toggle,
     Start(Option<RealtimeVoice>),
     Stop,
@@ -599,40 +669,72 @@ pub(crate) async fn run(
         .as_ref()
         .map(|session| PathBuf::from(session.workspace()))
         .unwrap_or(resolve_cwd(&config)?);
-    let configured = if let Some(session) = resume {
-        config.build_resumed(session, vm).await?
+    let factory = if let Some(session) = resume {
+        StandardWorkerFactory::build_resumed(config, session, vm).await?
     } else {
-        config.build(vm).await?
+        StandardWorkerFactory::build(config, vm).await?
     };
-    let agent = configured.handle;
-    let mut agent_events = configured.events;
-    let realtime = configured.realtime;
-    let root_session_id = Arc::<str>::from(agent_events.request_id());
-    let child_agents = configured.child_agents;
-    let mpp_adapter = configured.mpp_adapter;
-    let mcp = configured.mcp;
-    let browser = configured.browser;
-    let vm = configured.vm;
-    let (worker_tx, worker_rx) = mpsc::unbounded_channel();
-    let (update_tx, mut update_rx) = mpsc::unbounded_channel();
-    let worker = spawn_agent_worker(
-        agent,
-        Arc::clone(&root_session_id),
-        realtime,
-        mcp,
-        worker_rx,
-        update_tx,
-    );
+    run_with_worker(
+        factory,
+        cwd,
+        initial_model,
+        initial_thinking,
+        initial_fast_mode,
+        restored_transcript,
+        initial_prompt,
+    )
+    .await
+}
 
-    let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
+#[allow(
+    clippy::too_many_lines,
+    reason = "the ordered terminal, agent, worker, and render event loop is intentionally cohesive"
+)]
+pub(crate) async fn run_with_worker<F>(
+    factory: F,
+    cwd: PathBuf,
+    initial_model: Model,
+    initial_thinking: Thinking,
+    initial_fast_mode: bool,
+    restored_transcript: Vec<RolloutTranscriptItem>,
+    initial_prompt: Option<InitialPrompt>,
+) -> Result<()>
+where
+    F: WorkerFactory<Command = WorkerCommand, Event = WorkerEvent>,
+{
+    let mut worker = factory.start();
+    if !worker.capabilities().supports(WorkerCapability::Prompt) {
+        return finish_worker(
+            worker,
+            Err(eyre::eyre!(
+                "the selected application worker cannot accept prompts"
+            )),
+        )
+        .await;
+    }
+    let capabilities = worker.capabilities();
+    let root_session_id = Arc::<str>::from(worker.session_id());
+
+    let mut terminal = match TerminalSession::enter().wrap_err("failed to initialize the terminal")
+    {
+        Ok(terminal) => terminal,
+        Err(error) => return finish_worker(worker, Err(error)).await,
+    };
     let terminal_profile = TerminalProfile::query(Duration::from_millis(750));
     let (math_update_tx, mut math_update_rx) = mpsc::channel(1);
-    let math_renderer = Ratatex::builder(terminal_profile)
+    let math_renderer = match Ratatex::builder(terminal_profile)
         .on_update(move || {
             let _ = math_update_tx.try_send(());
         })
         .build()
-        .wrap_err("failed to initialize the display-math renderer")?;
+        .wrap_err("failed to initialize the display-math renderer")
+    {
+        Ok(math_renderer) => math_renderer,
+        Err(error) => {
+            drop(terminal);
+            return finish_worker(worker, Err(error)).await;
+        }
+    };
     let availability = math_renderer.availability();
     tracing::debug!(
         graphics = availability.graphics,
@@ -648,16 +750,26 @@ pub(crate) async fn run(
         .with_fast_mode(initial_fast_mode);
     app.set_math_renderer(math_renderer.clone());
     app.restore_transcript(restored_transcript);
-    let mut ui = UiModel::new(app, Arc::clone(&root_session_id));
+    let mut ui = UiModel::with_capabilities(app, Arc::clone(&root_session_id), capabilities);
     let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
     let mut stream_telemetry = StreamTelemetry::default();
     let mut view_telemetry = ViewTelemetry::new(Arc::clone(&root_session_id));
     let mut notifier = Notifier::from_env();
+    let mut pending_worker_updates = VecDeque::new();
 
-    submit_initial_prompt(&mut ui.app, &root_session_id, &worker_tx, initial_prompt)?;
+    let loop_result: Result<()> = {
+        let worker_tx = worker.commands().clone();
+        let update_rx = worker.events_mut();
 
-    let loop_result: Result<()> = async {
-        loop {
+        async {
+            submit_initial_prompt(
+                &mut ui.app,
+                &root_session_id,
+                capabilities,
+                &worker_tx,
+                initial_prompt,
+            )?;
+            loop {
             view_telemetry.observe(&ui.app);
             render_due_frame(
                 &mut ui,
@@ -692,36 +804,16 @@ pub(crate) async fn run(
                     break Ok(());
                 }
             }
-            event = agent_events.recv_timed(), if ui.agent_events_open => {
-                if apply_main_agent_event_batch(
+            update = next_worker_event(&mut pending_worker_updates, update_rx), if ui.worker_updates_open => {
+                if apply_worker_event_batch(
                     &mut ui,
                     &worker_tx,
                     &mut stream_telemetry,
                     &mut scheduler,
-                    &mut agent_events,
-                    event,
+                    update_rx,
+                    &mut pending_worker_updates,
+                    update,
                 )? {
-                    return Ok(());
-                }
-            }
-            update = update_rx.recv(), if ui.worker_updates_open => {
-                if update.as_ref().is_some_and(|update| {
-                    handle_worker_telemetry(update, &mut stream_telemetry)
-                }) {
-                    continue;
-                }
-                let received = update
-                    .as_ref()
-                    .and_then(|update| worker_event_received(update, &stream_telemetry));
-                let action = update.map_or(UiAction::WorkerStopped, UiAction::Worker);
-                let update = ui.update(action, &worker_tx)?;
-                if let Some(received) = received {
-                    stream_telemetry.event_applied(
-                        received,
-                        matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming)),
-                    );
-                }
-                if apply_update(update, &mut scheduler) {
                     break Ok(());
                 }
             }
@@ -738,14 +830,24 @@ pub(crate) async fn run(
             }
             }
         }
-    }
-    .await;
+        }
+        .await
+    };
 
     // Restore the terminal before disconnecting the paid WebSocket session.
-    drop((terminal, worker_tx, agent_events));
+    drop(terminal);
     math_renderer.shutdown();
-    let shutdown_result = shutdown_runtime(worker, child_agents, mpp_adapter, browser, vm).await;
+    let shutdown_result = worker.shutdown().await;
     loop_result?;
+    shutdown_result
+}
+
+async fn finish_worker(
+    worker: WorkerHandle<WorkerCommand, WorkerEvent>,
+    run_result: Result<()>,
+) -> Result<()> {
+    let shutdown_result = worker.shutdown().await;
+    run_result?;
     shutdown_result
 }
 
@@ -756,81 +858,73 @@ fn resolve_cwd(config: &AgentArgs) -> Result<PathBuf> {
         .wrap_err("failed to resolve the working directory")
 }
 
-async fn shutdown_runtime(
-    worker: tokio::task::JoinHandle<()>,
-    child_agents: Option<std::sync::Arc<crate::subagents::ChildAgents>>,
-    mpp_adapter: Option<crate::mpp::MppAdapter>,
-    browser: Option<crate::browser::ConfiguredBrowser>,
-    vm: Option<crate::vm::ConfiguredVm>,
-) -> Result<()> {
-    worker.abort();
-    let worker_result = worker.await;
-    if let Some(child_agents) = child_agents {
-        child_agents.shutdown().await;
+async fn next_worker_event(
+    pending: &mut VecDeque<WorkerEvent>,
+    updates: &mut mpsc::UnboundedReceiver<WorkerEvent>,
+) -> Option<WorkerEvent> {
+    if let Some(update) = pending.pop_front() {
+        Some(update)
+    } else {
+        updates.recv().await
     }
-    let browser_shutdown_result = if let Some(browser) = browser {
-        browser.shutdown().await
-    } else {
-        Ok(())
-    };
-    let vm_shutdown_result = if let Some(vm) = vm {
-        vm.shutdown().await
-    } else {
-        Ok(())
-    };
-    let shutdown_result = if let Some(adapter) = mpp_adapter {
-        adapter.shutdown().await
-    } else {
-        Ok(())
-    };
-    match worker_result {
-        Ok(()) => {}
-        Err(error) if error.is_cancelled() => {}
-        Err(error) => return Err(error).wrap_err("TUI agent worker failed"),
-    }
-    browser_shutdown_result?;
-    vm_shutdown_result?;
-    shutdown_result
 }
 
-fn apply_main_agent_event_batch(
+fn apply_worker_event_batch(
     ui: &mut UiModel,
     worker_tx: &mpsc::UnboundedSender<WorkerCommand>,
     stream_telemetry: &mut StreamTelemetry,
     scheduler: &mut RenderScheduler,
-    agent_events: &mut AgentEvents,
-    first: Option<TimedAgentEvent>,
+    updates: &mut mpsc::UnboundedReceiver<WorkerEvent>,
+    pending: &mut VecDeque<WorkerEvent>,
+    first: Option<WorkerEvent>,
 ) -> Result<bool> {
-    if apply_main_agent_event(ui, worker_tx, stream_telemetry, scheduler, first)? {
+    let batch_root_events = matches!(&first, Some(WorkerEvent::RootAgentEvent { .. }));
+    if apply_worker_event(ui, worker_tx, stream_telemetry, scheduler, first)? {
         return Ok(true);
+    }
+    if !batch_root_events {
+        return Ok(false);
     }
     for _ in 1..MAX_AGENT_EVENTS_PER_BATCH {
         if scheduler.is_due(Instant::now()) {
             break;
         }
-        let Some(event) = agent_events.try_recv_timed() else {
+        let event = if let Some(event) = pending.pop_front() {
+            Some(event)
+        } else {
+            updates.try_recv().ok()
+        };
+        let Some(event) = event else {
             break;
         };
-        if apply_main_agent_event(ui, worker_tx, stream_telemetry, scheduler, Some(event))? {
+        if !matches!(event, WorkerEvent::RootAgentEvent { .. }) {
+            pending.push_front(event);
+            break;
+        }
+        if apply_worker_event(ui, worker_tx, stream_telemetry, scheduler, Some(event))? {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn apply_main_agent_event(
+fn apply_worker_event(
     ui: &mut UiModel,
     worker_tx: &mpsc::UnboundedSender<WorkerCommand>,
     stream_telemetry: &mut StreamTelemetry,
     scheduler: &mut RenderScheduler,
-    event: Option<TimedAgentEvent>,
+    event: Option<WorkerEvent>,
 ) -> Result<bool> {
+    if event
+        .as_ref()
+        .is_some_and(|event| handle_worker_telemetry(event, stream_telemetry))
+    {
+        return Ok(false);
+    }
     let received = event
         .as_ref()
-        .map(|event| stream_telemetry.event_received(PaneId::Main, event));
-    let action = event.map_or(UiAction::AgentStreamClosed, |event| {
-        UiAction::Agent(event.event)
-    });
+        .and_then(|event| worker_event_received(event, stream_telemetry));
+    let action = event.map_or(UiAction::WorkerStopped, UiAction::Worker);
     let update = ui.update(action, worker_tx)?;
     if let Some(received) = received {
         stream_telemetry.event_applied(
@@ -907,6 +1001,9 @@ fn worker_event_received(
     telemetry: &StreamTelemetry,
 ) -> Option<telemetry::ReceivedEvent> {
     match update {
+        WorkerEvent::RootAgentEvent { event } => {
+            Some(telemetry.event_received(PaneId::Main, event))
+        }
         WorkerEvent::BtwAgentEvent { id, event } => {
             Some(telemetry.event_received(PaneId::Btw(*id), event))
         }
@@ -940,6 +1037,7 @@ fn handle_worker_telemetry(update: &WorkerEvent, telemetry: &mut StreamTelemetry
 fn submit_initial_prompt(
     app: &mut App,
     root_session_id: &str,
+    capabilities: WorkerCapabilities,
     worker: &mpsc::UnboundedSender<WorkerCommand>,
     initial_prompt: Option<InitialPrompt>,
 ) -> Result<()> {
@@ -965,7 +1063,13 @@ fn submit_initial_prompt(
             }
             return Ok(());
         }
-        submit(app, root_session_id, worker, SubmitIntent::Immediate)?;
+        submit(
+            app,
+            root_session_id,
+            capabilities,
+            worker,
+            SubmitIntent::Immediate,
+        )?;
     }
     Ok(())
 }
@@ -984,19 +1088,32 @@ fn apply_update(update: UiUpdate, scheduler: &mut RenderScheduler) -> bool {
     false
 }
 
+#[cfg(test)]
 fn handle_worker_update(
     app: &mut App,
     update: WorkerEvent,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<()> {
+    handle_worker_update_with_capabilities(app, update, WorkerCapabilities::standard(), commands)
+}
+
+fn handle_worker_update_with_capabilities(
+    app: &mut App,
+    update: WorkerEvent,
+    capabilities: WorkerCapabilities,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<()> {
     match update {
+        WorkerEvent::RootAgentEvent { .. } | WorkerEvent::RootEventStreamClosed => {
+            unreachable!("root events are applied by UiModel before worker updates")
+        }
         WorkerEvent::TurnFinished {
             target,
             main_branch_id,
             error,
         } => {
             app.turn_finished(target, main_branch_id, error);
-            request_navigated_branch_switch(app, commands)?;
+            request_navigated_branch_switch(app, capabilities, commands)?;
         }
         WorkerEvent::TurnTraceStarted { .. } | WorkerEvent::TurnTraceRejected { .. } => {}
         WorkerEvent::SteerAdmitted { target, id } => app.steer_admitted(target, id),
@@ -1053,14 +1170,14 @@ fn handle_worker_update(
         }
         WorkerEvent::MainBranchSwitched { id, request_id } => {
             app.main_branch_switched(id, request_id);
-            request_navigated_branch_switch(app, commands)?;
+            request_navigated_branch_switch(app, capabilities, commands)?;
         }
         WorkerEvent::MainBranchSwitchFailed { id, error } => {
             app.main_branch_switch_failed(id, &error);
         }
         WorkerEvent::MainBranchAgentEvent { id, event } => {
             let _ = app.on_main_agent_event(id, &event.event);
-            request_navigated_branch_switch(app, commands)?;
+            request_navigated_branch_switch(app, capabilities, commands)?;
         }
         WorkerEvent::MainBranchEventStreamClosed { id } => {
             app.main_branch_event_stream_closed(id);
@@ -1112,7 +1229,7 @@ fn handle_worker_update(
     Ok(())
 }
 
-fn spawn_agent_worker(
+pub(crate) fn spawn_agent_worker(
     root: Nanocodex,
     root_session_id: Arc<str>,
     realtime: Option<OpenAi>,
@@ -2194,12 +2311,13 @@ fn handle_terminal_event(
     event: Event,
     app: &mut App,
     root_session_id: &str,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<TerminalAction> {
     match event {
         Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
             let _ = app.clear_mouse_selection();
-            handle_key(key, app, root_session_id, commands)
+            handle_key_with_capabilities(key, app, root_session_id, capabilities, commands)
         }
         Event::Paste(text) => {
             let _ = app.clear_mouse_selection();
@@ -2251,10 +2369,27 @@ fn handle_terminal_event(
     }
 }
 
+#[cfg(test)]
 fn handle_key(
     key: KeyEvent,
     app: &mut App,
     root_session_id: &str,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<TerminalAction> {
+    handle_key_with_capabilities(
+        key,
+        app,
+        root_session_id,
+        WorkerCapabilities::standard(),
+        commands,
+    )
+}
+
+fn handle_key_with_capabilities(
+    key: KeyEvent,
+    app: &mut App,
+    root_session_id: &str,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<TerminalAction> {
     if matches!(key.code, KeyCode::Char('v' | 'V'))
@@ -2266,23 +2401,23 @@ fn handle_key(
         return Ok(TerminalAction::Redraw);
     }
 
-    if let Some(action) = handle_reasoning_picker_key(key, app, commands)? {
+    if let Some(action) = handle_reasoning_picker_key(key, app, capabilities, commands)? {
         return Ok(action);
     }
 
-    if let Some(action) = handle_inline_historical_editor_key(key, app, commands)? {
+    if let Some(action) = handle_inline_historical_editor_key(key, app, capabilities, commands)? {
         return Ok(action);
     }
 
-    if let Some(action) = handle_global_navigation_key(key, app, commands)? {
+    if let Some(action) = handle_global_navigation_key(key, app, capabilities, commands)? {
         return Ok(action);
     }
 
-    if let Some(action) = handle_branch_navigator_key(key, app, commands)? {
+    if let Some(action) = handle_branch_navigator_key(key, app, capabilities, commands)? {
         return Ok(action);
     }
 
-    if let Some(action) = handle_transcript_selection_key(key, app) {
+    if let Some(action) = handle_transcript_selection_key(key, app, capabilities) {
         return Ok(action);
     }
 
@@ -2332,7 +2467,13 @@ fn handle_key(
         {
             app.insert_char('\n');
         }
-        KeyCode::Enter => submit(app, root_session_id, commands, SubmitIntent::Immediate)?,
+        KeyCode::Enter => submit(
+            app,
+            root_session_id,
+            capabilities,
+            commands,
+            SubmitIntent::Immediate,
+        )?,
         KeyCode::Char(character) => app.insert_char(character),
         KeyCode::Backspace => app.backspace(),
         KeyCode::Delete => app.delete(),
@@ -2345,9 +2486,15 @@ fn handle_key(
         KeyCode::PageUp => app.scroll_up(12),
         KeyCode::PageDown => app.scroll_down(12),
         KeyCode::Esc if key.kind == KeyEventKind::Repeat => {}
-        KeyCode::Esc => handle_escape_key(app, commands)?,
+        KeyCode::Esc => handle_escape_key(app, capabilities, commands)?,
         KeyCode::Tab if app.has_input() => {
-            submit(app, root_session_id, commands, SubmitIntent::Queue)?;
+            submit(
+                app,
+                root_session_id,
+                capabilities,
+                commands,
+                SubmitIntent::Queue,
+            )?;
         }
         KeyCode::Tab | KeyCode::BackTab => app.toggle_focus(),
         KeyCode::Insert
@@ -2369,6 +2516,7 @@ fn handle_key(
 fn handle_reasoning_picker_key(
     key: KeyEvent,
     app: &mut App,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<Option<TerminalAction>> {
     if app.reasoning_picker().is_none() {
@@ -2382,6 +2530,9 @@ fn handle_reasoning_picker_key(
             KeyCode::Up | KeyCode::Char('k') => app.move_reasoning_picker(-1),
             KeyCode::Down | KeyCode::Char('j') => app.move_reasoning_picker(1),
             KeyCode::Enter => {
+                if !require_worker_capability(app, capabilities, WorkerCapability::Thinking) {
+                    return Ok(Some(TerminalAction::Redraw));
+                }
                 if let Some(ReasoningPickerAction::Selected(thinking)) =
                     app.confirm_reasoning_picker()
                 {
@@ -2395,9 +2546,29 @@ fn handle_reasoning_picker_key(
     Ok(Some(TerminalAction::Redraw))
 }
 
-fn handle_escape_key(app: &mut App, commands: &mpsc::UnboundedSender<WorkerCommand>) -> Result<()> {
+fn handle_escape_key(
+    app: &mut App,
+    capabilities: WorkerCapabilities,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<()> {
+    let target = app.focus;
+    if app.is_running(target)
+        && app.pending_steers(target)
+        && !require_worker_capability(app, capabilities, WorkerCapability::Steer)
+    {
+        return Ok(());
+    }
+    if app.is_running(target)
+        && app.pending_steers(target)
+        && !require_worker_capability(app, capabilities, WorkerCapability::Cancel)
+    {
+        return Ok(());
+    }
     match app.handle_escape(Instant::now()) {
         Some(EscapeAction::Cancel(target)) => {
+            if !require_worker_capability(app, capabilities, WorkerCapability::Cancel) {
+                return Ok(());
+            }
             app.cancel_pending(target);
             send_command(commands, WorkerCommand::Cancel { target })?;
         }
@@ -2441,6 +2612,7 @@ fn paste_clipboard_image(
 fn handle_global_navigation_key(
     key: KeyEvent,
     app: &mut App,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<Option<TerminalAction>> {
     if !key
@@ -2450,6 +2622,9 @@ fn handle_global_navigation_key(
         return Ok(None);
     }
     if matches!(key.code, KeyCode::Char('b')) {
+        if !require_worker_capability(app, capabilities, WorkerCapability::MainBranchSwitch) {
+            return Ok(Some(TerminalAction::Redraw));
+        }
         let _ = app.toggle_branch_navigator();
         return Ok(Some(TerminalAction::Redraw));
     }
@@ -2461,6 +2636,9 @@ fn handle_global_navigation_key(
     let Some(direction) = direction else {
         return Ok(None);
     };
+    if !require_worker_capability(app, capabilities, WorkerCapability::MainBranchSwitch) {
+        return Ok(Some(TerminalAction::Redraw));
+    }
     if let Some(id) = app.cycle_main_branch(direction) {
         send_command(commands, WorkerCommand::SwitchMainBranch { id })?;
     }
@@ -2470,6 +2648,7 @@ fn handle_global_navigation_key(
 fn handle_branch_navigator_key(
     key: KeyEvent,
     app: &mut App,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<Option<TerminalAction>> {
     if !app.branch_navigator_active() {
@@ -2481,14 +2660,22 @@ fn handle_branch_navigator_key(
     if key.modifiers.is_empty() {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
+                if !require_worker_capability(app, capabilities, WorkerCapability::MainBranchSwitch)
+                {
+                    return Ok(Some(TerminalAction::Redraw));
+                }
                 app.move_branch_navigator(-1);
-                request_navigated_branch_switch(app, commands)?;
+                request_navigated_branch_switch(app, capabilities, commands)?;
             }
             KeyCode::Down | KeyCode::Char('j') => {
+                if !require_worker_capability(app, capabilities, WorkerCapability::MainBranchSwitch)
+                {
+                    return Ok(Some(TerminalAction::Redraw));
+                }
                 app.move_branch_navigator(1);
-                request_navigated_branch_switch(app, commands)?;
+                request_navigated_branch_switch(app, capabilities, commands)?;
             }
-            KeyCode::Enter => request_navigated_branch_switch(app, commands)?,
+            KeyCode::Enter => request_navigated_branch_switch(app, capabilities, commands)?,
             KeyCode::Esc | KeyCode::Char('q') => app.close_branch_navigator(),
             _ => {}
         }
@@ -2498,15 +2685,26 @@ fn handle_branch_navigator_key(
 
 fn request_navigated_branch_switch(
     app: &mut App,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<()> {
+    if !app.branch_navigator_active() {
+        return Ok(());
+    }
+    if !require_worker_capability(app, capabilities, WorkerCapability::MainBranchSwitch) {
+        return Ok(());
+    }
     if let Some(id) = app.switch_to_navigated_branch() {
         send_command(commands, WorkerCommand::SwitchMainBranch { id })?;
     }
     Ok(())
 }
 
-fn handle_transcript_selection_key(key: KeyEvent, app: &mut App) -> Option<TerminalAction> {
+fn handle_transcript_selection_key(
+    key: KeyEvent,
+    app: &mut App,
+    capabilities: WorkerCapabilities,
+) -> Option<TerminalAction> {
     if !app.transcript_selection_active() {
         return None;
     }
@@ -2522,6 +2720,9 @@ fn handle_transcript_selection_key(key: KeyEvent, app: &mut App) -> Option<Termi
             KeyCode::Up => app.move_up(),
             KeyCode::Down => app.move_down(),
             KeyCode::Char('e') => {
+                if !require_worker_capability(app, capabilities, WorkerCapability::HistoricalEdit) {
+                    return Some(TerminalAction::Redraw);
+                }
                 let _ = app.start_historical_edit();
             }
             KeyCode::Esc => app.dismiss_transcript_selection(),
@@ -2533,9 +2734,16 @@ fn handle_transcript_selection_key(key: KeyEvent, app: &mut App) -> Option<Termi
 
 fn request_historical_edit(
     app: &mut App,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<()> {
+    if !require_worker_capability(app, capabilities, WorkerCapability::HistoricalEdit) {
+        return Ok(());
+    }
     let cancel_source = app.main.running || app.main.pending_turns > 0;
+    if cancel_source && !require_worker_capability(app, capabilities, WorkerCapability::Cancel) {
+        return Ok(());
+    }
     let Some(request) = app.commit_historical_edit() else {
         return Ok(());
     };
@@ -2555,6 +2763,7 @@ fn request_historical_edit(
 fn handle_inline_historical_editor_key(
     key: KeyEvent,
     app: &mut App,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<Option<TerminalAction>> {
     if !app.historical_editor_active() {
@@ -2595,7 +2804,7 @@ fn handle_inline_historical_editor_key(
 
     match key.code {
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => app.insert_char('\n'),
-        KeyCode::Enter => request_historical_edit(app, commands)?,
+        KeyCode::Enter => request_historical_edit(app, capabilities, commands)?,
         KeyCode::Char(character) => app.insert_char(character),
         KeyCode::Backspace => app.backspace(),
         KeyCode::Delete => app.delete(),
@@ -2645,9 +2854,16 @@ async fn run_external_editor(
 fn submit(
     app: &mut App,
     root_session_id: &str,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
     intent: SubmitIntent,
 ) -> Result<()> {
+    let capability = submission_capability(app, intent);
+    if let Some(capability) = capability
+        && !require_worker_capability(app, capabilities, capability)
+    {
+        return Ok(());
+    }
     let Some(input) = app.take_submission() else {
         return Ok(());
     };
@@ -2751,6 +2967,55 @@ fn send_command(
     commands
         .send(command)
         .map_err(|_| eyre::eyre!("agent worker stopped"))
+}
+
+fn submission_capability(app: &App, intent: SubmitIntent) -> Option<WorkerCapability> {
+    match classify_submission(SubmittedPrompt::text(app.input.clone())) {
+        Submission::Btw(_) | Submission::CloseBtw => Some(WorkerCapability::Btw),
+        Submission::Cancel => Some(WorkerCapability::Cancel),
+        Submission::Prompt(_)
+            if matches!(intent, SubmitIntent::Immediate) && app.is_running(app.focus) =>
+        {
+            Some(WorkerCapability::Steer)
+        }
+        Submission::Prompt(_) => Some(WorkerCapability::Prompt),
+        Submission::Fast(_) => Some(WorkerCapability::FastMode),
+        Submission::ReasoningPicker => Some(WorkerCapability::Thinking),
+        Submission::Voice(_) => Some(WorkerCapability::Voice),
+        Submission::McpLogin(_) | Submission::McpReload(_) => Some(WorkerCapability::Mcp),
+        Submission::Trace | Submission::InvalidCommand(_) => None,
+    }
+}
+
+fn require_worker_capability(
+    app: &mut App,
+    capabilities: WorkerCapabilities,
+    capability: WorkerCapability,
+) -> bool {
+    if capabilities.supports(capability) {
+        return true;
+    }
+    app.push_active_error(format!(
+        "The selected worker does not support {}.",
+        worker_capability_label(capability)
+    ));
+    false
+}
+
+const fn worker_capability_label(capability: WorkerCapability) -> &'static str {
+    match capability {
+        WorkerCapability::Prompt => "new prompts",
+        WorkerCapability::Steer => "steering active turns",
+        WorkerCapability::Cancel => "cancelling active turns",
+        WorkerCapability::Btw => "BTW forks",
+        WorkerCapability::Resume => "session resume",
+        WorkerCapability::HistoricalEdit => "historical edits",
+        WorkerCapability::MainBranchSwitch => "main-branch switching",
+        WorkerCapability::FastMode => "fast mode",
+        WorkerCapability::Thinking => "thinking selection",
+        WorkerCapability::Mcp => "MCP controls",
+        WorkerCapability::Voice => "voice controls",
+    }
 }
 
 fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
@@ -2920,12 +3185,14 @@ fn browser_command(url: &str) -> Command {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         path::PathBuf,
         sync::Arc,
         time::{Duration, Instant},
     };
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+    use eyre::Result;
     use futures_util::{SinkExt, StreamExt};
     use nanocodex::{
         Nanocodex, OpenAi, Thinking,
@@ -2934,15 +3201,19 @@ mod tests {
     };
     use nanocodex_voice::RealtimeVoice;
     use serde_json::{Value, json};
-    use tokio::{net::TcpListener, sync::mpsc, time::timeout};
+    use tokio::{
+        net::TcpListener,
+        sync::{mpsc, oneshot},
+        time::timeout,
+    };
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
     use super::{
         BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
-        UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, active_session_id,
-        apply_main_agent_event_batch, classify_submission, handle_key, handle_worker_update,
-        paste_clipboard_image, prepare_btw_prompt, report_cancel_outcome, session_trace_url,
-        spawn_agent_worker,
+        UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, WorkerHandle, active_session_id,
+        apply_worker_event_batch, classify_submission, finish_worker, handle_key,
+        handle_worker_update, paste_clipboard_image, prepare_btw_prompt, report_cancel_outcome,
+        session_trace_url, spawn_agent_worker,
     };
     use crate::tui::{
         app::App,
@@ -3067,6 +3338,44 @@ mod tests {
             classify_submission("/modeling"),
             Submission::Prompt("/modeling".into())
         );
+    }
+
+    #[test]
+    fn prompt_only_workers_reject_unsupported_controls_before_mutating_ui_state() {
+        for input in [
+            "/btw inspect the cache",
+            "/fast",
+            "/thinking",
+            "/mcp reload cache",
+            "/voice list",
+        ] {
+            let (commands, mut worker) = mpsc::unbounded_channel();
+            let app = App::new("/workspace".into());
+            let mut ui = UiModel::with_capabilities(
+                app,
+                Arc::from("main-session"),
+                crate::app_core::WorkerCapabilities::empty()
+                    .with(crate::app_core::WorkerCapability::Prompt),
+            );
+            ui.app.input = input.to_owned();
+            ui.app.cursor = ui.app.input.len();
+
+            let update = ui
+                .update(
+                    UiAction::Terminal(Event::Key(KeyEvent::new(
+                        KeyCode::Enter,
+                        KeyModifiers::NONE,
+                    ))),
+                    &commands,
+                )
+                .unwrap();
+
+            assert_eq!(update, UiUpdate::Redraw(RedrawPriority::Immediate));
+            assert!(worker.try_recv().is_err());
+            assert_eq!(ui.app.input, input);
+            assert!(ui.app.btw_id().is_none());
+            assert!(ui.app.reasoning_picker().is_none());
+        }
     }
 
     #[test]
@@ -3271,21 +3580,27 @@ mod tests {
         let now = Instant::now();
         let mut scheduler = RenderScheduler::new(Duration::from_secs(1), now);
         scheduler.presented(now);
-        let first = agent_events.try_recv_timed();
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        while let Some(event) = agent_events.try_recv_timed() {
+            updates.send(WorkerEvent::RootAgentEvent { event }).unwrap();
+        }
+        let first = update_rx.try_recv().ok();
+        let mut pending = VecDeque::new();
 
         assert!(
-            !apply_main_agent_event_batch(
+            !apply_worker_event_batch(
                 &mut ui,
                 &commands,
                 &mut telemetry,
                 &mut scheduler,
-                &mut agent_events,
+                &mut update_rx,
+                &mut pending,
                 first,
             )
             .unwrap()
         );
         assert_eq!(ui.app.main.transcript.assistant_sources(), ["AB", "CD"]);
-        assert!(agent_events.try_recv_timed().is_none());
+        assert!(update_rx.try_recv().is_err());
     }
 
     #[test]
@@ -3315,15 +3630,21 @@ mod tests {
         let now = Instant::now();
         let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, now);
         scheduler.presented(now - STREAM_FRAME_INTERVAL);
-        let first = agent_events.try_recv_timed();
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        while let Some(event) = agent_events.try_recv_timed() {
+            updates.send(WorkerEvent::RootAgentEvent { event }).unwrap();
+        }
+        let first = update_rx.try_recv().ok();
+        let mut pending = VecDeque::new();
 
         assert!(
-            !apply_main_agent_event_batch(
+            !apply_worker_event_batch(
                 &mut ui,
                 &commands,
                 &mut telemetry,
                 &mut scheduler,
-                &mut agent_events,
+                &mut update_rx,
+                &mut pending,
                 first,
             )
             .unwrap()
@@ -3332,7 +3653,7 @@ mod tests {
         assert!(scheduler.is_due(Instant::now()));
         assert_eq!(ui.app.main.status, "Thinking...");
         assert_eq!(ui.app.main.transcript.assistant_sources(), [] as [&str; 0]);
-        assert!(agent_events.try_recv_timed().is_some());
+        assert!(update_rx.try_recv().is_ok());
     }
 
     #[test]
@@ -3873,6 +4194,96 @@ mod tests {
         ));
         assert_eq!(app.input, "preserved draft");
         assert!(worker.try_recv().is_err());
+    }
+
+    #[test]
+    fn steer_only_workers_do_not_interrupt_pending_steers() {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        app.main.running = true;
+        app.queue_steer(PaneId::Main, "first correction".to_owned())
+            .unwrap();
+        let mut ui = UiModel::with_capabilities(
+            app,
+            Arc::from("main-session"),
+            crate::app_core::WorkerCapabilities::empty()
+                .with(crate::app_core::WorkerCapability::Prompt)
+                .with(crate::app_core::WorkerCapability::Steer),
+        );
+
+        let update = ui
+            .update(
+                UiAction::Terminal(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+                &commands,
+            )
+            .unwrap();
+
+        assert_eq!(update, UiUpdate::Redraw(RedrawPriority::Immediate));
+        assert!(worker.try_recv().is_err());
+        assert!(ui.app.main.running);
+        assert!(ui.app.pending_steers(PaneId::Main));
+    }
+
+    #[test]
+    fn historical_edit_of_an_active_turn_requires_cancel_capability() {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        app.main
+            .transcript
+            .push_editable_user("message with typo".to_owned(), 1);
+        app.main.running = true;
+        app.move_up();
+        assert!(app.start_historical_edit());
+        app.replace_input("message without typo".to_owned());
+        let mut ui = UiModel::with_capabilities(
+            app,
+            Arc::from("main-session"),
+            crate::app_core::WorkerCapabilities::empty()
+                .with(crate::app_core::WorkerCapability::Prompt)
+                .with(crate::app_core::WorkerCapability::HistoricalEdit),
+        );
+
+        let update = ui
+            .update(
+                UiAction::Terminal(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                ))),
+                &commands,
+            )
+            .unwrap();
+
+        assert_eq!(update, UiUpdate::Redraw(RedrawPriority::Immediate));
+        assert!(worker.try_recv().is_err());
+        assert!(ui.app.main.running);
+        assert!(ui.app.historical_editor_active());
+        assert_eq!(ui.app.input, "message without typo");
+    }
+
+    #[tokio::test]
+    async fn shuts_down_a_worker_after_setup_fails() -> Result<()> {
+        let (commands, mut command_rx) = mpsc::unbounded_channel::<WorkerCommand>();
+        let (_updates, events) = mpsc::unbounded_channel::<WorkerEvent>();
+        let (cleaned_tx, cleaned_rx) = oneshot::channel();
+        let worker = WorkerHandle::new(
+            commands,
+            events,
+            Arc::from("test-session"),
+            crate::app_core::WorkerCapabilities::standard(),
+            async move {
+                assert!(command_rx.recv().await.is_none());
+                cleaned_tx.send(()).unwrap();
+                Ok(())
+            },
+        );
+
+        let error = finish_worker(worker, Err(eyre::eyre!("setup failed")))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "setup failed");
+        cleaned_rx.await?;
+        Ok(())
     }
 
     #[test]

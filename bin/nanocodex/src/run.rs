@@ -1,10 +1,13 @@
 use clap::{Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, eyre};
-use nanocodex::AgentEvents;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::config::AgentArgs;
 use crate::vm::VmArgs;
+use crate::{
+    app_core::{StandardWorkerFactory, WorkerFactory},
+    tui::{WorkerCommand, WorkerEvent},
+};
 
 #[derive(Args)]
 pub(crate) struct Run {
@@ -19,62 +22,35 @@ pub(crate) struct Run {
 
 impl Run {
     pub(crate) async fn run(self, config: AgentArgs, vm: VmArgs) -> Result<()> {
-        let configured = config.build(vm).await?;
-        let handle = configured.handle;
-        let mut events = configured.events;
+        let factory = StandardWorkerFactory::build(config, vm).await?;
+        let mut worker = factory.start();
         let mut stdout = tokio::io::stdout();
         let run_result: Result<()> = async {
-            for _ in 0..self.repeat {
-                let turn = handle.prompt(self.prompt.clone()).await?;
-                let control = turn.control();
-                let completion = async {
-                    write_turn_jsonl(&mut events, &mut stdout).await?;
-                    turn.result().await?;
-                    Ok::<(), eyre::Report>(())
-                };
+            for prompt_id in 1..=u64::from(self.repeat) {
+                let commands = worker.commands().clone();
+                commands
+                    .send(WorkerCommand::root_prompt(prompt_id, self.prompt.clone()))
+                    .map_err(|_| eyre!("application worker stopped"))?;
+                let completion = complete_turn(worker.events_mut(), &mut stdout);
                 tokio::pin!(completion);
                 tokio::select! {
                     result = &mut completion => result?,
                     signal = interrupt_signal() => {
                         signal?;
-                        // The driver may have completed while JSONL was still
+                        // The worker may have completed while JSONL was still
                         // backpressured. A late cancellation rejection must not
                         // discard its already-produced terminal event.
-                        let _ = control.cancel().await;
+                        let _ = commands.send(WorkerCommand::root_cancel());
                         let _ = completion.await;
                         return Err(eyre!("interrupted"));
                     }
                 }
-                handle.flush_rollout().await?;
             }
             Ok(())
         }
         .await;
-        let agent_shutdown = handle.shutdown().await;
-        drop(handle);
-        drop(events);
-        if let Some(child_agents) = configured.child_agents {
-            child_agents.shutdown().await;
-        }
-        let browser_shutdown_result = if let Some(browser) = configured.browser {
-            browser.shutdown().await
-        } else {
-            Ok(())
-        };
-        let vm_shutdown_result = if let Some(vm) = configured.vm {
-            vm.shutdown().await
-        } else {
-            Ok(())
-        };
-        let shutdown_result = if let Some(adapter) = configured.mpp_adapter {
-            adapter.shutdown().await
-        } else {
-            Ok(())
-        };
+        let shutdown_result = worker.shutdown().await;
         run_result?;
-        agent_shutdown?;
-        browser_shutdown_result?;
-        vm_shutdown_result?;
         shutdown_result
     }
 }
@@ -105,21 +81,251 @@ pub(crate) async fn run_prompt(prompt: String, config: AgentArgs, vm: VmArgs) ->
     Run { prompt, repeat: 1 }.run(config, vm).await
 }
 
-async fn write_turn_jsonl(
-    events: &mut AgentEvents,
+async fn complete_turn(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<WorkerEvent>,
     output: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {
+    let mut terminal_emitted = false;
+    let mut root_event_stream_closed = false;
+    let mut turn_rejected = false;
+    let mut finished = None;
     while let Some(event) = events.recv().await {
-        let terminal = event.kind.is_terminal();
-        let mut record = serde_json::to_vec(&event)?;
-        record.push(b'\n');
-        output.write_all(&record).await?;
-        output.flush().await?;
-        if terminal {
-            return Ok(());
+        match event {
+            WorkerEvent::RootAgentEvent { event } => {
+                let terminal = event.event.kind.is_terminal();
+                write_turn_jsonl(&event.event, output).await?;
+                if terminal {
+                    terminal_emitted = true;
+                    if let Some(result) = finished {
+                        return result;
+                    }
+                }
+            }
+            WorkerEvent::TurnTraceRejected { .. } => turn_rejected = true,
+            WorkerEvent::TurnFinished {
+                error: Some(error), ..
+            } => {
+                let result = Err(eyre!(error));
+                if terminal_emitted || root_event_stream_closed || turn_rejected {
+                    return result;
+                }
+                finished = Some(result);
+            }
+            WorkerEvent::TurnFinished { error: None, .. } => {
+                if terminal_emitted {
+                    return Ok(());
+                }
+                if root_event_stream_closed {
+                    return Err(eyre!(
+                        "root event stream closed before the turn emitted a terminal event"
+                    ));
+                }
+                finished = Some(Ok(()));
+            }
+            WorkerEvent::RootEventStreamClosed => {
+                root_event_stream_closed = true;
+                if let Some(result) = finished {
+                    return match result {
+                        Ok(()) => Err(eyre!(
+                            "root event stream closed before the turn emitted a terminal event"
+                        )),
+                        Err(error) => Err(error),
+                    };
+                }
+            }
+            _ => {}
         }
     }
-    Err(eyre!(
-        "agent event stream closed before the turn emitted a terminal event"
-    ))
+    if let Some(result) = finished {
+        return match result {
+            Ok(()) => Err(eyre!(
+                "application worker stopped before the turn emitted a terminal event"
+            )),
+            Err(error) => Err(error),
+        };
+    }
+    Err(eyre!("application worker stopped before the turn finished"))
+}
+
+async fn write_turn_jsonl(
+    event: &nanocodex::agent::events::AgentEvent,
+    output: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
+    let mut record = serde_json::to_vec(event)?;
+    record.push(b'\n');
+    output.write_all(&record).await?;
+    output.flush().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use eyre::Result;
+    use nanocodex::agent::events::{AgentEvent, AgentEventKind, AgentEventTiming, TimedAgentEvent};
+    use serde_json::value::RawValue;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+
+    use super::{complete_turn, write_turn_jsonl};
+    use crate::tui::WorkerEvent;
+
+    #[tokio::test]
+    async fn writes_root_terminal_event_as_jsonl() -> Result<()> {
+        let event = AgentEvent {
+            protocol_version: 1,
+            request_id: Arc::from("session"),
+            seq: 1,
+            kind: AgentEventKind::RunCompleted,
+            payload: RawValue::from_string(r#"{"status":"ok"}"#.to_owned())?.into(),
+        };
+        let mut output = Vec::new();
+
+        write_turn_jsonl(&event, &mut output).await?;
+
+        assert_eq!(
+            String::from_utf8(output)?,
+            "{\"protocol_version\":1,\"request_id\":\"session\",\"seq\":1,\"type\":\"run.completed\",\"payload\":{\"status\":\"ok\"}}\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn waits_for_a_terminal_root_event_after_worker_completion() -> Result<()> {
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        updates.send(WorkerEvent::root_turn_finished(None))?;
+        updates.send(WorkerEvent::RootAgentEvent {
+            event: TimedAgentEvent {
+                event: AgentEvent {
+                    protocol_version: 1,
+                    request_id: Arc::from("session"),
+                    seq: 1,
+                    kind: AgentEventKind::RunCompleted,
+                    payload: RawValue::from_string(r#"{"status":"ok"}"#.to_owned())?.into(),
+                },
+                timing: AgentEventTiming {
+                    emitted_ns: 1,
+                    source_received_ns: Some(1),
+                },
+            },
+        })?;
+        let mut output = Vec::new();
+
+        complete_turn(&mut update_rx, &mut output).await?;
+
+        assert_eq!(
+            String::from_utf8(output)?,
+            "{\"protocol_version\":1,\"request_id\":\"session\",\"seq\":1,\"type\":\"run.completed\",\"payload\":{\"status\":\"ok\"}}\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn waits_for_worker_completion_after_the_root_event_stream_closes() -> Result<()> {
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        updates.send(WorkerEvent::RootAgentEvent {
+            event: TimedAgentEvent {
+                event: AgentEvent {
+                    protocol_version: 1,
+                    request_id: Arc::from("session"),
+                    seq: 1,
+                    kind: AgentEventKind::RunCompleted,
+                    payload: RawValue::from_string(r#"{"status":"ok"}"#.to_owned())?.into(),
+                },
+                timing: AgentEventTiming {
+                    emitted_ns: 1,
+                    source_received_ns: Some(1),
+                },
+            },
+        })?;
+        updates.send(WorkerEvent::RootEventStreamClosed)?;
+        updates.send(WorkerEvent::root_turn_finished(None))?;
+        let mut output = Vec::new();
+
+        complete_turn(&mut update_rx, &mut output).await?;
+
+        assert_eq!(
+            String::from_utf8(output)?,
+            "{\"protocol_version\":1,\"request_id\":\"session\",\"seq\":1,\"type\":\"run.completed\",\"payload\":{\"status\":\"ok\"}}\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writes_terminal_failure_before_returning_worker_error() -> Result<()> {
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        updates.send(WorkerEvent::root_turn_finished(Some(
+            "worker failed".to_owned(),
+        )))?;
+        updates.send(WorkerEvent::RootAgentEvent {
+            event: TimedAgentEvent {
+                event: AgentEvent {
+                    protocol_version: 1,
+                    request_id: Arc::from("session"),
+                    seq: 1,
+                    kind: AgentEventKind::RunFailed,
+                    payload: RawValue::from_string(r#"{"error":"worker failed"}"#.to_owned())?
+                        .into(),
+                },
+                timing: AgentEventTiming {
+                    emitted_ns: 1,
+                    source_received_ns: Some(1),
+                },
+            },
+        })?;
+        let mut output = Vec::new();
+
+        let error = complete_turn(&mut update_rx, &mut output)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "worker failed");
+        assert_eq!(
+            String::from_utf8(output)?,
+            "{\"protocol_version\":1,\"request_id\":\"session\",\"seq\":1,\"type\":\"run.failed\",\"payload\":{\"error\":\"worker failed\"}}\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn returns_a_rejected_prompt_error_without_a_terminal_root_event() -> Result<()> {
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        updates.send(WorkerEvent::root_turn_trace_rejected(1))?;
+        updates.send(WorkerEvent::root_turn_finished(Some(
+            "prompt rejected".to_owned(),
+        )))?;
+        let mut output = Vec::new();
+
+        let error = timeout(
+            Duration::from_millis(50),
+            complete_turn(&mut update_rx, &mut output),
+        )
+        .await
+        .expect("rejected prompts must not wait for a terminal root event")
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "prompt rejected");
+        assert!(output.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_a_completed_turn_without_a_terminal_root_event() -> Result<()> {
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        updates.send(WorkerEvent::root_turn_finished(None))?;
+        updates.send(WorkerEvent::RootEventStreamClosed)?;
+        let mut output = Vec::new();
+
+        let error = complete_turn(&mut update_rx, &mut output)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "root event stream closed before the turn emitted a terminal event"
+        );
+        Ok(())
+    }
 }
