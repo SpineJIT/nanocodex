@@ -2,7 +2,10 @@ use std::{process::ExitCode, sync::Arc};
 
 use clap::{Parser, builder::NonEmptyStringValueParser};
 use eyre::{Result, eyre};
-use nanocodex_spine_runtime::{SpineRuntime, SpineRuntimeLimits, with_spine_tools};
+use nanocodex_spine_runtime::{
+    SpineRuntime, SpineRuntimeError, SpineRuntimeLimits, SpineTreeObserver, with_spine_tools,
+};
+use tokio::sync::mpsc;
 
 use crate::{
     app_core::{
@@ -83,14 +86,18 @@ async fn run(cli: Cli) -> Result<()> {
 
 struct SpineWorkerFactory {
     configured: ConfiguredAgent,
+    runtime: Arc<SpineRuntime>,
 }
 
 impl SpineWorkerFactory {
     async fn build(config: AgentArgs, vm: VmArgs, runtime: Arc<SpineRuntime>) -> Result<Self> {
-        let customizer: ToolCustomizer =
-            Arc::new(move |tools, agent| with_spine_tools(tools, agent, Arc::clone(&runtime)));
+        let runtime_for_tools = Arc::clone(&runtime);
+        let customizer: ToolCustomizer = Arc::new(move |tools, agent| {
+            with_spine_tools(tools, agent, Arc::clone(&runtime_for_tools))
+        });
         Ok(Self {
             configured: config.build_with_tool_customizer(vm, customizer).await?,
+            runtime,
         })
     }
 }
@@ -100,8 +107,25 @@ impl WorkerFactory for SpineWorkerFactory {
     type Event = WorkerEvent;
 
     fn start(self) -> WorkerHandle<Self::Command, Self::Event> {
-        start_configured_worker(self.configured, spine_capabilities())
+        let runtime = self.runtime;
+        start_configured_worker(self.configured, spine_capabilities(), move |updates| {
+            if let Err(error) = bind_spine_tree_updates(&runtime, updates.clone()) {
+                let _ = updates.send(WorkerEvent::SpineTreeFailed {
+                    error: error.to_string(),
+                });
+            }
+        })
     }
+}
+
+fn bind_spine_tree_updates(
+    runtime: &SpineRuntime,
+    updates: mpsc::UnboundedSender<WorkerEvent>,
+) -> Result<(), SpineRuntimeError> {
+    let observer: SpineTreeObserver = Arc::new(move |snapshot| {
+        let _ = updates.send(WorkerEvent::SpineTreeUpdated { snapshot });
+    });
+    runtime.set_tree_observer(observer)
 }
 
 const fn spine_capabilities() -> WorkerCapabilities {
@@ -117,14 +141,32 @@ const fn spine_capabilities() -> WorkerCapabilities {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use std::sync::Arc;
 
-    use super::Cli;
+    use clap::Parser;
+    use nanocodex_spine_runtime::{SpineRuntime, SpineRuntimeLimits};
+    use tokio::sync::mpsc;
+
+    use super::{Cli, bind_spine_tree_updates};
+    use crate::tui::WorkerEvent;
 
     #[test]
     fn spine_cli_reuses_the_standard_agent_flags() {
         let cli = Cli::try_parse_from(["nanocodex-spine", "--api-key", "test-key"]);
 
         assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn spine_tree_observer_forwards_snapshots_to_the_tui() {
+        let runtime = Arc::new(SpineRuntime::new(SpineRuntimeLimits::default()));
+        let (updates, mut received) = mpsc::unbounded_channel();
+
+        bind_spine_tree_updates(&runtime, updates).unwrap();
+
+        assert!(matches!(
+            received.try_recv(),
+            Ok(WorkerEvent::SpineTreeUpdated { snapshot }) if snapshot.active_node_id == "1"
+        ));
     }
 }

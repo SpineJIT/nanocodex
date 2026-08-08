@@ -16,6 +16,7 @@ use nanocodex::{
         rollout::RolloutTranscriptItem,
     },
 };
+use nanocodex_spine_runtime::SpineTreeSnapshot;
 use ratatex::Ratatex;
 use ratatui::{
     buffer::Buffer,
@@ -939,6 +940,15 @@ impl Conversation {
     pub(super) fn push_output(&mut self, item: TranscriptItem) {
         self.note_new_entry();
         self.transcript.push(item);
+    }
+
+    pub(super) fn upsert_spine_tree(&mut self, snapshot: SpineTreeSnapshot) {
+        if self.transcript.tail_is_spine_tree() {
+            self.note_tail_will_change();
+        } else {
+            self.note_new_entry();
+        }
+        self.transcript.upsert_spine_tree(snapshot);
     }
 
     fn note_tail_will_change(&mut self) {

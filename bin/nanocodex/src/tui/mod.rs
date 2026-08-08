@@ -8,6 +8,7 @@ mod notification;
 mod resume_picker;
 mod scheduler;
 mod selection;
+mod spine_tree;
 mod telemetry;
 mod terminal;
 mod transcript;
@@ -34,6 +35,7 @@ use nanocodex::{
     },
     tools::mcp::McpHandle,
 };
+use nanocodex_spine_runtime::SpineTreeSnapshot;
 use nanocodex_voice::{
     CHATGPT_REALTIME_VOICES, PLATFORM_REALTIME_VOICES, RealtimeVoice, VoiceAgentControl,
     VoiceEvent, VoiceEvents, VoiceSession, VoiceSessionBuilder, VoiceSpeaker,
@@ -170,6 +172,12 @@ pub enum WorkerEvent {
         event: TimedAgentEvent,
     },
     RootEventStreamClosed,
+    SpineTreeUpdated {
+        snapshot: SpineTreeSnapshot,
+    },
+    SpineTreeFailed {
+        error: String,
+    },
     TurnTraceStarted {
         target: PaneId,
         id: u64,
@@ -1106,6 +1114,10 @@ fn handle_worker_update_with_capabilities(
     match update {
         WorkerEvent::RootAgentEvent { .. } | WorkerEvent::RootEventStreamClosed => {
             unreachable!("root events are applied by UiModel before worker updates")
+        }
+        WorkerEvent::SpineTreeUpdated { snapshot } => app.main.upsert_spine_tree(snapshot),
+        WorkerEvent::SpineTreeFailed { error } => {
+            app.push_active_error(format!("Spine tree unavailable: {error}"));
         }
         WorkerEvent::TurnFinished {
             target,
@@ -3200,6 +3212,9 @@ mod tests {
         agent::events::AgentEventKind,
         oai::{__private::EventSink, PromptInput},
     };
+    use nanocodex_spine_runtime::{
+        SpineTreeNode, SpineTreeNodeKind, SpineTreeNodeStatus, SpineTreeSnapshot,
+    };
     use nanocodex_voice::RealtimeVoice;
     use serde_json::{Value, json};
     use tokio::{
@@ -3222,6 +3237,54 @@ mod tests {
         telemetry::StreamTelemetry,
     };
 
+    #[test]
+    fn spine_tree_updates_replace_the_transcript_card() -> Result<()> {
+        let (commands, _) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+
+        handle_worker_update(
+            &mut app,
+            WorkerEvent::SpineTreeUpdated {
+                snapshot: spine_tree_snapshot("1.1", SpineTreeNodeStatus::Live),
+            },
+            &commands,
+        )?;
+        handle_worker_update(
+            &mut app,
+            WorkerEvent::SpineTreeUpdated {
+                snapshot: spine_tree_snapshot("1.2", SpineTreeNodeStatus::Closed),
+            },
+            &commands,
+        )?;
+
+        assert_eq!(app.main.transcript.len(), 1);
+        Ok(())
+    }
+
+    fn spine_tree_snapshot(
+        active_node_id: &str,
+        first_task_status: SpineTreeNodeStatus,
+    ) -> SpineTreeSnapshot {
+        SpineTreeSnapshot {
+            active_node_id: active_node_id.to_owned(),
+            nodes: vec![
+                SpineTreeNode {
+                    id: "1".to_owned(),
+                    parent_id: None,
+                    kind: SpineTreeNodeKind::RootEpoch,
+                    status: SpineTreeNodeStatus::Opened,
+                    summary: None,
+                },
+                SpineTreeNode {
+                    id: "1.1".to_owned(),
+                    parent_id: Some("1".to_owned()),
+                    kind: SpineTreeNodeKind::Task,
+                    status: first_task_status,
+                    summary: Some("inspect the parser".to_owned()),
+                },
+            ],
+        }
+    }
     fn mouse_scroll(kind: MouseEventKind) -> Event {
         Event::Mouse(MouseEvent {
             kind,

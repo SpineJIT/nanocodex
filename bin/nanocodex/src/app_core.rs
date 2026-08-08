@@ -196,13 +196,14 @@ impl WorkerFactory for StandardWorkerFactory {
     type Event = WorkerEvent;
 
     fn start(self) -> WorkerHandle<Self::Command, Self::Event> {
-        start_configured_worker(self.configured, WorkerCapabilities::standard())
+        start_configured_worker(self.configured, WorkerCapabilities::standard(), |_| {})
     }
 }
 
 pub(crate) fn start_configured_worker(
     configured: ConfiguredAgent,
     capabilities: WorkerCapabilities,
+    configure_updates: impl FnOnce(&mpsc::UnboundedSender<WorkerEvent>),
 ) -> WorkerHandle<WorkerCommand, WorkerEvent> {
     let ConfiguredAgent {
         handle,
@@ -217,6 +218,7 @@ pub(crate) fn start_configured_worker(
     let root_session_id = Arc::<str>::from(events.request_id());
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (updates, update_rx) = mpsc::unbounded_channel();
+    configure_updates(&updates);
     let worker = tui::spawn_agent_worker(
         handle.clone(),
         Arc::clone(&root_session_id),
