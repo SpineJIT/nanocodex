@@ -37,11 +37,13 @@ This is an operations loop, not a software-development task. Do not inspect repo
 
 The desired amount of work is already materialized in {ledger}. Do not infer it from `{config}` or add ad-hoc work during this workflow. Inspect the durable ledger with:
 
-    {executable} eval status{profile_argument}{state_argument}{coordinator_argument} --json --family-limit 32
+    {executable} eval status{profile_argument}{state_argument}{coordinator_argument} --json --family-limit 128
 
 You own task and treatment priority. Read the family records, choose exact pending task and harness treatments, and invoke one repetition with `{executable} eval run{profile_argument} --config {config_argument}{state_argument}{coordinator_argument}{worker_argument} --task <exact-profile-selector>` plus `--harness`, model, or thinking selectors required to identify that profile family. Omit `--harness` for built-in Nanocodex. The CLI atomically allocates the internal repetition; never pass or invent a trial number.
 
-Drive the host aggressively. Immediately launch 32 concurrent run processes in the first wave; do not begin with a one- or two-run probe. Keep 32 run slots occupied while pending work remains, replacing each process as soon as it exits instead of waiting for the rest of its wave. Spread the initial slots across already-prepared tasks and independent treatments so one preparation lock or failing family cannot stall the host. Reduce fan-out only after concrete host pressure such as an OOM kill, sustained swapping, or repeated VM allocation failure. A model failure, verifier failure, or one broken harness treatment is not evidence that unrelated slots should be idled.
+Drive the host to its memory limit aggressively; there is no fixed run-slot ceiling. Start with at least one concurrent run per logical CPU, spread across already-prepared tasks and independent treatments so one preparation lock or failing family cannot stall the host. Then add runs in batches while pending work remains and host memory is healthy. On Linux, use `MemAvailable` from `/proc/meminfo`, swap activity, memory PSI, and OOM events as the pressure signals. Target a steady-state reserve of roughly five percent of physical RAM, never more than 4 GiB, so the benchmark deliberately runs close to OOM without continuously crossing it. Continue increasing fan-out while the reserve is materially above that target. When it falls below the target, stop launching replacements until completed runs return enough memory, then refill immediately. An isolated OOM or VM allocation failure means the latest ramp overshot: allow running work to drain, resume just below that level, and keep probing upward later as the workload mix changes. Sustained swap-in or memory PSI also requires a temporary backoff. Do not reduce fan-out for model failures, verifier failures, or one broken harness treatment.
+
+Do not operate in synchronized waves after startup. Keep every memory-safe slot occupied by replacing each process as soon as it exits, and re-evaluate pressure before every replacement and after each ramp batch. The live process count is an outcome of host pressure, not a configured maximum; it may grow far beyond the logical CPU count when runs are waiting on remote model work.
 
 Task preparation is part of each task's durable state. One run process may prepare a task while another receives a temporary-unavailable result. Retry temporary contention after its suggested delay. Retry durable infrastructure failures, but treat accepted model and verifier outcomes as terminal even when the benchmark failed.
 
@@ -71,11 +73,12 @@ mod tests {
 
         assert!(prompt.contains("choose exact pending task and harness treatments"));
         assert!(prompt.contains("Omit `--harness` for built-in Nanocodex"));
-        assert!(prompt.contains("Immediately launch 32 concurrent run processes"));
-        assert!(prompt.contains("do not begin with a one- or two-run probe"));
-        assert!(prompt.contains("Keep 32 run slots occupied"));
+        assert!(prompt.contains("there is no fixed run-slot ceiling"));
+        assert!(prompt.contains("at least one concurrent run per logical CPU"));
+        assert!(prompt.contains("Target a steady-state reserve of roughly five percent"));
+        assert!(prompt.contains("The live process count is an outcome of host pressure"));
         assert!(prompt.contains("replacing each process as soon as it exits"));
-        assert!(prompt.contains("Reduce fan-out only after concrete host pressure"));
+        assert!(prompt.contains("keep probing upward later as the workload mix changes"));
         assert!(prompt.contains("never pass or invent a trial number"));
         assert!(prompt.contains("--state-dir '/mnt/evals'"));
         assert!(!prompt.contains("eval work"));
@@ -108,7 +111,7 @@ mod tests {
         );
 
         assert!(prompt.contains("status 'release' --coordinator 'http://127.0.0.1:8789'"));
-        assert!(prompt.contains("--json --family-limit 32"));
+        assert!(prompt.contains("--json --family-limit 128"));
         assert!(prompt.contains(
             "'/opt/nanocodex/bin/nanocodex' eval run 'release' --config 'nanocodex.toml' --coordinator 'http://127.0.0.1:8789' --worker 'dev-georgios-01' --task"
         ));
