@@ -225,12 +225,10 @@ async fn run_continuation(
 ) -> Result<OpenResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut prior_memory = None;
     loop {
+        let context = runtime.continuation_context(&summary, prior_memory.as_deref())?;
         let (child, events) = parent.fork().await?;
         drop(events);
-        let result = match child
-            .prompt(continuation_prompt(&summary, prior_memory.as_deref()))
-            .await
-        {
+        let result = match child.prompt(context.render()).await {
             Ok(turn) => turn.result().await,
             Err(error) => Err(error),
         };
@@ -269,17 +267,4 @@ async fn run_continuation(
             }
         }
     }
-}
-
-fn continuation_prompt(summary: &str, prior_memory: Option<&str>) -> String {
-    let prior_memory = prior_memory.map_or_else(String::new, |memory| {
-        format!("\n\nPrevious sibling handoff:\n<spine_memory>\n{memory}\n</spine_memory>")
-    });
-    format!(
-        "You now own one focused Spine continuation scope. Work only on this scope, then call \
-         tools.spine__close({{memory: ...}}) with a compact, evidence-backed handoff. If the \
-         scope genuinely changes but its frozen parent should remain blocked, call \
-         tools.spine__next({{summary: ..., memory: ...}}). Do not finish with a normal assistant \
-         message.\n\nScope:\n{summary}{prior_memory}"
-    )
 }

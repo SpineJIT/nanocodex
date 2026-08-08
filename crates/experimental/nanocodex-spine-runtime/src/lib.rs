@@ -14,10 +14,7 @@ mod tools;
 
 pub use tools::with_spine_tools;
 
-const MAX_CONTINUATION_CONTEXT_TOKENS: usize = 1_000;
-const APPROX_BYTES_PER_TOKEN: usize = 4;
-const MAX_CONTINUATION_CONTEXT_BYTES: usize =
-    MAX_CONTINUATION_CONTEXT_TOKENS * APPROX_BYTES_PER_TOKEN;
+const MAX_CONTINUATION_CONTEXT_BYTES: usize = 4_000;
 
 /// A receiver for reducer-derived tree snapshots suitable for a live UI.
 pub type SpineTreeObserver = Arc<dyn Fn(SpineTreeSnapshot) + Send + Sync>;
@@ -75,11 +72,13 @@ pub struct SpineRuntimeLimits {
     pub max_depth: u32,
     /// Maximum number of task scopes accepted during the root session.
     pub max_nodes: u32,
-    /// Maximum UTF-8 byte length of one child-scope summary, subject to the
-    /// runtime's non-overridable context budget.
+    /// Maximum UTF-8 byte length of one child-scope summary. The rendered
+    /// continuation context, including its instruction and sibling handoff,
+    /// remains subject to the runtime's non-overridable context budget.
     pub max_summary_bytes: usize,
-    /// Maximum UTF-8 byte length of one model-visible compact handoff, subject
-    /// to the runtime's non-overridable context budget.
+    /// Maximum UTF-8 byte length of one model-visible compact handoff. The
+    /// rendered continuation context, including its instruction and scope
+    /// summary, remains subject to the runtime's non-overridable context budget.
     pub max_memory_bytes: usize,
 }
 
@@ -139,6 +138,9 @@ pub enum SpineRuntimeError {
     /// The compact handoff exceeds the injected-context bound.
     #[error("spine memory exceeds the {0}-byte limit")]
     MemoryTooLarge(usize),
+    /// The full model-visible continuation context exceeds the hard cap.
+    #[error("spine continuation context exceeds the {0}-byte limit")]
+    ContinuationContextTooLarge(usize),
     /// The configured nesting cap would be exceeded.
     #[error("spine continuation depth limit of {0} reached")]
     DepthLimit(u32),
@@ -181,6 +183,45 @@ struct RuntimeState {
 
 pub(crate) struct SpineRuntimeCheckpoint(RuntimeState);
 
+/// One bounded model-visible continuation request.
+///
+/// This stays local to the Spine runtime rather than extending Nano's internal
+/// conversation state: it owns only the scoped context injected into a child.
+pub(crate) struct ContinuationContext {
+    summary: String,
+    prior_memory: Option<String>,
+}
+
+impl ContinuationContext {
+    fn new(summary: &str, prior_memory: Option<&str>) -> Self {
+        Self {
+            summary: summary.trim().to_owned(),
+            prior_memory: prior_memory.map(|memory| memory.trim().to_owned()),
+        }
+    }
+
+    fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub(crate) fn render(&self) -> String {
+        let prior_memory = self
+            .prior_memory
+            .as_deref()
+            .map_or_else(String::new, |memory| {
+                format!("\n\nPrevious sibling handoff:\n<spine_memory>\n{memory}\n</spine_memory>")
+            });
+        format!(
+            "You now own one focused Spine continuation scope. Work only on this scope, then call \
+             tools.spine__close({{memory: ...}}) with a compact, evidence-backed handoff. If the \
+             scope genuinely changes but its frozen parent should remain blocked, call \
+             tools.spine__next({{summary: ..., memory: ...}}). Do not finish with a normal assistant \
+             message.\n\nScope:\n{}{prior_memory}",
+            self.summary
+        )
+    }
+}
+
 impl SpineRuntime {
     /// Starts a fresh logical Spine root epoch.
     #[must_use]
@@ -198,8 +239,8 @@ impl SpineRuntime {
 
     /// Commits a successful `spine.open` tool call and returns its child node.
     pub fn open(&self, call_id: &str, summary: &str) -> Result<NodeId, SpineRuntimeError> {
-        self.validate_summary(summary)?;
-        let summary = summary.trim();
+        let context = self.continuation_context(summary, None)?;
+        let summary = context.summary();
         let (node, tree) = {
             let mut state = self
                 .state
@@ -264,9 +305,8 @@ impl SpineRuntime {
         summary: &str,
         memory: &str,
     ) -> Result<SpineHandoff, SpineRuntimeError> {
-        self.validate_summary(summary)?;
-        self.validate_memory(memory)?;
-        let summary = summary.trim();
+        let context = self.continuation_context(summary, Some(memory))?;
+        let summary = context.summary();
         let memory = memory.trim();
         let (handoff, tree) = {
             let mut state = self
@@ -387,6 +427,24 @@ impl SpineRuntime {
         let memory = required(memory, SpineRuntimeError::EmptyMemory)?;
         let limit = self.context_byte_limit(self.limits.max_memory_bytes);
         bounded(memory, limit, SpineRuntimeError::MemoryTooLarge(limit))
+    }
+
+    pub(crate) fn continuation_context(
+        &self,
+        summary: &str,
+        prior_memory: Option<&str>,
+    ) -> Result<ContinuationContext, SpineRuntimeError> {
+        self.validate_summary(summary)?;
+        if let Some(memory) = prior_memory {
+            self.validate_memory(memory)?;
+        }
+        let context = ContinuationContext::new(summary, prior_memory);
+        bounded(
+            &context.render(),
+            MAX_CONTINUATION_CONTEXT_BYTES,
+            SpineRuntimeError::ContinuationContextTooLarge(MAX_CONTINUATION_CONTEXT_BYTES),
+        )?;
+        Ok(context)
     }
 
     fn context_byte_limit(&self, configured_limit: usize) -> usize {

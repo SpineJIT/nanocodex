@@ -19,7 +19,10 @@ use nanocodex::oai::{
 };
 use nanocodex::{Nanocodex, OpenAi, Thinking, Tools};
 use nanocodex_spine_runtime::{SpineRuntime, SpineRuntimeLimits, with_spine_tools};
-use tokio::{sync::Notify, time::Duration};
+use tokio::{
+    sync::{Notify, mpsc},
+    time::Duration,
+};
 use tower::Service;
 
 #[tokio::test]
@@ -179,6 +182,14 @@ async fn cancelling_an_open_continuation_restores_the_parent_logical_tree() {
         .build()
         .unwrap();
     let runtime = Arc::new(SpineRuntime::new(SpineRuntimeLimits::default()));
+    let (tree_updates, mut received_tree_updates) = mpsc::unbounded_channel();
+    runtime
+        .set_tree_observer(Arc::new(move |snapshot| {
+            tree_updates.send(snapshot).unwrap();
+        }))
+        .unwrap();
+    let initial_tree = received_tree_updates.recv().await.unwrap();
+    assert_eq!(initial_tree.active_node_id, "1");
     let tools = Tools::builder().without_defaults().build().unwrap();
     let runtime_for_tools = Arc::clone(&runtime);
     let (agent, events) = Nanocodex::builder(openai)
@@ -198,6 +209,8 @@ async fn cancelling_an_open_continuation_restores_the_parent_logical_tree() {
     tokio::time::timeout(Duration::from_secs(5), child_waiting)
         .await
         .expect("child continuation did not start");
+    let opened_tree = received_tree_updates.recv().await.unwrap();
+    assert_eq!(opened_tree.active_node_id, "1.1");
 
     turn.cancel().await.unwrap();
     assert!(matches!(
@@ -207,6 +220,9 @@ async fn cancelling_an_open_continuation_restores_the_parent_logical_tree() {
     let projection = runtime.projection().unwrap();
     assert_eq!(projection.cursor.to_string(), "1");
     assert_eq!(projection.nodes.len(), 1);
+    let restored_tree = received_tree_updates.recv().await.unwrap();
+    assert_eq!(restored_tree.active_node_id, "1");
+    assert_eq!(restored_tree.nodes.len(), 1);
 
     agent.shutdown().await.unwrap();
     drop(events);

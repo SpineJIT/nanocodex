@@ -123,3 +123,37 @@ fn memory_respects_the_hard_context_bound_when_configuration_is_larger() {
         "spine memory exceeds the 4000-byte limit"
     );
 }
+
+#[test]
+fn open_rejects_a_summary_that_overflows_the_final_continuation_context() {
+    let runtime = SpineRuntime::new(SpineRuntimeLimits::default());
+
+    let error = runtime.open("open-1", &"x".repeat(4_000)).unwrap_err();
+    let projection = runtime.projection().unwrap();
+
+    assert_eq!(
+        error.to_string(),
+        "spine continuation context exceeds the 4000-byte limit"
+    );
+    assert_eq!(projection.cursor.to_string(), "1");
+    assert_eq!(projection.nodes.len(), 1);
+}
+
+#[test]
+fn next_rejects_an_oversized_handoff_without_closing_the_live_scope() {
+    let runtime = SpineRuntime::new(SpineRuntimeLimits::default());
+    runtime.open("open-1", "inspect the parser").unwrap();
+
+    let error = runtime
+        .next("next-1", &"x".repeat(3_000), &"y".repeat(1_000))
+        .unwrap_err();
+    let projection = runtime.projection().unwrap();
+
+    assert_eq!(
+        error.to_string(),
+        "spine continuation context exceeds the 4000-byte limit"
+    );
+    assert_eq!(projection.cursor.to_string(), "1.1");
+    assert_eq!(projection.nodes.len(), 2);
+    assert_eq!(projection.nodes[1].status, NodeStatus::Live);
+}
