@@ -10,7 +10,7 @@ use nanocodex_eval::{
     EvalAttemptOutcome, EvalEventKind, EvalEventStream, EvalOutcome, Evaluation, EvaluationClaim,
     EvaluationSelector, EvaluationWork, Evaluator, ResolvedHarness, Task,
     atif::AtifBuilder,
-    coordinator::{CoordinatorClient, RemoteClaim, RemoteLease},
+    coordinator::{CoordinatorAddRequest, CoordinatorClient, RemoteClaim, RemoteLease},
     harness::{Harness, HarnessAuth},
     vm::{CachePolicy, VmBackend, VmResources},
 };
@@ -79,13 +79,19 @@ pub(super) struct Add {
     #[arg(long)]
     new: bool,
 
-    /// Optional profile recipes and runtime harness helpers.
+    /// Optional local profile recipes and runtime harness helpers.
+    ///
+    /// A remote coordinator resolves recipes from its own configured file.
     #[arg(long, default_value = CONFIG_FILE)]
     config: PathBuf,
 
-    /// Durable SQLite ledger and retained artifacts.
+    /// Local durable SQLite ledger and retained artifacts.
     #[arg(long, value_name = "DIRECTORY")]
     state_dir: Option<PathBuf>,
+
+    /// Add work through a remote coordinator instead of opening SQLite directly.
+    #[arg(long, value_name = "URL", conflicts_with = "state_dir")]
+    coordinator: Option<String>,
 }
 
 #[derive(Args)]
@@ -144,6 +150,42 @@ pub(super) struct Run {
 
 impl Add {
     pub(super) async fn run(self) -> Result<()> {
+        if let Some(coordinator) = &self.coordinator {
+            for task in &self.task {
+                if !task.is_absolute() {
+                    return Err(eyre!(
+                        "remote task paths must be absolute coordinator-host paths: {}",
+                        task.display()
+                    ));
+                }
+            }
+            let request = CoordinatorAddRequest {
+                profile: self.profile,
+                recipe: self.recipe,
+                tasks: self
+                    .task
+                    .into_iter()
+                    .map(|task| task.to_string_lossy().into_owned())
+                    .collect(),
+                harnesses: self.harness,
+                models: self
+                    .model
+                    .into_iter()
+                    .map(|model| model.as_str().to_owned())
+                    .collect(),
+                thinking: self
+                    .thinking
+                    .into_iter()
+                    .map(|thinking| thinking.as_str().to_owned())
+                    .collect(),
+                trials: self.trials,
+                web_search: self.web_search,
+                new_generation: self.new,
+            };
+            let status = CoordinatorClient::new(coordinator)?.add(&request).await?;
+            print_added_remote_status(&status);
+            return Ok(());
+        }
         let state = self.state_dir.map_or_else(default_state_dir, Ok)?;
         if let Some(recipe) = self.recipe.as_deref() {
             if !self.task.is_empty()
@@ -209,6 +251,19 @@ impl Add {
         );
         Ok(())
     }
+}
+
+fn print_added_remote_status(status: &serde_json::Value) {
+    let profile = status["profile"].as_str().unwrap_or("unknown");
+    let generation = status["generation"].as_str().unwrap_or("unknown");
+    let generation = generation.get(..12).unwrap_or(generation);
+    println!(
+        "{} {} · {} tasks · {} coordinate(s)",
+        profile,
+        generation,
+        count_total(&status["preparation"]),
+        count_total(&status["coordinates"]),
+    );
 }
 
 #[derive(Serialize)]
@@ -820,6 +875,47 @@ mod tests {
         };
         assert_eq!(run.task, "terminal/fix-git");
         assert_eq!(run.worker.as_deref(), Some("dev-one"));
+    }
+
+    #[test]
+    fn add_accepts_remote_coordinator_and_rejects_direct_sqlite_combination() {
+        let cli = Cli::try_parse_from([
+            "nanocodex",
+            "eval",
+            "add",
+            "release",
+            "--coordinator",
+            "http://127.0.0.1:8788",
+            "--task",
+            "/mnt/tasks/fix-git",
+            "--trials",
+            "3",
+        ])
+        .unwrap();
+        let Some(Command::Eval(eval)) = cli.command else {
+            panic!("expected eval command");
+        };
+        let EvalCommand::Add(add) = eval.command else {
+            panic!("expected profile add");
+        };
+        assert_eq!(add.coordinator.as_deref(), Some("http://127.0.0.1:8788"));
+        assert_eq!(add.task, [Path::new("/mnt/tasks/fix-git")]);
+
+        assert!(
+            Cli::try_parse_from([
+                "nanocodex",
+                "eval",
+                "add",
+                "release",
+                "--coordinator",
+                "http://127.0.0.1:8788",
+                "--state-dir",
+                "/mnt/evals",
+                "--task",
+                "/mnt/tasks/fix-git",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

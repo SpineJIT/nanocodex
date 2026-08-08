@@ -289,6 +289,10 @@ impl Evaluation {
         &self.state_directory
     }
 
+    pub(crate) fn config(&self) -> &Path {
+        &self.config
+    }
+
     /// Reads a structured snapshot from SQLite.
     pub fn status(&self) -> Result<EvaluationStatus, EvaluationError> {
         let status = self.workset()?.status().map_err(error)?;

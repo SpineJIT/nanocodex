@@ -25,8 +25,8 @@ use tokio_util::io::{ReaderStream, SyncIoBridge};
 use uuid::Uuid;
 
 use crate::{
-    CoordinateClaim, Evaluation, EvaluationClaim, EvaluationSelector, EvaluationTreatment,
-    PreparationClaim, api::EvalApi,
+    CoordinateClaim, Evaluation, EvaluationClaim, EvaluationSelector, EvaluationStatus,
+    EvaluationTreatment, EvaluationWork, PreparationClaim, Task, api::EvalApi,
 };
 
 const MAX_COMPRESSED_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
@@ -49,6 +49,37 @@ pub struct CoordinatorClient {
     base: Url,
     http: reqwest::Client,
     worker: Option<String>,
+}
+
+/// Work to append to the coordinator-owned SQLite evaluation.
+///
+/// Task paths are resolved on the coordinator host and must be absolute.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CoordinatorAddRequest {
+    /// Expected profile owned by the target coordinator.
+    pub profile: String,
+    /// Optional profile recipe resolved from the coordinator's configuration.
+    pub recipe: Option<String>,
+    /// Absolute task-package paths visible on the coordinator host.
+    #[serde(default)]
+    pub tasks: Vec<String>,
+    /// Harness matrix. An empty list selects built-in Nanocodex.
+    #[serde(default)]
+    pub harnesses: Vec<String>,
+    /// Model matrix. Values use ordinary Nanocodex model names.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Reasoning-effort matrix.
+    #[serde(default)]
+    pub thinking: Vec<String>,
+    /// Desired repetitions for each concrete treatment.
+    pub trials: Option<u16>,
+    /// Whether model-facing web search is enabled.
+    #[serde(default)]
+    pub web_search: bool,
+    /// Whether to start a new generation instead of extending the latest one.
+    #[serde(default)]
+    pub new_generation: bool,
 }
 
 /// One action atomically allocated by the coordinator.
@@ -239,6 +270,7 @@ impl CoordinatorServer {
         let app = Router::new()
             .route("/v1/status", get(status))
             .route("/v1/evals", get(eval_overview))
+            .route("/v1/evals/work", post(add_work))
             .route("/v1/evals/worksets/{digest}", get(eval_workset))
             .route(
                 "/v1/evals/worksets/{digest}/tasks/{task_id}",
@@ -309,6 +341,20 @@ impl CoordinatorClient {
     /// Reads the coordinator's complete structured ledger snapshot.
     pub async fn status(&self) -> Result<serde_json::Value, CoordinatorError> {
         let response = self.http.get(self.endpoint("v1/status")?).send().await?;
+        decode(response).await
+    }
+
+    /// Appends work through the coordinator and returns the resulting status.
+    pub async fn add(
+        &self,
+        request: &CoordinatorAddRequest,
+    ) -> Result<serde_json::Value, CoordinatorError> {
+        let response = self
+            .http
+            .post(self.endpoint("v1/evals/work")?)
+            .json(request)
+            .send()
+            .await?;
         decode(response).await
     }
 
@@ -455,6 +501,130 @@ async fn status(
     Ok(Json(
         serde_json::to_value(status).map_err(ApiError::internal)?,
     ))
+}
+
+async fn add_work(
+    State(state): State<CoordinatorState>,
+    Json(request): Json<CoordinatorAddRequest>,
+) -> Result<Json<EvaluationStatus>, ApiError> {
+    let evaluation = state.evaluation;
+    let status = tokio::task::spawn_blocking(move || apply_add(&evaluation, request))
+        .await
+        .map_err(ApiError::internal)??;
+    Ok(Json(status))
+}
+
+fn apply_add(
+    evaluation: &Evaluation,
+    request: CoordinatorAddRequest,
+) -> Result<EvaluationStatus, ApiError> {
+    let CoordinatorAddRequest {
+        profile,
+        recipe,
+        tasks,
+        harnesses,
+        models,
+        thinking,
+        trials,
+        web_search,
+        new_generation,
+    } = request;
+    if profile != evaluation.name() {
+        return Err(ApiError::bad_request(format!(
+            "coordinator owns profile {:?}, not {:?}",
+            evaluation.name(),
+            profile
+        )));
+    }
+    if let Some(recipe) = recipe {
+        if !tasks.is_empty()
+            || !harnesses.is_empty()
+            || !models.is_empty()
+            || !thinking.is_empty()
+            || trials.is_some()
+            || web_search
+        {
+            return Err(ApiError::bad_request(
+                "recipe work cannot be combined with explicit work knobs",
+            ));
+        }
+        Evaluation::add_profile(
+            evaluation.config(),
+            Some(&recipe),
+            evaluation.state_directory(),
+            evaluation.name(),
+            new_generation,
+        )
+        .map_err(ApiError::ledger)?;
+        return evaluation.status().map_err(ApiError::ledger);
+    }
+    if tasks.is_empty() {
+        return Err(ApiError::bad_request(
+            "at least one task or recipe is required",
+        ));
+    }
+    let trials = trials.unwrap_or(1);
+    if trials == 0 {
+        return Err(ApiError::bad_request(
+            "evaluation treatments must request at least one trial",
+        ));
+    }
+    if harnesses.iter().any(|harness| harness.trim().is_empty()) {
+        return Err(ApiError::bad_request("harness names cannot be empty"));
+    }
+    let models = if models.is_empty() {
+        vec![nanocodex_oai_api::Model::default()]
+    } else {
+        models
+            .into_iter()
+            .map(|model| model.parse().map_err(ApiError::bad_request))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let thinking = if thinking.is_empty() {
+        vec![nanocodex_oai_api::Thinking::default()]
+    } else {
+        thinking
+            .into_iter()
+            .map(|thinking| thinking.parse().map_err(ApiError::bad_request))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut work = Vec::new();
+    for selector in tasks {
+        let path = PathBuf::from(&selector);
+        if !path.is_absolute() {
+            return Err(ApiError::bad_request(format!(
+                "remote task paths must be absolute: {selector}"
+            )));
+        }
+        let task = Task::load(&path).map_err(ApiError::bad_request)?;
+        let selected_harnesses = harnesses
+            .iter()
+            .map(Some)
+            .chain(harnesses.is_empty().then_some(None));
+        for harness in selected_harnesses {
+            for model in &models {
+                for thinking in &thinking {
+                    let mut item = EvaluationWork::new(&selector, task.clone())
+                        .model(*model)
+                        .thinking(*thinking)
+                        .web_search(web_search)
+                        .trials(trials);
+                    if let Some(harness) = harness {
+                        item = item.harness(harness);
+                    }
+                    work.push(item);
+                }
+            }
+        }
+    }
+    Evaluation::add(
+        evaluation.state_directory(),
+        evaluation.name(),
+        &work,
+        new_generation,
+    )
+    .map_err(ApiError::ledger)?;
+    evaluation.status().map_err(ApiError::ledger)
 }
 
 async fn eval_overview(State(state): State<CoordinatorState>) -> Result<Response, ApiError> {
@@ -1120,6 +1290,131 @@ allow_internet = false
         assert_ne!(replaced["generation"], previous_generation);
         assert_eq!(replaced["coordinates"]["pending"], 3);
         assert_eq!(replaced["families"].as_array().unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn coordinator_add_route_appends_and_replaces_work_without_restart() {
+        let (directory, client, _selection, server) = fixture().await;
+        write_task(directory.path(), "two");
+        let two = directory.path().join("two");
+        let initial = client.status().await.unwrap();
+        let initial_generation = initial["generation"].as_str().unwrap().to_owned();
+
+        let appended = client
+            .add(&CoordinatorAddRequest {
+                profile: "release".to_owned(),
+                tasks: vec![two.to_string_lossy().into_owned()],
+                models: vec!["sol".to_owned()],
+                thinking: vec!["high".to_owned()],
+                trials: Some(3),
+                recipe: None,
+                harnesses: Vec::new(),
+                web_search: false,
+                new_generation: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(appended["generation"], initial_generation);
+        assert_eq!(appended["coordinates"]["pending"], 5);
+        assert_eq!(appended["families"].as_array().unwrap().len(), 2);
+
+        let selector = EvaluationSelector::new(two.to_string_lossy());
+        let RemoteClaim::Prepare { lease, .. } = client.claim(&selector).await.unwrap() else {
+            panic!("remotely appended work must be claimable immediately");
+        };
+        client.prepared(&lease).await.unwrap();
+        let RemoteClaim::Run { lease, .. } = client.claim(&selector).await.unwrap() else {
+            panic!("remotely appended work must become runnable");
+        };
+        client.retry(&lease, "test cleanup").await.unwrap();
+
+        let one = directory.path().join("one");
+        let replaced = client
+            .add(&CoordinatorAddRequest {
+                profile: "release".to_owned(),
+                tasks: vec![one.to_string_lossy().into_owned()],
+                models: vec!["sol".to_owned()],
+                thinking: vec!["high".to_owned()],
+                trials: Some(4),
+                new_generation: true,
+                recipe: None,
+                harnesses: Vec::new(),
+                web_search: false,
+            })
+            .await
+            .unwrap();
+        assert_ne!(replaced["generation"], initial_generation);
+        assert_eq!(replaced["coordinates"]["pending"], 4);
+        assert_eq!(replaced["families"].as_array().unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn coordinator_add_route_rejects_ambiguous_or_invalid_work() {
+        let (_directory, client, _selection, server) = fixture().await;
+        for request in [
+            CoordinatorAddRequest {
+                profile: "release".to_owned(),
+                tasks: vec!["relative/task".to_owned()],
+                recipe: None,
+                harnesses: Vec::new(),
+                models: Vec::new(),
+                thinking: Vec::new(),
+                trials: None,
+                web_search: false,
+                new_generation: false,
+            },
+            CoordinatorAddRequest {
+                profile: "release".to_owned(),
+                recipe: Some("release".to_owned()),
+                tasks: vec!["/srv/task".to_owned()],
+                harnesses: Vec::new(),
+                models: Vec::new(),
+                thinking: Vec::new(),
+                trials: None,
+                web_search: false,
+                new_generation: false,
+            },
+            CoordinatorAddRequest {
+                profile: "release".to_owned(),
+                tasks: vec!["/srv/task".to_owned()],
+                trials: Some(0),
+                recipe: None,
+                harnesses: Vec::new(),
+                models: Vec::new(),
+                thinking: Vec::new(),
+                web_search: false,
+                new_generation: false,
+            },
+        ] {
+            assert!(matches!(
+                client.add(&request).await,
+                Err(CoordinatorError::Rejected {
+                    status: StatusCode::BAD_REQUEST,
+                    ..
+                })
+            ));
+        }
+        assert!(matches!(
+            client
+                .add(&CoordinatorAddRequest {
+                    profile: "another-profile".to_owned(),
+                    recipe: None,
+                    tasks: vec!["/srv/task".to_owned()],
+                    harnesses: Vec::new(),
+                    models: Vec::new(),
+                    thinking: Vec::new(),
+                    trials: None,
+                    web_search: false,
+                    new_generation: false,
+                })
+                .await,
+            Err(CoordinatorError::Rejected {
+                status: StatusCode::BAD_REQUEST,
+                ..
+            })
+        ));
         server.abort();
     }
 

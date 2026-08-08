@@ -15,7 +15,7 @@ pub(crate) struct Eval {
 
 #[derive(Subcommand)]
 enum EvalCommand {
-    /// Add concrete tasks and treatments to a durable SQLite profile.
+    /// Add concrete tasks and treatments to a durable evaluation profile.
     Add(profile::Add),
 
     /// Launch the agent-owned benchmark workflow in the TUI or headlessly.
