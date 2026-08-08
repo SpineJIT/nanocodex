@@ -87,6 +87,7 @@ async fn complete_turn(
 ) -> Result<()> {
     let mut terminal_emitted = false;
     let mut root_event_stream_closed = false;
+    let mut turn_rejected = false;
     let mut finished = None;
     while let Some(event) = events.recv().await {
         match event {
@@ -100,12 +101,12 @@ async fn complete_turn(
                     }
                 }
             }
-            WorkerEvent::TurnTraceRejected { .. } => {}
+            WorkerEvent::TurnTraceRejected { .. } => turn_rejected = true,
             WorkerEvent::TurnFinished {
                 error: Some(error), ..
             } => {
                 let result = Err(eyre!(error));
-                if terminal_emitted || root_event_stream_closed {
+                if terminal_emitted || root_event_stream_closed || turn_rejected {
                     return result;
                 }
                 finished = Some(result);
@@ -160,11 +161,13 @@ async fn write_turn_jsonl(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use eyre::Result;
     use nanocodex::agent::events::{AgentEvent, AgentEventKind, AgentEventTiming, TimedAgentEvent};
     use serde_json::value::RawValue;
     use tokio::sync::mpsc;
+    use tokio::time::timeout;
 
     use super::{complete_turn, write_turn_jsonl};
     use crate::tui::WorkerEvent;
@@ -283,6 +286,28 @@ mod tests {
             String::from_utf8(output)?,
             "{\"protocol_version\":1,\"request_id\":\"session\",\"seq\":1,\"type\":\"run.failed\",\"payload\":{\"error\":\"worker failed\"}}\n"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn returns_a_rejected_prompt_error_without_a_terminal_root_event() -> Result<()> {
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        updates.send(WorkerEvent::root_turn_trace_rejected(1))?;
+        updates.send(WorkerEvent::root_turn_finished(Some(
+            "prompt rejected".to_owned(),
+        )))?;
+        let mut output = Vec::new();
+
+        let error = timeout(
+            Duration::from_millis(50),
+            complete_turn(&mut update_rx, &mut output),
+        )
+        .await
+        .expect("rejected prompts must not wait for a terminal root event")
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "prompt rejected");
+        assert!(output.is_empty());
         Ok(())
     }
 

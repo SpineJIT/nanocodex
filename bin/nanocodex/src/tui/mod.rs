@@ -296,6 +296,14 @@ pub enum WorkerEvent {
 
 impl WorkerEvent {
     #[cfg(test)]
+    pub(crate) const fn root_turn_trace_rejected(id: u64) -> Self {
+        Self::TurnTraceRejected {
+            target: PaneId::Main,
+            id,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) const fn root_turn_finished(error: Option<String>) -> Self {
         Self::TurnFinished {
             target: PaneId::Main,
@@ -531,7 +539,7 @@ impl UiModel {
                 }
             }
             UiAction::Agent(event) => {
-                if self.voice_observing {
+                if self.voice_observing && self.capabilities.supports(WorkerCapability::Voice) {
                     drop(commands.send(WorkerCommand::VoiceAgentEvent(event.clone())));
                 }
                 let updated = self.app.on_main_agent_event(0, &event);
@@ -2366,7 +2374,7 @@ fn handle_key_with_capabilities(
         return Ok(TerminalAction::Redraw);
     }
 
-    if let Some(action) = handle_reasoning_picker_key(key, app, commands)? {
+    if let Some(action) = handle_reasoning_picker_key(key, app, capabilities, commands)? {
         return Ok(action);
     }
 
@@ -2481,6 +2489,7 @@ fn handle_key_with_capabilities(
 fn handle_reasoning_picker_key(
     key: KeyEvent,
     app: &mut App,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<Option<TerminalAction>> {
     if app.reasoning_picker().is_none() {
@@ -2494,6 +2503,9 @@ fn handle_reasoning_picker_key(
             KeyCode::Up | KeyCode::Char('k') => app.move_reasoning_picker(-1),
             KeyCode::Down | KeyCode::Char('j') => app.move_reasoning_picker(1),
             KeyCode::Enter => {
+                if !require_worker_capability(app, capabilities, WorkerCapability::Thinking) {
+                    return Ok(Some(TerminalAction::Redraw));
+                }
                 if let Some(ReasoningPickerAction::Selected(thinking)) =
                     app.confirm_reasoning_picker()
                 {
@@ -2931,13 +2943,11 @@ fn submission_capability(app: &App, intent: SubmitIntent) -> Option<WorkerCapabi
             Some(WorkerCapability::Steer)
         }
         Submission::Prompt(_) => Some(WorkerCapability::Prompt),
-        Submission::Trace
-        | Submission::Fast(_)
-        | Submission::ReasoningPicker
-        | Submission::Voice(_)
-        | Submission::McpLogin(_)
-        | Submission::McpReload(_)
-        | Submission::InvalidCommand(_) => None,
+        Submission::Fast(_) => Some(WorkerCapability::FastMode),
+        Submission::ReasoningPicker => Some(WorkerCapability::Thinking),
+        Submission::Voice(_) => Some(WorkerCapability::Voice),
+        Submission::McpLogin(_) | Submission::McpReload(_) => Some(WorkerCapability::Mcp),
+        Submission::Trace | Submission::InvalidCommand(_) => None,
     }
 }
 
@@ -2965,6 +2975,10 @@ const fn worker_capability_label(capability: WorkerCapability) -> &'static str {
         WorkerCapability::Resume => "session resume",
         WorkerCapability::HistoricalEdit => "historical edits",
         WorkerCapability::MainBranchSwitch => "main-branch switching",
+        WorkerCapability::FastMode => "fast mode",
+        WorkerCapability::Thinking => "thinking selection",
+        WorkerCapability::Mcp => "MCP controls",
+        WorkerCapability::Voice => "voice controls",
     }
 }
 
@@ -3286,31 +3300,41 @@ mod tests {
     }
 
     #[test]
-    fn prompt_only_workers_reject_btw_before_creating_a_pane() {
-        let (commands, mut worker) = mpsc::unbounded_channel();
-        let app = App::new("/workspace".into());
-        let mut ui = UiModel::with_capabilities(
-            app,
-            Arc::from("main-session"),
-            crate::app_core::WorkerCapabilities::empty()
-                .with(crate::app_core::WorkerCapability::Prompt),
-        );
-        ui.app.input = "/btw inspect the cache".to_owned();
-        ui.app.cursor = ui.app.input.len();
+    fn prompt_only_workers_reject_unsupported_controls_before_mutating_ui_state() {
+        for input in [
+            "/btw inspect the cache",
+            "/fast",
+            "/thinking",
+            "/mcp reload cache",
+            "/voice list",
+        ] {
+            let (commands, mut worker) = mpsc::unbounded_channel();
+            let app = App::new("/workspace".into());
+            let mut ui = UiModel::with_capabilities(
+                app,
+                Arc::from("main-session"),
+                crate::app_core::WorkerCapabilities::empty()
+                    .with(crate::app_core::WorkerCapability::Prompt),
+            );
+            ui.app.input = input.to_owned();
+            ui.app.cursor = ui.app.input.len();
 
-        let update = ui
-            .update(
-                UiAction::Terminal(Event::Key(KeyEvent::new(
-                    KeyCode::Enter,
-                    KeyModifiers::NONE,
-                ))),
-                &commands,
-            )
-            .unwrap();
+            let update = ui
+                .update(
+                    UiAction::Terminal(Event::Key(KeyEvent::new(
+                        KeyCode::Enter,
+                        KeyModifiers::NONE,
+                    ))),
+                    &commands,
+                )
+                .unwrap();
 
-        assert_eq!(update, UiUpdate::Redraw(RedrawPriority::Immediate));
-        assert!(worker.try_recv().is_err());
-        assert!(ui.app.btw_id().is_none());
+            assert_eq!(update, UiUpdate::Redraw(RedrawPriority::Immediate));
+            assert!(worker.try_recv().is_err());
+            assert_eq!(ui.app.input, input);
+            assert!(ui.app.btw_id().is_none());
+            assert!(ui.app.reasoning_picker().is_none());
+        }
     }
 
     #[test]

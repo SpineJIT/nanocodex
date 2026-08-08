@@ -10,7 +10,7 @@ use crate::{
     vm::VmArgs,
 };
 
-pub use crate::tui::{WorkerCommand, WorkerEvent};
+pub use crate::tui::{VoiceControl, WorkerCommand, WorkerEvent};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkerCapability {
@@ -21,10 +21,14 @@ pub enum WorkerCapability {
     Resume,
     HistoricalEdit,
     MainBranchSwitch,
+    FastMode,
+    Thinking,
+    Mcp,
+    Voice,
 }
 
 impl WorkerCapability {
-    const fn bit(self) -> u8 {
+    const fn bit(self) -> u16 {
         match self {
             Self::Prompt => 1 << 0,
             Self::Steer => 1 << 1,
@@ -33,12 +37,16 @@ impl WorkerCapability {
             Self::Resume => 1 << 4,
             Self::HistoricalEdit => 1 << 5,
             Self::MainBranchSwitch => 1 << 6,
+            Self::FastMode => 1 << 7,
+            Self::Thinking => 1 << 8,
+            Self::Mcp => 1 << 9,
+            Self::Voice => 1 << 10,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WorkerCapabilities(u8);
+pub struct WorkerCapabilities(u16);
 
 impl WorkerCapabilities {
     pub const fn empty() -> Self {
@@ -58,6 +66,10 @@ impl WorkerCapabilities {
             .with(WorkerCapability::Resume)
             .with(WorkerCapability::HistoricalEdit)
             .with(WorkerCapability::MainBranchSwitch)
+            .with(WorkerCapability::FastMode)
+            .with(WorkerCapability::Thinking)
+            .with(WorkerCapability::Mcp)
+            .with(WorkerCapability::Voice)
     }
 
     pub const fn supports(self, capability: WorkerCapability) -> bool {
@@ -288,6 +300,10 @@ mod tests {
         assert!(capabilities.supports(WorkerCapability::Resume));
         assert!(capabilities.supports(WorkerCapability::HistoricalEdit));
         assert!(capabilities.supports(WorkerCapability::MainBranchSwitch));
+        assert!(capabilities.supports(WorkerCapability::FastMode));
+        assert!(capabilities.supports(WorkerCapability::Thinking));
+        assert!(capabilities.supports(WorkerCapability::Mcp));
+        assert!(capabilities.supports(WorkerCapability::Voice));
     }
 
     #[test]
