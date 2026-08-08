@@ -638,8 +638,18 @@ where
                 unreachable!("native tool_search returned through Code Mode")
             }
         };
-        let mut outputs = Vec::with_capacity(execution.notifications.len() + 1);
+        let mut outputs = Vec::with_capacity(
+            execution.notifications.len() + 1 + usize::from(terminal_receipt.is_some()),
+        );
         outputs.push(output);
+        if let Some(receipt) = &terminal_receipt {
+            // A terminal nested call can be the only useful cell output. Keep its bounded
+            // receipt in the outer Code Mode call's retained history for a later replay.
+            outputs.push(custom_tool_notification(
+                call.call_id.clone(),
+                serde_json::to_string(receipt).expect("terminal receipt was validated"),
+            ));
+        }
         outputs.extend(
             execution.notifications.into_iter().map(|notification| {
                 custom_tool_notification(notification.call_id, notification.text)

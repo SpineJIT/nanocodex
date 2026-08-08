@@ -171,6 +171,84 @@ async fn successful_terminal_code_mode_cell_stops_before_a_follow_on_model_reque
 }
 
 #[tokio::test]
+async fn terminal_code_mode_follow_on_replays_the_nested_tool_result() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        let _warmup = next_json(&mut socket).await?;
+        send_warmup(&mut socket, "resp-warmup").await?;
+
+        let _generation = next_json(&mut socket).await?;
+        send_json(
+            &mut socket,
+            completed_response(
+                "resp-terminal",
+                &[json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call-exec",
+                    "name": "exec",
+                    "input": "await tools.finish_turn({});"
+                })],
+            ),
+        )
+        .await?;
+
+        let follow_on = next_json(&mut socket).await?;
+        assert!(follow_on.get("previous_response_id").is_none());
+        let replay = follow_on.to_string();
+        assert!(replay.contains("call-exec/code-1"));
+        assert!(replay.contains("terminal result"));
+        assert!(replay.contains("Continue after the terminal result."));
+        send_final(&mut socket, "resp-follow-on").await
+    });
+
+    let workspace = temporary_workspace("terminal-code-mode-follow-on")?;
+    let openai = OpenAi::builder("test-key")
+        .websocket_url(&endpoint)
+        .build()?;
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(FinishTurn)
+        .build()?;
+    let (agent, events) = Nanocodex::builder(openai)
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .session_id(test_session_id())
+        .tools(tools)
+        .build()?;
+
+    let terminal = agent
+        .prompt("Finish with the application tool.")
+        .await?
+        .result()
+        .await?;
+    assert!(matches!(
+        terminal.completion(),
+        TurnCompletion::TerminalTool { .. }
+    ));
+
+    let follow_on = agent
+        .prompt("Continue after the terminal result.")
+        .await?
+        .result()
+        .await?;
+    assert!(matches!(
+        follow_on.completion(),
+        TurnCompletion::Message { final_message } if final_message == "done"
+    ));
+
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    agent.shutdown().await?;
+    drop((agent, events));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn successful_direct_terminal_tool_stops_before_a_follow_on_model_request() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
