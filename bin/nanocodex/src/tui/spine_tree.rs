@@ -77,7 +77,7 @@ fn node_line(node: &SpineTreeNode, active: bool, prefix: String) -> Line<'static
     ])
 }
 
-fn marker(status: SpineTreeNodeStatus, active: bool) -> &'static str {
+const fn marker(status: SpineTreeNodeStatus, active: bool) -> &'static str {
     if active {
         return "◉";
     }

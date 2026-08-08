@@ -14,6 +14,11 @@ mod tools;
 
 pub use tools::with_spine_tools;
 
+const MAX_CONTINUATION_CONTEXT_TOKENS: usize = 1_000;
+const APPROX_BYTES_PER_TOKEN: usize = 4;
+const MAX_CONTINUATION_CONTEXT_BYTES: usize =
+    MAX_CONTINUATION_CONTEXT_TOKENS * APPROX_BYTES_PER_TOKEN;
+
 /// A receiver for reducer-derived tree snapshots suitable for a live UI.
 pub type SpineTreeObserver = Arc<dyn Fn(SpineTreeSnapshot) + Send + Sync>;
 
@@ -70,9 +75,11 @@ pub struct SpineRuntimeLimits {
     pub max_depth: u32,
     /// Maximum number of task scopes accepted during the root session.
     pub max_nodes: u32,
-    /// Maximum UTF-8 byte length of one child-scope summary.
+    /// Maximum UTF-8 byte length of one child-scope summary, subject to the
+    /// runtime's non-overridable context budget.
     pub max_summary_bytes: usize,
-    /// Maximum UTF-8 byte length of one model-visible compact handoff.
+    /// Maximum UTF-8 byte length of one model-visible compact handoff, subject
+    /// to the runtime's non-overridable context budget.
     pub max_memory_bytes: usize,
 }
 
@@ -82,7 +89,7 @@ impl Default for SpineRuntimeLimits {
             max_depth: 8,
             max_nodes: 128,
             max_summary_bytes: 4 * 1024,
-            max_memory_bytes: 16 * 1024,
+            max_memory_bytes: MAX_CONTINUATION_CONTEXT_BYTES,
         }
     }
 }
@@ -372,20 +379,18 @@ impl SpineRuntime {
 
     pub(crate) fn validate_summary(&self, summary: &str) -> Result<(), SpineRuntimeError> {
         let summary = required(summary, SpineRuntimeError::EmptySummary)?;
-        bounded(
-            summary,
-            self.limits.max_summary_bytes,
-            SpineRuntimeError::SummaryTooLarge(self.limits.max_summary_bytes),
-        )
+        let limit = self.context_byte_limit(self.limits.max_summary_bytes);
+        bounded(summary, limit, SpineRuntimeError::SummaryTooLarge(limit))
     }
 
     pub(crate) fn validate_memory(&self, memory: &str) -> Result<(), SpineRuntimeError> {
         let memory = required(memory, SpineRuntimeError::EmptyMemory)?;
-        bounded(
-            memory,
-            self.limits.max_memory_bytes,
-            SpineRuntimeError::MemoryTooLarge(self.limits.max_memory_bytes),
-        )
+        let limit = self.context_byte_limit(self.limits.max_memory_bytes);
+        bounded(memory, limit, SpineRuntimeError::MemoryTooLarge(limit))
+    }
+
+    fn context_byte_limit(&self, configured_limit: usize) -> usize {
+        configured_limit.min(MAX_CONTINUATION_CONTEXT_BYTES)
     }
 
     fn tree_snapshot(&self) -> Result<SpineTreeSnapshot, SpineRuntimeError> {

@@ -11,7 +11,7 @@ use nanocodex::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{SpineRuntime, SpineTerminalTransition, TerminalControl};
+use crate::{SpineRuntime, SpineRuntimeError, SpineTerminalTransition, TerminalControl};
 
 /// Adds the synchronous Spine control tools to one agent-local tool set.
 ///
@@ -100,15 +100,50 @@ impl Tool for SpineOpen {
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
         let OpenArgs { summary } = input.decode_json()?;
-        let checkpoint = self.runtime.checkpoint()?;
+        let mut transaction = SpineOpenTransaction::begin(Arc::clone(&self.runtime))?;
         self.runtime.open(context.call_id(), &summary)?;
         match run_continuation(&self.agent, Arc::clone(&self.runtime), summary).await {
-            Ok(result) => Ok(ToolOutput::json(&result)),
+            Ok(result) => {
+                transaction.commit();
+                Ok(ToolOutput::json(&result))
+            }
             Err(error) => {
-                self.runtime.restore(checkpoint)?;
+                transaction.rollback()?;
                 Err(error)
             }
         }
+    }
+}
+
+struct SpineOpenTransaction {
+    runtime: Arc<SpineRuntime>,
+    checkpoint: Option<super::SpineRuntimeCheckpoint>,
+}
+
+impl SpineOpenTransaction {
+    fn begin(runtime: Arc<SpineRuntime>) -> Result<Self, SpineRuntimeError> {
+        let checkpoint = runtime.checkpoint()?;
+        Ok(Self {
+            runtime,
+            checkpoint: Some(checkpoint),
+        })
+    }
+
+    fn commit(&mut self) {
+        self.checkpoint = None;
+    }
+
+    fn rollback(&mut self) -> Result<(), SpineRuntimeError> {
+        if let Some(checkpoint) = self.checkpoint.take() {
+            self.runtime.restore(checkpoint)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SpineOpenTransaction {
+    fn drop(&mut self) {
+        let _ = self.rollback();
     }
 }
 

@@ -147,7 +147,7 @@ mod tests {
     use nanocodex_spine_runtime::{SpineRuntime, SpineRuntimeLimits};
     use tokio::sync::mpsc;
 
-    use super::{Cli, bind_spine_tree_updates};
+    use super::{Cli, bind_spine_tree_updates, run};
     use crate::tui::WorkerEvent;
 
     #[test]
@@ -155,6 +155,18 @@ mod tests {
         let cli = Cli::try_parse_from(["nanocodex-spine", "--api-key", "test-key"]);
 
         assert!(cli.is_ok());
+    }
+
+    #[tokio::test]
+    async fn spine_cli_rejects_legacy_subagents_before_startup() {
+        let cli = Cli::try_parse_from(["nanocodex-spine", "--subagents", "true"]).unwrap();
+
+        let error = run(cli).await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "nanocodex-spine does not support --subagents; use the synchronous Spine continuation tools instead"
+        );
     }
 
     #[test]

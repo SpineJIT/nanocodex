@@ -1,5 +1,6 @@
 use std::{
-    future::{Ready, ready},
+    future::{Future, Ready, pending, ready},
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -7,6 +8,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use codex_spine_core::NodeStatus;
 use nanocodex::oai::{
     ResponseError,
     responses::{ContentItem, MessageRole, ResponseItem, Usage, WarmupResponse},
@@ -17,6 +19,7 @@ use nanocodex::oai::{
 };
 use nanocodex::{Nanocodex, OpenAi, Thinking, Tools};
 use nanocodex_spine_runtime::{SpineRuntime, SpineRuntimeLimits, with_spine_tools};
+use tokio::{sync::Notify, time::Duration};
 use tower::Service;
 
 #[tokio::test]
@@ -162,6 +165,96 @@ async fn failed_child_continuation_restores_the_parent_logical_tree() {
     drop(events);
 }
 
+#[tokio::test]
+async fn cancelling_an_open_continuation_restores_the_parent_logical_tree() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let child_started = Arc::new(Notify::new());
+    let service_calls = Arc::clone(&calls);
+    let service_child_started = Arc::clone(&child_started);
+    let openai = OpenAi::builder("test-key")
+        .service(move || PendingChildService {
+            calls: Arc::clone(&service_calls),
+            child_started: Arc::clone(&service_child_started),
+        })
+        .build()
+        .unwrap();
+    let runtime = Arc::new(SpineRuntime::new(SpineRuntimeLimits::default()));
+    let tools = Tools::builder().without_defaults().build().unwrap();
+    let runtime_for_tools = Arc::clone(&runtime);
+    let (agent, events) = Nanocodex::builder(openai)
+        .thinking(Thinking::Low)
+        .workspace(".")
+        .tools_factory(move |agent| {
+            with_spine_tools(tools.clone(), agent, Arc::clone(&runtime_for_tools))
+        })
+        .build()
+        .unwrap();
+
+    let child_waiting = child_started.notified();
+    let turn = agent
+        .prompt("Use a focused continuation to inspect the parser.")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), child_waiting)
+        .await
+        .expect("child continuation did not start");
+
+    turn.cancel().await.unwrap();
+    assert!(matches!(
+        turn.result().await,
+        Err(nanocodex::NanocodexError::TurnCancelled)
+    ));
+    let projection = runtime.projection().unwrap();
+    assert_eq!(projection.cursor.to_string(), "1");
+    assert_eq!(projection.nodes.len(), 1);
+
+    agent.shutdown().await.unwrap();
+    drop(events);
+}
+
+#[tokio::test]
+async fn nested_opens_return_memory_one_scope_at_a_time() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let service_calls = Arc::clone(&calls);
+    let openai = OpenAi::builder("test-key")
+        .service(move || ScriptedService {
+            calls: Arc::clone(&service_calls),
+            script: Script::Nested,
+        })
+        .build()
+        .unwrap();
+    let runtime = Arc::new(SpineRuntime::new(SpineRuntimeLimits::default()));
+    let tools = Tools::builder().without_defaults().build().unwrap();
+    let runtime_for_tools = Arc::clone(&runtime);
+    let (agent, events) = Nanocodex::builder(openai)
+        .thinking(Thinking::Low)
+        .workspace(".")
+        .tools_factory(move |agent| {
+            with_spine_tools(tools.clone(), agent, Arc::clone(&runtime_for_tools))
+        })
+        .build()
+        .unwrap();
+
+    let result = agent
+        .prompt("Use nested continuations to inspect the parser and lexer.")
+        .await
+        .unwrap()
+        .result()
+        .await
+        .unwrap();
+
+    let projection = runtime.projection().unwrap();
+    assert_eq!(result.final_message(), Some("parent resumed"));
+    assert_eq!(projection.cursor.to_string(), "1");
+    assert_eq!(projection.nodes.len(), 3);
+    assert_eq!(projection.nodes[1].status, NodeStatus::Closed);
+    assert_eq!(projection.nodes[2].status, NodeStatus::Closed);
+    assert_eq!(calls.load(Ordering::Relaxed), 6);
+
+    agent.shutdown().await.unwrap();
+    drop(events);
+}
+
 #[derive(Clone)]
 struct ScriptedService {
     calls: Arc<AtomicU32>,
@@ -173,6 +266,51 @@ enum Script {
     Close,
     Next,
     ChildMessage,
+    Nested,
+}
+
+#[derive(Clone)]
+struct PendingChildService {
+    calls: Arc<AtomicU32>,
+    child_started: Arc<Notify>,
+}
+
+impl Service<ResponsesAttempt> for PendingChildService {
+    type Response = ResponsesServiceResponse;
+    type Error = ResponseError;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<ResponsesServiceResponse, ResponseError>> + Send>>;
+
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
+        let call = self.calls.fetch_add(1, Ordering::Relaxed);
+        let child_started = Arc::clone(&self.child_started);
+        Box::pin(async move {
+            match (call, request.kind()) {
+                (0, ResponsesAttemptKind::Warmup) => Ok(ResponsesServiceResponse::new(
+                    ResponsesOutput::Warmup(WarmupResponse {
+                        id: "resp-warmup".to_owned(),
+                        usage: None,
+                    }),
+                )),
+                (1, ResponsesAttemptKind::Generation) => {
+                    Ok(ResponsesServiceResponse::new(code_generation(
+                        "resp-root-open",
+                        "call-root-exec",
+                        "await tools.spine__open({summary: 'inspect the parser'});",
+                    )))
+                }
+                (2, ResponsesAttemptKind::Generation) => {
+                    child_started.notify_one();
+                    pending::<Result<ResponsesServiceResponse, ResponseError>>().await
+                }
+                _ => panic!("unexpected scripted Responses attempt {call}"),
+            }
+        })
+    }
 }
 
 impl Service<ResponsesAttempt> for ScriptedService {
@@ -228,10 +366,41 @@ impl Service<ResponsesAttempt> for ScriptedService {
             (Script::ChildMessage, 3, ResponsesAttemptKind::Generation) => {
                 final_generation("resp-parent-final", "parent recovered")
             }
+            (Script::Nested, 2, ResponsesAttemptKind::Generation) => code_generation(
+                "resp-child-open",
+                "call-child-exec",
+                "const handoff = await tools.spine__open({summary: 'inspect the lexer'}); text(handoff.memory);",
+            ),
+            (Script::Nested, 3, ResponsesAttemptKind::Generation) => code_generation(
+                "resp-grandchild-close",
+                "call-grandchild-exec",
+                "await tools.spine__close({memory: 'lexer accepts one token too eagerly'});",
+            ),
+            (Script::Nested, 4, ResponsesAttemptKind::Generation) => {
+                assert_input_contains(&request, "lexer accepts one token too eagerly");
+                code_generation(
+                    "resp-child-close",
+                    "call-child-close-exec",
+                    "await tools.spine__close({memory: 'parser must defer to the lexer'});",
+                )
+            }
+            (Script::Nested, 5, ResponsesAttemptKind::Generation) => {
+                assert_input_contains(&request, "parser must defer to the lexer");
+                assert_input_omits(&request, "lexer accepts one token too eagerly");
+                final_generation("resp-parent-final", "parent resumed")
+            }
             _ => panic!("unexpected scripted Responses attempt {call}"),
         };
         ready(Ok(ResponsesServiceResponse::new(output)))
     }
+}
+
+fn assert_input_omits(request: &ResponsesAttempt, unexpected: &str) {
+    let input = serde_json::to_string(&request.input_items().collect::<Vec<_>>()).unwrap();
+    assert!(
+        !input.contains(unexpected),
+        "request unexpectedly contained detailed Spine child context: {input}"
+    );
 }
 
 fn assert_input_contains(request: &ResponsesAttempt, expected: &str) {
