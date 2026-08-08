@@ -84,7 +84,10 @@ mod tests {
         assert!(prompt.contains("4 GiB for each such outstanding live run"));
         assert!(prompt.contains("add at most four runs at a time"));
         assert!(prompt.contains("at least 60 seconds"));
-        assert!(prompt.contains("greater of ten percent of physical RAM or"));
+        assert!(prompt.contains("launch exactly zero"));
+        assert!(prompt.contains("memory_cap = floor"));
+        assert!(prompt.contains("launch count must never exceed `memory_cap`"));
+        assert!(prompt.contains("Do not use `dmesg --since`"));
         assert!(prompt.contains("kernel journal and `/proc/vmstat`"));
         assert!(prompt.contains("never less than the last 30 minutes"));
         assert!(prompt.contains("direct parallel tool calls"));
