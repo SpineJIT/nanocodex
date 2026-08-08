@@ -196,76 +196,83 @@ impl WorkerFactory for StandardWorkerFactory {
     type Event = WorkerEvent;
 
     fn start(self) -> WorkerHandle<Self::Command, Self::Event> {
-        let ConfiguredAgent {
-            handle,
-            events,
-            realtime,
-            child_agents,
-            mpp_adapter,
-            mcp,
-            browser,
-            vm,
-        } = self.configured;
-        let root_session_id = Arc::<str>::from(events.request_id());
-        let (commands, command_rx) = mpsc::unbounded_channel();
-        let (updates, update_rx) = mpsc::unbounded_channel();
-        let worker = tui::spawn_agent_worker(
-            handle.clone(),
-            Arc::clone(&root_session_id),
-            realtime,
-            mcp,
-            command_rx,
-            updates.clone(),
-        );
-        let root_events = forward_root_events(events, updates);
-
-        WorkerHandle::new(
-            commands,
-            update_rx,
-            root_session_id,
-            WorkerCapabilities::standard(),
-            async move {
-                worker.abort();
-                let worker_result = worker.await;
-                root_events.abort();
-                let root_events_result = root_events.await;
-                let agent_shutdown_result = handle.shutdown().await;
-                if let Some(child_agents) = child_agents {
-                    child_agents.shutdown().await;
-                }
-                let browser_shutdown_result = if let Some(browser) = browser {
-                    browser.shutdown().await
-                } else {
-                    Ok(())
-                };
-                let vm_shutdown_result = if let Some(vm) = vm {
-                    vm.shutdown().await
-                } else {
-                    Ok(())
-                };
-                let mpp_shutdown_result = if let Some(adapter) = mpp_adapter {
-                    adapter.shutdown().await
-                } else {
-                    Ok(())
-                };
-
-                match worker_result {
-                    Ok(()) => {}
-                    Err(error) if error.is_cancelled() => {}
-                    Err(error) => return Err(error).wrap_err("application worker failed"),
-                }
-                match root_events_result {
-                    Ok(()) => {}
-                    Err(error) if error.is_cancelled() => {}
-                    Err(error) => return Err(error).wrap_err("root event worker failed"),
-                }
-                agent_shutdown_result?;
-                browser_shutdown_result?;
-                vm_shutdown_result?;
-                mpp_shutdown_result
-            },
-        )
+        start_configured_worker(self.configured, WorkerCapabilities::standard())
     }
+}
+
+pub(crate) fn start_configured_worker(
+    configured: ConfiguredAgent,
+    capabilities: WorkerCapabilities,
+) -> WorkerHandle<WorkerCommand, WorkerEvent> {
+    let ConfiguredAgent {
+        handle,
+        events,
+        realtime,
+        child_agents,
+        mpp_adapter,
+        mcp,
+        browser,
+        vm,
+    } = configured;
+    let root_session_id = Arc::<str>::from(events.request_id());
+    let (commands, command_rx) = mpsc::unbounded_channel();
+    let (updates, update_rx) = mpsc::unbounded_channel();
+    let worker = tui::spawn_agent_worker(
+        handle.clone(),
+        Arc::clone(&root_session_id),
+        realtime,
+        mcp,
+        command_rx,
+        updates.clone(),
+    );
+    let root_events = forward_root_events(events, updates);
+
+    WorkerHandle::new(
+        commands,
+        update_rx,
+        root_session_id,
+        capabilities,
+        async move {
+            worker.abort();
+            let worker_result = worker.await;
+            root_events.abort();
+            let root_events_result = root_events.await;
+            let agent_shutdown_result = handle.shutdown().await;
+            if let Some(child_agents) = child_agents {
+                child_agents.shutdown().await;
+            }
+            let browser_shutdown_result = if let Some(browser) = browser {
+                browser.shutdown().await
+            } else {
+                Ok(())
+            };
+            let vm_shutdown_result = if let Some(vm) = vm {
+                vm.shutdown().await
+            } else {
+                Ok(())
+            };
+            let mpp_shutdown_result = if let Some(adapter) = mpp_adapter {
+                adapter.shutdown().await
+            } else {
+                Ok(())
+            };
+
+            match worker_result {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => return Err(error).wrap_err("application worker failed"),
+            }
+            match root_events_result {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => return Err(error).wrap_err("root event worker failed"),
+            }
+            agent_shutdown_result?;
+            browser_shutdown_result?;
+            vm_shutdown_result?;
+            mpp_shutdown_result
+        },
+    )
 }
 
 fn forward_root_events(

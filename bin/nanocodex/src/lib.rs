@@ -21,6 +21,7 @@ mod mcp;
 mod mpp;
 mod observability;
 mod run;
+pub mod spine;
 mod subagents;
 mod tui;
 mod update;

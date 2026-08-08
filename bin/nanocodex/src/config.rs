@@ -14,6 +14,7 @@ use nanocodex::NanocodexBuilder;
 use nanocodex::{
     AgentEvents, Model, Nanocodex, OpenAi, ReasoningMode, Thinking, Tools,
     agent::{
+        AgentHandle,
         rollout::{DurableSession, RolloutConfig},
         session::{SessionId, SessionSnapshot},
     },
@@ -21,6 +22,7 @@ use nanocodex::{
         auth::{OpenAiAuth, OpenAiAuthMode},
         transport::ResponsesTransport,
     },
+    tools::ToolsBuildError,
     tools::mcp::McpHandle,
 };
 
@@ -40,6 +42,9 @@ pub(crate) struct ConfiguredAgent {
     pub(crate) browser: Option<ConfiguredBrowser>,
     pub(crate) vm: Option<ConfiguredVm>,
 }
+
+pub(crate) type ToolCustomizer =
+    Arc<dyn Fn(Tools, AgentHandle) -> std::result::Result<Tools, ToolsBuildError> + Send + Sync>;
 
 struct SessionBuild {
     workspace: PathBuf,
@@ -232,6 +237,10 @@ impl AgentArgs {
         self.fast_mode
     }
 
+    pub(crate) const fn subagents_enabled(&self) -> bool {
+        self.subagents
+    }
+
     pub(crate) const fn model(&self) -> Model {
         self.model
     }
@@ -246,7 +255,15 @@ impl AgentArgs {
     }
 
     pub(crate) async fn build(self, vm: VmArgs) -> Result<ConfiguredAgent> {
-        self.build_inner(None, vm).await
+        self.build_inner(None, vm, None).await
+    }
+
+    pub(crate) async fn build_with_tool_customizer(
+        self,
+        vm: VmArgs,
+        customizer: ToolCustomizer,
+    ) -> Result<ConfiguredAgent> {
+        self.build_inner(None, vm, Some(customizer)).await
     }
 
     pub(crate) async fn build_resumed(
@@ -254,13 +271,14 @@ impl AgentArgs {
         session: DurableSession,
         vm: VmArgs,
     ) -> Result<ConfiguredAgent> {
-        self.build_inner(Some(session), vm).await
+        self.build_inner(Some(session), vm, None).await
     }
 
     async fn build_inner(
         self,
         durable: Option<DurableSession>,
         vm: VmArgs,
+        customizer: Option<ToolCustomizer>,
     ) -> Result<ConfiguredAgent> {
         let thinking = self.thinking();
         let web_search = self.web_search();
@@ -353,11 +371,20 @@ impl AgentArgs {
         if let Some(rollout) = session.rollout {
             builder = builder.rollout(rollout);
         }
-        let builder = if let Some(child_agents) = &child_agents {
+        let builder = if child_agents.is_some() || customizer.is_some() {
             let tools = tools;
-            let child_agents = Arc::downgrade(child_agents);
+            let child_agents = child_agents.as_ref().map(Arc::downgrade);
             builder.tools_factory(move |agent| {
-                subagents::with_subagents(tools.clone(), agent, child_agents.clone())
+                let tools = if let Some(child_agents) = &child_agents {
+                    subagents::with_subagents(tools.clone(), agent.clone(), child_agents.clone())?
+                } else {
+                    tools.clone()
+                };
+                if let Some(customizer) = &customizer {
+                    customizer(tools, agent)
+                } else {
+                    Ok(tools)
+                }
             })
         } else {
             builder.tools(tools)

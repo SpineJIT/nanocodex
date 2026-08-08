@@ -43,6 +43,7 @@ image.workspace = true
 nanocodex.workspace = true
 nanocodex-browser.workspace = true
 nanocodex-observability.workspace = true
+nanocodex-spine-runtime.workspace = true
 nanocodex-voice.workspace = true
 nix.workspace = true
 nanousd = { workspace = true, optional = true }
@@ -100,6 +101,11 @@ harness = false
 [[bin]]
 name = "nanocodex"
 path = "src/main.rs"
+doc = false
+
+[[bin]]
+name = "nanocodex-spine"
+path = "src/bin/nanocodex-spine.rs"
 doc = false
 
 [lints]
