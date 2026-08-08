@@ -289,6 +289,51 @@ async fn nested_opens_return_memory_one_scope_at_a_time() {
     drop(events);
 }
 
+#[tokio::test]
+async fn one_open_handoff_per_code_mode_cell_allows_a_later_cell_to_open() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let service_calls = Arc::clone(&calls);
+    let openai = OpenAi::builder("test-key")
+        .service(move || ScriptedService {
+            calls: Arc::clone(&service_calls),
+            script: Script::TwoCells,
+        })
+        .build()
+        .unwrap();
+    let runtime = Arc::new(SpineRuntime::new(SpineRuntimeLimits::default()));
+    let tools = Tools::builder().without_defaults().build().unwrap();
+    let runtime_for_tools = Arc::clone(&runtime);
+    let (agent, events) = Nanocodex::builder(openai)
+        .thinking(Thinking::Low)
+        .workspace(".")
+        .tools_factory(move |agent| {
+            with_spine_tools(tools.clone(), agent, Arc::clone(&runtime_for_tools))
+        })
+        .build()
+        .unwrap();
+
+    let result = agent
+        .prompt("Use focused continuations in two Code Mode cells.")
+        .await
+        .unwrap()
+        .result()
+        .await
+        .unwrap();
+
+    let projection = runtime.projection().unwrap();
+    assert_eq!(result.final_message(), Some("parent resumed"));
+    assert_eq!(projection.cursor.to_string(), "1");
+    assert_eq!(projection.nodes.len(), 3);
+    assert_eq!(projection.nodes[1].summary.as_deref(), Some("first scope"));
+    assert_eq!(projection.nodes[1].status, NodeStatus::Closed);
+    assert_eq!(projection.nodes[2].summary.as_deref(), Some("later scope"));
+    assert_eq!(projection.nodes[2].status, NodeStatus::Closed);
+    assert_eq!(calls.load(Ordering::Relaxed), 6);
+
+    agent.shutdown().await.unwrap();
+    drop(events);
+}
+
 #[derive(Clone)]
 struct ScriptedService {
     calls: Arc<AtomicU32>,
@@ -301,6 +346,7 @@ enum Script {
     Next,
     ChildMessage,
     Nested,
+    TwoCells,
 }
 
 #[derive(Clone)]
@@ -363,16 +409,25 @@ impl Service<ResponsesAttempt> for ScriptedService {
                 id: "resp-warmup".to_owned(),
                 usage: None,
             }),
+            (Script::TwoCells, 1, ResponsesAttemptKind::Generation) => code_generation(
+                "resp-root-first-open",
+                "call-root-first-exec",
+                "try {\n  await tools.spine__open({summary: 'first scope'});\n  await tools.spine__open({summary: 'second scope'});\n} catch (error) {\n  text(error);\n}",
+            ),
             (_, 1, ResponsesAttemptKind::Generation) => code_generation(
                 "resp-root-open",
                 "call-root-exec",
                 "await tools.spine__open({summary: 'inspect the parser'});",
             ),
-            (Script::Close, 2, ResponsesAttemptKind::Generation) => code_generation(
-                "resp-child-close",
-                "call-child-exec",
-                "await tools.spine__close({memory: 'parser accepts one token too eagerly'});",
-            ),
+            (Script::Close, 2, ResponsesAttemptKind::Generation) => {
+                assert_input_contains(&request, "Scope:\\ninspect the parser");
+                assert_input_contains(&request, "tools.spine__close");
+                code_generation(
+                    "resp-child-close",
+                    "call-child-exec",
+                    "await tools.spine__close({memory: 'parser accepts one token too eagerly'});",
+                )
+            }
             (Script::Close, 3, ResponsesAttemptKind::Generation) => {
                 assert_input_contains(
                     &request,
@@ -380,11 +435,14 @@ impl Service<ResponsesAttempt> for ScriptedService {
                 );
                 final_generation("resp-parent-final", "parent resumed")
             }
-            (Script::Next, 2, ResponsesAttemptKind::Generation) => code_generation(
-                "resp-child-next",
-                "call-child-exec",
-                "await tools.spine__next({summary: 'confirm the fix', memory: 'parser requires one-token lookahead'});",
-            ),
+            (Script::Next, 2, ResponsesAttemptKind::Generation) => {
+                assert_input_contains(&request, "Scope:\\ninspect the parser");
+                code_generation(
+                    "resp-child-next",
+                    "call-child-exec",
+                    "await tools.spine__next({summary: 'confirm the fix', memory: 'parser requires one-token lookahead'});",
+                )
+            }
             (Script::Next, 3, ResponsesAttemptKind::Generation) => {
                 assert_input_contains(&request, "parser requires one-token lookahead");
                 assert_input_contains(&request, "confirm the fix");
@@ -404,16 +462,22 @@ impl Service<ResponsesAttempt> for ScriptedService {
             (Script::ChildMessage, 3, ResponsesAttemptKind::Generation) => {
                 final_generation("resp-parent-final", "parent recovered")
             }
-            (Script::Nested, 2, ResponsesAttemptKind::Generation) => code_generation(
-                "resp-child-open",
-                "call-child-exec",
-                "await tools.spine__open({summary: 'inspect the lexer'});",
-            ),
-            (Script::Nested, 3, ResponsesAttemptKind::Generation) => code_generation(
-                "resp-grandchild-close",
-                "call-grandchild-exec",
-                "await tools.spine__close({memory: 'lexer accepts one token too eagerly'});",
-            ),
+            (Script::Nested, 2, ResponsesAttemptKind::Generation) => {
+                assert_input_contains(&request, "Scope:\\ninspect the parser");
+                code_generation(
+                    "resp-child-open",
+                    "call-child-exec",
+                    "await tools.spine__open({summary: 'inspect the lexer'});",
+                )
+            }
+            (Script::Nested, 3, ResponsesAttemptKind::Generation) => {
+                assert_input_contains(&request, "Scope:\\ninspect the lexer");
+                code_generation(
+                    "resp-grandchild-close",
+                    "call-grandchild-exec",
+                    "await tools.spine__close({memory: 'lexer accepts one token too eagerly'});",
+                )
+            }
             (Script::Nested, 4, ResponsesAttemptKind::Generation) => {
                 assert_input_contains(&request, "lexer accepts one token too eagerly");
                 code_generation(
@@ -425,6 +489,37 @@ impl Service<ResponsesAttempt> for ScriptedService {
             (Script::Nested, 5, ResponsesAttemptKind::Generation) => {
                 assert_input_contains(&request, "parser must defer to the lexer");
                 assert_input_omits(&request, "lexer accepts one token too eagerly");
+                final_generation("resp-parent-final", "parent resumed")
+            }
+            (Script::TwoCells, 2, ResponsesAttemptKind::Generation) => {
+                assert_input_contains(&request, "Scope:\\nfirst scope");
+                code_generation(
+                    "resp-first-child-close",
+                    "call-first-child-exec",
+                    "await tools.spine__close({memory: 'first scope is done'});",
+                )
+            }
+            (Script::TwoCells, 3, ResponsesAttemptKind::Generation) => {
+                assert_input_contains(
+                    &request,
+                    "spine__open may emit only one handoff per Code Mode cell",
+                );
+                code_generation(
+                    "resp-root-second-open",
+                    "call-root-second-exec",
+                    "await tools.spine__open({summary: 'later scope'});",
+                )
+            }
+            (Script::TwoCells, 4, ResponsesAttemptKind::Generation) => {
+                assert_input_contains(&request, "Scope:\\nlater scope");
+                code_generation(
+                    "resp-second-child-close",
+                    "call-second-child-exec",
+                    "await tools.spine__close({memory: 'later scope is done'});",
+                )
+            }
+            (Script::TwoCells, 5, ResponsesAttemptKind::Generation) => {
+                assert_input_contains(&request, "later scope is done");
                 final_generation("resp-parent-final", "parent resumed")
             }
             _ => panic!("unexpected scripted Responses attempt {call}"),

@@ -238,6 +238,47 @@ async fn emitted_output_has_a_non_configurable_aggregate_limit() -> Result<()> {
 }
 
 #[tokio::test]
+async fn emitted_output_stays_within_the_hard_model_visible_output_budget() -> Result<()> {
+    let workspace = temporary_workspace("bounded-emitting-tool-cell-output")?;
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(EmitsLargeOutput)
+        .build()?;
+    let runtime = ToolRuntime::new_with_tools(&workspace, None, None, &tools);
+    let execution = runtime
+        .execute_code(
+            "// @exec: {\"max_output_tokens\": 100000}\ntext('ordinary output '.repeat(4_000)); await tools.emits_large_output({}); await tools.emits_large_output({});",
+            ToolContext::new(
+                "test-model",
+                "test-session",
+                "test-call",
+                &[],
+                crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
+            ),
+        )
+        .await;
+
+    assert!(execution.success);
+    assert!(emitted_text(&execution)?.contains("[emitted output truncated]"));
+    let model_visible_text_bytes = match &execution.output {
+        ToolOutputBody::Text(text) => text.len(),
+        ToolOutputBody::Content(content) => content
+            .iter()
+            .filter_map(|item| match item {
+                ToolOutputContent::InputText { text } => Some(text.len()),
+                ToolOutputContent::InputImage { .. } | ToolOutputContent::InputAudio { .. } => None,
+            })
+            .sum(),
+    };
+    assert!(
+        model_visible_text_bytes <= crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS * 4,
+        "model-visible cell output was {model_visible_text_bytes} bytes"
+    );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn completed_cell_selects_a_successful_terminal_tool() -> Result<()> {
     let workspace = temporary_workspace("terminal-tool-completion")?;
     let tools = Tools::builder()
@@ -2364,6 +2405,7 @@ fn test_live_cell(
         id,
         turn_id: AtomicU64::new(0),
         output_token_budget: crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
+        output_token_ceiling: crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
         observation: Arc::new(tokio::sync::Mutex::new(CellObservationState {
             updates,
             buffered: ObservationBuffer::default(),

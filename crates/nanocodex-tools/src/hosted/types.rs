@@ -4,7 +4,7 @@ use nanocodex_oai_api::{
     responses::ResponseItem,
     tools::{
         TerminalToolReceipt, TerminalToolReceiptError, ToolContext, ToolOutputBody,
-        ToolOutputContent, ToolTurnBehavior,
+        ToolTurnBehavior,
     },
 };
 use serde::Deserialize;
@@ -166,16 +166,16 @@ impl CodeModeExecution {
         turn_behavior: impl Fn(&str) -> ToolTurnBehavior,
         emits_output_on_success: impl Fn(&str) -> bool,
     ) {
-        let mut emitted_outputs = Vec::new();
         for call in &mut self.nested_calls {
             call.turn_behavior = turn_behavior(&call.name);
-            if call.success && emits_output_on_success(&call.name) {
-                emitted_outputs.push(call.output.clone());
-            }
         }
-        if let Some(output) = crate::emitted_output::bounded_emitted_output(emitted_outputs.iter())
-        {
-            append_nested_output(&mut self.output, output);
+        if let Some(output) = crate::emitted_output::bounded_emitted_output(
+            self.nested_calls
+                .iter()
+                .filter(|call| call.success && emits_output_on_success(&call.name))
+                .map(|call| &call.output),
+        ) {
+            crate::emitted_output::append_bounded_output(&mut self.output, output);
         }
         let candidates = if self.success {
             self.nested_calls
@@ -196,22 +196,6 @@ impl CodeModeExecution {
             Vec::new()
         };
         self.select_terminal_tools(candidates);
-    }
-}
-
-fn append_nested_output(output: &mut ToolOutputBody, nested_output: ToolOutputBody) {
-    let mut nested_content = match nested_output {
-        ToolOutputBody::Text(text) => vec![ToolOutputContent::InputText { text }],
-        ToolOutputBody::Content(content) => content,
-    };
-    match output {
-        ToolOutputBody::Text(text) => {
-            let prior_text = std::mem::take(text);
-            let mut content = vec![ToolOutputContent::InputText { text: prior_text }];
-            content.append(&mut nested_content);
-            *output = ToolOutputBody::Content(content);
-        }
-        ToolOutputBody::Content(content) => content.append(&mut nested_content),
     }
 }
 

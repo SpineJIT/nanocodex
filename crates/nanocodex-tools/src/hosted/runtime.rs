@@ -503,7 +503,7 @@ mod tests {
         ) -> HostFuture<'a, Result<CodeModeExecution, CodeModeHostError>> {
             Box::pin(async {
                 Ok(CodeModeExecution::new(
-                    ToolOutputBody::Text("ordinary output".to_owned()),
+                    ToolOutputBody::Text("ordinary output ".repeat(4_000)),
                     true,
                     vec![NestedToolCall {
                         call_id: "call-exec/code-1".to_owned(),
@@ -568,6 +568,17 @@ mod tests {
             item,
             ToolOutputContent::InputText { text } if text == "hosted handoff"
         )));
+        let model_visible_text_bytes = output
+            .iter()
+            .filter_map(|item| match item {
+                ToolOutputContent::InputText { text } => Some(text.len()),
+                ToolOutputContent::InputImage { .. } | ToolOutputContent::InputAudio { .. } => None,
+            })
+            .sum::<usize>();
+        assert!(
+            model_visible_text_bytes <= crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS * 4,
+            "model-visible hosted output was {model_visible_text_bytes} bytes"
+        );
     }
 
     #[tokio::test]

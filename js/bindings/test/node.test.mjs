@@ -181,6 +181,52 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
   await server.close();
 });
 
+test("Node-hosted WASM emits a declared handoff without text()", async () => {
+  const server = await startServer();
+  const agent = await Agent.create({
+    apiKey: "test-key",
+    websocketUrl: server.url,
+    thinking: "none",
+    sessionId: SESSION_IDS.embedded,
+    tools: {
+      handoff: {
+        description: "Return the compact continuation handoff.",
+        parameters: { type: "object", additionalProperties: false },
+        turnBehavior: "emitOutputOnSuccess",
+        handler: () => "<spine_memory>handoff</spine_memory>",
+      },
+    },
+  });
+
+  const scenario = (async () => {
+    const socket = await server.connection;
+    const reader = messageReader(socket);
+    const warmup = await reader.next();
+    assert.equal(warmup.generate, false);
+    sendWarmup(socket, "resp-warmup");
+
+    const generation = await reader.next();
+    assert.equal(generation.previous_response_id, "resp-warmup");
+    sendCompleted(socket, "resp-tool", [{
+      type: "custom_tool_call",
+      call_id: "call-exec",
+      name: "exec",
+      input: "await tools.handoff({});",
+    }]);
+
+    const continuation = await reader.next();
+    assert.match(JSON.stringify(continuation.input), /<spine_memory>handoff<\/spine_memory>/);
+    sendFinal(socket, "resp-final", "parent resumed");
+  })();
+
+  const result = await agent.turn.prompt({ input: "Use the handoff tool." }).result();
+  assert.equal(result.finalMessage, "parent resumed");
+  await scenario;
+
+  agent.dispose();
+  await server.close();
+});
+
 test("WASM snapshots resume authoritative history in a fresh agent", async () => {
   const originalServer = await startServer();
   const original = await Agent.create({
