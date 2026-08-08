@@ -27,10 +27,10 @@ use crossterm::event::{
 use eyre::{Result, WrapErr};
 use futures_util::StreamExt;
 use nanocodex::{
-    AgentEvents, Nanocodex, NanocodexError, OpenAi, Thinking, TurnControl, TurnResult,
+    AgentEvents, Model, Nanocodex, NanocodexError, OpenAi, Thinking, TurnControl, TurnResult,
     agent::{
         events::{AgentEvent, TimedAgentEvent},
-        rollout::DurableSession,
+        rollout::{DurableSession, RolloutTranscriptItem},
     },
     tools::mcp::McpHandle,
 };
@@ -53,7 +53,10 @@ use self::{
     terminal::TerminalSession,
     transcript::TranscriptItem,
 };
-use crate::config::AgentArgs;
+use crate::{
+    app_core::{StandardWorkerFactory, WorkerCapability, WorkerFactory},
+    config::AgentArgs,
+};
 
 pub(crate) use resume_picker::select_resume_session;
 
@@ -90,7 +93,7 @@ impl InitialPrompt {
     }
 }
 
-enum WorkerCommand {
+pub enum WorkerCommand {
     Prompt {
         target: PaneId,
         prompt_id: u64,
@@ -142,7 +145,27 @@ enum WorkerCommand {
     Voice(VoiceControl),
 }
 
-enum WorkerEvent {
+impl WorkerCommand {
+    pub fn root_prompt(prompt_id: u64, prompt: String) -> Self {
+        Self::Prompt {
+            target: PaneId::Main,
+            prompt_id,
+            prompt: prompt.into(),
+        }
+    }
+
+    pub const fn root_cancel() -> Self {
+        Self::Cancel {
+            target: PaneId::Main,
+        }
+    }
+}
+
+pub enum WorkerEvent {
+    RootAgentEvent {
+        event: TimedAgentEvent,
+    },
+    RootEventStreamClosed,
     TurnTraceStarted {
         target: PaneId,
         id: u64,
@@ -271,6 +294,17 @@ enum WorkerEvent {
     VoiceStopped,
 }
 
+impl WorkerEvent {
+    #[cfg(test)]
+    pub(crate) const fn root_turn_finished(error: Option<String>) -> Self {
+        Self::TurnFinished {
+            target: PaneId::Main,
+            main_branch_id: Some(0),
+            error,
+        }
+    }
+}
+
 struct MainWorkerBranch {
     id: u64,
     request_id: Arc<str>,
@@ -358,7 +392,6 @@ enum UiUpdate {
 struct UiModel {
     app: App,
     root_session_id: Arc<str>,
-    agent_events_open: bool,
     worker_updates_open: bool,
     voice_observing: bool,
     terminal_focused: bool,
@@ -409,7 +442,6 @@ impl UiModel {
         Self {
             app,
             root_session_id,
-            agent_events_open: true,
             worker_updates_open: true,
             voice_observing: false,
             terminal_focused: true,
@@ -496,8 +528,13 @@ impl UiModel {
             }
             UiAction::AgentStreamClosed => {
                 self.app.main_branch_event_stream_closed(0);
-                self.agent_events_open = false;
                 Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
+            }
+            UiAction::Worker(WorkerEvent::RootAgentEvent { event }) => {
+                self.update(UiAction::Agent(event.event), commands)
+            }
+            UiAction::Worker(WorkerEvent::RootEventStreamClosed) => {
+                self.update(UiAction::AgentStreamClosed, commands)
             }
             UiAction::Worker(update) => {
                 match &update {
@@ -569,7 +606,7 @@ enum Submission {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VoiceControl {
+pub enum VoiceControl {
     Toggle,
     Start(Option<RealtimeVoice>),
     Stop,
@@ -599,30 +636,47 @@ pub(crate) async fn run(
         .as_ref()
         .map(|session| PathBuf::from(session.workspace()))
         .unwrap_or(resolve_cwd(&config)?);
-    let configured = if let Some(session) = resume {
-        config.build_resumed(session, vm).await?
+    let factory = if let Some(session) = resume {
+        StandardWorkerFactory::build_resumed(config, session, vm).await?
     } else {
-        config.build(vm).await?
+        StandardWorkerFactory::build(config, vm).await?
     };
-    let agent = configured.handle;
-    let mut agent_events = configured.events;
-    let realtime = configured.realtime;
-    let root_session_id = Arc::<str>::from(agent_events.request_id());
-    let child_agents = configured.child_agents;
-    let mpp_adapter = configured.mpp_adapter;
-    let mcp = configured.mcp;
-    let browser = configured.browser;
-    let vm = configured.vm;
-    let (worker_tx, worker_rx) = mpsc::unbounded_channel();
-    let (update_tx, mut update_rx) = mpsc::unbounded_channel();
-    let worker = spawn_agent_worker(
-        agent,
-        Arc::clone(&root_session_id),
-        realtime,
-        mcp,
-        worker_rx,
-        update_tx,
-    );
+    run_with_worker(
+        factory,
+        cwd,
+        initial_model,
+        initial_thinking,
+        initial_fast_mode,
+        restored_transcript,
+        initial_prompt,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the ordered terminal, agent, worker, and render event loop is intentionally cohesive"
+)]
+pub(crate) async fn run_with_worker<F>(
+    factory: F,
+    cwd: PathBuf,
+    initial_model: Model,
+    initial_thinking: Thinking,
+    initial_fast_mode: bool,
+    restored_transcript: Vec<RolloutTranscriptItem>,
+    initial_prompt: Option<InitialPrompt>,
+) -> Result<()>
+where
+    F: WorkerFactory<Command = WorkerCommand, Event = WorkerEvent>,
+{
+    let mut worker = factory.start();
+    if !worker.capabilities().supports(WorkerCapability::Prompt) {
+        worker.shutdown().await?;
+        return Err(eyre::eyre!(
+            "the selected application worker cannot accept prompts"
+        ));
+    }
+    let root_session_id = Arc::<str>::from(worker.session_id());
 
     let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
     let terminal_profile = TerminalProfile::query(Duration::from_millis(750));
@@ -653,11 +707,15 @@ pub(crate) async fn run(
     let mut stream_telemetry = StreamTelemetry::default();
     let mut view_telemetry = ViewTelemetry::new(Arc::clone(&root_session_id));
     let mut notifier = Notifier::from_env();
+    let mut pending_worker_updates = VecDeque::new();
 
-    submit_initial_prompt(&mut ui.app, &root_session_id, &worker_tx, initial_prompt)?;
+    let loop_result: Result<()> = {
+        let worker_tx = worker.commands().clone();
+        let update_rx = worker.events_mut();
 
-    let loop_result: Result<()> = async {
-        loop {
+        async {
+            submit_initial_prompt(&mut ui.app, &root_session_id, &worker_tx, initial_prompt)?;
+            loop {
             view_telemetry.observe(&ui.app);
             render_due_frame(
                 &mut ui,
@@ -692,36 +750,16 @@ pub(crate) async fn run(
                     break Ok(());
                 }
             }
-            event = agent_events.recv_timed(), if ui.agent_events_open => {
-                if apply_main_agent_event_batch(
+            update = next_worker_event(&mut pending_worker_updates, update_rx), if ui.worker_updates_open => {
+                if apply_worker_event_batch(
                     &mut ui,
                     &worker_tx,
                     &mut stream_telemetry,
                     &mut scheduler,
-                    &mut agent_events,
-                    event,
+                    update_rx,
+                    &mut pending_worker_updates,
+                    update,
                 )? {
-                    return Ok(());
-                }
-            }
-            update = update_rx.recv(), if ui.worker_updates_open => {
-                if update.as_ref().is_some_and(|update| {
-                    handle_worker_telemetry(update, &mut stream_telemetry)
-                }) {
-                    continue;
-                }
-                let received = update
-                    .as_ref()
-                    .and_then(|update| worker_event_received(update, &stream_telemetry));
-                let action = update.map_or(UiAction::WorkerStopped, UiAction::Worker);
-                let update = ui.update(action, &worker_tx)?;
-                if let Some(received) = received {
-                    stream_telemetry.event_applied(
-                        received,
-                        matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming)),
-                    );
-                }
-                if apply_update(update, &mut scheduler) {
                     break Ok(());
                 }
             }
@@ -738,13 +776,14 @@ pub(crate) async fn run(
             }
             }
         }
-    }
-    .await;
+        }
+        .await
+    };
 
     // Restore the terminal before disconnecting the paid WebSocket session.
-    drop((terminal, worker_tx, agent_events));
+    drop(terminal);
     math_renderer.shutdown();
-    let shutdown_result = shutdown_runtime(worker, child_agents, mpp_adapter, browser, vm).await;
+    let shutdown_result = worker.shutdown().await;
     loop_result?;
     shutdown_result
 }
@@ -756,81 +795,73 @@ fn resolve_cwd(config: &AgentArgs) -> Result<PathBuf> {
         .wrap_err("failed to resolve the working directory")
 }
 
-async fn shutdown_runtime(
-    worker: tokio::task::JoinHandle<()>,
-    child_agents: Option<std::sync::Arc<crate::subagents::ChildAgents>>,
-    mpp_adapter: Option<crate::mpp::MppAdapter>,
-    browser: Option<crate::browser::ConfiguredBrowser>,
-    vm: Option<crate::vm::ConfiguredVm>,
-) -> Result<()> {
-    worker.abort();
-    let worker_result = worker.await;
-    if let Some(child_agents) = child_agents {
-        child_agents.shutdown().await;
+async fn next_worker_event(
+    pending: &mut VecDeque<WorkerEvent>,
+    updates: &mut mpsc::UnboundedReceiver<WorkerEvent>,
+) -> Option<WorkerEvent> {
+    if let Some(update) = pending.pop_front() {
+        Some(update)
+    } else {
+        updates.recv().await
     }
-    let browser_shutdown_result = if let Some(browser) = browser {
-        browser.shutdown().await
-    } else {
-        Ok(())
-    };
-    let vm_shutdown_result = if let Some(vm) = vm {
-        vm.shutdown().await
-    } else {
-        Ok(())
-    };
-    let shutdown_result = if let Some(adapter) = mpp_adapter {
-        adapter.shutdown().await
-    } else {
-        Ok(())
-    };
-    match worker_result {
-        Ok(()) => {}
-        Err(error) if error.is_cancelled() => {}
-        Err(error) => return Err(error).wrap_err("TUI agent worker failed"),
-    }
-    browser_shutdown_result?;
-    vm_shutdown_result?;
-    shutdown_result
 }
 
-fn apply_main_agent_event_batch(
+fn apply_worker_event_batch(
     ui: &mut UiModel,
     worker_tx: &mpsc::UnboundedSender<WorkerCommand>,
     stream_telemetry: &mut StreamTelemetry,
     scheduler: &mut RenderScheduler,
-    agent_events: &mut AgentEvents,
-    first: Option<TimedAgentEvent>,
+    updates: &mut mpsc::UnboundedReceiver<WorkerEvent>,
+    pending: &mut VecDeque<WorkerEvent>,
+    first: Option<WorkerEvent>,
 ) -> Result<bool> {
-    if apply_main_agent_event(ui, worker_tx, stream_telemetry, scheduler, first)? {
+    let batch_root_events = matches!(&first, Some(WorkerEvent::RootAgentEvent { .. }));
+    if apply_worker_event(ui, worker_tx, stream_telemetry, scheduler, first)? {
         return Ok(true);
+    }
+    if !batch_root_events {
+        return Ok(false);
     }
     for _ in 1..MAX_AGENT_EVENTS_PER_BATCH {
         if scheduler.is_due(Instant::now()) {
             break;
         }
-        let Some(event) = agent_events.try_recv_timed() else {
+        let event = if let Some(event) = pending.pop_front() {
+            Some(event)
+        } else {
+            updates.try_recv().ok()
+        };
+        let Some(event) = event else {
             break;
         };
-        if apply_main_agent_event(ui, worker_tx, stream_telemetry, scheduler, Some(event))? {
+        if !matches!(event, WorkerEvent::RootAgentEvent { .. }) {
+            pending.push_front(event);
+            break;
+        }
+        if apply_worker_event(ui, worker_tx, stream_telemetry, scheduler, Some(event))? {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn apply_main_agent_event(
+fn apply_worker_event(
     ui: &mut UiModel,
     worker_tx: &mpsc::UnboundedSender<WorkerCommand>,
     stream_telemetry: &mut StreamTelemetry,
     scheduler: &mut RenderScheduler,
-    event: Option<TimedAgentEvent>,
+    event: Option<WorkerEvent>,
 ) -> Result<bool> {
+    if event
+        .as_ref()
+        .is_some_and(|event| handle_worker_telemetry(event, stream_telemetry))
+    {
+        return Ok(false);
+    }
     let received = event
         .as_ref()
-        .map(|event| stream_telemetry.event_received(PaneId::Main, event));
-    let action = event.map_or(UiAction::AgentStreamClosed, |event| {
-        UiAction::Agent(event.event)
-    });
+        .and_then(|event| worker_event_received(event, stream_telemetry));
+    let action = event.map_or(UiAction::WorkerStopped, UiAction::Worker);
     let update = ui.update(action, worker_tx)?;
     if let Some(received) = received {
         stream_telemetry.event_applied(
@@ -907,6 +938,9 @@ fn worker_event_received(
     telemetry: &StreamTelemetry,
 ) -> Option<telemetry::ReceivedEvent> {
     match update {
+        WorkerEvent::RootAgentEvent { event } => {
+            Some(telemetry.event_received(PaneId::Main, event))
+        }
         WorkerEvent::BtwAgentEvent { id, event } => {
             Some(telemetry.event_received(PaneId::Btw(*id), event))
         }
@@ -990,6 +1024,9 @@ fn handle_worker_update(
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<()> {
     match update {
+        WorkerEvent::RootAgentEvent { .. } | WorkerEvent::RootEventStreamClosed => {
+            unreachable!("root events are applied by UiModel before worker updates")
+        }
         WorkerEvent::TurnFinished {
             target,
             main_branch_id,
@@ -1112,7 +1149,7 @@ fn handle_worker_update(
     Ok(())
 }
 
-fn spawn_agent_worker(
+pub(crate) fn spawn_agent_worker(
     root: Nanocodex,
     root_session_id: Arc<str>,
     realtime: Option<OpenAi>,
@@ -2920,6 +2957,7 @@ fn browser_command(url: &str) -> Command {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         path::PathBuf,
         sync::Arc,
         time::{Duration, Instant},
@@ -2940,7 +2978,7 @@ mod tests {
     use super::{
         BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
         UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, active_session_id,
-        apply_main_agent_event_batch, classify_submission, handle_key, handle_worker_update,
+        apply_worker_event_batch, classify_submission, handle_key, handle_worker_update,
         paste_clipboard_image, prepare_btw_prompt, report_cancel_outcome, session_trace_url,
         spawn_agent_worker,
     };
@@ -3271,21 +3309,27 @@ mod tests {
         let now = Instant::now();
         let mut scheduler = RenderScheduler::new(Duration::from_secs(1), now);
         scheduler.presented(now);
-        let first = agent_events.try_recv_timed();
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        while let Some(event) = agent_events.try_recv_timed() {
+            updates.send(WorkerEvent::RootAgentEvent { event }).unwrap();
+        }
+        let first = update_rx.try_recv().ok();
+        let mut pending = VecDeque::new();
 
         assert!(
-            !apply_main_agent_event_batch(
+            !apply_worker_event_batch(
                 &mut ui,
                 &commands,
                 &mut telemetry,
                 &mut scheduler,
-                &mut agent_events,
+                &mut update_rx,
+                &mut pending,
                 first,
             )
             .unwrap()
         );
         assert_eq!(ui.app.main.transcript.assistant_sources(), ["AB", "CD"]);
-        assert!(agent_events.try_recv_timed().is_none());
+        assert!(update_rx.try_recv().is_err());
     }
 
     #[test]
@@ -3315,15 +3359,21 @@ mod tests {
         let now = Instant::now();
         let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, now);
         scheduler.presented(now - STREAM_FRAME_INTERVAL);
-        let first = agent_events.try_recv_timed();
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        while let Some(event) = agent_events.try_recv_timed() {
+            updates.send(WorkerEvent::RootAgentEvent { event }).unwrap();
+        }
+        let first = update_rx.try_recv().ok();
+        let mut pending = VecDeque::new();
 
         assert!(
-            !apply_main_agent_event_batch(
+            !apply_worker_event_batch(
                 &mut ui,
                 &commands,
                 &mut telemetry,
                 &mut scheduler,
-                &mut agent_events,
+                &mut update_rx,
+                &mut pending,
                 first,
             )
             .unwrap()
@@ -3332,7 +3382,7 @@ mod tests {
         assert!(scheduler.is_due(Instant::now()));
         assert_eq!(ui.app.main.status, "Thinking...");
         assert_eq!(ui.app.main.transcript.assistant_sources(), [] as [&str; 0]);
-        assert!(agent_events.try_recv_timed().is_some());
+        assert!(update_rx.try_recv().is_ok());
     }
 
     #[test]
