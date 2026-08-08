@@ -3,14 +3,14 @@ use std::{
     time::Duration,
 };
 
-use clap::Args;
+use clap::{Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr as _, eyre};
-use nanocodex::Model;
+use nanocodex::{Model, Thinking};
 use nanocodex_eval::{
     EvalAttemptOutcome, EvalEventKind, EvalEventStream, EvalOutcome, Evaluation, EvaluationClaim,
-    EvaluationSelection, EvaluationSelector, Evaluator, ResolvedHarness, Task,
+    EvaluationSelector, EvaluationWork, Evaluator, ResolvedHarness, Task,
     atif::AtifBuilder,
-    coordinator::{CoordinatorClient, RemoteClaim, RemoteLease},
+    coordinator::{CoordinatorAddRequest, CoordinatorClient, RemoteClaim, RemoteLease},
     harness::{Harness, HarnessAuth},
     vm::{CachePolicy, VmBackend, VmResources},
 };
@@ -27,13 +27,9 @@ const CONFIG_FILE: &str = "nanocodex.toml";
 const LEASE_DURATION: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug, Args)]
-pub(super) struct ProfileTarget {
-    /// Evaluation profile. Uses the manifest's top-level default when omitted.
-    profile: Option<String>,
-
-    /// Evaluation manifest containing the closed desired work bundle.
-    #[arg(long, default_value = CONFIG_FILE)]
-    config: PathBuf,
+pub(super) struct WorksetTarget {
+    /// Named durable profile stored in SQLite. Uses its latest generation.
+    profile: String,
 
     /// Durable SQLite ledger and retained artifacts.
     ///
@@ -47,21 +43,84 @@ pub(super) struct ProfileTarget {
 }
 
 #[derive(Args)]
+pub(super) struct Add {
+    /// Named durable profile to create or extend.
+    profile: String,
+
+    /// Expand this optional nanocodex.toml recipe into SQLite.
+    #[arg(long, value_name = "NAME")]
+    recipe: Option<String>,
+
+    /// Task package to add. Repeat to add multiple task packages.
+    #[arg(long, value_name = "PATH")]
+    task: Vec<PathBuf>,
+
+    /// Harness name to store. Repeat to create a matrix.
+    #[arg(long, value_name = "NAME")]
+    harness: Vec<String>,
+
+    /// Model to store. Repeat to create a matrix.
+    #[arg(long)]
+    model: Vec<Model>,
+
+    /// Reasoning effort to store. Repeat to create a matrix.
+    #[arg(long)]
+    thinking: Vec<Thinking>,
+
+    /// Desired repetitions for every added treatment.
+    #[arg(long)]
+    trials: Option<u16>,
+
+    /// Enable model-facing web search for the added treatments.
+    #[arg(long)]
+    web_search: bool,
+
+    /// Start a new profile generation. By default, extends the latest generation.
+    #[arg(long)]
+    new: bool,
+
+    /// Optional local profile recipes and runtime harness helpers.
+    ///
+    /// A remote coordinator resolves recipes from its own configured file.
+    #[arg(long, default_value = CONFIG_FILE)]
+    config: PathBuf,
+
+    /// Local durable SQLite ledger and retained artifacts.
+    #[arg(long, value_name = "DIRECTORY")]
+    state_dir: Option<PathBuf>,
+
+    /// Add work through a remote coordinator instead of opening SQLite directly.
+    #[arg(long, value_name = "URL", conflicts_with = "state_dir")]
+    coordinator: Option<String>,
+}
+
+#[derive(Args)]
 pub(super) struct Status {
     #[command(flatten)]
-    target: ProfileTarget,
+    target: WorksetTarget,
 
     /// Print the complete machine-readable profile ledger.
     #[arg(long)]
     json: bool,
+
+    /// Return at most this many nonterminal family records while preserving exact totals.
+    #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u16).range(1..))]
+    family_limit: Option<u16>,
 }
 
 #[derive(Args)]
 pub(super) struct Run {
     #[command(flatten)]
-    target: ProfileTarget,
+    target: WorksetTarget,
 
-    /// Exact task selector from the configured profile.
+    /// Runtime harness helper configuration.
+    #[arg(long, default_value = CONFIG_FILE)]
+    config: PathBuf,
+
+    /// Exact SQLite task selector and locally loadable task package path.
+    ///
+    /// Remote workers need this local task package, but never the profile that
+    /// originally added it to the coordinator.
     #[arg(long, value_name = "TASK", required = true)]
     task: String,
 
@@ -74,7 +133,12 @@ pub(super) struct Run {
     harness: Option<String>,
 
     /// Advisory stable name used for coordinator task affinity and status.
-    #[arg(long, env = "NANOCODEX_WORKER_NAME", value_name = "NAME")]
+    #[arg(
+        long,
+        env = "NANOCODEX_WORKER_NAME",
+        value_name = "NAME",
+        value_parser = NonEmptyStringValueParser::new()
+    )]
     worker: Option<String>,
 
     #[command(flatten)]
@@ -82,6 +146,124 @@ pub(super) struct Run {
 
     #[command(flatten)]
     agent: EvalAgentArgs,
+}
+
+impl Add {
+    pub(super) async fn run(self) -> Result<()> {
+        if let Some(coordinator) = &self.coordinator {
+            for task in &self.task {
+                if !task.is_absolute() {
+                    return Err(eyre!(
+                        "remote task paths must be absolute coordinator-host paths: {}",
+                        task.display()
+                    ));
+                }
+            }
+            let request = CoordinatorAddRequest {
+                profile: self.profile,
+                recipe: self.recipe,
+                tasks: self
+                    .task
+                    .into_iter()
+                    .map(|task| task.to_string_lossy().into_owned())
+                    .collect(),
+                harnesses: self.harness,
+                models: self
+                    .model
+                    .into_iter()
+                    .map(|model| model.as_str().to_owned())
+                    .collect(),
+                thinking: self
+                    .thinking
+                    .into_iter()
+                    .map(|thinking| thinking.as_str().to_owned())
+                    .collect(),
+                trials: self.trials,
+                web_search: self.web_search,
+                new_generation: self.new,
+            };
+            let status = CoordinatorClient::new(coordinator)?.add(&request).await?;
+            print_added_remote_status(&status);
+            return Ok(());
+        }
+        let state = self.state_dir.map_or_else(default_state_dir, Ok)?;
+        if let Some(recipe) = self.recipe.as_deref() {
+            if !self.task.is_empty()
+                || !self.harness.is_empty()
+                || !self.model.is_empty()
+                || !self.thinking.is_empty()
+                || self.trials.is_some()
+                || self.web_search
+            {
+                return Err(eyre!(
+                    "--recipe is complete; use either --recipe or explicit work knobs"
+                ));
+            }
+            Evaluation::add_profile(&self.config, Some(recipe), &state, &self.profile, self.new)?;
+        } else {
+            if self.task.is_empty() {
+                return Err(eyre!("at least one --task or --recipe is required"));
+            }
+            let trials = self.trials.unwrap_or(1);
+            let harnesses = if self.harness.is_empty() {
+                vec!["nanocodex".to_owned()]
+            } else {
+                self.harness
+            };
+            let models = if self.model.is_empty() {
+                vec![Model::default()]
+            } else {
+                self.model
+            };
+            let thinking = if self.thinking.is_empty() {
+                vec![Thinking::default()]
+            } else {
+                self.thinking
+            };
+            let mut work = Vec::new();
+            for path in self.task {
+                let selector = path.to_string_lossy().into_owned();
+                let task = Task::load(&path)?;
+                for harness in &harnesses {
+                    for model in &models {
+                        for thinking in &thinking {
+                            work.push(
+                                EvaluationWork::new(&selector, task.clone())
+                                    .harness(harness)
+                                    .model(*model)
+                                    .thinking(*thinking)
+                                    .web_search(self.web_search)
+                                    .trials(trials),
+                            );
+                        }
+                    }
+                }
+            }
+            Evaluation::add(&state, &self.profile, &work, self.new)?;
+        }
+        let status = Evaluation::open(&self.config, &self.profile, state)?.status()?;
+        println!(
+            "{} {} · {} tasks · {} coordinate(s)",
+            status.profile,
+            &status.generation[..12],
+            status.preparation.pending + status.preparation.running + status.preparation.complete,
+            status.coordinates.pending + status.coordinates.running + status.coordinates.complete,
+        );
+        Ok(())
+    }
+}
+
+fn print_added_remote_status(status: &serde_json::Value) {
+    let profile = status["profile"].as_str().unwrap_or("unknown");
+    let generation = status["generation"].as_str().unwrap_or("unknown");
+    let generation = generation.get(..12).unwrap_or(generation);
+    println!(
+        "{} {} · {} tasks · {} coordinate(s)",
+        profile,
+        generation,
+        count_total(&status["preparation"]),
+        count_total(&status["coordinates"]),
+    );
 }
 
 #[derive(Serialize)]
@@ -108,7 +290,8 @@ enum RunOutput<'a> {
 impl Status {
     pub(super) async fn run(self) -> Result<()> {
         if let Some(coordinator) = &self.target.coordinator {
-            let status = CoordinatorClient::new(coordinator)?.status().await?;
+            let mut status = CoordinatorClient::new(coordinator)?.status().await?;
+            limit_remote_families(&mut status, self.family_limit);
             if self.json {
                 serde_json::to_writer_pretty(std::io::stdout().lock(), &status)?;
                 println!();
@@ -117,8 +300,14 @@ impl Status {
             }
             return Ok(());
         }
-        let evaluation = self.target.open()?;
-        let status = evaluation.status()?;
+        let evaluation = self.target.open(Path::new(CONFIG_FILE))?;
+        let mut status = evaluation.status()?;
+        if let Some(limit) = self.family_limit {
+            status
+                .families
+                .retain(|family| family.pending > 0 || family.running > 0);
+            status.families.truncate(usize::from(limit));
+        }
         if self.json {
             serde_json::to_writer_pretty(std::io::stdout().lock(), &status)?;
             println!();
@@ -126,7 +315,7 @@ impl Status {
             println!(
                 "{} {} · preparation {}/{} ready · coordinates {}/{} terminal, {} running",
                 status.profile,
-                &status.digest[..12],
+                &status.generation[..12],
                 status.preparation.complete,
                 status.preparation.pending
                     + status.preparation.running
@@ -148,6 +337,23 @@ impl Status {
     }
 }
 
+fn limit_remote_families(status: &mut serde_json::Value, limit: Option<u16>) {
+    let Some(limit) = limit else {
+        return;
+    };
+    let Some(families) = status
+        .get_mut("families")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    families.retain(|family| {
+        family.get("pending").and_then(serde_json::Value::as_u64) > Some(0)
+            || family.get("running").and_then(serde_json::Value::as_u64) > Some(0)
+    });
+    families.truncate(usize::from(limit));
+}
+
 impl Run {
     pub(super) async fn run(self) -> Result<()> {
         let _observability = self.observability.install(false, Path::new("."))?;
@@ -155,22 +361,26 @@ impl Run {
         let selector = EvaluationSelector::new(&self.task)
             .harness(self.harness)
             .model(self.model)
-            .thinking(requested_thinking);
+            .thinking(requested_thinking)
+            .web_search(self.agent.web_search());
         if let Some(coordinator) = &self.target.coordinator {
-            let selection = EvaluationSelection::load(
-                &self.target.config,
-                self.target.profile.as_deref(),
-                &selector,
-            )?;
-            validate_web_search(&self.agent, selection.profile(), selection.web_search())?;
+            let task = Task::load(&self.task)?;
             let mut coordinator = CoordinatorClient::new(coordinator)?;
             if let Some(worker) = self.worker {
                 coordinator = coordinator.worker(worker);
             }
-            return run_remote(coordinator, selection, &self.task, self.agent).await;
+            return run_remote(
+                coordinator,
+                selector,
+                &self.target.profile,
+                task,
+                &self.config,
+                &self.task,
+                self.agent,
+            )
+            .await;
         }
-        let evaluation = self.target.open()?;
-        validate_web_search(&self.agent, evaluation.name(), evaluation.web_search())?;
+        let evaluation = self.target.open(&self.config)?;
         let mut prepared = None;
         loop {
             match evaluation.claim(&selector, LEASE_DURATION)? {
@@ -258,16 +468,21 @@ impl Run {
 
 async fn run_remote(
     coordinator: CoordinatorClient,
-    selection: EvaluationSelection,
+    selector: EvaluationSelector,
+    profile: &str,
+    task: Task,
+    config: &Path,
     task_selector: &str,
     agent: EvalAgentArgs,
 ) -> Result<()> {
     let mut prepared = None;
     loop {
-        match coordinator.claim(&selection).await? {
-            RemoteClaim::Prepare(lease) => {
+        match coordinator.claim(&selector).await? {
+            RemoteClaim::Prepare { lease, treatment } => {
+                let harness = Evaluation::resolve_harness(config, &treatment.harness)?;
+                let harnesses = harness.iter().cloned().collect::<Vec<_>>();
                 let heartbeat = remote_heartbeat(coordinator.clone(), lease.clone());
-                let result = prepare_resources(selection.task(), selection.harnesses()).await;
+                let result = prepare_resources(&task, &harnesses).await;
                 match result {
                     Ok(resources) => {
                         let finish = coordinator.prepared(&lease).await;
@@ -283,7 +498,13 @@ async fn run_remote(
                     }
                 }
             }
-            RemoteClaim::Run { lease, repetition } => {
+            RemoteClaim::Run {
+                lease,
+                repetition,
+                treatment,
+            } => {
+                let harness = Evaluation::resolve_harness(config, &treatment.harness)?;
+                let harnesses = harness.iter().cloned().collect::<Vec<_>>();
                 let host = run::PreparedVmHost::open()?;
                 let output = tempfile::Builder::new()
                     .prefix("nanocodex-eval-worker-")
@@ -292,16 +513,13 @@ async fn run_remote(
                 let result = async {
                     let resources = match prepared.take() {
                         Some(resources) => resources,
-                        None => {
-                            prepare_resources_from(selection.task(), selection.harnesses(), &host)
-                                .await?
-                        }
+                        None => prepare_resources_from(&task, &harnesses, &host).await?,
                     };
                     execute_coordinate(
-                        selection.task().clone(),
-                        selection.treatment().clone(),
-                        selection.web_search(),
-                        selection.harness().cloned(),
+                        task.clone(),
+                        treatment.clone(),
+                        treatment.web_search,
+                        harness,
                         output.path().to_path_buf(),
                         resources,
                         agent,
@@ -315,7 +533,7 @@ async fn run_remote(
                         heartbeat.abort();
                         finish?;
                         write_json(&RunOutput::Completed {
-                            profile: selection.profile(),
+                            profile,
                             task: task_selector,
                             repetition,
                             evidence: "coordinator",
@@ -349,7 +567,7 @@ async fn run_remote(
                 retry_after_ms,
             } => {
                 write_json(&RunOutput::TemporarilyUnavailable {
-                    profile: selection.profile(),
+                    profile,
                     task: task_selector,
                     reason: &reason,
                     retry_after_ms,
@@ -360,7 +578,7 @@ async fn run_remote(
             }
             RemoteClaim::Complete => {
                 write_json(&RunOutput::AlreadyComplete {
-                    profile: selection.profile(),
+                    profile,
                     task: task_selector,
                 })?;
                 return Ok(());
@@ -385,26 +603,10 @@ fn remote_heartbeat(
     })
 }
 
-fn validate_web_search(agent: &EvalAgentArgs, profile: &str, web_search: bool) -> Result<()> {
-    if agent
-        .web_search()
-        .is_some_and(|requested| requested != web_search)
-    {
-        return Err(eyre!(
-            "--web-search cannot override profile `{profile}`; the profile fixes web_search={web_search}"
-        ));
-    }
-    Ok(())
-}
-
-impl ProfileTarget {
-    fn open(&self) -> Result<Evaluation> {
+impl WorksetTarget {
+    fn open(&self, config: &Path) -> Result<Evaluation> {
         let state_directory = self.state_dir.clone().map_or_else(default_state_dir, Ok)?;
-        Ok(Evaluation::open(
-            &self.config,
-            self.profile.as_deref(),
-            state_directory,
-        )?)
+        Ok(Evaluation::open(config, &self.profile, state_directory)?)
     }
 }
 
@@ -596,9 +798,6 @@ async fn retain_native_trajectory(
 }
 
 pub(super) fn default_state_dir() -> Result<PathBuf> {
-    if let Some(home) = std::env::var_os("NANOCODEX_HOME") {
-        return Ok(PathBuf::from(home).join("evals"));
-    }
     let home = std::env::var_os("HOME")
         .ok_or_else(|| eyre!("HOME is not set; pass --state-dir for durable eval state"))?;
     Ok(PathBuf::from(home).join(".nanocodex/evals"))
@@ -606,13 +805,13 @@ pub(super) fn default_state_dir() -> Result<PathBuf> {
 
 fn print_remote_status(status: &serde_json::Value) {
     let profile = status["profile"].as_str().unwrap_or("unknown");
-    let digest = status["digest"].as_str().unwrap_or("unknown");
+    let generation = status["generation"].as_str().unwrap_or("unknown");
     let preparation = &status["preparation"];
     let coordinates = &status["coordinates"];
     println!(
         "{} {} · preparation {}/{} ready · coordinates {}/{} terminal, {} running",
         profile,
-        &digest[..digest.len().min(12)],
+        &generation[..generation.len().min(12)],
         preparation["complete"].as_u64().unwrap_or(0),
         count_total(preparation),
         coordinates["complete"].as_u64().unwrap_or(0),
@@ -650,7 +849,7 @@ mod tests {
 
     use clap::Parser as _;
 
-    use super::default_state_dir;
+    use super::{default_state_dir, limit_remote_families};
     use crate::{Cli, Command, eval::EvalCommand};
 
     #[test]
@@ -676,6 +875,63 @@ mod tests {
         };
         assert_eq!(run.task, "terminal/fix-git");
         assert_eq!(run.worker.as_deref(), Some("dev-one"));
+    }
+
+    #[test]
+    fn add_accepts_remote_coordinator_and_rejects_direct_sqlite_combination() {
+        let cli = Cli::try_parse_from([
+            "nanocodex",
+            "eval",
+            "add",
+            "release",
+            "--coordinator",
+            "http://127.0.0.1:8788",
+            "--task",
+            "/mnt/tasks/fix-git",
+            "--trials",
+            "3",
+        ])
+        .unwrap();
+        let Some(Command::Eval(eval)) = cli.command else {
+            panic!("expected eval command");
+        };
+        let EvalCommand::Add(add) = eval.command else {
+            panic!("expected profile add");
+        };
+        assert_eq!(add.coordinator.as_deref(), Some("http://127.0.0.1:8788"));
+        assert_eq!(add.task, [Path::new("/mnt/tasks/fix-git")]);
+
+        assert!(
+            Cli::try_parse_from([
+                "nanocodex",
+                "eval",
+                "add",
+                "release",
+                "--coordinator",
+                "http://127.0.0.1:8788",
+                "--state-dir",
+                "/mnt/evals",
+                "--task",
+                "/mnt/tasks/fix-git",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn status_family_limit_keeps_exact_totals_and_only_nonterminal_rows() {
+        let mut status = serde_json::json!({
+            "coordinates": { "complete": 10, "pending": 20, "running": 2 },
+            "families": [
+                { "id": "done", "pending": 0, "running": 0 },
+                { "id": "one", "pending": 1, "running": 0 },
+                { "id": "two", "pending": 0, "running": 1 },
+            ],
+        });
+        limit_remote_families(&mut status, Some(1));
+        assert_eq!(status["coordinates"]["pending"], 20);
+        assert_eq!(status["families"].as_array().unwrap().len(), 1);
+        assert_eq!(status["families"][0]["id"], "one");
     }
 
     #[test]
@@ -726,7 +982,7 @@ mod tests {
     }
 
     #[test]
-    fn nanocodex_home_owns_the_default_eval_directory() {
+    fn home_owns_the_default_eval_directory() {
         let path = default_state_dir().unwrap();
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),

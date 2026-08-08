@@ -36,7 +36,7 @@ mod vm;
 #[path = "vm_unsupported.rs"]
 mod vm;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr, eyre};
@@ -44,6 +44,22 @@ use nanocodex::agent::rollout::RolloutConfig;
 
 use config::AgentArgs;
 use observability::ObservabilityArgs;
+
+const RETRYABLE_EXIT_CODE: u8 = 75;
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct RetryableProcessExit {
+    message: String,
+}
+
+impl RetryableProcessExit {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -126,7 +142,17 @@ struct ResumeCommand {
     prompt: Option<String>,
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+    match try_main() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            ExitCode::from(process_exit_code(&error))
+        }
+    }
+}
+
+fn try_main() -> Result<()> {
     nanocodex::oai::transport::install_default_rustls_crypto_provider();
     // Keep direct `cargo run` behavior consistent with the Justfile without
     // requiring shell-specific syntax to load the repository's `.env` file.
@@ -140,6 +166,14 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?
         .block_on(run(cli))
+}
+
+fn process_exit_code(error: &eyre::Report) -> u8 {
+    if error.downcast_ref::<RetryableProcessExit>().is_some() {
+        RETRYABLE_EXIT_CODE
+    } else {
+        1
+    }
 }
 
 async fn run(cli: Cli) -> Result<()> {

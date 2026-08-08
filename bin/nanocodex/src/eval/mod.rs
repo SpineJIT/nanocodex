@@ -2,6 +2,7 @@ mod benchmark;
 mod coordinator;
 mod profile;
 mod run;
+mod systemd;
 
 use clap::{Args, Subcommand};
 use eyre::Result;
@@ -14,16 +15,19 @@ pub(crate) struct Eval {
 
 #[derive(Subcommand)]
 enum EvalCommand {
+    /// Add concrete tasks and treatments to a durable evaluation profile.
+    Add(profile::Add),
+
     /// Launch the agent-owned benchmark workflow in the TUI or headlessly.
     Benchmark(benchmark::Benchmark),
 
     /// Own one SQLite ledger for pull workers on this machine.
     Coordinator(coordinator::Coordinator),
 
-    /// Inspect one immutable profile revision and its durable progress.
+    /// Inspect one named SQLite profile and its durable progress.
     Status(profile::Status),
 
-    /// Durably execute one agent-selected task repetition from a profile.
+    /// Durably execute one selected task treatment from a SQLite profile.
     Run(profile::Run),
 }
 
@@ -41,6 +45,7 @@ fn enable_paint() {
 
 async fn run(eval: Eval) -> Result<()> {
     match eval.command {
+        EvalCommand::Add(command) => command.run().await?,
         EvalCommand::Benchmark(command) => command.run().await?,
         EvalCommand::Coordinator(command) => command.run().await?,
         EvalCommand::Status(command) => command.run().await?,
@@ -61,6 +66,18 @@ mod tests {
             vec![
                 "nanocodex",
                 "eval",
+                "add",
+                "local-smoke",
+                "--task",
+                "tasks/write-greeting",
+                "--harness",
+                "codex",
+                "--trials",
+                "5",
+            ],
+            vec![
+                "nanocodex",
+                "eval",
                 "run",
                 "local-smoke",
                 "--task",
@@ -68,6 +85,18 @@ mod tests {
             ],
             vec!["nanocodex", "eval", "status", "local-smoke"],
             vec!["nanocodex", "eval", "benchmark", "local-smoke"],
+            vec!["nanocodex", "eval", "benchmark", "local-smoke", "--systemd"],
+            vec![
+                "nanocodex",
+                "eval",
+                "benchmark",
+                "local-smoke",
+                "--coordinator",
+                "http://127.0.0.1:8788",
+                "--worker",
+                "dev-one",
+                "--systemd",
+            ],
             vec!["nanocodex", "eval", "coordinator", "local-smoke"],
         ] {
             Cli::try_parse_from(arguments).expect("supported eval command must parse");
@@ -112,6 +141,21 @@ mod tests {
                 "local-smoke",
                 "--bind",
                 "100.64.0.1",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn status_reads_only_the_sqlite_workset() {
+        assert!(
+            Cli::try_parse_from([
+                "nanocodex",
+                "eval",
+                "status",
+                "local-smoke",
+                "--config",
+                "nanocodex.toml",
             ])
             .is_err()
         );

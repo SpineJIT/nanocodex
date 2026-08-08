@@ -9,10 +9,10 @@ use super::profile::default_state_dir;
 
 #[derive(Args)]
 pub(super) struct Coordinator {
-    /// Evaluation profile. Uses the manifest's top-level default when omitted.
-    profile: Option<String>,
+    /// Named durable profile served from SQLite.
+    profile: String,
 
-    /// Evaluation manifest containing the closed desired work bundle.
+    /// Runtime harness helper configuration.
     #[arg(long, default_value = "nanocodex.toml")]
     config: PathBuf,
 
@@ -28,7 +28,7 @@ pub(super) struct Coordinator {
 impl Coordinator {
     pub(super) async fn run(self) -> Result<()> {
         let state = self.state_dir.map_or_else(default_state_dir, Ok)?;
-        let evaluation = Evaluation::open(&self.config, self.profile.as_deref(), state)?;
+        let evaluation = Evaluation::open(&self.config, &self.profile, state)?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, self.port))
             .await
             .wrap_err("failed to bind the evaluation coordinator")?;

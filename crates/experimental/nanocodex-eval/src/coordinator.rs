@@ -12,7 +12,7 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{ConnectInfo, Path as AxumPath, State},
+    extract::{ConnectInfo, Path as AxumPath, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -24,7 +24,10 @@ use tokio::{io::AsyncWriteExt as _, net::TcpListener, sync::Mutex, task::JoinHan
 use tokio_util::io::{ReaderStream, SyncIoBridge};
 use uuid::Uuid;
 
-use crate::{CoordinateClaim, Evaluation, EvaluationClaim, EvaluationSelection, PreparationClaim};
+use crate::{
+    CoordinateClaim, Evaluation, EvaluationClaim, EvaluationSelector, EvaluationStatus,
+    EvaluationTreatment, EvaluationWork, PreparationClaim, Task, api::EvalApi,
+};
 
 const MAX_COMPRESSED_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXTRACTED_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -48,17 +51,55 @@ pub struct CoordinatorClient {
     worker: Option<String>,
 }
 
+/// Work to append to the coordinator-owned SQLite evaluation.
+///
+/// Task paths are resolved on the coordinator host and must be absolute.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CoordinatorAddRequest {
+    /// Expected profile owned by the target coordinator.
+    pub profile: String,
+    /// Optional profile recipe resolved from the coordinator's configuration.
+    pub recipe: Option<String>,
+    /// Absolute task-package paths visible on the coordinator host.
+    #[serde(default)]
+    pub tasks: Vec<String>,
+    /// Harness matrix. An empty list selects built-in Nanocodex.
+    #[serde(default)]
+    pub harnesses: Vec<String>,
+    /// Model matrix. Values use ordinary Nanocodex model names.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Reasoning-effort matrix.
+    #[serde(default)]
+    pub thinking: Vec<String>,
+    /// Desired repetitions for each concrete treatment.
+    pub trials: Option<u16>,
+    /// Whether model-facing web search is enabled.
+    #[serde(default)]
+    pub web_search: bool,
+    /// Whether to start a new generation instead of extending the latest one.
+    #[serde(default)]
+    pub new_generation: bool,
+}
+
 /// One action atomically allocated by the coordinator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RemoteClaim {
     /// This host must prepare the selected task first.
-    Prepare(RemoteLease),
+    Prepare {
+        /// Opaque lease capability required for all later mutations.
+        lease: RemoteLease,
+        /// Exact treatment resolved by the coordinator from SQLite.
+        treatment: EvaluationTreatment,
+    },
     /// Execute one coordinator-allocated repetition.
     Run {
         /// Opaque lease capability required for all later mutations.
         lease: RemoteLease,
         /// Internal fungible repetition selected by SQLite.
         repetition: u16,
+        /// Exact treatment resolved by the coordinator from SQLite.
+        treatment: EvaluationTreatment,
     },
     /// Matching work is temporarily unavailable.
     Busy {
@@ -103,11 +144,15 @@ pub enum CoordinatorError {
     /// Blocking archive construction or extraction failed.
     #[error("evaluation artifact archive task failed: {0}")]
     ArchiveTask(#[from] tokio::task::JoinError),
+    /// Coordinator returned an invalid retained treatment.
+    #[error("evaluation coordinator returned an invalid treatment: {0}")]
+    InvalidTreatment(String),
 }
 
 #[derive(Clone)]
 struct CoordinatorState {
     evaluation: Evaluation,
+    eval_api: EvalApi,
     lease_duration: Duration,
     active: Arc<Mutex<HashMap<String, ActiveClaim>>>,
 }
@@ -124,17 +169,38 @@ enum HeldClaim {
 
 #[derive(Deserialize)]
 struct ClaimRequest {
-    profile_digest: String,
-    family_key: String,
+    task: String,
+    harness: Option<String>,
+    model: Option<String>,
+    thinking: Option<String>,
+    web_search: Option<bool>,
     worker: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireTreatment {
+    harness: String,
+    model: String,
+    thinking: String,
+    web_search: bool,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum ClaimResponse {
-    Prepare { lease: String },
-    Run { lease: String, repetition: u16 },
-    Busy { reason: String, retry_after_ms: u64 },
+    Prepare {
+        lease: String,
+        treatment: WireTreatment,
+    },
+    Run {
+        lease: String,
+        repetition: u16,
+        treatment: WireTreatment,
+    },
+    Busy {
+        reason: String,
+        retry_after_ms: u64,
+    },
     Complete,
 }
 
@@ -149,6 +215,12 @@ enum FinishRequest {
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     error: &'a str,
+}
+
+#[derive(Deserialize)]
+struct EvalOutcomesQuery {
+    cursor: Option<usize>,
+    limit: Option<usize>,
 }
 
 struct ApiError {
@@ -174,9 +246,11 @@ impl CoordinatorServer {
         lease_duration: Duration,
         worker_timeout: Duration,
     ) -> Self {
+        let eval_api = EvalApi::new(evaluation.state_directory());
         Self {
             state: CoordinatorState {
                 evaluation,
+                eval_api,
                 lease_duration,
                 active: Arc::new(Mutex::new(HashMap::new())),
             },
@@ -195,6 +269,18 @@ impl CoordinatorServer {
         let reaper = spawn_reaper(self.state.active.clone(), self.worker_timeout);
         let app = Router::new()
             .route("/v1/status", get(status))
+            .route("/v1/evals", get(eval_overview))
+            .route("/v1/evals/work", post(add_work))
+            .route("/v1/evals/worksets/{digest}", get(eval_workset))
+            .route(
+                "/v1/evals/worksets/{digest}/tasks/{task_id}",
+                get(eval_task),
+            )
+            .route(
+                "/v1/evals/worksets/{digest}/tasks/{task_id}/outcomes",
+                get(eval_task_outcomes),
+            )
+            .route("/v1/evals/cases/{id}", get(eval_case))
             .route("/v1/claims", post(claim))
             .route("/v1/claims/{token}/heartbeat", post(heartbeat))
             .route("/v1/claims/{token}/artifacts", put(upload_artifacts))
@@ -258,17 +344,34 @@ impl CoordinatorClient {
         decode(response).await
     }
 
-    /// Claims preparation or one repetition for an exact local profile selection.
+    /// Appends work through the coordinator and returns the resulting status.
+    pub async fn add(
+        &self,
+        request: &CoordinatorAddRequest,
+    ) -> Result<serde_json::Value, CoordinatorError> {
+        let response = self
+            .http
+            .post(self.endpoint("v1/evals/work")?)
+            .json(request)
+            .send()
+            .await?;
+        decode(response).await
+    }
+
+    /// Claims preparation or one repetition matching ordinary task selectors.
     pub async fn claim(
         &self,
-        selection: &EvaluationSelection,
+        selector: &EvaluationSelector,
     ) -> Result<RemoteClaim, CoordinatorError> {
         let response: ClaimResponse = decode(
             self.http
                 .post(self.endpoint("v1/claims")?)
                 .json(&serde_json::json!({
-                    "profile_digest": selection.profile_digest(),
-                    "family_key": selection.family_key(),
+                    "task": selector.task(),
+                    "harness": selector.harness_name(),
+                    "model": selector.model_value().map(|model| model.as_str()),
+                    "thinking": selector.thinking_value().map(|thinking| thinking.as_str()),
+                    "web_search": selector.web_search_value(),
                     "worker": self.worker,
                 }))
                 .send()
@@ -276,10 +379,18 @@ impl CoordinatorClient {
         )
         .await?;
         Ok(match response {
-            ClaimResponse::Prepare { lease } => RemoteClaim::Prepare(RemoteLease { token: lease }),
-            ClaimResponse::Run { lease, repetition } => RemoteClaim::Run {
+            ClaimResponse::Prepare { lease, treatment } => RemoteClaim::Prepare {
+                lease: RemoteLease { token: lease },
+                treatment: treatment.try_into()?,
+            },
+            ClaimResponse::Run {
+                lease,
+                repetition,
+                treatment,
+            } => RemoteClaim::Run {
                 lease: RemoteLease { token: lease },
                 repetition,
+                treatment: treatment.try_into()?,
             },
             ClaimResponse::Busy {
                 reason,
@@ -392,6 +503,202 @@ async fn status(
     ))
 }
 
+async fn add_work(
+    State(state): State<CoordinatorState>,
+    Json(request): Json<CoordinatorAddRequest>,
+) -> Result<Json<EvaluationStatus>, ApiError> {
+    let evaluation = state.evaluation;
+    let status = tokio::task::spawn_blocking(move || apply_add(&evaluation, request))
+        .await
+        .map_err(ApiError::internal)??;
+    Ok(Json(status))
+}
+
+fn apply_add(
+    evaluation: &Evaluation,
+    request: CoordinatorAddRequest,
+) -> Result<EvaluationStatus, ApiError> {
+    let CoordinatorAddRequest {
+        profile,
+        recipe,
+        tasks,
+        harnesses,
+        models,
+        thinking,
+        trials,
+        web_search,
+        new_generation,
+    } = request;
+    if profile != evaluation.name() {
+        return Err(ApiError::bad_request(format!(
+            "coordinator owns profile {:?}, not {:?}",
+            evaluation.name(),
+            profile
+        )));
+    }
+    if let Some(recipe) = recipe {
+        if !tasks.is_empty()
+            || !harnesses.is_empty()
+            || !models.is_empty()
+            || !thinking.is_empty()
+            || trials.is_some()
+            || web_search
+        {
+            return Err(ApiError::bad_request(
+                "recipe work cannot be combined with explicit work knobs",
+            ));
+        }
+        Evaluation::add_profile(
+            evaluation.config(),
+            Some(&recipe),
+            evaluation.state_directory(),
+            evaluation.name(),
+            new_generation,
+        )
+        .map_err(ApiError::ledger)?;
+        return evaluation.status().map_err(ApiError::ledger);
+    }
+    if tasks.is_empty() {
+        return Err(ApiError::bad_request(
+            "at least one task or recipe is required",
+        ));
+    }
+    let trials = trials.unwrap_or(1);
+    if trials == 0 {
+        return Err(ApiError::bad_request(
+            "evaluation treatments must request at least one trial",
+        ));
+    }
+    if harnesses.iter().any(|harness| harness.trim().is_empty()) {
+        return Err(ApiError::bad_request("harness names cannot be empty"));
+    }
+    let models = if models.is_empty() {
+        vec![nanocodex_oai_api::Model::default()]
+    } else {
+        models
+            .into_iter()
+            .map(|model| model.parse().map_err(ApiError::bad_request))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let thinking = if thinking.is_empty() {
+        vec![nanocodex_oai_api::Thinking::default()]
+    } else {
+        thinking
+            .into_iter()
+            .map(|thinking| thinking.parse().map_err(ApiError::bad_request))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut work = Vec::new();
+    for selector in tasks {
+        let path = PathBuf::from(&selector);
+        if !path.is_absolute() {
+            return Err(ApiError::bad_request(format!(
+                "remote task paths must be absolute: {selector}"
+            )));
+        }
+        let task = Task::load(&path).map_err(ApiError::bad_request)?;
+        let selected_harnesses = harnesses
+            .iter()
+            .map(Some)
+            .chain(harnesses.is_empty().then_some(None));
+        for harness in selected_harnesses {
+            for model in &models {
+                for thinking in &thinking {
+                    let mut item = EvaluationWork::new(&selector, task.clone())
+                        .model(*model)
+                        .thinking(*thinking)
+                        .web_search(web_search)
+                        .trials(trials);
+                    if let Some(harness) = harness {
+                        item = item.harness(harness);
+                    }
+                    work.push(item);
+                }
+            }
+        }
+    }
+    Evaluation::add(
+        evaluation.state_directory(),
+        evaluation.name(),
+        &work,
+        new_generation,
+    )
+    .map_err(ApiError::ledger)?;
+    evaluation.status().map_err(ApiError::ledger)
+}
+
+async fn eval_overview(State(state): State<CoordinatorState>) -> Result<Response, ApiError> {
+    let api = state.eval_api;
+    let overview = tokio::task::spawn_blocking(move || api.overview())
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    Ok(Json(overview).into_response())
+}
+
+async fn eval_workset(
+    State(state): State<CoordinatorState>,
+    AxumPath(digest): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let api = state.eval_api;
+    let workset = tokio::task::spawn_blocking(move || api.workset(&digest))
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    workset
+        .map(|workset| Json(workset).into_response())
+        .ok_or_else(|| ApiError::not_found("evaluation workset was not found"))
+}
+
+async fn eval_task(
+    State(state): State<CoordinatorState>,
+    AxumPath((digest, task_id)): AxumPath<(String, String)>,
+) -> Result<Response, ApiError> {
+    let api = state.eval_api;
+    let task = tokio::task::spawn_blocking(move || api.task(&digest, &task_id))
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    task.map(|task| Json(task).into_response())
+        .ok_or_else(|| ApiError::not_found("evaluation task was not found"))
+}
+
+async fn eval_task_outcomes(
+    State(state): State<CoordinatorState>,
+    AxumPath((digest, task_id)): AxumPath<(String, String)>,
+    Query(query): Query<EvalOutcomesQuery>,
+) -> Result<Response, ApiError> {
+    let cursor = query.cursor.unwrap_or(0);
+    let limit = query.limit.unwrap_or(8);
+    if !(1..=32).contains(&limit) {
+        return Err(ApiError::bad_request(
+            "evaluation outcome page limit must be between 1 and 32",
+        ));
+    }
+    let api = state.eval_api;
+    let page =
+        tokio::task::spawn_blocking(move || api.task_outcomes(&digest, &task_id, cursor, limit))
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(ApiError::internal)?;
+    page.map(|page| Json(page).into_response())
+        .ok_or_else(|| ApiError::not_found("evaluation task was not found"))
+}
+
+async fn eval_case(
+    State(state): State<CoordinatorState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let api = state.eval_api;
+    let evidence = tokio::task::spawn_blocking(move || api.case(&id))
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    evidence
+        .map(|evidence| Json(evidence).into_response())
+        .ok_or_else(|| ApiError::not_found("evaluation case was not found"))
+}
+
 async fn claim(
     State(state): State<CoordinatorState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -401,24 +708,38 @@ async fn claim(
         .worker
         .filter(|worker| !worker.trim().is_empty())
         .unwrap_or_else(|| peer.ip().to_string());
+    let model = request
+        .model
+        .map(|model| model.parse().map_err(ApiError::bad_request))
+        .transpose()?;
+    let thinking = request
+        .thinking
+        .map(|thinking| thinking.parse().map_err(ApiError::bad_request))
+        .transpose()?;
+    let selector = EvaluationSelector::new(request.task)
+        .harness(request.harness)
+        .model(model)
+        .thinking(thinking)
+        .web_search(request.web_search);
     let claim = state
         .evaluation
-        .claim_family_for_host(
-            &request.profile_digest,
-            &request.family_key,
-            &host,
-            state.lease_duration,
-        )
+        .claim_for_host(&selector, &host, state.lease_duration)
         .map_err(ApiError::bad_gateway)?;
     let response = match claim {
         EvaluationClaim::Prepare(claim) => {
+            let treatment = claim.treatment().into();
             let lease = insert_claim(&state, HeldClaim::Preparation(claim)).await;
-            ClaimResponse::Prepare { lease }
+            ClaimResponse::Prepare { lease, treatment }
         }
         EvaluationClaim::Run(claim) => {
             let repetition = claim.repetition();
+            let treatment = claim.treatment().into();
             let lease = insert_claim(&state, HeldClaim::Coordinate(claim)).await;
-            ClaimResponse::Run { lease, repetition }
+            ClaimResponse::Run {
+                lease,
+                repetition,
+                treatment,
+            }
         }
         EvaluationClaim::Busy(busy) => ClaimResponse::Busy {
             reason: busy.reason.to_owned(),
@@ -523,10 +844,31 @@ fn spawn_reaper(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            active
-                .lock()
-                .await
-                .retain(|_, claim| claim.last_seen.elapsed() <= worker_timeout);
+            let expired = {
+                let mut active = active.lock().await;
+                let tokens = active
+                    .iter()
+                    .filter(|(_, claim)| claim.last_seen.elapsed() > worker_timeout)
+                    .map(|(token, _)| token.clone())
+                    .collect::<Vec<_>>();
+                tokens
+                    .into_iter()
+                    .filter_map(|token| active.remove(&token))
+                    .collect::<Vec<_>>()
+            };
+            for expired in expired {
+                let result = match expired.claim {
+                    HeldClaim::Preparation(claim) => {
+                        claim.retry("coordinator worker heartbeat expired")
+                    }
+                    HeldClaim::Coordinate(claim) => {
+                        claim.retry("coordinator worker heartbeat expired")
+                    }
+                };
+                if let Err(error) = result {
+                    tracing::warn!(%error, "failed to release expired coordinator claim");
+                }
+            }
         }
     })
 }
@@ -775,6 +1117,38 @@ impl ApiError {
     }
 }
 
+impl From<&EvaluationTreatment> for WireTreatment {
+    fn from(treatment: &EvaluationTreatment) -> Self {
+        Self {
+            harness: treatment.harness.clone(),
+            model: treatment.model.as_str().to_owned(),
+            thinking: treatment.thinking.as_str().to_owned(),
+            web_search: treatment.web_search,
+        }
+    }
+}
+
+impl TryFrom<WireTreatment> for EvaluationTreatment {
+    type Error = CoordinatorError;
+
+    fn try_from(treatment: WireTreatment) -> Result<Self, Self::Error> {
+        let model = treatment
+            .model
+            .parse()
+            .map_err(|error| CoordinatorError::InvalidTreatment(format!("model: {error}")))?;
+        let thinking = treatment
+            .thinking
+            .parse()
+            .map_err(|error| CoordinatorError::InvalidTreatment(format!("thinking: {error}")))?;
+        Ok(Self {
+            harness: treatment.harness,
+            model,
+            thinking,
+            web_search: treatment.web_search,
+        })
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = Json(ErrorBody {
@@ -788,18 +1162,21 @@ impl IntoResponse for ApiError {
 mod tests {
     use std::{fs, path::Path};
 
-    use super::*;
-    use crate::{EvaluationSelector, coordinator::RemoteClaim};
+    use nanocodex_oai_api::{Model, Thinking};
 
-    fn write_task(root: &Path) {
-        let task = root.join("one");
+    use super::*;
+    use crate::{EvaluationSelector, EvaluationWork, Task, coordinator::RemoteClaim};
+
+    fn write_task(root: &Path, name: &str) {
+        let task = root.join(name);
         fs::create_dir_all(task.join("environment")).unwrap();
         fs::create_dir_all(task.join("tests")).unwrap();
         fs::write(
             task.join("task.toml"),
-            r#"schema_version = "1.1"
+            format!(
+                r#"schema_version = "1.1"
 [task]
-name = "one"
+name = "{name}"
 description = "test"
 [agent]
 timeout_sec = 1.0
@@ -813,6 +1190,8 @@ storage_mb = 128
 gpus = 0
 allow_internet = false
 "#,
+                name = name
+            ),
         )
         .unwrap();
         fs::write(task.join("instruction.md"), "do it").unwrap();
@@ -823,39 +1202,34 @@ allow_internet = false
     async fn fixture() -> (
         tempfile::TempDir,
         CoordinatorClient,
-        EvaluationSelection,
+        EvaluationSelector,
         JoinHandle<()>,
     ) {
-        fixture_with_policy(Duration::from_secs(30), Duration::from_secs(5)).await
+        fixture_with_policy(Duration::from_secs(30), Duration::from_secs(5), 2).await
     }
 
     async fn fixture_with_policy(
         lease_duration: Duration,
         worker_timeout: Duration,
+        trials: u16,
     ) -> (
         tempfile::TempDir,
         CoordinatorClient,
-        EvaluationSelection,
+        EvaluationSelector,
         JoinHandle<()>,
     ) {
         let directory = tempfile::tempdir().unwrap();
-        write_task(directory.path());
-        let config = directory.path().join("nanocodex.toml");
-        fs::write(
-            &config,
-            r#"[profiles.release]
-tasks = ["one"]
-trials = 2
-model = ["sol"]
-thinking = ["high"]
-"#,
-        )
-        .unwrap();
-        let evaluation =
-            Evaluation::open(&config, Some("release"), directory.path().join("state")).unwrap();
-        let selection =
-            EvaluationSelection::load(&config, Some("release"), &EvaluationSelector::new("one"))
-                .unwrap();
+        write_task(directory.path(), "one");
+        let state = directory.path().join("state");
+        let task = Task::load(directory.path().join("one")).unwrap();
+        let work = EvaluationWork::new("one", task)
+            .model(Model::Sol)
+            .thinking(Thinking::High)
+            .trials(trials);
+        Evaluation::add(&state, "release", &[work], false).unwrap();
+        let missing_profile = directory.path().join("profile-is-not-required.toml");
+        let evaluation = Evaluation::open(missing_profile, "release", state).unwrap();
+        let selection = EvaluationSelector::new("one");
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -871,10 +1245,224 @@ thinking = ["high"]
     }
 
     #[tokio::test]
+    async fn running_coordinator_reads_appends_and_new_generations_from_sqlite() {
+        let (directory, client, _selection, server) = fixture().await;
+        let state = directory.path().join("state");
+        write_task(directory.path(), "two");
+        let two = Task::load(directory.path().join("two")).unwrap();
+        Evaluation::add(
+            &state,
+            "release",
+            &[EvaluationWork::new("two", two)
+                .model(Model::Sol)
+                .thinking(Thinking::High)],
+            false,
+        )
+        .unwrap();
+
+        let appended = client.status().await.unwrap();
+        assert_eq!(appended["coordinates"]["pending"], 3);
+        assert_eq!(appended["families"].as_array().unwrap().len(), 2);
+        let two = EvaluationSelector::new("two");
+        let RemoteClaim::Prepare { lease, .. } = client.claim(&two).await.unwrap() else {
+            panic!("the running coordinator must claim newly appended work");
+        };
+        client.prepared(&lease).await.unwrap();
+        let RemoteClaim::Run { lease, .. } = client.claim(&two).await.unwrap() else {
+            panic!("the appended task must become runnable");
+        };
+        client.retry(&lease, "test cleanup").await.unwrap();
+
+        let previous_generation = appended["generation"].as_str().unwrap().to_owned();
+        let one = Task::load(directory.path().join("one")).unwrap();
+        Evaluation::add(
+            &state,
+            "release",
+            &[EvaluationWork::new("one", one)
+                .model(Model::Sol)
+                .thinking(Thinking::High)
+                .trials(3)],
+            true,
+        )
+        .unwrap();
+
+        let replaced = client.status().await.unwrap();
+        assert_ne!(replaced["generation"], previous_generation);
+        assert_eq!(replaced["coordinates"]["pending"], 3);
+        assert_eq!(replaced["families"].as_array().unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn coordinator_add_route_appends_and_replaces_work_without_restart() {
+        let (directory, client, _selection, server) = fixture().await;
+        write_task(directory.path(), "two");
+        let two = directory.path().join("two");
+        let initial = client.status().await.unwrap();
+        let initial_generation = initial["generation"].as_str().unwrap().to_owned();
+
+        let appended = client
+            .add(&CoordinatorAddRequest {
+                profile: "release".to_owned(),
+                tasks: vec![two.to_string_lossy().into_owned()],
+                models: vec!["sol".to_owned()],
+                thinking: vec!["high".to_owned()],
+                trials: Some(3),
+                recipe: None,
+                harnesses: Vec::new(),
+                web_search: false,
+                new_generation: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(appended["generation"], initial_generation);
+        assert_eq!(appended["coordinates"]["pending"], 5);
+        assert_eq!(appended["families"].as_array().unwrap().len(), 2);
+
+        let selector = EvaluationSelector::new(two.to_string_lossy());
+        let RemoteClaim::Prepare { lease, .. } = client.claim(&selector).await.unwrap() else {
+            panic!("remotely appended work must be claimable immediately");
+        };
+        client.prepared(&lease).await.unwrap();
+        let RemoteClaim::Run { lease, .. } = client.claim(&selector).await.unwrap() else {
+            panic!("remotely appended work must become runnable");
+        };
+        client.retry(&lease, "test cleanup").await.unwrap();
+
+        let one = directory.path().join("one");
+        let replaced = client
+            .add(&CoordinatorAddRequest {
+                profile: "release".to_owned(),
+                tasks: vec![one.to_string_lossy().into_owned()],
+                models: vec!["sol".to_owned()],
+                thinking: vec!["high".to_owned()],
+                trials: Some(4),
+                new_generation: true,
+                recipe: None,
+                harnesses: Vec::new(),
+                web_search: false,
+            })
+            .await
+            .unwrap();
+        assert_ne!(replaced["generation"], initial_generation);
+        assert_eq!(replaced["coordinates"]["pending"], 4);
+        assert_eq!(replaced["families"].as_array().unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn coordinator_add_route_rejects_ambiguous_or_invalid_work() {
+        let (_directory, client, _selection, server) = fixture().await;
+        for request in [
+            CoordinatorAddRequest {
+                profile: "release".to_owned(),
+                tasks: vec!["relative/task".to_owned()],
+                recipe: None,
+                harnesses: Vec::new(),
+                models: Vec::new(),
+                thinking: Vec::new(),
+                trials: None,
+                web_search: false,
+                new_generation: false,
+            },
+            CoordinatorAddRequest {
+                profile: "release".to_owned(),
+                recipe: Some("release".to_owned()),
+                tasks: vec!["/srv/task".to_owned()],
+                harnesses: Vec::new(),
+                models: Vec::new(),
+                thinking: Vec::new(),
+                trials: None,
+                web_search: false,
+                new_generation: false,
+            },
+            CoordinatorAddRequest {
+                profile: "release".to_owned(),
+                tasks: vec!["/srv/task".to_owned()],
+                trials: Some(0),
+                recipe: None,
+                harnesses: Vec::new(),
+                models: Vec::new(),
+                thinking: Vec::new(),
+                web_search: false,
+                new_generation: false,
+            },
+        ] {
+            assert!(matches!(
+                client.add(&request).await,
+                Err(CoordinatorError::Rejected {
+                    status: StatusCode::BAD_REQUEST,
+                    ..
+                })
+            ));
+        }
+        assert!(matches!(
+            client
+                .add(&CoordinatorAddRequest {
+                    profile: "another-profile".to_owned(),
+                    recipe: None,
+                    tasks: vec!["/srv/task".to_owned()],
+                    harnesses: Vec::new(),
+                    models: Vec::new(),
+                    thinking: Vec::new(),
+                    trials: None,
+                    web_search: false,
+                    new_generation: false,
+                })
+                .await,
+            Err(CoordinatorError::Rejected {
+                status: StatusCode::BAD_REQUEST,
+                ..
+            })
+        ));
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_workers_claim_every_repetition_exactly_once() {
+        const TRIALS: u16 = 32;
+        let (_directory, client, selection, server) =
+            fixture_with_policy(Duration::from_secs(30), Duration::from_secs(5), TRIALS).await;
+        let client = client.worker("saturated-host");
+        let RemoteClaim::Prepare { lease, .. } = client.claim(&selection).await.unwrap() else {
+            panic!("first claim should prepare the task");
+        };
+        client.prepared(&lease).await.unwrap();
+
+        let claims = futures_util::future::join_all((0..TRIALS).map(|_| {
+            let client = client.clone();
+            let selection = selection.clone();
+            async move { client.claim(&selection).await }
+        }))
+        .await;
+        let mut repetitions = Vec::with_capacity(usize::from(TRIALS));
+        let mut leases = Vec::with_capacity(usize::from(TRIALS));
+        for claim in claims {
+            let RemoteClaim::Run {
+                lease, repetition, ..
+            } = claim.unwrap()
+            else {
+                panic!("every available repetition should be claimed");
+            };
+            repetitions.push(repetition);
+            leases.push(lease);
+        }
+        repetitions.sort_unstable();
+        assert_eq!(repetitions, (1..=TRIALS).collect::<Vec<_>>());
+        for lease in leases {
+            client.retry(&lease, "test cleanup").await.unwrap();
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn workers_prepare_claim_upload_and_converge_through_the_coordinator() {
         let (directory, client, selection, server) = fixture().await;
         let client = client.worker("worker-one");
-        let RemoteClaim::Prepare(preparation) = client.claim(&selection).await.unwrap() else {
+        let RemoteClaim::Prepare {
+            lease: preparation, ..
+        } = client.claim(&selection).await.unwrap()
+        else {
             panic!("first worker should prepare");
         };
         client.heartbeat(&preparation).await.unwrap();
@@ -884,6 +1472,7 @@ thinking = ["high"]
         let RemoteClaim::Run {
             lease: first_lease,
             repetition: first_repetition,
+            ..
         } = first.unwrap()
         else {
             panic!("first worker should run");
@@ -891,6 +1480,7 @@ thinking = ["high"]
         let RemoteClaim::Run {
             lease: second_lease,
             repetition: second_repetition,
+            ..
         } = second.unwrap()
         else {
             panic!("second worker should run");
@@ -908,7 +1498,8 @@ thinking = ["high"]
             fs::write(&evidence, format!("{{\"worker\":\"{name}\"}}\n")).unwrap();
             fs::write(
                 output.join("events.jsonl"),
-                format!("{{\"worker\":\"{name}\"}}\n"),
+                "{\"type\":\"attempt_started\",\"payload\":{\"prompt\":\"do it\"},\"attempt\":{\"task_name\":\"one\"}}\n\
+                 {\"type\":\"completed\",\"payload\":{\"task_name\":\"one\",\"status\":\"passed\",\"outcome\":\"passed\",\"environment\":\"micro_vm\",\"agent\":{\"model\":\"sol\",\"effort\":\"high\",\"tool_calls\":1,\"usage\":{\"total_tokens\":10}},\"verifier\":{\"exit_code\":0,\"rewards\":{\"reward\":1}}}}\n",
             )
             .unwrap();
             fs::write(
@@ -928,6 +1519,91 @@ thinking = ["high"]
         assert_eq!(status["coordinates"]["complete"], 2);
         assert_eq!(status["coordinates"]["pending"], 0);
         assert_eq!(status["families"][0]["assigned_host"], "worker-one");
+        let overview: serde_json::Value = decode(
+            client
+                .http
+                .get(client.endpoint("v1/evals").unwrap())
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(overview["worksets"][0]["summary"]["completed"], 2);
+        assert_eq!(overview["worksets"][0]["taskCount"], 1);
+        let digest = overview["worksets"][0]["id"].as_str().unwrap();
+        let workset: serde_json::Value = decode(
+            client
+                .http
+                .get(
+                    client
+                        .endpoint(&format!("v1/evals/worksets/{digest}"))
+                        .unwrap(),
+                )
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(workset["tasks"][0]["summary"]["completed"], 2);
+        let task_id = workset["tasks"][0]["id"].as_str().unwrap();
+        let task: serde_json::Value = decode(
+            client
+                .http
+                .get(
+                    client
+                        .endpoint(&format!("v1/evals/worksets/{digest}/tasks/{task_id}"))
+                        .unwrap(),
+                )
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            task["task"]["treatments"][0]["cells"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(task["task"]["treatments"][0]["cells"][0]["status"].is_null());
+        let outcomes: serde_json::Value = decode(
+            client
+                .http
+                .get(
+                    client
+                        .endpoint(&format!(
+                            "v1/evals/worksets/{digest}/tasks/{task_id}/outcomes?limit=1"
+                        ))
+                        .unwrap(),
+                )
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcomes["total"], 2);
+        assert_eq!(outcomes["outcomes"][0]["status"], "passed");
+        assert_eq!(outcomes["nextCursor"], 1);
+        let case = task["task"]["treatments"][0]["cells"][0]["detailId"]
+            .as_str()
+            .unwrap();
+        let detail: serde_json::Value = decode(
+            client
+                .http
+                .get(client.endpoint(&format!("v1/evals/cases/{case}")).unwrap())
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(detail["status"], "passed");
+        assert_eq!(detail["prompt"], "do it");
         let artifacts = directory.path().join("state/artifacts");
         assert_eq!(count_named_files(&artifacts, "events.jsonl"), 2);
         assert_eq!(count_named_files(&artifacts, "trajectory.json"), 2);
@@ -976,8 +1652,11 @@ thinking = ["high"]
     #[tokio::test]
     async fn unreachable_worker_is_reclaimed_and_its_stale_token_is_fenced() {
         let (_directory, client, selection, server) =
-            fixture_with_policy(Duration::from_millis(80), Duration::from_millis(20)).await;
-        let RemoteClaim::Prepare(preparation) = client.claim(&selection).await.unwrap() else {
+            fixture_with_policy(Duration::from_secs(30), Duration::from_millis(20), 2).await;
+        let RemoteClaim::Prepare {
+            lease: preparation, ..
+        } = client.claim(&selection).await.unwrap()
+        else {
             panic!("first worker should prepare");
         };
         client.prepared(&preparation).await.unwrap();
@@ -985,6 +1664,7 @@ thinking = ["high"]
         let RemoteClaim::Run {
             lease: stale,
             repetition,
+            ..
         } = client.claim(&selection).await.unwrap()
         else {
             panic!("first worker should run");
@@ -994,6 +1674,7 @@ thinking = ["high"]
         let RemoteClaim::Run {
             lease: replacement,
             repetition: replacement_repetition,
+            ..
         } = client.claim(&selection).await.unwrap()
         else {
             panic!("expired work should be reclaimed");

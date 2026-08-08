@@ -2785,8 +2785,14 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
         if argument.is_some_and(|argument| argument.split_whitespace().count() != 1) {
             return Submission::InvalidCommand("Usage: /benchmark [profile]".to_owned());
         }
-        let instruction =
-            crate::benchmark::prompt(argument, std::path::Path::new("nanocodex.toml"), None, None);
+        let instruction = crate::benchmark::prompt(
+            argument,
+            std::path::Path::new("nanocodex.toml"),
+            None,
+            None,
+            None,
+            None,
+        );
         input.set_display(display);
         input.set_instruction(instruction);
         return Submission::Prompt(input);
