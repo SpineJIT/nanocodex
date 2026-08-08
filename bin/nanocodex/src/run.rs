@@ -103,7 +103,13 @@ async fn complete_turn(
             WorkerEvent::TurnTraceRejected { .. } => {}
             WorkerEvent::TurnFinished {
                 error: Some(error), ..
-            } => return Err(eyre!(error)),
+            } => {
+                let result = Err(eyre!(error));
+                if terminal_emitted || root_event_stream_closed {
+                    return result;
+                }
+                finished = Some(result);
+            }
             WorkerEvent::TurnFinished { error: None, .. } => {
                 if terminal_emitted {
                     return Ok(());
@@ -118,17 +124,24 @@ async fn complete_turn(
             WorkerEvent::RootEventStreamClosed => {
                 root_event_stream_closed = true;
                 if let Some(result) = finished {
-                    result?;
-                    return Err(eyre!(
-                        "root event stream closed before the turn emitted a terminal event"
-                    ));
+                    return match result {
+                        Ok(()) => Err(eyre!(
+                            "root event stream closed before the turn emitted a terminal event"
+                        )),
+                        Err(error) => Err(error),
+                    };
                 }
             }
             _ => {}
         }
     }
     if let Some(result) = finished {
-        return result;
+        return match result {
+            Ok(()) => Err(eyre!(
+                "application worker stopped before the turn emitted a terminal event"
+            )),
+            Err(error) => Err(error),
+        };
     }
     Err(eyre!("application worker stopped before the turn finished"))
 }
@@ -233,6 +246,42 @@ mod tests {
         assert_eq!(
             String::from_utf8(output)?,
             "{\"protocol_version\":1,\"request_id\":\"session\",\"seq\":1,\"type\":\"run.completed\",\"payload\":{\"status\":\"ok\"}}\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writes_terminal_failure_before_returning_worker_error() -> Result<()> {
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        updates.send(WorkerEvent::root_turn_finished(Some(
+            "worker failed".to_owned(),
+        )))?;
+        updates.send(WorkerEvent::RootAgentEvent {
+            event: TimedAgentEvent {
+                event: AgentEvent {
+                    protocol_version: 1,
+                    request_id: Arc::from("session"),
+                    seq: 1,
+                    kind: AgentEventKind::RunFailed,
+                    payload: RawValue::from_string(r#"{"error":"worker failed"}"#.to_owned())?
+                        .into(),
+                },
+                timing: AgentEventTiming {
+                    emitted_ns: 1,
+                    source_received_ns: Some(1),
+                },
+            },
+        })?;
+        let mut output = Vec::new();
+
+        let error = complete_turn(&mut update_rx, &mut output)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "worker failed");
+        assert_eq!(
+            String::from_utf8(output)?,
+            "{\"protocol_version\":1,\"request_id\":\"session\",\"seq\":1,\"type\":\"run.failed\",\"payload\":{\"error\":\"worker failed\"}}\n"
         );
         Ok(())
     }

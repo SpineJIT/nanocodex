@@ -54,7 +54,7 @@ use self::{
     transcript::TranscriptItem,
 };
 use crate::{
-    app_core::{StandardWorkerFactory, WorkerCapability, WorkerFactory},
+    app_core::{StandardWorkerFactory, WorkerCapabilities, WorkerCapability, WorkerFactory},
     config::AgentArgs,
 };
 
@@ -392,6 +392,7 @@ enum UiUpdate {
 struct UiModel {
     app: App,
     root_session_id: Arc<str>,
+    capabilities: WorkerCapabilities,
     worker_updates_open: bool,
     voice_observing: bool,
     terminal_focused: bool,
@@ -438,10 +439,20 @@ impl MouseScrollBurst {
 }
 
 impl UiModel {
+    #[cfg(test)]
     const fn new(app: App, root_session_id: Arc<str>) -> Self {
+        Self::with_capabilities(app, root_session_id, WorkerCapabilities::standard())
+    }
+
+    const fn with_capabilities(
+        app: App,
+        root_session_id: Arc<str>,
+        capabilities: WorkerCapabilities,
+    ) -> Self {
         Self {
             app,
             root_session_id,
+            capabilities,
             worker_updates_open: true,
             voice_observing: false,
             terminal_focused: true,
@@ -506,8 +517,13 @@ impl UiModel {
                     }
                     _ => {}
                 }
-                match handle_terminal_event(event, &mut self.app, &self.root_session_id, commands)?
-                {
+                match handle_terminal_event(
+                    event,
+                    &mut self.app,
+                    &self.root_session_id,
+                    self.capabilities,
+                    commands,
+                )? {
                     TerminalAction::Redraw => Ok(UiUpdate::Redraw(RedrawPriority::Immediate)),
                     TerminalAction::Ignore => Ok(UiUpdate::Ignore),
                     TerminalAction::Quit => Ok(UiUpdate::Quit),
@@ -519,7 +535,7 @@ impl UiModel {
                     drop(commands.send(WorkerCommand::VoiceAgentEvent(event.clone())));
                 }
                 let updated = self.app.on_main_agent_event(0, &event);
-                request_navigated_branch_switch(&mut self.app, commands)?;
+                request_navigated_branch_switch(&mut self.app, self.capabilities, commands)?;
                 if updated {
                     Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
                 } else {
@@ -560,7 +576,12 @@ impl UiModel {
                         format!("{scope} finished")
                     });
                 }
-                handle_worker_update(&mut self.app, update, commands)?;
+                handle_worker_update_with_capabilities(
+                    &mut self.app,
+                    update,
+                    self.capabilities,
+                    commands,
+                )?;
                 Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
             }
             UiAction::WorkerStopped => {
@@ -676,6 +697,7 @@ where
             "the selected application worker cannot accept prompts"
         ));
     }
+    let capabilities = worker.capabilities();
     let root_session_id = Arc::<str>::from(worker.session_id());
 
     let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
@@ -702,7 +724,7 @@ where
         .with_fast_mode(initial_fast_mode);
     app.set_math_renderer(math_renderer.clone());
     app.restore_transcript(restored_transcript);
-    let mut ui = UiModel::new(app, Arc::clone(&root_session_id));
+    let mut ui = UiModel::with_capabilities(app, Arc::clone(&root_session_id), capabilities);
     let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
     let mut stream_telemetry = StreamTelemetry::default();
     let mut view_telemetry = ViewTelemetry::new(Arc::clone(&root_session_id));
@@ -714,7 +736,13 @@ where
         let update_rx = worker.events_mut();
 
         async {
-            submit_initial_prompt(&mut ui.app, &root_session_id, &worker_tx, initial_prompt)?;
+            submit_initial_prompt(
+                &mut ui.app,
+                &root_session_id,
+                capabilities,
+                &worker_tx,
+                initial_prompt,
+            )?;
             loop {
             view_telemetry.observe(&ui.app);
             render_due_frame(
@@ -974,6 +1002,7 @@ fn handle_worker_telemetry(update: &WorkerEvent, telemetry: &mut StreamTelemetry
 fn submit_initial_prompt(
     app: &mut App,
     root_session_id: &str,
+    capabilities: WorkerCapabilities,
     worker: &mpsc::UnboundedSender<WorkerCommand>,
     initial_prompt: Option<InitialPrompt>,
 ) -> Result<()> {
@@ -999,7 +1028,13 @@ fn submit_initial_prompt(
             }
             return Ok(());
         }
-        submit(app, root_session_id, worker, SubmitIntent::Immediate)?;
+        submit(
+            app,
+            root_session_id,
+            capabilities,
+            worker,
+            SubmitIntent::Immediate,
+        )?;
     }
     Ok(())
 }
@@ -1018,9 +1053,19 @@ fn apply_update(update: UiUpdate, scheduler: &mut RenderScheduler) -> bool {
     false
 }
 
+#[cfg(test)]
 fn handle_worker_update(
     app: &mut App,
     update: WorkerEvent,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<()> {
+    handle_worker_update_with_capabilities(app, update, WorkerCapabilities::standard(), commands)
+}
+
+fn handle_worker_update_with_capabilities(
+    app: &mut App,
+    update: WorkerEvent,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<()> {
     match update {
@@ -1033,7 +1078,7 @@ fn handle_worker_update(
             error,
         } => {
             app.turn_finished(target, main_branch_id, error);
-            request_navigated_branch_switch(app, commands)?;
+            request_navigated_branch_switch(app, capabilities, commands)?;
         }
         WorkerEvent::TurnTraceStarted { .. } | WorkerEvent::TurnTraceRejected { .. } => {}
         WorkerEvent::SteerAdmitted { target, id } => app.steer_admitted(target, id),
@@ -1090,14 +1135,14 @@ fn handle_worker_update(
         }
         WorkerEvent::MainBranchSwitched { id, request_id } => {
             app.main_branch_switched(id, request_id);
-            request_navigated_branch_switch(app, commands)?;
+            request_navigated_branch_switch(app, capabilities, commands)?;
         }
         WorkerEvent::MainBranchSwitchFailed { id, error } => {
             app.main_branch_switch_failed(id, &error);
         }
         WorkerEvent::MainBranchAgentEvent { id, event } => {
             let _ = app.on_main_agent_event(id, &event.event);
-            request_navigated_branch_switch(app, commands)?;
+            request_navigated_branch_switch(app, capabilities, commands)?;
         }
         WorkerEvent::MainBranchEventStreamClosed { id } => {
             app.main_branch_event_stream_closed(id);
@@ -2231,12 +2276,13 @@ fn handle_terminal_event(
     event: Event,
     app: &mut App,
     root_session_id: &str,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<TerminalAction> {
     match event {
         Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
             let _ = app.clear_mouse_selection();
-            handle_key(key, app, root_session_id, commands)
+            handle_key_with_capabilities(key, app, root_session_id, capabilities, commands)
         }
         Event::Paste(text) => {
             let _ = app.clear_mouse_selection();
@@ -2288,10 +2334,27 @@ fn handle_terminal_event(
     }
 }
 
+#[cfg(test)]
 fn handle_key(
     key: KeyEvent,
     app: &mut App,
     root_session_id: &str,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<TerminalAction> {
+    handle_key_with_capabilities(
+        key,
+        app,
+        root_session_id,
+        WorkerCapabilities::standard(),
+        commands,
+    )
+}
+
+fn handle_key_with_capabilities(
+    key: KeyEvent,
+    app: &mut App,
+    root_session_id: &str,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<TerminalAction> {
     if matches!(key.code, KeyCode::Char('v' | 'V'))
@@ -2307,19 +2370,19 @@ fn handle_key(
         return Ok(action);
     }
 
-    if let Some(action) = handle_inline_historical_editor_key(key, app, commands)? {
+    if let Some(action) = handle_inline_historical_editor_key(key, app, capabilities, commands)? {
         return Ok(action);
     }
 
-    if let Some(action) = handle_global_navigation_key(key, app, commands)? {
+    if let Some(action) = handle_global_navigation_key(key, app, capabilities, commands)? {
         return Ok(action);
     }
 
-    if let Some(action) = handle_branch_navigator_key(key, app, commands)? {
+    if let Some(action) = handle_branch_navigator_key(key, app, capabilities, commands)? {
         return Ok(action);
     }
 
-    if let Some(action) = handle_transcript_selection_key(key, app) {
+    if let Some(action) = handle_transcript_selection_key(key, app, capabilities) {
         return Ok(action);
     }
 
@@ -2369,7 +2432,13 @@ fn handle_key(
         {
             app.insert_char('\n');
         }
-        KeyCode::Enter => submit(app, root_session_id, commands, SubmitIntent::Immediate)?,
+        KeyCode::Enter => submit(
+            app,
+            root_session_id,
+            capabilities,
+            commands,
+            SubmitIntent::Immediate,
+        )?,
         KeyCode::Char(character) => app.insert_char(character),
         KeyCode::Backspace => app.backspace(),
         KeyCode::Delete => app.delete(),
@@ -2382,9 +2451,15 @@ fn handle_key(
         KeyCode::PageUp => app.scroll_up(12),
         KeyCode::PageDown => app.scroll_down(12),
         KeyCode::Esc if key.kind == KeyEventKind::Repeat => {}
-        KeyCode::Esc => handle_escape_key(app, commands)?,
+        KeyCode::Esc => handle_escape_key(app, capabilities, commands)?,
         KeyCode::Tab if app.has_input() => {
-            submit(app, root_session_id, commands, SubmitIntent::Queue)?;
+            submit(
+                app,
+                root_session_id,
+                capabilities,
+                commands,
+                SubmitIntent::Queue,
+            )?;
         }
         KeyCode::Tab | KeyCode::BackTab => app.toggle_focus(),
         KeyCode::Insert
@@ -2432,9 +2507,23 @@ fn handle_reasoning_picker_key(
     Ok(Some(TerminalAction::Redraw))
 }
 
-fn handle_escape_key(app: &mut App, commands: &mpsc::UnboundedSender<WorkerCommand>) -> Result<()> {
+fn handle_escape_key(
+    app: &mut App,
+    capabilities: WorkerCapabilities,
+    commands: &mpsc::UnboundedSender<WorkerCommand>,
+) -> Result<()> {
+    let target = app.focus;
+    if app.is_running(target)
+        && app.pending_steers(target)
+        && !require_worker_capability(app, capabilities, WorkerCapability::Steer)
+    {
+        return Ok(());
+    }
     match app.handle_escape(Instant::now()) {
         Some(EscapeAction::Cancel(target)) => {
+            if !require_worker_capability(app, capabilities, WorkerCapability::Cancel) {
+                return Ok(());
+            }
             app.cancel_pending(target);
             send_command(commands, WorkerCommand::Cancel { target })?;
         }
@@ -2478,6 +2567,7 @@ fn paste_clipboard_image(
 fn handle_global_navigation_key(
     key: KeyEvent,
     app: &mut App,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<Option<TerminalAction>> {
     if !key
@@ -2487,6 +2577,9 @@ fn handle_global_navigation_key(
         return Ok(None);
     }
     if matches!(key.code, KeyCode::Char('b')) {
+        if !require_worker_capability(app, capabilities, WorkerCapability::MainBranchSwitch) {
+            return Ok(Some(TerminalAction::Redraw));
+        }
         let _ = app.toggle_branch_navigator();
         return Ok(Some(TerminalAction::Redraw));
     }
@@ -2498,6 +2591,9 @@ fn handle_global_navigation_key(
     let Some(direction) = direction else {
         return Ok(None);
     };
+    if !require_worker_capability(app, capabilities, WorkerCapability::MainBranchSwitch) {
+        return Ok(Some(TerminalAction::Redraw));
+    }
     if let Some(id) = app.cycle_main_branch(direction) {
         send_command(commands, WorkerCommand::SwitchMainBranch { id })?;
     }
@@ -2507,6 +2603,7 @@ fn handle_global_navigation_key(
 fn handle_branch_navigator_key(
     key: KeyEvent,
     app: &mut App,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<Option<TerminalAction>> {
     if !app.branch_navigator_active() {
@@ -2518,14 +2615,22 @@ fn handle_branch_navigator_key(
     if key.modifiers.is_empty() {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
+                if !require_worker_capability(app, capabilities, WorkerCapability::MainBranchSwitch)
+                {
+                    return Ok(Some(TerminalAction::Redraw));
+                }
                 app.move_branch_navigator(-1);
-                request_navigated_branch_switch(app, commands)?;
+                request_navigated_branch_switch(app, capabilities, commands)?;
             }
             KeyCode::Down | KeyCode::Char('j') => {
+                if !require_worker_capability(app, capabilities, WorkerCapability::MainBranchSwitch)
+                {
+                    return Ok(Some(TerminalAction::Redraw));
+                }
                 app.move_branch_navigator(1);
-                request_navigated_branch_switch(app, commands)?;
+                request_navigated_branch_switch(app, capabilities, commands)?;
             }
-            KeyCode::Enter => request_navigated_branch_switch(app, commands)?,
+            KeyCode::Enter => request_navigated_branch_switch(app, capabilities, commands)?,
             KeyCode::Esc | KeyCode::Char('q') => app.close_branch_navigator(),
             _ => {}
         }
@@ -2535,15 +2640,26 @@ fn handle_branch_navigator_key(
 
 fn request_navigated_branch_switch(
     app: &mut App,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<()> {
+    if !app.branch_navigator_active() {
+        return Ok(());
+    }
+    if !require_worker_capability(app, capabilities, WorkerCapability::MainBranchSwitch) {
+        return Ok(());
+    }
     if let Some(id) = app.switch_to_navigated_branch() {
         send_command(commands, WorkerCommand::SwitchMainBranch { id })?;
     }
     Ok(())
 }
 
-fn handle_transcript_selection_key(key: KeyEvent, app: &mut App) -> Option<TerminalAction> {
+fn handle_transcript_selection_key(
+    key: KeyEvent,
+    app: &mut App,
+    capabilities: WorkerCapabilities,
+) -> Option<TerminalAction> {
     if !app.transcript_selection_active() {
         return None;
     }
@@ -2559,6 +2675,9 @@ fn handle_transcript_selection_key(key: KeyEvent, app: &mut App) -> Option<Termi
             KeyCode::Up => app.move_up(),
             KeyCode::Down => app.move_down(),
             KeyCode::Char('e') => {
+                if !require_worker_capability(app, capabilities, WorkerCapability::HistoricalEdit) {
+                    return Some(TerminalAction::Redraw);
+                }
                 let _ = app.start_historical_edit();
             }
             KeyCode::Esc => app.dismiss_transcript_selection(),
@@ -2570,8 +2689,12 @@ fn handle_transcript_selection_key(key: KeyEvent, app: &mut App) -> Option<Termi
 
 fn request_historical_edit(
     app: &mut App,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<()> {
+    if !require_worker_capability(app, capabilities, WorkerCapability::HistoricalEdit) {
+        return Ok(());
+    }
     let cancel_source = app.main.running || app.main.pending_turns > 0;
     let Some(request) = app.commit_historical_edit() else {
         return Ok(());
@@ -2592,6 +2715,7 @@ fn request_historical_edit(
 fn handle_inline_historical_editor_key(
     key: KeyEvent,
     app: &mut App,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<Option<TerminalAction>> {
     if !app.historical_editor_active() {
@@ -2632,7 +2756,7 @@ fn handle_inline_historical_editor_key(
 
     match key.code {
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => app.insert_char('\n'),
-        KeyCode::Enter => request_historical_edit(app, commands)?,
+        KeyCode::Enter => request_historical_edit(app, capabilities, commands)?,
         KeyCode::Char(character) => app.insert_char(character),
         KeyCode::Backspace => app.backspace(),
         KeyCode::Delete => app.delete(),
@@ -2682,9 +2806,16 @@ async fn run_external_editor(
 fn submit(
     app: &mut App,
     root_session_id: &str,
+    capabilities: WorkerCapabilities,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
     intent: SubmitIntent,
 ) -> Result<()> {
+    let capability = submission_capability(app, intent);
+    if let Some(capability) = capability
+        && !require_worker_capability(app, capabilities, capability)
+    {
+        return Ok(());
+    }
     let Some(input) = app.take_submission() else {
         return Ok(());
     };
@@ -2788,6 +2919,53 @@ fn send_command(
     commands
         .send(command)
         .map_err(|_| eyre::eyre!("agent worker stopped"))
+}
+
+fn submission_capability(app: &App, intent: SubmitIntent) -> Option<WorkerCapability> {
+    match classify_submission(SubmittedPrompt::text(app.input.clone())) {
+        Submission::Btw(_) | Submission::CloseBtw => Some(WorkerCapability::Btw),
+        Submission::Cancel => Some(WorkerCapability::Cancel),
+        Submission::Prompt(_)
+            if matches!(intent, SubmitIntent::Immediate) && app.is_running(app.focus) =>
+        {
+            Some(WorkerCapability::Steer)
+        }
+        Submission::Prompt(_) => Some(WorkerCapability::Prompt),
+        Submission::Trace
+        | Submission::Fast(_)
+        | Submission::ReasoningPicker
+        | Submission::Voice(_)
+        | Submission::McpLogin(_)
+        | Submission::McpReload(_)
+        | Submission::InvalidCommand(_) => None,
+    }
+}
+
+fn require_worker_capability(
+    app: &mut App,
+    capabilities: WorkerCapabilities,
+    capability: WorkerCapability,
+) -> bool {
+    if capabilities.supports(capability) {
+        return true;
+    }
+    app.push_active_error(format!(
+        "The selected worker does not support {}.",
+        worker_capability_label(capability)
+    ));
+    false
+}
+
+const fn worker_capability_label(capability: WorkerCapability) -> &'static str {
+    match capability {
+        WorkerCapability::Prompt => "new prompts",
+        WorkerCapability::Steer => "steering active turns",
+        WorkerCapability::Cancel => "cancelling active turns",
+        WorkerCapability::Btw => "BTW forks",
+        WorkerCapability::Resume => "session resume",
+        WorkerCapability::HistoricalEdit => "historical edits",
+        WorkerCapability::MainBranchSwitch => "main-branch switching",
+    }
 }
 
 fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
@@ -3105,6 +3283,34 @@ mod tests {
             classify_submission("/modeling"),
             Submission::Prompt("/modeling".into())
         );
+    }
+
+    #[test]
+    fn prompt_only_workers_reject_btw_before_creating_a_pane() {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let app = App::new("/workspace".into());
+        let mut ui = UiModel::with_capabilities(
+            app,
+            Arc::from("main-session"),
+            crate::app_core::WorkerCapabilities::empty()
+                .with(crate::app_core::WorkerCapability::Prompt),
+        );
+        ui.app.input = "/btw inspect the cache".to_owned();
+        ui.app.cursor = ui.app.input.len();
+
+        let update = ui
+            .update(
+                UiAction::Terminal(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                ))),
+                &commands,
+            )
+            .unwrap();
+
+        assert_eq!(update, UiUpdate::Redraw(RedrawPriority::Immediate));
+        assert!(worker.try_recv().is_err());
+        assert!(ui.app.btw_id().is_none());
     }
 
     #[test]

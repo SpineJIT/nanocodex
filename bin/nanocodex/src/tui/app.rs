@@ -2326,6 +2326,11 @@ impl App {
             .is_some_and(|conversation| conversation.running)
     }
 
+    pub(super) fn pending_steers(&self, target: PaneId) -> bool {
+        self.conversation(target)
+            .is_some_and(|conversation| !conversation.pending_steers.is_empty())
+    }
+
     pub(super) fn has_input(&self) -> bool {
         !self.input.chars().all(char::is_whitespace)
     }
