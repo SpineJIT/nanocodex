@@ -1,5 +1,8 @@
 use std::path::Path;
 
+pub(crate) const DEFAULT_ORCHESTRATOR_POLICY: &str =
+    include_str!("../prompts/benchmark-orchestrator.md");
+
 pub(crate) fn prompt(
     profile: Option<&str>,
     config: &Path,
@@ -7,6 +10,7 @@ pub(crate) fn prompt(
     coordinator: Option<&str>,
     worker: Option<&str>,
     executable: Option<&Path>,
+    orchestration_policy: &str,
 ) -> String {
     let selected = profile.unwrap_or("the selected SQLite profile");
     let profile_argument =
@@ -37,16 +41,19 @@ This is an operations loop, not a software-development task. Do not inspect repo
 
 The desired amount of work is already materialized in {ledger}. Do not infer it from `{config}` or add ad-hoc work during this workflow. Inspect the durable ledger with:
 
-    {executable} eval status{profile_argument}{state_argument}{coordinator_argument} --json --family-limit 32
+    {executable} eval status{profile_argument}{state_argument}{coordinator_argument} --json --family-limit 128
 
 You own task and treatment priority. Read the family records, choose exact pending task and harness treatments, and invoke one repetition with `{executable} eval run{profile_argument} --config {config_argument}{state_argument}{coordinator_argument}{worker_argument} --task <exact-profile-selector>` plus `--harness`, model, or thinking selectors required to identify that profile family. Omit `--harness` for built-in Nanocodex. The CLI atomically allocates the internal repetition; never pass or invent a trial number.
 
-Drive the host aggressively. Immediately launch 32 concurrent run processes in the first wave; do not begin with a one- or two-run probe. Keep 32 run slots occupied while pending work remains, replacing each process as soon as it exits instead of waiting for the rest of its wave. Spread the initial slots across already-prepared tasks and independent treatments so one preparation lock or failing family cannot stall the host. Reduce fan-out only after concrete host pressure such as an OOM kill, sustained swapping, or repeated VM allocation failure. A model failure, verifier failure, or one broken harness treatment is not evidence that unrelated slots should be idled.
+Orchestration policy:
+
+{orchestration_policy}
 
 Task preparation is part of each task's durable state. One run process may prepare a task while another receives a temporary-unavailable result. Retry temporary contention after its suggested delay. Retry durable infrastructure failures, but treat accepted model and verifier outcomes as terminal even when the benchmark failed.
 
 Re-read the bounded ledger whenever a slot needs replacement and periodically while long runs are active. Continue until every desired coordinate is terminal or a concrete non-retryable blocker is established. Inspect retained evidence for infrastructure failures and representative accepted results. Do not modify Nanocodex source, benchmark tasks, verifier code, or expected outputs in this workflow. Finish with exact completed/running/pending counts, evidence locations, failures, exclusions, and any remaining blocker."#,
         config = config.display(),
+        orchestration_policy = orchestration_policy.trim(),
     )
 }
 
@@ -67,15 +74,23 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_ORCHESTRATOR_POLICY,
         );
 
         assert!(prompt.contains("choose exact pending task and harness treatments"));
         assert!(prompt.contains("Omit `--harness` for built-in Nanocodex"));
-        assert!(prompt.contains("Immediately launch 32 concurrent run processes"));
-        assert!(prompt.contains("do not begin with a one- or two-run probe"));
-        assert!(prompt.contains("Keep 32 run slots occupied"));
-        assert!(prompt.contains("replacing each process as soon as it exits"));
-        assert!(prompt.contains("Reduce fan-out only after concrete host pressure"));
+        assert!(prompt.contains("Ledger `running` is the number of unexpired leases"));
+        assert!(prompt.contains("Live runs are retained"));
+        assert!(prompt.contains("4 GiB for each such outstanding live run"));
+        assert!(prompt.contains("add at most four runs at a time"));
+        assert!(prompt.contains("at least 60 seconds"));
+        assert!(prompt.contains("launch exactly zero"));
+        assert!(prompt.contains("memory_cap = floor"));
+        assert!(prompt.contains("launch count must never exceed `memory_cap`"));
+        assert!(prompt.contains("Do not use `dmesg --since`"));
+        assert!(prompt.contains("kernel journal and `/proc/vmstat`"));
+        assert!(prompt.contains("never less than the last 30 minutes"));
+        assert!(prompt.contains("direct parallel tool calls"));
         assert!(prompt.contains("never pass or invent a trial number"));
         assert!(prompt.contains("--state-dir '/mnt/evals'"));
         assert!(!prompt.contains("eval work"));
@@ -90,6 +105,7 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_ORCHESTRATOR_POLICY,
         );
 
         assert!(prompt.contains("status 'release candidate' --state-dir '/mnt/eval state'"));
@@ -105,15 +121,32 @@ mod tests {
             Some("http://127.0.0.1:8789"),
             Some("dev-georgios-01"),
             Some(Path::new("/opt/nanocodex/bin/nanocodex")),
+            DEFAULT_ORCHESTRATOR_POLICY,
         );
 
         assert!(prompt.contains("status 'release' --coordinator 'http://127.0.0.1:8789'"));
-        assert!(prompt.contains("--json --family-limit 32"));
+        assert!(prompt.contains("--json --family-limit 128"));
         assert!(prompt.contains(
             "'/opt/nanocodex/bin/nanocodex' eval run 'release' --config 'nanocodex.toml' --coordinator 'http://127.0.0.1:8789' --worker 'dev-georgios-01' --task"
         ));
         assert!(prompt.contains("do not open SQLite directly"));
         assert!(prompt.contains("not a software-development task"));
         assert!(!prompt.contains("--state-dir"));
+    }
+
+    #[test]
+    fn workflow_accepts_a_runtime_orchestration_policy() {
+        let prompt = prompt(
+            Some("release"),
+            Path::new("nanocodex.toml"),
+            None,
+            None,
+            None,
+            None,
+            "Keep exactly three observed sessions.",
+        );
+
+        assert!(prompt.contains("Orchestration policy:\n\nKeep exactly three observed sessions."));
+        assert!(!prompt.contains("add at most four runs at a time"));
     }
 }

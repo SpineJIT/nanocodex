@@ -1,7 +1,7 @@
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 use clap::{Args, builder::NonEmptyStringValueParser};
-use eyre::{Result, WrapErr as _};
+use eyre::{Result, WrapErr as _, bail};
 use nanocodex_eval::{Evaluation, EvaluationStatus, coordinator::CoordinatorClient};
 use serde::Deserialize;
 
@@ -59,6 +59,14 @@ pub(super) struct Benchmark {
     #[arg(long, value_name = "DIRECTORY", requires = "systemd")]
     runtime_dir: Option<PathBuf>,
 
+    /// Replace the embedded agent-owned scheduling policy at runtime.
+    ///
+    /// The generated ledger and command contract remains fixed. The systemd
+    /// installer resolves this path absolutely so editing the file followed by
+    /// a service restart updates policy without rebuilding Nanocodex.
+    #[arg(long, env = "NANOCODEX_BENCHMARK_PROMPT_FILE", value_name = "FILE")]
+    orchestrator_prompt_file: Option<PathBuf>,
+
     #[command(flatten)]
     agent: AgentArgs,
 
@@ -80,6 +88,7 @@ impl Benchmark {
             headless,
             systemd,
             runtime_dir,
+            orchestrator_prompt_file,
             agent,
             observability,
             vm,
@@ -91,8 +100,10 @@ impl Benchmark {
                 state_dir.as_deref(),
                 coordinator.as_deref(),
                 runtime_dir.as_deref(),
+                orchestrator_prompt_file.as_deref(),
             );
         }
+        let orchestration_policy = load_orchestration_policy(orchestrator_prompt_file.as_deref())?;
         let executable =
             std::env::current_exe().wrap_err("failed to resolve nanocodex executable")?;
         let prompt = benchmark::prompt(
@@ -102,6 +113,7 @@ impl Benchmark {
             coordinator.as_deref(),
             worker.as_deref(),
             Some(&executable),
+            &orchestration_policy,
         );
         let initial = BoardStatus::load(
             &profile,
@@ -136,6 +148,18 @@ impl Benchmark {
         .await?;
         board.require_complete(workflow.as_ref().err())
     }
+}
+
+fn load_orchestration_policy(path: Option<&std::path::Path>) -> Result<String> {
+    let policy = match path {
+        Some(path) => fs::read_to_string(path)
+            .wrap_err_with(|| format!("failed to read orchestrator prompt {}", path.display()))?,
+        None => benchmark::DEFAULT_ORCHESTRATOR_POLICY.to_owned(),
+    };
+    if policy.trim().is_empty() {
+        bail!("benchmark orchestrator prompt must not be empty");
+    }
+    Ok(policy)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -223,8 +247,26 @@ impl From<EvaluationStatus> for BoardStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::{BoardCounts, BoardStatus};
+    use super::{BoardCounts, BoardStatus, load_orchestration_policy};
     use crate::{RETRYABLE_EXIT_CODE, process_exit_code};
+
+    #[test]
+    fn orchestration_policy_uses_the_embedded_default_or_a_runtime_file() {
+        let default = load_orchestration_policy(None).unwrap();
+        assert!(default.contains("Ledger `running` is the number of unexpired leases"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let custom = directory.path().join("benchmark-policy.md");
+        std::fs::write(&custom, "Keep four useful workers.\n").unwrap();
+        assert_eq!(
+            load_orchestration_policy(Some(&custom)).unwrap(),
+            "Keep four useful workers.\n"
+        );
+
+        std::fs::write(&custom, "  \n").unwrap();
+        let error = load_orchestration_policy(Some(&custom)).unwrap_err();
+        assert!(error.to_string().contains("must not be empty"));
+    }
 
     #[test]
     fn benchmark_succeeds_only_when_the_entire_board_is_terminal() {
