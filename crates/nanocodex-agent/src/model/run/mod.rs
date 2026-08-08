@@ -62,7 +62,9 @@ use nanocodex_tools::{
     __private::model_contract as model_tool_contract,
     TerminalToolReceipt, TerminalToolReceiptError, ToolContext, ToolTurnBehavior, Tools,
     code_mode::{CodeModeExecution, CodeModeObserver, CodeModeUpdate},
-    contract::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolInput, ToolOutput, ToolOutputBody},
+    contract::{
+        DEFAULT_TOOL_OUTPUT_TOKENS, ToolInput, ToolOutput, ToolOutputBody, ToolOutputContent,
+    },
     image::{prepare_output_images, prepare_user_input},
     runtime::{
         ImageGenerationConfig, OwnedToolContext, ToolRuntime, ToolRuntimeControl, WebSearchConfig,

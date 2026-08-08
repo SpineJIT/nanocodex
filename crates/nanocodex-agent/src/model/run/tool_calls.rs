@@ -620,6 +620,20 @@ where
         let terminal_ambiguous = execution.has_ambiguous_terminal_tool();
         let terminal_receipt_error = execution.terminal_receipt_error();
         prepare_output_images(&mut execution.output).await;
+        if let Some(receipt) = &terminal_receipt {
+            // The outer call is either `exec` or `wait`; its one paired output must retain the
+            // nested terminal result so a later full replay remains structurally valid.
+            let receipt = serde_json::to_string(receipt).expect("terminal receipt was validated");
+            match &mut execution.output {
+                ToolOutputBody::Text(output) => {
+                    output.push('\n');
+                    output.push_str(&receipt);
+                }
+                ToolOutputBody::Content(content) => {
+                    content.push(ToolOutputContent::InputText { text: receipt });
+                }
+            }
+        }
         if let Some(content) = serialize_trace_content(&execution.output) {
             record_span_content(tool_span, "tool.output", &content);
         }
@@ -638,18 +652,8 @@ where
                 unreachable!("native tool_search returned through Code Mode")
             }
         };
-        let mut outputs = Vec::with_capacity(
-            execution.notifications.len() + 1 + usize::from(terminal_receipt.is_some()),
-        );
+        let mut outputs = Vec::with_capacity(execution.notifications.len() + 1);
         outputs.push(output);
-        if let Some(receipt) = &terminal_receipt {
-            // A terminal nested call can be the only useful cell output. Keep its bounded
-            // receipt in the outer Code Mode call's retained history for a later replay.
-            outputs.push(custom_tool_notification(
-                call.call_id.clone(),
-                serde_json::to_string(receipt).expect("terminal receipt was validated"),
-            ));
-        }
         outputs.extend(
             execution.notifications.into_iter().map(|notification| {
                 custom_tool_notification(notification.call_id, notification.text)
