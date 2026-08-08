@@ -25,7 +25,7 @@ pub mod usage;
 
 pub use agent::{
     AgentHandle, AgentSessionContext, ExecutionEnvironment, Nanocodex, NanocodexBuilder,
-    PromptRoute, Turn, TurnControl, TurnResult,
+    PromptRoute, Turn, TurnCompletion, TurnControl, TurnResult,
 };
 pub use error::{NanocodexError, Result};
 pub use nanocodex_oai_api::{
@@ -44,9 +44,9 @@ pub mod events {
         AssistantEvent, AssistantMessage, CompactionCompleted, CompactionFailed, CompactionStarted,
         ContextEvent, EventUsage, ModelCallCompleted, ModelCallFailed, ModelCallStarted,
         ModelEvent, ModelWarmupCompleted, ModelWarmupFailed, ModelWarmupStarted, OpenAiEvent,
-        ReasoningEvent, ReasoningSummaryDelta, RunError, RunEvent, RunMetrics, RunStarted,
-        RunStatus, RunSteered, RunTerminal, TimedAgentEvent, ToolCall, ToolEvent, ToolResultEvent,
-        ToolStatus, TransportEvent, monotonic_now_ns,
+        ReasoningEvent, ReasoningSummaryDelta, RunCompletion, RunError, RunEvent, RunMetrics,
+        RunStarted, RunStatus, RunSteered, RunTerminal, TimedAgentEvent, ToolCall, ToolEvent,
+        ToolResultEvent, ToolStatus, TransportEvent, monotonic_now_ns,
     };
     pub use nanocodex_oai_api::responses::AgentMessageContent;
 }

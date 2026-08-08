@@ -101,7 +101,7 @@ pub use builder::NanocodexBuilder;
 pub use context_source::ExecutionEnvironment;
 pub use handle::{AgentHandle, Nanocodex};
 pub use session_context::AgentSessionContext;
-pub use turn::{PromptRoute, Turn, TurnControl, TurnResult};
+pub use turn::{PromptRoute, Turn, TurnCompletion, TurnControl, TurnResult};
 
 use builder::{CodexCompatibility, PromptCacheConfig};
 pub(crate) use context_source::ContextSource;

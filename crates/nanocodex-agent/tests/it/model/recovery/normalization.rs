@@ -153,9 +153,9 @@ async fn agent_repairs_unmatched_tool_calls_before_continuing_and_restores_delta
         .prompt("Look up the deployment region.")
         .await?
         .await?;
-    assert_eq!(first.final_message(), "answer-2");
+    assert_eq!(first.final_message(), Some("answer-2"));
     let second = agent.prompt("Now answer one more question.").await?.await?;
-    assert_eq!(second.final_message(), "answer-3");
+    assert_eq!(second.final_message(), Some("answer-3"));
 
     let observed = observed.lock().unwrap();
     assert_eq!(observed.generations.len(), 3);

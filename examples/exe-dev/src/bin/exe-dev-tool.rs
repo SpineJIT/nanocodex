@@ -103,8 +103,11 @@ async fn run_agent(sandbox: &ExeDevSandbox, prompt: String) -> Result<String> {
     let shutdown = agent.shutdown().await;
     shutdown.wrap_err("failed to shut down the external Nanocodex session")?;
     result
-        .map(|result| result.into_final_message())
-        .wrap_err("external Nanocodex turn failed")
+        .wrap_err("external Nanocodex turn failed")?
+        .into_final_message()
+        .ok_or_else(|| {
+            eyre::eyre!("agent completed with a terminal tool instead of a final message")
+        })
 }
 
 fn model_auth() -> Result<OpenAiAuth> {

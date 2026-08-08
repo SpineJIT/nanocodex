@@ -233,7 +233,9 @@ impl Tool for ChildAgent {
             agent_id,
             kind: self.kind.result_name(),
             role,
-            report: result.into_final_message(),
+            report: result.into_final_message().unwrap_or_else(|| {
+                "Child completed with a terminal tool instead of a final message.".to_owned()
+            }),
         }))
     }
 }
@@ -280,7 +282,9 @@ impl Tool for PromptAgent {
         let result = child.prompt(task).await?.result().await?;
         Ok(ToolOutput::json(&FollowUpResult {
             agent_id,
-            report: result.into_final_message(),
+            report: result.into_final_message().unwrap_or_else(|| {
+                "Child completed with a terminal tool instead of a final message.".to_owned()
+            }),
         }))
     }
 }

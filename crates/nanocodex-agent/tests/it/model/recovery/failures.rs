@@ -160,7 +160,7 @@ async fn failed_turn_forces_the_next_turn_to_replay_its_latest_safe_history() ->
     let failed = agent.prompt("failed prompt").await?.await;
     assert!(failed.is_err());
     let completed = agent.prompt("follow-on prompt").await?.await?;
-    assert_eq!(completed.final_message(), "done");
+    assert_eq!(completed.final_message(), Some("done"));
 
     drop(agent);
     timeout(std::time::Duration::from_secs(5), server)
@@ -255,7 +255,7 @@ async fn context_window_error_forces_compaction_before_the_next_prompt() -> Resu
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
 
     drop(agent);

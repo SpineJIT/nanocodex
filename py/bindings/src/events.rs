@@ -152,7 +152,7 @@ impl AgentEvents {
     }
 }
 
-fn json_to_python(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
+pub(crate) fn json_to_python(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
     match value {
         Value::Null => Ok(py.None()),
         Value::Bool(value) => value.into_py_any(py),

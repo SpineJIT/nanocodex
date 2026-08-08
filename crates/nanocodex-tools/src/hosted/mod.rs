@@ -30,12 +30,12 @@
 //!         _context: ToolContext<'a>,
 //!     ) -> HostFuture<'a, Result<CodeModeExecution, CodeModeHostError>> {
 //!         Box::pin(async move {
-//!             Ok(CodeModeExecution {
-//!                 output: ToolOutputBody::Text(format!("evaluated: {source}")),
-//!                 success: true,
-//!                 nested_calls: Vec::new(),
-//!                 notifications: Vec::new(),
-//!             })
+//!             Ok(CodeModeExecution::new(
+//!                 ToolOutputBody::Text(format!("evaluated: {source}")),
+//!                 true,
+//!                 Vec::new(),
+//!                 Vec::new(),
+//!             ))
 //!         })
 //!     }
 //! }
@@ -50,7 +50,7 @@ mod types;
 
 use std::{error::Error, fmt, future::Future, pin::Pin};
 
-use crate::{ToolContext, ToolDefinition, ToolInput, ToolOutput};
+use crate::{ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolTurnBehavior};
 
 pub use input::{prepare_output_images, prepare_user_input};
 pub use runtime::{HostedToolRuntime, HostedToolRuntimeControl, HostedTools};
@@ -124,6 +124,15 @@ pub trait CodeModeHost: Send + Sync + 'static {
     /// Selects Code Mode or CSP-safe direct function dispatch.
     fn tool_mode(&self) -> HostedToolMode {
         HostedToolMode::Code
+    }
+
+    /// Returns the static completion behavior of one application-defined tool.
+    ///
+    /// Hosts must return [`ToolTurnBehavior::FinishTurnOnSuccess`] only for a
+    /// tool that is never dispatched in parallel. Unknown names continue the
+    /// enclosing turn.
+    fn turn_behavior(&self, _name: &str) -> ToolTurnBehavior {
+        ToolTurnBehavior::Continue
     }
 
     /// Returns the tools available to Code Mode for this session.

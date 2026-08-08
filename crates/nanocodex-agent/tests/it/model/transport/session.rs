@@ -31,7 +31,7 @@ async fn a_turn_stream_mirrors_one_turn_and_await_retains_its_result() -> Result
         streamed.push(event);
     }
     let result = turn.await?;
-    assert_eq!(result.final_message(), "done");
+    assert_eq!(result.final_message(), Some("done"));
     assert_eq!(result.usage().input_tokens(), 10);
     assert_eq!(result.usage().cached_input_tokens(), 5);
     assert_eq!(result.usage().cache_write_input_tokens(), 0);
@@ -143,7 +143,7 @@ async fn https_ephemeral_replays_complete_follow_on_history() -> Result<()> {
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     assert_eq!(
         agent
@@ -152,7 +152,7 @@ async fn https_ephemeral_replays_complete_follow_on_history() -> Result<()> {
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     drop((agent, events));
     timeout(std::time::Duration::from_secs(5), server)
@@ -198,7 +198,7 @@ async fn https_stored_fork_uses_the_historical_response_checkpoint() -> Result<(
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     drop((agent, fork, root_events, fork_events));
     timeout(std::time::Duration::from_secs(5), server)
@@ -242,7 +242,7 @@ async fn chatgpt_https_uses_subscription_headers_and_ephemeral_replay() -> Resul
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     drop((agent, events));
     timeout(std::time::Duration::from_secs(5), server)
@@ -288,7 +288,7 @@ async fn https_uses_the_configured_http_client() -> Result<()> {
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     drop((agent, events));
     timeout(std::time::Duration::from_secs(5), server)

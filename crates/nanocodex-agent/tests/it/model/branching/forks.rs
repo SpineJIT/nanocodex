@@ -52,11 +52,11 @@ async fn latest_fork_during_streaming_inherits_the_active_prompt_delta() -> Resu
     agent.set_thinking(Thinking::High).await?;
     let (fork, fork_events) = agent.fork().await?;
     let branch = fork.prompt("BTW question").await?;
-    assert_eq!(branch.result().await?.final_message(), "done");
+    assert_eq!(branch.result().await?.final_message(), Some("done"));
     release_root
         .send(())
         .map_err(|()| eyre!("root release receiver dropped"))?;
-    assert_eq!(root.result().await?.final_message(), "done");
+    assert_eq!(root.result().await?.final_message(), Some("done"));
 
     drop((agent, fork, root_events, fork_events));
     timeout(std::time::Duration::from_secs(5), server)
@@ -197,12 +197,12 @@ async fn active_boundary_fork_sends_tool_and_steer_delta_then_replays_on_checkpo
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     release_root
         .send(())
         .map_err(|()| eyre!("root release receiver dropped"))?;
-    assert_eq!(root.result().await?.final_message(), "done");
+    assert_eq!(root.result().await?.final_message(), Some("done"));
 
     drop((agent, fork, root_events, fork_events));
     timeout(std::time::Duration::from_secs(5), server)
@@ -304,7 +304,7 @@ async fn latest_and_historical_forks_keep_distinct_boundaries_during_an_active_t
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     let (historical, historical_events) = agent.fork_from(&completed).await?;
     assert_eq!(
@@ -314,12 +314,12 @@ async fn latest_and_historical_forks_keep_distinct_boundaries_during_an_active_t
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     release_active
         .send(())
         .map_err(|()| eyre!("active release receiver dropped"))?;
-    assert_eq!(active.result().await?.final_message(), "done");
+    assert_eq!(active.result().await?.final_message(), Some("done"));
 
     drop((
         agent,
@@ -410,8 +410,8 @@ async fn historical_fork_runs_while_the_mainline_turn_is_in_flight() -> Result<(
     let (fork, fork_events) = agent.fork_from(&first).await?;
     let branch = fork.prompt("fork prompt").await?;
     let (mainline, branch) = tokio::join!(mainline.result(), branch.result());
-    assert_eq!(mainline?.final_message(), "done");
-    assert_eq!(branch?.final_message(), "done");
+    assert_eq!(mainline?.final_message(), Some("done"));
+    assert_eq!(branch?.final_message(), Some("done"));
 
     drop((agent, fork, root_events, fork_events));
     timeout(std::time::Duration::from_secs(5), server)

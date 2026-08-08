@@ -37,7 +37,7 @@ async fn execution_environment_suppresses_host_context_discovery() -> Result<()>
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
 
     drop((agent, events));
@@ -88,7 +88,7 @@ async fn ordinary_turns_keep_creation_time_agents_md() -> Result<()> {
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
 
     std::fs::write(
@@ -102,7 +102,7 @@ async fn ordinary_turns_keep_creation_time_agents_md() -> Result<()> {
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
 
     drop((agent, events));
@@ -176,7 +176,7 @@ async fn fork_replaces_or_removes_changed_agents_md_once() -> Result<()> {
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
 
     std::fs::remove_file(workspace.join("AGENTS.md"))?;
@@ -188,7 +188,7 @@ async fn fork_replaces_or_removes_changed_agents_md_once() -> Result<()> {
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
 
     drop((
@@ -255,7 +255,7 @@ async fn fork_reloads_a_changed_global_agents_source_once() -> Result<()> {
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
 
     drop((agent, fork, root_events, fork_events));
@@ -326,7 +326,7 @@ async fn legacy_snapshot_reconstructs_agents_md_before_diffing() -> Result<()> {
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     drop((resumed, resumed_events));
 

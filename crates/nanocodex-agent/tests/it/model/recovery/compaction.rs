@@ -163,7 +163,7 @@ async fn manual_compaction_before_first_prompt_reinjects_cached_context_and_pers
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     agent.shutdown().await?;
     drop((agent, events));
@@ -240,7 +240,7 @@ async fn manual_compaction_after_a_turn_uses_the_live_session_and_reinjects_next
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     agent.compact().await?;
     assert_eq!(
@@ -250,7 +250,7 @@ async fn manual_compaction_after_a_turn_uses_the_live_session_and_reinjects_next
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     agent.shutdown().await?;
     drop((agent, events));
@@ -335,7 +335,7 @@ async fn manual_compaction_uses_current_defaults_and_a_fresh_logical_turn() -> R
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     agent.set_thinking(Thinking::High).await?;
     agent.set_fast_mode(true).await?;
@@ -347,7 +347,7 @@ async fn manual_compaction_uses_current_defaults_and_a_fresh_logical_turn() -> R
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     agent.shutdown().await?;
     drop((agent, events));
@@ -610,7 +610,7 @@ async fn manual_compaction_replaces_an_active_turn_before_queued_prompts() -> Re
         Err(NanocodexError::TurnCancelled)
     ));
     compact.await??;
-    assert_eq!(queued.result().await?.final_message(), "done");
+    assert_eq!(queued.result().await?.final_message(), Some("done"));
     assert_eq!(
         order.lock().unwrap().as_slice(),
         [
@@ -780,10 +780,10 @@ async fn pre_turn_compaction_keeps_creation_time_agents_md() -> Result<()> {
 
     assert_eq!(
         agent.prompt("first prompt").await?.await?.final_message(),
-        "answer-1"
+        Some("answer-1")
     );
     let second = agent.prompt("second prompt").await?.await?;
-    assert_eq!(second.final_message(), "answer-2");
+    assert_eq!(second.final_message(), Some("answer-2"));
 
     let observations = observations.lock().unwrap();
     assert_eq!(observations.compactions.len(), 1);

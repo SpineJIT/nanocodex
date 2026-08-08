@@ -10,7 +10,7 @@ use nanocodex_oai_api::{auth::OpenAiAuth, responses::JsonSchema, tools::ToolDefi
 use serde::Deserialize;
 use serde_json::{Value, json, value::to_raw_value};
 
-use crate::{ToolOutputBody, ToolResult, contract::DEFAULT_TOOL_OUTPUT_TOKENS};
+use crate::{ToolOutputBody, ToolResult, ToolTurnBehavior, contract::DEFAULT_TOOL_OUTPUT_TOKENS};
 
 use super::{
     DynamicToolProvider, ImageGenerationConfig, Tool, ToolContext, ToolExposure, ToolInput,
@@ -48,6 +48,8 @@ struct StartTrackingProvider {
 }
 
 struct CollisionTool;
+
+struct ParallelTerminalTool;
 
 struct NamedTool {
     name: &'static str,
@@ -98,6 +100,29 @@ impl Tool for NamedTool {
 
     async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
         Ok(ToolOutput::text(self.output))
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for ParallelTerminalTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "parallel_terminal",
+            "Invalid terminal tool used to validate builder rejection.",
+            json!({"type": "object", "properties": {}}),
+        )
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
+    fn turn_behavior(&self) -> ToolTurnBehavior {
+        ToolTurnBehavior::FinishTurnOnSuccess
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        Ok(ToolOutput::text("unreachable"))
     }
 }
 
@@ -489,6 +514,20 @@ fn without_defaults_allows_replacing_a_standard_workspace_tool() {
         .collect::<Vec<_>>();
 
     assert_eq!(names, ["exec_command"]);
+}
+
+#[test]
+fn terminal_tools_cannot_opt_into_parallel_dispatch() {
+    let error = Tools::builder()
+        .without_defaults()
+        .tool(ParallelTerminalTool)
+        .build()
+        .expect_err("terminal tools must be serialized");
+
+    assert!(matches!(
+        error,
+        super::ToolsBuildError::TerminalToolParallel(name) if &*name == "parallel_terminal"
+    ));
 }
 
 #[test]

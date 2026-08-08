@@ -244,6 +244,8 @@ export function createNodeHost(options = {}) {
     executeTool: code.executeTool,
     toolMode: () => toolMode,
     toolDefinitions: code.toolDefinitions,
+    toolTurnBehavior: code.toolTurnBehavior,
+    toolTurnBehaviors: code.toolTurnBehaviors,
     emitEvent: onEvent,
     reset: code.reset,
   });

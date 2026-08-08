@@ -92,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let completed_tx = completed_tx.clone();
                                 tokio::spawn(async move {
                                     let output = match turn.await {
-                                        Ok(result) => result.final_message().to_owned(),
+                                        Ok(result) => result.final_message().expect("example expects a final assistant message").to_owned(),
                                         Err(error) => {
                                             format!("The coding agent failed: {error}")
                                         }

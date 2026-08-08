@@ -181,7 +181,7 @@ async fn parallel_results_emit_on_completion_but_enter_history_in_provider_order
     assert_eq!(state.maximum.load(Ordering::SeqCst), 2);
 
     state.release_first.add_permits(1);
-    assert_eq!(turn.result().await?.final_message(), "done");
+    assert_eq!(turn.result().await?.final_message(), Some("done"));
     let first = next_tool_result(&mut events).await?;
     assert_eq!(first["call_id"], "call-first");
     assert_eq!(first["status"], "completed");
@@ -301,7 +301,7 @@ async fn cancellation_keeps_completed_siblings_and_aborts_only_pending_calls() -
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     timeout(std::time::Duration::from_secs(5), server)
         .await
@@ -452,7 +452,7 @@ async fn unsafe_tool_calls_exclude_parallel_safe_siblings() -> Result<()> {
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     assert!(!state.overlap.load(Ordering::SeqCst));
     let terminal = next_run_completed(&mut events).await?;

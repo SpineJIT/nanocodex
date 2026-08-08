@@ -734,7 +734,7 @@ where
             let (outcome, was_cancelled): (Result<TurnResult>, bool) = match completed {
                 Ok(ModelTurnOutcome::Completed(completed)) => {
                     let CompletedModelTurn {
-                        final_message,
+                        completion,
                         usage,
                         checkpoint,
                     } = completed;
@@ -743,7 +743,14 @@ where
                         thread_model,
                         checkpoint,
                     ));
-                    let durability_turn = durability_turn.completed(final_message.clone());
+                    let durability_turn = match &completion {
+                        TurnCompletion::Message { final_message } => {
+                            durability_turn.completed(final_message.clone())
+                        }
+                        TurnCompletion::TerminalTool { .. } => {
+                            durability_turn.completed_without_message()
+                        }
+                    };
                     self.durability
                         .persist(&checkpoint, durability_turn)
                         .instrument(turn_span.clone())
@@ -751,7 +758,7 @@ where
                     latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
                     (
                         Ok(TurnResult {
-                            final_message,
+                            completion,
                             usage,
                             checkpoint,
                         }),

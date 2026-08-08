@@ -75,7 +75,7 @@ async fn turn_result_does_not_wait_for_attempt_event_producers_to_close() {
         .await
         .expect("a completed result must not wait for event producers to close")
         .unwrap();
-    assert_eq!(result.final_message(), "done");
+    assert_eq!(result.final_message(), Some("done"));
     assert!(matches!(
         retained_attempt.kind(),
         nanocodex_agent::transport::ResponsesAttemptKind::Generation

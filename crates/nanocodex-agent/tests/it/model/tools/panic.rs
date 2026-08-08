@@ -175,7 +175,7 @@ async fn provider_panic_is_repaired_and_the_private_driver_remains_usable() -> R
             .result()
             .await?
             .final_message(),
-        "recovered"
+        Some("recovered")
     );
     assert_eq!(
         agent
@@ -184,7 +184,7 @@ async fn provider_panic_is_repaired_and_the_private_driver_remains_usable() -> R
             .result()
             .await?
             .final_message(),
-        "later"
+        Some("later")
     );
     agent.shutdown().await?;
     drop(agent);

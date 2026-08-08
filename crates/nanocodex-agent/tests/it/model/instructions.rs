@@ -94,7 +94,7 @@ async fn run_global_instructions_case(
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
 
     agent.flush_rollout().await?;

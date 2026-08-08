@@ -25,6 +25,11 @@ async fn main() -> Result<()> {
     let turn = agent.prompt(prompt).await?;
     events.write_turn_jsonl(std::io::stdout()).await?;
     let result = turn.result().await?;
-    eprintln!("final result: {}", result.final_message());
+    eprintln!(
+        "final result: {}",
+        result
+            .final_message()
+            .expect("example expects a final assistant message")
+    );
     Ok(())
 }

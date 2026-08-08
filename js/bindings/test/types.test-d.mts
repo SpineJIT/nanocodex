@@ -25,7 +25,9 @@ async function check() {
   const sameTurn: Actions.turn.prompt.ReturnType = Actions.turn.prompt(agent, options);
   const completed: TurnResult = await sameTurn.result();
   const sameResult: Actions.turn.getResult.ReturnType = completed;
-  const message: string = completed.finalMessage;
+  const message: string = completed.completion.type === "message"
+    ? completed.completion.finalMessage
+    : "terminal tool completed";
   const snapshot: SessionSnapshot = completed.snapshot;
   const usage: Actions.turn.getUsage.ReturnType = completed.usage;
   usage.estimated_cost?.usd;

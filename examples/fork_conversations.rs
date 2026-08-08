@@ -74,7 +74,12 @@ async fn main() -> Result<()> {
             .await?
             .result()
             .await?;
-        println!("root {turn:02}: {}", result.final_message());
+        println!(
+            "root {turn:02}: {}",
+            result
+                .final_message()
+                .expect("example expects a final assistant message")
+        );
         checkpoints.push(result);
     }
 
@@ -120,11 +125,36 @@ async fn main() -> Result<()> {
         latest_turn.result(),
     )?;
     println!("\ncheckpoint views (UNKNOWN proves later context did not leak backward)");
-    println!("root mainline : {}", mainline_11.final_message());
-    println!("branch from 03: {}", result_3.final_message());
-    println!("branch from 06: {}", result_6.final_message());
-    println!("branch from 09: {}", result_9.final_message());
-    println!("latest at 10 : {}", result_10.final_message());
+    println!(
+        "root mainline : {}",
+        mainline_11
+            .final_message()
+            .expect("example expects a final assistant message")
+    );
+    println!(
+        "branch from 03: {}",
+        result_3
+            .final_message()
+            .expect("example expects a final assistant message")
+    );
+    println!(
+        "branch from 06: {}",
+        result_6
+            .final_message()
+            .expect("example expects a final assistant message")
+    );
+    println!(
+        "branch from 09: {}",
+        result_9
+            .final_message()
+            .expect("example expects a final assistant message")
+    );
+    println!(
+        "latest at 10 : {}",
+        result_10
+            .final_message()
+            .expect("example expects a final assistant message")
+    );
 
     // A branch is a normal Nanocodex handle: it retains its own response chain
     // and can diverge while the root continues independently.
@@ -143,8 +173,18 @@ async fn main() -> Result<()> {
     let (branch_divergence, root_continuation) =
         tokio::try_join!(branch_divergence.result(), root_continuation.result())?;
     println!("\nindependent continuation");
-    println!("branch from 03: {}", branch_divergence.final_message());
-    println!("root           : {}", root_continuation.final_message());
+    println!(
+        "branch from 03: {}",
+        branch_divergence
+            .final_message()
+            .expect("example expects a final assistant message")
+    );
+    println!(
+        "root           : {}",
+        root_continuation
+            .final_message()
+            .expect("example expects a final assistant message")
+    );
 
     // Dropping command handles stops their drivers and closes their independent
     // event streams. TurnResults may outlive the agents as inert checkpoints.

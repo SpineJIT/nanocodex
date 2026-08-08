@@ -3,6 +3,7 @@ use super::*;
 mod environment;
 mod panic;
 mod parallel;
+mod terminal;
 
 struct NativeToolSearch;
 struct NamespacedEcho;

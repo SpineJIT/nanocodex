@@ -35,6 +35,11 @@ async fn main() -> Result<()> {
         .await?
         .result()
         .await?;
-    println!("{}", result.final_message());
+    println!(
+        "{}",
+        result
+            .final_message()
+            .expect("example expects a final assistant message")
+    );
     Ok(())
 }

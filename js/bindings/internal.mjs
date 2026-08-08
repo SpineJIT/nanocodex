@@ -249,6 +249,12 @@ const hostBridge = Object.freeze({
     // factories activate their host directly around that synchronous step.
     return (hostSessions.get(sessionId) ?? requiredActiveHost()).toolDefinitions();
   },
+  toolTurnBehavior(name) {
+    return requiredActiveHost().toolTurnBehavior(name);
+  },
+  toolTurnBehaviors() {
+    return requiredActiveHost().toolTurnBehaviors();
+  },
   emitEvent(eventJson) {
     const event = JSON.parse(eventJson);
     requiredSessionHost(event.request_id).emitEvent(eventJson);
@@ -417,7 +423,9 @@ function createTurn(raw, agent) {
 function createTurnResult(raw) {
   if (
     !raw
-    || typeof raw.finalMessage !== "string"
+    || !raw.completion
+    || typeof raw.completion.type !== "string"
+    || (raw.finalMessage !== undefined && typeof raw.finalMessage !== "string")
     || typeof raw.snapshot !== "function"
     || typeof raw.usage !== "function"
   ) {
@@ -438,6 +446,7 @@ function createTurnResult(raw) {
     },
   };
   const result = {
+    completion: freezeJson(raw.completion),
     finalMessage: raw.finalMessage,
     get snapshot() { return state.snapshot(); },
     get usage() { return state.usage(); },

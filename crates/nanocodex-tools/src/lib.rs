@@ -54,9 +54,10 @@ pub mod contract {
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     pub use async_trait::async_trait;
     pub use nanocodex_oai_api::tools::{
-        DEFAULT_TOOL_OUTPUT_TOKENS, Tool, ToolContext, ToolDefinition, ToolError, ToolInput,
-        ToolInputError, ToolOutput, ToolOutputBody, ToolOutputContent, ToolOutputWire,
-        ToolProcessTraceWire, ToolResult,
+        DEFAULT_TOOL_OUTPUT_TOKENS, TerminalToolReceipt, TerminalToolReceiptError, Tool,
+        ToolContext, ToolDefinition, ToolError, ToolInput, ToolInputError, ToolOutput,
+        ToolOutputBody, ToolOutputContent, ToolOutputWire, ToolProcessTraceWire, ToolResult,
+        ToolTurnBehavior,
     };
 }
 
@@ -91,7 +92,10 @@ pub mod runtime {
 pub(crate) use contract::ToolOutputBody;
 #[cfg(all(not(target_family = "wasm"), feature = "workspace-runtime"))]
 pub(crate) use contract::ToolOutputContent;
-pub use contract::{Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult};
+pub use contract::{
+    TerminalToolReceipt, TerminalToolReceiptError, Tool, ToolContext, ToolDefinition, ToolInput,
+    ToolOutput, ToolResult, ToolTurnBehavior,
+};
 #[cfg(all(not(target_family = "wasm"), feature = "workspace-runtime"))]
 pub(crate) use nanocodex_oai_api::ImageDetail;
 #[cfg(all(not(target_family = "wasm"), feature = "native"))]

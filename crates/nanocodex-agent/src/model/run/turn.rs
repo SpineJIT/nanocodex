@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::telemetry::TerminalOutcome;
 
 impl<S> ModelRun<S>
 where
@@ -127,7 +128,7 @@ where
         self.events.emit(
             AgentEventKind::RunFailed,
             terminal_payload(
-                "cancelled",
+                TerminalOutcome::Cancelled,
                 self.started_at.elapsed(),
                 &self.config,
                 self.model,
@@ -186,15 +187,17 @@ where
             .await;
         let elapsed = self.started_at.elapsed();
         match outcome {
-            Ok(ModelTaskOutcome::Completed(message)) => {
+            Ok(ModelTaskOutcome::Completed(completion)) => {
                 self.stats
                     .apply_transport(self.transport_stats.since(transport_before));
                 let usage = self.stats.turn_usage(self.model, self.fast_mode);
                 record_turn_usage(&tracing::Span::current(), &usage);
+                let event_completion = completion.run_completion();
+                let checkpoint = self.commit_checkpoint()?;
                 self.events.emit(
                     AgentEventKind::RunCompleted,
                     terminal_payload(
-                        "completed",
+                        TerminalOutcome::Completed(&event_completion),
                         elapsed,
                         &self.config,
                         self.model,
@@ -203,9 +206,8 @@ where
                         &usage,
                     ),
                 )?;
-                let checkpoint = self.commit_checkpoint()?;
                 Ok(ModelTurnOutcome::Completed(CompletedModelTurn {
-                    final_message: message,
+                    completion,
                     usage,
                     checkpoint,
                 }))
@@ -227,7 +229,7 @@ where
                 self.events.emit(
                     AgentEventKind::RunFailed,
                     terminal_payload(
-                        "cancelled",
+                        TerminalOutcome::Cancelled,
                         elapsed,
                         &self.config,
                         self.model,
@@ -285,7 +287,7 @@ where
                 self.events.emit(
                     AgentEventKind::RunFailed,
                     terminal_payload(
-                        "failed",
+                        TerminalOutcome::Failed,
                         elapsed,
                         &self.config,
                         self.model,
@@ -623,7 +625,7 @@ where
         session: &mut ModelSessionState,
         mut steers: tokio::sync::mpsc::Receiver<Prompt>,
         fork_snapshots: &watch::Sender<Option<ModelCheckpoint>>,
-    ) -> Result<String> {
+    ) -> Result<TurnCompletion> {
         // Match Codex's ordering: always sample the turn's initial prompt once
         // before injecting input that arrived while that first request ran.
         let mut can_drain_steers = false;
@@ -690,10 +692,12 @@ where
                     continue;
                 }
                 if let Some(message) = final_message {
-                    return Ok(if message.trim().is_empty() {
-                        "The model completed without emitting assistant text.".to_owned()
-                    } else {
-                        message
+                    return Ok(TurnCompletion::Message {
+                        final_message: if message.trim().is_empty() {
+                            "The model completed without emitting assistant text.".to_owned()
+                        } else {
+                            message
+                        },
                     });
                 }
                 return Err(NanocodexError::MalformedResponse {
@@ -706,14 +710,18 @@ where
                 .iter()
                 .any(|call| call.name == "exec")
                 .then(|| Arc::new(session.conversation.flattened_history()));
-            self.execute_model_tools(
-                &session.tools,
-                &mut session.conversation,
-                call_index,
-                code_calls,
-                history,
-            )
-            .await?;
+            if let Some(receipt) = self
+                .execute_model_tools(
+                    &session.tools,
+                    &mut session.conversation,
+                    call_index,
+                    code_calls,
+                    history,
+                )
+                .await?
+            {
+                return Ok(TurnCompletion::TerminalTool { receipt });
+            }
             let compacted = self
                 .maybe_compact(
                     call_index,

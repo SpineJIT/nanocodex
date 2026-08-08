@@ -760,7 +760,12 @@ impl Evaluator {
             match event_result {
                 Ok(Ok(terminal)) => {
                     let (primary, final_message) = match turn.result().await {
-                        Ok(result) => (None, result.into_final_message()),
+                        Ok(result) => (
+                            None,
+                            result
+                                .into_final_message()
+                                .unwrap_or_else(|| observation.final_message.clone()),
+                        ),
                         Err(error) => (
                             Some(EvalError::Nanocodex(error)),
                             observation.final_message.clone(),

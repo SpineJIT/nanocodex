@@ -64,7 +64,7 @@ async fn cancellation_retains_interrupted_prompt_and_resumes_from_the_abort_boun
         .build()?;
 
     let first = agent.prompt(Prompt::new("first prompt")).await?;
-    assert_eq!(first.result().await?.final_message(), "done");
+    assert_eq!(first.result().await?.final_message(), Some("done"));
 
     let cancelled = agent.prompt("cancel me").await?;
     second_seen_rx
@@ -98,7 +98,7 @@ async fn cancellation_retains_interrupted_prompt_and_resumes_from_the_abort_boun
         cancellation.cancel().await,
         Err(NanocodexError::TurnNotCancellable)
     ));
-    assert_eq!(follow_up.result().await?.final_message(), "done");
+    assert_eq!(follow_up.result().await?.final_message(), Some("done"));
     drop((queued_control, cancellation, agent));
 
     let mut terminal_statuses = Vec::new();
@@ -270,7 +270,7 @@ async fn cancelling_a_later_turn_preserves_an_earlier_shell_session() -> Result<
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     let cancelled = agent.prompt("cancel this model call").await?;
     timeout(std::time::Duration::from_secs(5), active_started.notified())
@@ -288,7 +288,7 @@ async fn cancelling_a_later_turn_preserves_an_earlier_shell_session() -> Result<
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     assert_eq!(
         builds.load(Ordering::Relaxed),
@@ -431,7 +431,7 @@ async fn cancellation_during_pre_turn_compaction_retains_the_accepted_prompt() -
             .result()
             .await?
             .final_message(),
-        "first done"
+        Some("first done")
     );
 
     let interrupted = agent.prompt("cancel during compaction").await?;
@@ -454,7 +454,7 @@ async fn cancellation_during_pre_turn_compaction_retains_the_accepted_prompt() -
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     drop(agent);
     drop(events);
@@ -551,7 +551,7 @@ async fn cancellation_pairs_an_active_tool_call_before_resuming() -> Result<()> 
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     drop(agent);
 

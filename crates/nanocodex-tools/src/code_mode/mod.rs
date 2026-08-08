@@ -25,7 +25,10 @@ use tokio::{
 };
 use tracing::{Instrument, info_span};
 
-use super::{ToolContext, ToolOutputBody, ToolOutputContent};
+use super::{
+    TerminalToolReceipt, TerminalToolReceiptError, ToolContext, ToolOutputBody, ToolOutputContent,
+    ToolTurnBehavior,
+};
 pub use crate::hosted::{
     CodeModeExecution, CodeModeNotification, CodeModeObserver, CodeModeUpdate, NestedToolCall,
 };
@@ -141,6 +144,7 @@ struct ObservationBuffer {
     content: Vec<ToolOutputContent>,
     nested_calls: Vec<ObservedNestedCall>,
     notifications: Vec<CodeModeNotification>,
+    terminal_tools: Vec<Result<TerminalToolReceipt, TerminalToolReceiptError>>,
 }
 
 // One compare-exchange decides whether termination or completion owns the
@@ -814,14 +818,16 @@ async fn observe_cell(
                     None => std::future::pending().await,
                 }
             } => {
-                let buffered = std::mem::take(&mut observation.buffered);
+                let content = std::mem::take(&mut observation.buffered.content);
+                let nested_calls = std::mem::take(&mut observation.buffered.nested_calls);
+                let notifications = std::mem::take(&mut observation.buffered.notifications);
                 return running_observation(
                     cell.id,
                     started_at,
-                    buffered.content,
+                    content,
                     max_output_tokens,
-                    buffered.nested_calls,
-                    buffered.notifications,
+                    nested_calls,
+                    notifications,
                 );
             }
             update = observation.updates.recv(), if !yield_deadline_elapsed => update,
@@ -840,6 +846,19 @@ async fn observe_cell(
             }
             Some(CellUpdate::NestedCall(call)) => {
                 observer.update(CodeModeUpdate::NestedCallCompleted(&call.call));
+                if call.call.success
+                    && call.call.turn_behavior == ToolTurnBehavior::FinishTurnOnSuccess
+                {
+                    observation
+                        .buffered
+                        .terminal_tools
+                        .push(TerminalToolReceipt::new(
+                            call.call.call_id.clone(),
+                            call.call.name.clone(),
+                            call.call.output.clone(),
+                            call.call.metadata.clone(),
+                        ));
+                }
                 observation.buffered.nested_calls.push(call);
             }
             Some(CellUpdate::Notification(notification)) => {
@@ -848,14 +867,16 @@ async fn observe_cell(
             Some(CellUpdate::Content(item)) => observation.buffered.content.push(item),
             Some(CellUpdate::Yielded) if terminating => {}
             Some(CellUpdate::Yielded) => {
-                let buffered = std::mem::take(&mut observation.buffered);
+                let content = std::mem::take(&mut observation.buffered.content);
+                let nested_calls = std::mem::take(&mut observation.buffered.nested_calls);
+                let notifications = std::mem::take(&mut observation.buffered.notifications);
                 return running_observation(
                     cell.id,
                     started_at,
-                    buffered.content,
+                    content,
                     max_output_tokens,
-                    buffered.nested_calls,
-                    buffered.notifications,
+                    nested_calls,
+                    notifications,
                 );
             }
             Some(CellUpdate::Completed) => {
@@ -865,25 +886,22 @@ async fn observe_cell(
                         "Script completed",
                         true,
                         started_at,
-                        buffered.content,
                         max_output_tokens,
-                        buffered.nested_calls,
-                        buffered.notifications,
+                        buffered,
                     ),
                     false,
                 );
             }
             Some(CellUpdate::Terminated) => {
-                let buffered = std::mem::take(&mut observation.buffered);
+                let mut buffered = std::mem::take(&mut observation.buffered);
+                buffered.terminal_tools.clear();
                 return (
                     observed_execution(
                         "Script terminated",
                         true,
                         started_at,
-                        buffered.content,
                         max_output_tokens,
-                        buffered.nested_calls,
-                        buffered.notifications,
+                        buffered,
                     ),
                     false,
                 );
@@ -901,10 +919,11 @@ async fn observe_cell(
                         "Script failed",
                         false,
                         started_at,
-                        buffered.content,
                         max_output_tokens,
-                        buffered.nested_calls,
-                        buffered.notifications,
+                        ObservationBuffer {
+                            terminal_tools: Vec::new(),
+                            ..buffered
+                        },
                     ),
                     false,
                 );
@@ -920,10 +939,11 @@ async fn observe_cell(
                         "Script failed",
                         false,
                         started_at,
-                        buffered.content,
                         max_output_tokens,
-                        buffered.nested_calls,
-                        buffered.notifications,
+                        ObservationBuffer {
+                            terminal_tools: Vec::new(),
+                            ..buffered
+                        },
                     ),
                     false,
                 );
@@ -941,10 +961,11 @@ async fn observe_cell(
                         "Script failed",
                         false,
                         started_at,
-                        buffered.content,
                         max_output_tokens,
-                        buffered.nested_calls,
-                        buffered.notifications,
+                        ObservationBuffer {
+                            terminal_tools: Vec::new(),
+                            ..buffered
+                        },
                     ),
                     false,
                 );
@@ -966,10 +987,13 @@ fn running_observation(
             &format!("Script running with cell ID {cell_id}"),
             true,
             started_at,
-            content,
             max_output_tokens,
-            nested_calls,
-            notifications,
+            ObservationBuffer {
+                content,
+                nested_calls,
+                notifications,
+                terminal_tools: Vec::new(),
+            },
         ),
         true,
     )
@@ -979,19 +1003,25 @@ fn observed_execution(
     status: &str,
     success: bool,
     started_at: Instant,
-    mut content: Vec<ToolOutputContent>,
     max_output_tokens: Option<usize>,
-    nested_calls: Vec<ObservedNestedCall>,
-    notifications: Vec<CodeModeNotification>,
+    ObservationBuffer {
+        mut content,
+        nested_calls,
+        notifications,
+        terminal_tools,
+    }: ObservationBuffer,
 ) -> CodeModeExecution {
     expose_running_shell_sessions(&mut content, &nested_calls);
     let content = output::truncate_content(content, max_output_tokens);
-    CodeModeExecution {
+    let mut execution = CodeModeExecution {
         output: with_status(status, started_at.elapsed().as_secs_f64(), content),
         success,
         nested_calls: ordered_calls(nested_calls),
         notifications,
-    }
+        terminal_selection: Default::default(),
+    };
+    execution.select_terminal_tools(terminal_tools);
+    execution
 }
 
 fn expose_running_shell_sessions(
@@ -1329,6 +1359,7 @@ async fn execute_nested_call(
         context.output_token_budget(),
     );
     let execution = tools.execute_nested(&name, input.clone(), context).await;
+    let turn_behavior = tools.turn_behavior(&name);
     let duration_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let value = execution.code_mode_value();
     let shell_session_id = execution
@@ -1345,6 +1376,7 @@ async fn execute_nested_call(
             input,
             output: execution.output,
             success: execution.success,
+            turn_behavior,
             started_after_ns,
             duration_ns,
             metadata: execution.metadata,
@@ -1365,6 +1397,7 @@ fn failed_execution(
         success: false,
         nested_calls,
         notifications: Vec::new(),
+        terminal_selection: Default::default(),
     }
 }
 

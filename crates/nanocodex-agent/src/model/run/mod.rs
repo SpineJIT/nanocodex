@@ -54,13 +54,13 @@ use super::{
 };
 use crate::{
     NanocodexError, Result,
-    agent::{AgentSend, ContextSource},
+    agent::{AgentSend, ContextSource, TurnCompletion},
     prompt_cache::ModelPromptCache,
     usage::TurnUsage,
 };
 use nanocodex_tools::{
     __private::model_contract as model_tool_contract,
-    ToolContext, Tools,
+    TerminalToolReceipt, TerminalToolReceiptError, ToolContext, ToolTurnBehavior, Tools,
     code_mode::{CodeModeExecution, CodeModeObserver, CodeModeUpdate},
     contract::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolInput, ToolOutput, ToolOutputBody},
     image::{prepare_output_images, prepare_user_input},
@@ -111,7 +111,7 @@ pub(crate) enum ModelCompactOutcome {
 }
 
 pub(crate) struct CompletedModelTurn {
-    pub(crate) final_message: String,
+    pub(crate) completion: TurnCompletion,
     pub(crate) usage: TurnUsage,
     pub(crate) checkpoint: ModelCheckpoint,
 }

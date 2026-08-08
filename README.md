@@ -93,7 +93,9 @@ let result = agent
     .await?;
 
 event_task.await?;
-println!("{}", result.final_message());
+if let Some(message) = result.final_message() {
+    println!("{message}");
+}
 ```
 
 The first `await` accepts and orders the prompt. The second waits for its typed

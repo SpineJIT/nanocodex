@@ -26,7 +26,9 @@ let result = agent
     .await?
     .result()
     .await?;
-println!("{}", result.final_message());
+if let Some(message) = result.final_message() {
+    println!("{message}");
+}
 # Ok(())
 # }
 ```

@@ -306,7 +306,7 @@ impl Nanocodex {
     ///     .await?
     ///     .result()
     ///     .await?;
-    /// assert!(!result.final_message().is_empty());
+    /// assert!(result.final_message().is_some_and(|message| !message.is_empty()));
     /// # Ok(())
     /// # }
     /// ```

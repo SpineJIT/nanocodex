@@ -28,7 +28,9 @@ use std::{
 
 use async_trait::async_trait;
 use futures_util::FutureExt;
-use nanocodex_oai_api::tools::{Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput};
+use nanocodex_oai_api::tools::{
+    Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolTurnBehavior,
+};
 use schemars::{JsonSchema, r#gen::SchemaSettings};
 use serde_json::value::to_raw_value;
 use serde_json::{Map, Value, json};

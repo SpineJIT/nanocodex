@@ -62,7 +62,7 @@ async fn upgrade_required_warmup_moves_generation_to_https() -> Result<()> {
     let (event_result, turn_result) = tokio::join!(events.write_jsonl(&mut output), turn.result());
     event_result?;
     let completed = turn_result?;
-    assert_eq!(completed.final_message(), "done");
+    assert_eq!(completed.final_message(), Some("done"));
 
     timeout(std::time::Duration::from_secs(5), websocket_server)
         .await
@@ -161,7 +161,7 @@ async fn cancellation_preserves_session_scoped_https_fallback() -> Result<()> {
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     follow_up_done
         .send(())

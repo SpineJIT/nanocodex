@@ -28,7 +28,9 @@ let turn = agent
     .await?;
 let result = turn.await?;
 
-println!("{}", result.final_message());
+if let Some(message) = result.final_message() {
+    println!("{message}");
+}
 agent.shutdown().await?;
 # Ok(())
 # }
