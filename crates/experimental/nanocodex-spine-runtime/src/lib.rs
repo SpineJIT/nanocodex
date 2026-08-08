@@ -1,6 +1,9 @@
 //! Experimental synchronous continuation runtime backed by `codex-spine-core`.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+};
 
 use codex_spine_core::{
     NodeId, NodeKind, NodeStatus, RawBoundary, RolloutEvent, SpineProjection, SpineReducer,
@@ -148,6 +151,9 @@ pub enum SpineRuntimeError {
     /// The configured task-node cap would be exceeded.
     #[error("spine continuation node limit of {0} reached")]
     NodeLimit(u32),
+    /// One Code Mode cell attempted to return more than one parent handoff.
+    #[error("spine__open may emit only one handoff per Code Mode cell")]
+    MultipleOpenHandoffs,
     /// A close or next transition had no live task scope to finish.
     #[error("spine transition requires a live task scope")]
     NoLiveTask,
@@ -180,6 +186,7 @@ struct RuntimeState {
     reducer: SpineReducer,
     next_boundary: u64,
     task_nodes: u32,
+    open_handoff_cells: BTreeSet<String>,
 }
 
 pub(crate) struct SpineRuntimeCheckpoint(RuntimeState);
@@ -233,6 +240,7 @@ impl SpineRuntime {
                 reducer: SpineReducer::new(),
                 next_boundary: 1,
                 task_nodes: 0,
+                open_handoff_cells: BTreeSet::new(),
             }),
             tree_observer: Mutex::new(None),
         }
@@ -255,6 +263,10 @@ impl SpineRuntime {
             if state.task_nodes >= self.limits.max_nodes {
                 return Err(SpineRuntimeError::NodeLimit(self.limits.max_nodes));
             }
+            let parent_call_id = code_mode_cell_call_id(call_id);
+            if state.open_handoff_cells.contains(parent_call_id) {
+                return Err(SpineRuntimeError::MultipleOpenHandoffs);
+            }
 
             apply_control(
                 &mut state,
@@ -263,6 +275,7 @@ impl SpineRuntime {
                 json!({ "summary": summary }),
             )?;
             state.task_nodes = state.task_nodes.saturating_add(1);
+            state.open_handoff_cells.insert(parent_call_id.to_owned());
             let projection = state.reducer.projection();
             (projection.cursor.clone(), spine_tree_snapshot(&projection))
         };
@@ -489,6 +502,12 @@ fn required(value: &str, error: SpineRuntimeError) -> Result<&str, SpineRuntimeE
 
 fn bounded(value: &str, maximum: usize, error: SpineRuntimeError) -> Result<(), SpineRuntimeError> {
     (value.len() <= maximum).then_some(()).ok_or(error)
+}
+
+fn code_mode_cell_call_id(call_id: &str) -> &str {
+    call_id
+        .rsplit_once("/code-")
+        .map_or(call_id, |(parent, _)| parent)
 }
 
 fn live_task(projection: &SpineProjection) -> Result<NodeId, SpineRuntimeError> {

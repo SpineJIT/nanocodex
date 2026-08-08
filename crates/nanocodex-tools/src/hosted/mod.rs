@@ -135,6 +135,15 @@ pub trait CodeModeHost: Send + Sync + 'static {
         ToolTurnBehavior::Continue
     }
 
+    /// Returns whether a successful nested tool result should be appended to
+    /// the completed Code Mode output as a bounded text handoff.
+    ///
+    /// This is independent of [`Self::turn_behavior`]: emitting a handoff does
+    /// not finish the turn.
+    fn emits_output_on_success(&self, _name: &str) -> bool {
+        false
+    }
+
     /// Returns the tools available to Code Mode for this session.
     ///
     /// The runtime calls this synchronously while building the model-visible

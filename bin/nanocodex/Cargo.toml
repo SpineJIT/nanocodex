@@ -10,6 +10,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Daily-driver TUI and headless JSONL adapter for Nanocodex"
 build = "build.rs"
+default-run = "nanocodex"
 
 [package.metadata.cargo-machete]
 # cargo-machete does not resolve imports from the package build script.

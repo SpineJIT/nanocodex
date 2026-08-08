@@ -83,7 +83,7 @@ impl Tool for SpineOpen {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
             "spine__open",
-            "Open one synchronous semantic work scope. This blocks until that scope returns a compact handoff. Use it only for genuine focused work, never in a parallel batch.",
+            "Open one synchronous semantic work scope. This blocks until that scope returns a compact handoff, which is automatically added to the parent model context; do not echo it with text(). Use it only for genuine focused work, never in a parallel batch.",
             json!({
                 "type": "object",
                 "properties": {
@@ -98,8 +98,8 @@ impl Tool for SpineOpen {
         )
     }
 
-    fn turn_behavior(&self) -> ToolTurnBehavior {
-        ToolTurnBehavior::EmitOutputOnSuccess
+    fn emits_output_on_success(&self) -> bool {
+        true
     }
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {

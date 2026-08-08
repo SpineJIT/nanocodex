@@ -67,6 +67,31 @@ test("browser host exposes statically declared terminal tool behavior", async ()
   });
 });
 
+test("browser host accepts statically declared emitting tool behavior", async () => {
+  const host = createBrowserHost({
+    WebSocketImpl: FakeWebSocket,
+    tools: {
+      handoff: {
+        description: "Return a compact handoff.",
+        parameters: { type: "object" },
+        turnBehavior: "emitOutputOnSuccess",
+        handler: () => "handoff",
+      },
+    },
+  });
+
+  const execution = JSON.parse(await host.executeCode(
+    "await tools.handoff({});",
+    "session",
+    "call-exec",
+  ));
+  assert.equal(execution.nested_calls[0].turn_behavior, "continue");
+  assert.equal(host.toolTurnBehavior("handoff"), "emit_output_on_success");
+  assert.deepEqual(JSON.parse(host.toolTurnBehaviors()), {
+    handoff: "emit_output_on_success",
+  });
+});
+
 test("browser host serializes terminal tools against Promise.all siblings", async () => {
   const running = new Set();
   let overlapped = false;

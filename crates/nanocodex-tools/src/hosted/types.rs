@@ -164,15 +164,17 @@ impl CodeModeExecution {
     pub(crate) fn apply_host_turn_behaviors(
         &mut self,
         turn_behavior: impl Fn(&str) -> ToolTurnBehavior,
+        emits_output_on_success: impl Fn(&str) -> bool,
     ) {
         let mut emitted_outputs = Vec::new();
         for call in &mut self.nested_calls {
             call.turn_behavior = turn_behavior(&call.name);
-            if call.success && call.turn_behavior == ToolTurnBehavior::EmitOutputOnSuccess {
+            if call.success && emits_output_on_success(&call.name) {
                 emitted_outputs.push(call.output.clone());
             }
         }
-        for output in emitted_outputs {
+        if let Some(output) = crate::emitted_output::bounded_emitted_output(emitted_outputs.iter())
+        {
             append_nested_output(&mut self.output, output);
         }
         let candidates = if self.success {

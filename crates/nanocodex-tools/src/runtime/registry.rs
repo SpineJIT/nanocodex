@@ -39,6 +39,11 @@ impl ToolRegistry {
             })
     }
 
+    pub(crate) fn emits_output_on_success(&self, name: &str) -> bool {
+        self.get(name)
+            .is_some_and(|(handler, _)| handler.emits_output_on_success())
+    }
+
     pub(super) async fn execute_direct(
         &self,
         name: &str,

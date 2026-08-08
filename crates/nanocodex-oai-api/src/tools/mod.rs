@@ -23,9 +23,6 @@ pub enum ToolTurnBehavior {
     /// Continue the current model turn after the tool result is committed.
     #[default]
     Continue,
-    /// Continue the current model turn and append the successful nested result
-    /// to the enclosing Code Mode cell output in nested-call order.
-    EmitOutputOnSuccess,
     /// Return the successful tool result to the embedding host after the complete cell or batch
     /// commits, without requesting another model response.
     FinishTurnOnSuccess,
@@ -611,6 +608,16 @@ pub trait Tool: Send + Sync + 'static {
     /// unambiguous control result.
     fn turn_behavior(&self) -> ToolTurnBehavior {
         ToolTurnBehavior::Continue
+    }
+
+    /// Returns whether a successful nested invocation should append its bounded
+    /// text output to the enclosing Code Mode result.
+    ///
+    /// This does not affect direct tool calls or turn completion. Use it only
+    /// for compact handoffs that the next model response must receive even when
+    /// the Code Mode cell does not explicitly call `text()`.
+    fn emits_output_on_success(&self) -> bool {
+        false
     }
 
     /// Executes one invocation.

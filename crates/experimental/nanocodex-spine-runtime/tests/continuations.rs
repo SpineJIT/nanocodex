@@ -81,6 +81,28 @@ fn rejected_node_limit_preserves_the_live_scope() {
 }
 
 #[test]
+fn one_code_mode_cell_cannot_emit_two_spine_handoffs() {
+    let runtime = SpineRuntime::new(SpineRuntimeLimits::default());
+    runtime
+        .open("call-exec/code-1", "inspect the parser")
+        .unwrap();
+    runtime.close("close-1", "parser handoff").unwrap();
+
+    let error = runtime
+        .open("call-exec/code-2", "inspect the lexer")
+        .unwrap_err();
+    let projection = runtime.projection().unwrap();
+
+    assert_eq!(
+        error.to_string(),
+        "spine__open may emit only one handoff per Code Mode cell"
+    );
+    assert_eq!(projection.cursor.to_string(), "1");
+    assert_eq!(projection.nodes.len(), 2);
+    assert_eq!(projection.nodes[1].status, NodeStatus::Closed);
+}
+
+#[test]
 fn rejected_next_node_limit_preserves_the_live_scope() {
     let runtime = SpineRuntime::new(SpineRuntimeLimits {
         max_nodes: 1,

@@ -229,12 +229,14 @@ struct CompletedNestedCall {
     value: Value,
     call: NestedToolCall,
     shell_session_id: Option<i64>,
+    emits_output_on_success: bool,
 }
 
 struct ObservedNestedCall {
     id: u64,
     call: NestedToolCall,
     shell_session_id: Option<i64>,
+    emits_output_on_success: bool,
 }
 
 enum CellTerminal {
@@ -1012,9 +1014,19 @@ fn observed_execution(
     }: ObservationBuffer,
 ) -> CodeModeExecution {
     expose_running_shell_sessions(&mut content, &nested_calls);
-    let nested_calls = ordered_calls(nested_calls);
-    append_emitted_nested_outputs(&mut content, &nested_calls);
-    let content = output::truncate_content(content, max_output_tokens);
+    let mut nested_calls = nested_calls;
+    nested_calls.sort_unstable_by_key(|call| call.id);
+    let emitted_output = crate::emitted_output::bounded_emitted_output(
+        nested_calls
+            .iter()
+            .filter(|call| call.emits_output_on_success && call.call.success)
+            .map(|call| &call.call.output),
+    );
+    let nested_calls = nested_calls.into_iter().map(|call| call.call).collect();
+    let mut content = output::truncate_content(content, max_output_tokens);
+    if let Some(emitted_output) = emitted_output {
+        crate::emitted_output::append_to_content(&mut content, emitted_output);
+    }
     let mut execution = CodeModeExecution {
         output: with_status(status, started_at.elapsed().as_secs_f64(), content),
         success,
@@ -1024,20 +1036,6 @@ fn observed_execution(
     };
     execution.select_terminal_tools(terminal_tools);
     execution
-}
-
-fn append_emitted_nested_outputs(content: &mut Vec<ToolOutputContent>, calls: &[NestedToolCall]) {
-    for call in calls {
-        if !call.success || call.turn_behavior != ToolTurnBehavior::EmitOutputOnSuccess {
-            continue;
-        }
-        match &call.output {
-            ToolOutputBody::Text(text) => {
-                content.push(ToolOutputContent::InputText { text: text.clone() })
-            }
-            ToolOutputBody::Content(items) => content.extend(items.clone()),
-        }
-    }
 }
 
 fn expose_running_shell_sessions(
@@ -1217,6 +1215,7 @@ impl EmbeddedHost {
             id: completed.id,
             call: completed.call,
             shell_session_id: completed.shell_session_id,
+            emits_output_on_success: completed.emits_output_on_success,
         })
     }
 }
@@ -1349,11 +1348,6 @@ impl HostFailure {
     }
 }
 
-fn ordered_calls(mut calls: Vec<ObservedNestedCall>) -> Vec<NestedToolCall> {
-    calls.sort_unstable_by_key(|call| call.id);
-    calls.into_iter().map(|call| call.call).collect()
-}
-
 async fn execute_nested_call(
     tools: &ToolRegistry,
     id: u64,
@@ -1376,6 +1370,7 @@ async fn execute_nested_call(
     );
     let execution = tools.execute_nested(&name, input.clone(), context).await;
     let turn_behavior = tools.turn_behavior(&name);
+    let emits_output_on_success = tools.emits_output_on_success(&name);
     let duration_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let value = execution.code_mode_value();
     let shell_session_id = execution
@@ -1386,6 +1381,7 @@ async fn execute_nested_call(
         id,
         value,
         shell_session_id,
+        emits_output_on_success,
         call: NestedToolCall {
             call_id,
             name,

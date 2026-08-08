@@ -8,10 +8,12 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     if (!tool || typeof tool.handler !== "function") {
       throw new TypeError(`tool ${name} requires a handler function`);
     }
+    const turnBehavior = normalizeTurnBehavior(tool.turnBehavior);
     configuredTools.push(Object.freeze({
       handler: tool.handler,
       name,
-      turnBehavior: normalizeTurnBehavior(tool.turnBehavior),
+      turnBehavior: turnBehavior.nested,
+      hostTurnBehavior: turnBehavior.host,
     }));
     definitions.push(deepFreeze({
       type: "function",
@@ -187,9 +189,9 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     executeCode,
     executeTool,
     toolDefinitions: () => encodedDefinitions,
-    toolTurnBehavior: (name) => toolByName.get(name)?.turnBehavior ?? "continue",
+    toolTurnBehavior: (name) => toolByName.get(name)?.hostTurnBehavior ?? "continue",
     toolTurnBehaviors: () => JSON.stringify(Object.fromEntries(
-      configuredTools.map((tool) => [tool.name, tool.turnBehavior]),
+      configuredTools.map((tool) => [tool.name, tool.hostTurnBehavior]),
     )),
     reset() {
       stores.clear();
@@ -234,9 +236,18 @@ async function executeHandler(
 }
 
 function normalizeTurnBehavior(value) {
-  if (value === undefined || value === "continue") return "continue";
-  if (value === "finishTurnOnSuccess") return "finish_turn_on_success";
-  throw new TypeError("tool turnBehavior must be continue or finishTurnOnSuccess");
+  if (value === undefined || value === "continue") {
+    return { nested: "continue", host: "continue" };
+  }
+  if (value === "finishTurnOnSuccess") {
+    return { nested: "finish_turn_on_success", host: "finish_turn_on_success" };
+  }
+  if (value === "emitOutputOnSuccess") {
+    return { nested: "continue", host: "emit_output_on_success" };
+  }
+  throw new TypeError(
+    "tool turnBehavior must be continue, finishTurnOnSuccess, or emitOutputOnSuccess",
+  );
 }
 
 function encodeToolOutput(output, success, codeModeValue) {

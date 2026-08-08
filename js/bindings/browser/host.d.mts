@@ -1,7 +1,7 @@
 export type BrowserTool = {
   description: string;
   parameters: Record<string, unknown>;
-  turnBehavior?: "continue" | "finishTurnOnSuccess" | undefined;
+  turnBehavior?: "continue" | "emitOutputOnSuccess" | "finishTurnOnSuccess" | undefined;
   handler: (
     input: unknown,
     context: { sessionId: string },

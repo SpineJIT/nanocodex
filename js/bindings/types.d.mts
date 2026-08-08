@@ -141,8 +141,11 @@ export type ToolContext = {
 export type Tool = {
   description: string;
   parameters: Record<string, unknown>;
-  /** Ends the enclosing turn after a successful complete Code Mode cell or direct batch. */
-  turnBehavior?: "continue" | "finishTurnOnSuccess" | undefined;
+  /**
+   * Controls whether a successful call continues, finishes, or emits a bounded
+   * handoff into the enclosing Code Mode result.
+   */
+  turnBehavior?: "continue" | "emitOutputOnSuccess" | "finishTurnOnSuccess" | undefined;
   handler(input: unknown, context: ToolContext): unknown | Promise<unknown>;
 };
 

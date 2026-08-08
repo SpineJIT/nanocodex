@@ -35,6 +35,8 @@ struct FinishesTurn;
 
 struct EmitsOutput;
 
+struct EmitsLargeOutput;
+
 struct ConcurrencyProbeState {
     active: AtomicUsize,
     maximum: AtomicUsize,
@@ -134,12 +136,35 @@ impl Tool for EmitsOutput {
         )
     }
 
-    fn turn_behavior(&self) -> ToolTurnBehavior {
-        ToolTurnBehavior::EmitOutputOnSuccess
+    fn emits_output_on_success(&self) -> bool {
+        true
     }
 
     async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
         Ok(ToolOutput::text("model-facing handoff"))
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for EmitsLargeOutput {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "emits_large_output",
+            "Returns a large result that Code Mode should bound before exposing it.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    fn emits_output_on_success(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        Ok(ToolOutput::text("x".repeat(750)))
     }
 }
 
@@ -166,6 +191,48 @@ async fn successful_emitting_tool_surfaces_its_output_without_text() -> Result<(
 
     assert!(execution.success);
     assert!(emitted_text(&execution)?.contains("model-facing handoff"));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn emitted_output_survives_a_zero_normal_output_budget() -> Result<()> {
+    let workspace = temporary_workspace("emitting-tool-reserved-output")?;
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(EmitsOutput)
+        .build()?;
+    let runtime = ToolRuntime::new_with_tools(&workspace, None, None, &tools);
+    let execution = runtime
+        .execute_code(
+            "text('ordinary output'); await tools.emits_output({});",
+            ToolContext::new("test-model", "test-session", "test-call", &[], 0),
+        )
+        .await;
+
+    assert!(execution.success);
+    assert!(emitted_text(&execution)?.contains("model-facing handoff"));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn emitted_output_has_a_non_configurable_aggregate_limit() -> Result<()> {
+    let workspace = temporary_workspace("bounded-emitting-tool-output")?;
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(EmitsLargeOutput)
+        .build()?;
+    let runtime = ToolRuntime::new_with_tools(&workspace, None, None, &tools);
+    let execution = runtime
+        .execute_code(
+            "await tools.emits_large_output({}); await tools.emits_large_output({});",
+            ToolContext::new("test-model", "test-session", "test-call", &[], 0),
+        )
+        .await;
+
+    assert!(execution.success);
+    assert!(emitted_text(&execution)?.len() <= 1_000);
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
