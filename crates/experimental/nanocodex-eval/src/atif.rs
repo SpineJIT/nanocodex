@@ -846,6 +846,7 @@ mod tests {
         let metadata: AgentMetadata = serde_json::from_str(TERMINAL_METADATA).unwrap();
         let result = AgentResult {
             final_message: "Finished.".to_owned(),
+            terminal_tool: None,
             model: metadata.model.clone(),
             effort: metadata.effort.clone(),
             model_calls: metadata.model_calls,

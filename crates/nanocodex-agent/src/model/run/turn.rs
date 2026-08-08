@@ -193,7 +193,11 @@ where
                 let usage = self.stats.turn_usage(self.model, self.fast_mode);
                 record_turn_usage(&tracing::Span::current(), &usage);
                 let event_completion = completion.run_completion();
-                let checkpoint = self.commit_checkpoint()?;
+                let checkpoint = if matches!(&completion, TurnCompletion::TerminalTool { .. }) {
+                    self.commit_terminal_checkpoint()?
+                } else {
+                    self.commit_checkpoint()?
+                };
                 self.events.emit(
                     AgentEventKind::RunCompleted,
                     terminal_payload(
@@ -523,6 +527,25 @@ where
                 detail: "completed turn did not have a model session",
             })?;
         session.conversation.commit()?;
+        Ok(Self::checkpoint_from_session(
+            session,
+            false,
+            self.global_instructions.clone(),
+        ))
+    }
+
+    pub(super) fn commit_terminal_checkpoint(&mut self) -> Result<ModelCheckpoint> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or(NanocodexError::InvalidAttemptState {
+                detail: "completed terminal turn did not have a model session",
+            })?;
+        // The provider checkpoint predates the locally executed terminal tool.
+        // Preserve the complete typed history, but replay it on the next prompt
+        // so the provider observes the paired tool output before continuing.
+        session.conversation.reset_for_full_request();
+        session.conversation.commit_tail();
         Ok(Self::checkpoint_from_session(
             session,
             false,
