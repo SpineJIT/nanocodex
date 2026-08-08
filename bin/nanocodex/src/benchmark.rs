@@ -43,6 +43,8 @@ You own task and treatment priority. Read the family records, choose exact pendi
 
 Drive the host to its memory limit aggressively; there is no fixed run-slot ceiling. Start with at least one concurrent run per logical CPU, spread across already-prepared tasks and independent treatments so one preparation lock or failing family cannot stall the host. Then add runs in batches while pending work remains and host memory is healthy. On Linux, use `MemAvailable` from `/proc/meminfo`, swap activity, memory PSI, and OOM events as the pressure signals. Target a steady-state reserve of roughly five percent of physical RAM, never more than 4 GiB, so the benchmark deliberately runs close to OOM without continuously crossing it. Continue increasing fan-out while the reserve is materially above that target. When it falls below the target, stop launching replacements until completed runs return enough memory, then refill immediately. An isolated OOM or VM allocation failure means the latest ramp overshot: allow running work to drain, resume just below that level, and keep probing upward later as the workload mix changes. Sustained swap-in or memory PSI also requires a temporary backoff. Do not reduce fan-out for model failures, verifier failures, or one broken harness treatment.
 
+Time to first run is part of this contract. Immediately after the first status read and one host-pressure snapshot, use the next tool call to launch the initial CPU-sized fan-out directly. Do not spend another model turn designing a scheduler. Do not generate a scheduler script, background shell controller, temporary orchestration file, or long-lived child loop. Keep scheduling in this agent: invoke independent `eval run` commands through direct parallel tool calls, retain their process sessions, and make each later refill or ramp decision after observing those sessions and current host pressure.
+
 Do not operate in synchronized waves after startup. Keep every memory-safe slot occupied by replacing each process as soon as it exits, and re-evaluate pressure before every replacement and after each ramp batch. The live process count is an outcome of host pressure, not a configured maximum; it may grow far beyond the logical CPU count when runs are waiting on remote model work.
 
 Task preparation is part of each task's durable state. One run process may prepare a task while another receives a temporary-unavailable result. Retry temporary contention after its suggested delay. Retry durable infrastructure failures, but treat accepted model and verifier outcomes as terminal even when the benchmark failed.
@@ -76,6 +78,9 @@ mod tests {
         assert!(prompt.contains("there is no fixed run-slot ceiling"));
         assert!(prompt.contains("at least one concurrent run per logical CPU"));
         assert!(prompt.contains("Target a steady-state reserve of roughly five percent"));
+        assert!(prompt.contains("Time to first run is part of this contract"));
+        assert!(prompt.contains("Do not generate a scheduler script"));
+        assert!(prompt.contains("direct parallel tool calls"));
         assert!(prompt.contains("The live process count is an outcome of host pressure"));
         assert!(prompt.contains("replacing each process as soon as it exits"));
         assert!(prompt.contains("keep probing upward later as the workload mix changes"));
