@@ -41,6 +41,7 @@ const COMMAND_CAPACITY: usize = 8;
 pub struct RolloutConfig {
     codex_home: PathBuf,
     resume_path: Option<PathBuf>,
+    audit_only: bool,
 }
 
 impl RolloutConfig {
@@ -50,7 +51,15 @@ impl RolloutConfig {
         Self {
             codex_home: codex_home.into(),
             resume_path: None,
+            audit_only: false,
         }
+    }
+
+    /// Keeps the rollout as an audit record without permitting session resume.
+    #[must_use]
+    pub fn audit_only(mut self) -> Self {
+        self.audit_only = true;
+        self
     }
 
     /// Returns the Codex state directory used for this rollout policy.
@@ -88,6 +97,10 @@ impl RolloutConfig {
     }
 
     pub(crate) fn for_new_thread(&self) -> Self {
-        Self::new(self.codex_home.clone())
+        Self {
+            codex_home: self.codex_home.clone(),
+            resume_path: None,
+            audit_only: self.audit_only,
+        }
     }
 }

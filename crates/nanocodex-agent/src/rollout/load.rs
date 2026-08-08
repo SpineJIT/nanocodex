@@ -1,6 +1,8 @@
 use super::*;
 use std::{collections::HashMap, time::SystemTime};
 
+const AUDIT_ONLY_RESUME_POLICY: &str = "audit_only";
+
 /// Lightweight metadata for one resumable Codex-compatible rollout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RolloutSessionInfo {
@@ -237,6 +239,9 @@ fn rollout_session_info(
         match value.get("type").and_then(serde_json::Value::as_str) {
             Some("session_meta") if workspace.is_none() => {
                 let payload = value.get("payload")?;
+                if audit_only_rollout(payload) {
+                    return None;
+                }
                 validate_legacy_history_mode(payload).ok()?;
                 let stored_id = payload
                     .get("id")
@@ -388,6 +393,12 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
         match value.get("type").and_then(serde_json::Value::as_str) {
             Some("session_meta") if workspace.is_none() => {
                 let payload = &value["payload"];
+                if audit_only_rollout(payload) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "this Nanocodex rollout is audit-only and cannot be resumed",
+                    ));
+                }
                 validate_legacy_history_mode(payload)?;
                 if payload.get("id").and_then(serde_json::Value::as_str) != Some(thread_id) {
                     return Err(io::Error::new(
@@ -496,6 +507,13 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
         transcript,
         context_baseline,
     })
+}
+
+fn audit_only_rollout(payload: &serde_json::Value) -> bool {
+    payload
+        .get("nanocodex_resume_policy")
+        .and_then(serde_json::Value::as_str)
+        == Some(AUDIT_ONLY_RESUME_POLICY)
 }
 
 struct MaterializedRollout {

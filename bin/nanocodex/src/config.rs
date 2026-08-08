@@ -46,6 +46,12 @@ pub(crate) struct ConfiguredAgent {
 pub(crate) type ToolCustomizer =
     Arc<dyn Fn(Tools, AgentHandle) -> std::result::Result<Tools, ToolsBuildError> + Send + Sync>;
 
+#[derive(Clone, Copy)]
+pub(crate) enum RolloutPolicy {
+    Resumable,
+    AuditOnly,
+}
+
 struct SessionBuild {
     workspace: PathBuf,
     session_id: Option<SessionId>,
@@ -162,7 +168,7 @@ pub(crate) struct AgentArgs {
     )]
     subagents: bool,
 
-    /// Write Codex-compatible resumable threads beneath `CODEX_HOME`.
+    /// Write Codex-compatible rollout records beneath `CODEX_HOME`.
     #[arg(
         long,
         env = "NANOCODEX_ROLLOUTS",
@@ -255,15 +261,18 @@ impl AgentArgs {
     }
 
     pub(crate) async fn build(self, vm: VmArgs) -> Result<ConfiguredAgent> {
-        self.build_inner(None, vm, None).await
+        self.build_inner(None, vm, None, RolloutPolicy::Resumable)
+            .await
     }
 
     pub(crate) async fn build_with_tool_customizer(
         self,
         vm: VmArgs,
         customizer: ToolCustomizer,
+        rollout_policy: RolloutPolicy,
     ) -> Result<ConfiguredAgent> {
-        self.build_inner(None, vm, Some(customizer)).await
+        self.build_inner(None, vm, Some(customizer), rollout_policy)
+            .await
     }
 
     pub(crate) async fn build_resumed(
@@ -271,7 +280,8 @@ impl AgentArgs {
         session: DurableSession,
         vm: VmArgs,
     ) -> Result<ConfiguredAgent> {
-        self.build_inner(Some(session), vm, None).await
+        self.build_inner(Some(session), vm, None, RolloutPolicy::Resumable)
+            .await
     }
 
     async fn build_inner(
@@ -279,12 +289,19 @@ impl AgentArgs {
         durable: Option<DurableSession>,
         vm: VmArgs,
         customizer: Option<ToolCustomizer>,
+        rollout_policy: RolloutPolicy,
     ) -> Result<ConfiguredAgent> {
         let thinking = self.thinking();
         let web_search = self.web_search();
         let codex_home = default_codex_home()?;
         let responses_transport = self.responses_transport();
-        let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
+        let session = prepare_session_build(
+            self.cwd,
+            self.rollouts,
+            &codex_home,
+            durable,
+            rollout_policy,
+        )?;
         let configured_browser = self.browser.configure(&session.workspace)?;
         let mpp_enabled = self.mpp.is_enabled();
         if mpp_enabled && !matches!(responses_transport, ResponsesTransport::Https) {
@@ -481,13 +498,17 @@ fn prepare_session_build(
     rollouts: bool,
     codex_home: &Path,
     durable: Option<DurableSession>,
+    rollout_policy: RolloutPolicy,
 ) -> Result<SessionBuild> {
     let Some(session) = durable else {
         return Ok(SessionBuild {
             workspace: requested_workspace.unwrap_or_else(|| PathBuf::from(".")),
             session_id: None,
             snapshot: None,
-            rollout: rollouts.then(|| RolloutConfig::new(codex_home)),
+            rollout: rollouts.then(|| match rollout_policy {
+                RolloutPolicy::Resumable => RolloutConfig::new(codex_home),
+                RolloutPolicy::AuditOnly => RolloutConfig::new(codex_home).audit_only(),
+            }),
         });
     };
     let restored = Path::new(session.workspace())
