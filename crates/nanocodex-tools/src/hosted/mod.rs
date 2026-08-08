@@ -139,7 +139,8 @@ pub trait CodeModeHost: Send + Sync + 'static {
     /// the completed Code Mode output as a bounded text handoff.
     ///
     /// This is independent of [`Self::turn_behavior`]: emitting a handoff does
-    /// not finish the turn.
+    /// not finish the turn. The completed cell is normalized to text, so it
+    /// cannot forward image or audio payloads alongside the handoff.
     fn emits_output_on_success(&self, _name: &str) -> bool {
         false
     }

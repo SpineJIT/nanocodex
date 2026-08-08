@@ -232,7 +232,9 @@ async fn emitted_output_has_a_non_configurable_aggregate_limit() -> Result<()> {
         .await;
 
     assert!(execution.success);
-    assert!(emitted_text(&execution)?.len() <= 1_000);
+    let output = execution_output(&execution);
+    assert!(output.contains("[emitted output truncated]"));
+    assert!(output.len() <= crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS);
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -247,7 +249,7 @@ async fn emitted_output_stays_within_the_hard_model_visible_output_budget() -> R
     let runtime = ToolRuntime::new_with_tools(&workspace, None, None, &tools);
     let execution = runtime
         .execute_code(
-            "// @exec: {\"max_output_tokens\": 100000}\ntext('ordinary output '.repeat(4_000)); await tools.emits_large_output({}); await tools.emits_large_output({});",
+            "// @exec: {\"max_output_tokens\": 100000}\ntext('界'.repeat(20_000)); await tools.emits_large_output({}); await tools.emits_large_output({});",
             ToolContext::new(
                 "test-model",
                 "test-session",
@@ -271,7 +273,7 @@ async fn emitted_output_stays_within_the_hard_model_visible_output_budget() -> R
             .sum(),
     };
     assert!(
-        model_visible_text_bytes <= crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS * 4,
+        model_visible_text_bytes <= crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
         "model-visible cell output was {model_visible_text_bytes} bytes"
     );
     std::fs::remove_dir_all(workspace)?;
@@ -2364,17 +2366,17 @@ fn model_description_uses_codex_style_declarations() {
 }
 
 fn emitted_text(execution: &CodeModeExecution) -> Result<&str> {
-    let ToolOutputBody::Content(content) = &execution.output else {
-        return Err(eyre!("code-mode execution did not emit content"));
-    };
-    content
-        .iter()
-        .rev()
-        .find_map(|item| match item {
-            ToolOutputContent::InputText { text } => Some(text.as_str()),
-            ToolOutputContent::InputImage { .. } | ToolOutputContent::InputAudio { .. } => None,
-        })
-        .ok_or_else(|| eyre!("code-mode execution did not emit text"))
+    match &execution.output {
+        ToolOutputBody::Text(text) => Ok(text),
+        ToolOutputBody::Content(content) => content
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                ToolOutputContent::InputText { text } => Some(text.as_str()),
+                ToolOutputContent::InputImage { .. } | ToolOutputContent::InputAudio { .. } => None,
+            })
+            .ok_or_else(|| eyre!("code-mode execution did not emit text")),
+    }
 }
 
 fn execution_output(execution: &CodeModeExecution) -> String {

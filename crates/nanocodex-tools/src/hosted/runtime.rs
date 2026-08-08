@@ -392,7 +392,7 @@ mod tests {
 
     use super::{HostedToolRuntime, HostedTools};
     use crate::{
-        ToolContext, ToolDefinition, ToolOutputContent,
+        ToolContext, ToolDefinition,
         hosted::{CodeModeExecution, CodeModeHost, CodeModeHostError, HostFuture, NestedToolCall},
     };
 
@@ -561,23 +561,15 @@ mod tests {
             )
             .await;
 
-        let ToolOutputBody::Content(output) = execution.output else {
-            panic!("emitting output should preserve the original host output");
+        let ToolOutputBody::Text(output) = execution.output else {
+            panic!("emitting output should normalize the host output to bounded text");
         };
-        assert!(output.iter().any(|item| matches!(
-            item,
-            ToolOutputContent::InputText { text } if text == "hosted handoff"
-        )));
-        let model_visible_text_bytes = output
-            .iter()
-            .filter_map(|item| match item {
-                ToolOutputContent::InputText { text } => Some(text.len()),
-                ToolOutputContent::InputImage { .. } | ToolOutputContent::InputAudio { .. } => None,
-            })
-            .sum::<usize>();
+        assert!(output.contains("ordinary output"));
+        assert!(output.ends_with("hosted handoff"));
         assert!(
-            model_visible_text_bytes <= crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS * 4,
-            "model-visible hosted output was {model_visible_text_bytes} bytes"
+            output.len() <= crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
+            "model-visible hosted output was {} bytes",
+            output.len()
         );
     }
 
