@@ -192,7 +192,7 @@ test("Node-hosted WASM emits a declared handoff without text()", async () => {
       handoff: {
         description: "Return the compact continuation handoff.",
         parameters: { type: "object", additionalProperties: false },
-        turnBehavior: "emitOutputOnSuccess",
+        emitOutputOnSuccess: true,
         handler: () => "<spine_memory>handoff</spine_memory>",
       },
     },

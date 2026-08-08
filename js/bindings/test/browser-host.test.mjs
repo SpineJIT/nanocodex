@@ -74,7 +74,7 @@ test("browser host accepts statically declared emitting tool behavior", async ()
       handoff: {
         description: "Return a compact handoff.",
         parameters: { type: "object" },
-        turnBehavior: "emitOutputOnSuccess",
+        emitOutputOnSuccess: true,
         handler: () => "handoff",
       },
     },

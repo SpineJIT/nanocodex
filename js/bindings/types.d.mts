@@ -141,11 +141,10 @@ export type ToolContext = {
 export type Tool = {
   description: string;
   parameters: Record<string, unknown>;
-  /**
-   * Controls whether a successful call continues, finishes, or emits a bounded
-   * handoff into the enclosing Code Mode result.
-   */
-  turnBehavior?: "continue" | "emitOutputOnSuccess" | "finishTurnOnSuccess" | undefined;
+  /** Controls whether a successful call continues or finishes the enclosing turn. */
+  turnBehavior?: "continue" | "finishTurnOnSuccess" | undefined;
+  /** Appends the successful result as a bounded handoff to the enclosing Code Mode output. */
+  emitOutputOnSuccess?: boolean | undefined;
   handler(input: unknown, context: ToolContext): unknown | Promise<unknown>;
 };
 

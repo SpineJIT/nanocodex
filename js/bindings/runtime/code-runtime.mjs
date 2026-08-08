@@ -9,11 +9,15 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
       throw new TypeError(`tool ${name} requires a handler function`);
     }
     const turnBehavior = normalizeTurnBehavior(tool.turnBehavior);
+    const emitsOutputOnSuccess = normalizeEmitsOutputOnSuccess(tool.emitOutputOnSuccess);
+    if (emitsOutputOnSuccess && turnBehavior.host !== "continue") {
+      throw new TypeError("tool emitOutputOnSuccess requires turnBehavior continue");
+    }
     configuredTools.push(Object.freeze({
       handler: tool.handler,
       name,
       turnBehavior: turnBehavior.nested,
-      hostTurnBehavior: turnBehavior.host,
+      hostTurnBehavior: emitsOutputOnSuccess ? "emit_output_on_success" : turnBehavior.host,
     }));
     definitions.push(deepFreeze({
       type: "function",
@@ -242,12 +246,13 @@ function normalizeTurnBehavior(value) {
   if (value === "finishTurnOnSuccess") {
     return { nested: "finish_turn_on_success", host: "finish_turn_on_success" };
   }
-  if (value === "emitOutputOnSuccess") {
-    return { nested: "continue", host: "emit_output_on_success" };
-  }
-  throw new TypeError(
-    "tool turnBehavior must be continue, finishTurnOnSuccess, or emitOutputOnSuccess",
-  );
+  throw new TypeError("tool turnBehavior must be continue or finishTurnOnSuccess");
+}
+
+function normalizeEmitsOutputOnSuccess(value) {
+  if (value === undefined || value === false) return false;
+  if (value === true) return true;
+  throw new TypeError("tool emitOutputOnSuccess must be boolean");
 }
 
 function encodeToolOutput(output, success, codeModeValue) {

@@ -2055,37 +2055,34 @@ text(result);
 }
 
 #[tokio::test]
-async fn exec_pragma_and_wait_limit_direct_output() -> Result<()> {
+async fn exec_pragma_and_wait_cannot_exceed_the_context_output_budget() -> Result<()> {
     let workspace = temporary_workspace("code-output-limits")?;
     let tools = test_tools(&workspace);
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            "// @exec: {\"max_output_tokens\": 2}\ntext(\"abcdefghijklmnop\")",
-            test_context(&history),
+            r#"// @exec: {"max_output_tokens": 100000}
+text("a".repeat(10_000));
+await yield_control();
+text("b".repeat(10_000));"#,
+            ToolContext::new("test-model", "test-session", "call-exec", &history, 2),
         )
         .await;
     assert!(execution.success);
-    assert!(execution_output(&execution).contains("Warning: truncated output"));
+    let initial_output = execution_output(&execution);
+    assert!(initial_output.contains("Warning: truncated output"));
+    assert!(initial_output.len() < 500, "{initial_output}");
 
-    let yielded = tools
-        .execute_code(
-            r#"
-await yield_control();
-text("abcdefghijklmnop");
-"#,
-            test_context(&history),
-        )
-        .await;
-    assert!(yielded.success);
     let completed = tools
         .wait_for_code(
-            r#"{"cell_id":"2","yield_time_ms":1000,"max_tokens":2}"#,
-            test_context(&history),
+            r#"{"cell_id":"1","yield_time_ms":1000,"max_tokens":100000}"#,
+            ToolContext::new("test-model", "test-session", "call-exec", &history, 2),
         )
         .await;
     assert!(completed.success);
-    assert!(execution_output(&completed).contains("Warning: truncated output"));
+    let resumed_output = execution_output(&completed);
+    assert!(resumed_output.contains("Warning: truncated output"));
+    assert!(resumed_output.len() < 500, "{resumed_output}");
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
