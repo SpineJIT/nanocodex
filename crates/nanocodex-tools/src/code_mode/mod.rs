@@ -1012,16 +1012,32 @@ fn observed_execution(
     }: ObservationBuffer,
 ) -> CodeModeExecution {
     expose_running_shell_sessions(&mut content, &nested_calls);
+    let nested_calls = ordered_calls(nested_calls);
+    append_emitted_nested_outputs(&mut content, &nested_calls);
     let content = output::truncate_content(content, max_output_tokens);
     let mut execution = CodeModeExecution {
         output: with_status(status, started_at.elapsed().as_secs_f64(), content),
         success,
-        nested_calls: ordered_calls(nested_calls),
+        nested_calls,
         notifications,
         terminal_selection: Default::default(),
     };
     execution.select_terminal_tools(terminal_tools);
     execution
+}
+
+fn append_emitted_nested_outputs(content: &mut Vec<ToolOutputContent>, calls: &[NestedToolCall]) {
+    for call in calls {
+        if !call.success || call.turn_behavior != ToolTurnBehavior::EmitOutputOnSuccess {
+            continue;
+        }
+        match &call.output {
+            ToolOutputBody::Text(text) => {
+                content.push(ToolOutputContent::InputText { text: text.clone() })
+            }
+            ToolOutputBody::Content(items) => content.extend(items.clone()),
+        }
+    }
 }
 
 fn expose_running_shell_sessions(

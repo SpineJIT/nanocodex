@@ -263,7 +263,25 @@ async fn nested_opens_return_memory_one_scope_at_a_time() {
     assert_eq!(result.final_message(), Some("parent resumed"));
     assert_eq!(projection.cursor.to_string(), "1");
     assert_eq!(projection.nodes.len(), 3);
+    assert_eq!(projection.nodes[1].id.to_string(), "1.1");
+    assert_eq!(
+        projection.nodes[1].parent.as_ref().unwrap().to_string(),
+        "1"
+    );
+    assert_eq!(
+        projection.nodes[1].summary.as_deref(),
+        Some("inspect the parser")
+    );
     assert_eq!(projection.nodes[1].status, NodeStatus::Closed);
+    assert_eq!(projection.nodes[2].id.to_string(), "1.1.1");
+    assert_eq!(
+        projection.nodes[2].parent.as_ref().unwrap().to_string(),
+        "1.1"
+    );
+    assert_eq!(
+        projection.nodes[2].summary.as_deref(),
+        Some("inspect the lexer")
+    );
     assert_eq!(projection.nodes[2].status, NodeStatus::Closed);
     assert_eq!(calls.load(Ordering::Relaxed), 6);
 
@@ -348,7 +366,7 @@ impl Service<ResponsesAttempt> for ScriptedService {
             (_, 1, ResponsesAttemptKind::Generation) => code_generation(
                 "resp-root-open",
                 "call-root-exec",
-                "const handoff = await tools.spine__open({summary: 'inspect the parser'}); text(handoff.memory);",
+                "await tools.spine__open({summary: 'inspect the parser'});",
             ),
             (Script::Close, 2, ResponsesAttemptKind::Generation) => code_generation(
                 "resp-child-close",
@@ -356,7 +374,10 @@ impl Service<ResponsesAttempt> for ScriptedService {
                 "await tools.spine__close({memory: 'parser accepts one token too eagerly'});",
             ),
             (Script::Close, 3, ResponsesAttemptKind::Generation) => {
-                assert_input_contains(&request, "parser accepts one token too eagerly");
+                assert_input_contains(
+                    &request,
+                    r#"<spine_memory>\nparser accepts one token too eagerly\n</spine_memory>"#,
+                );
                 final_generation("resp-parent-final", "parent resumed")
             }
             (Script::Next, 2, ResponsesAttemptKind::Generation) => code_generation(
@@ -366,6 +387,7 @@ impl Service<ResponsesAttempt> for ScriptedService {
             ),
             (Script::Next, 3, ResponsesAttemptKind::Generation) => {
                 assert_input_contains(&request, "parser requires one-token lookahead");
+                assert_input_contains(&request, "confirm the fix");
                 code_generation(
                     "resp-sibling-close",
                     "call-sibling-exec",
@@ -385,7 +407,7 @@ impl Service<ResponsesAttempt> for ScriptedService {
             (Script::Nested, 2, ResponsesAttemptKind::Generation) => code_generation(
                 "resp-child-open",
                 "call-child-exec",
-                "const handoff = await tools.spine__open({summary: 'inspect the lexer'}); text(handoff.memory);",
+                "await tools.spine__open({summary: 'inspect the lexer'});",
             ),
             (Script::Nested, 3, ResponsesAttemptKind::Generation) => code_generation(
                 "resp-grandchild-close",

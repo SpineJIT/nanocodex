@@ -33,6 +33,8 @@ struct SerialConcurrencyProbe {
 
 struct FinishesTurn;
 
+struct EmitsOutput;
+
 struct ConcurrencyProbeState {
     active: AtomicUsize,
     maximum: AtomicUsize,
@@ -116,6 +118,56 @@ impl Tool for FinishesTurn {
     async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
         Ok(ToolOutput::text("finished"))
     }
+}
+
+#[async_trait::async_trait]
+impl Tool for EmitsOutput {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "emits_output",
+            "Returns a result that Code Mode should expose to the next model response.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    fn turn_behavior(&self) -> ToolTurnBehavior {
+        ToolTurnBehavior::EmitOutputOnSuccess
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        Ok(ToolOutput::text("model-facing handoff"))
+    }
+}
+
+#[tokio::test]
+async fn successful_emitting_tool_surfaces_its_output_without_text() -> Result<()> {
+    let workspace = temporary_workspace("emitting-tool-output")?;
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(EmitsOutput)
+        .build()?;
+    let runtime = ToolRuntime::new_with_tools(&workspace, None, None, &tools);
+    let execution = runtime
+        .execute_code(
+            "await tools.emits_output({});",
+            ToolContext::new(
+                "test-model",
+                "test-session",
+                "test-call",
+                &[],
+                crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
+            ),
+        )
+        .await;
+
+    assert!(execution.success);
+    assert!(emitted_text(&execution)?.contains("model-facing handoff"));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@ use nanocodex_oai_api::{
     responses::ResponseItem,
     tools::{
         TerminalToolReceipt, TerminalToolReceiptError, ToolContext, ToolOutputBody,
-        ToolTurnBehavior,
+        ToolOutputContent, ToolTurnBehavior,
     },
 };
 use serde::Deserialize;
@@ -165,8 +165,15 @@ impl CodeModeExecution {
         &mut self,
         turn_behavior: impl Fn(&str) -> ToolTurnBehavior,
     ) {
+        let mut emitted_outputs = Vec::new();
         for call in &mut self.nested_calls {
             call.turn_behavior = turn_behavior(&call.name);
+            if call.success && call.turn_behavior == ToolTurnBehavior::EmitOutputOnSuccess {
+                emitted_outputs.push(call.output.clone());
+            }
+        }
+        for output in emitted_outputs {
+            append_nested_output(&mut self.output, output);
         }
         let candidates = if self.success {
             self.nested_calls
@@ -187,6 +194,22 @@ impl CodeModeExecution {
             Vec::new()
         };
         self.select_terminal_tools(candidates);
+    }
+}
+
+fn append_nested_output(output: &mut ToolOutputBody, nested_output: ToolOutputBody) {
+    let mut nested_content = match nested_output {
+        ToolOutputBody::Text(text) => vec![ToolOutputContent::InputText { text }],
+        ToolOutputBody::Content(content) => content,
+    };
+    match output {
+        ToolOutputBody::Text(text) => {
+            let prior_text = std::mem::take(text);
+            let mut content = vec![ToolOutputContent::InputText { text: prior_text }];
+            content.append(&mut nested_content);
+            *output = ToolOutputBody::Content(content);
+        }
+        ToolOutputBody::Content(content) => content.append(&mut nested_content),
     }
 }
 

@@ -98,6 +98,10 @@ impl Tool for SpineOpen {
         )
     }
 
+    fn turn_behavior(&self) -> ToolTurnBehavior {
+        ToolTurnBehavior::EmitOutputOnSuccess
+    }
+
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
         let OpenArgs { summary } = input.decode_json()?;
         let mut transaction = SpineOpenTransaction::begin(Arc::clone(&self.runtime))?;
@@ -105,7 +109,11 @@ impl Tool for SpineOpen {
         match run_continuation(&self.agent, Arc::clone(&self.runtime), summary).await {
             Ok(result) => {
                 transaction.commit();
-                Ok(ToolOutput::json(&result))
+                let model_output = format!("<spine_memory>\n{}\n</spine_memory>", result.memory);
+                Ok(ToolOutput::text(model_output).with_code_mode_value(json!({
+                    "closed_node": result.closed_node,
+                    "memory": result.memory,
+                })))
             }
             Err(error) => {
                 transaction.rollback()?;

@@ -23,6 +23,9 @@ pub enum ToolTurnBehavior {
     /// Continue the current model turn after the tool result is committed.
     #[default]
     Continue,
+    /// Continue the current model turn and append the successful nested result
+    /// to the enclosing Code Mode cell output in nested-call order.
+    EmitOutputOnSuccess,
     /// Return the successful tool result to the embedding host after the complete cell or batch
     /// commits, without requesting another model response.
     FinishTurnOnSuccess,

@@ -14,7 +14,8 @@ mod tools;
 
 pub use tools::with_spine_tools;
 
-const MAX_CONTINUATION_CONTEXT_BYTES: usize = 4_000;
+const MAX_CONTINUATION_CONTEXT_BYTES: usize = 1_000;
+const MAX_HANDOFF_MEMORY_BYTES: usize = 900;
 
 /// A receiver for reducer-derived tree snapshots suitable for a live UI.
 pub type SpineTreeObserver = Arc<dyn Fn(SpineTreeSnapshot) + Send + Sync>;
@@ -88,7 +89,7 @@ impl Default for SpineRuntimeLimits {
             max_depth: 8,
             max_nodes: 128,
             max_summary_bytes: 4 * 1024,
-            max_memory_bytes: MAX_CONTINUATION_CONTEXT_BYTES,
+            max_memory_bytes: MAX_HANDOFF_MEMORY_BYTES,
         }
     }
 }
@@ -425,7 +426,7 @@ impl SpineRuntime {
 
     pub(crate) fn validate_memory(&self, memory: &str) -> Result<(), SpineRuntimeError> {
         let memory = required(memory, SpineRuntimeError::EmptyMemory)?;
-        let limit = self.context_byte_limit(self.limits.max_memory_bytes);
+        let limit = self.handoff_memory_byte_limit(self.limits.max_memory_bytes);
         bounded(memory, limit, SpineRuntimeError::MemoryTooLarge(limit))
     }
 
@@ -449,6 +450,10 @@ impl SpineRuntime {
 
     fn context_byte_limit(&self, configured_limit: usize) -> usize {
         configured_limit.min(MAX_CONTINUATION_CONTEXT_BYTES)
+    }
+
+    fn handoff_memory_byte_limit(&self, configured_limit: usize) -> usize {
+        configured_limit.min(MAX_HANDOFF_MEMORY_BYTES)
     }
 
     fn tree_snapshot(&self) -> Result<SpineTreeSnapshot, SpineRuntimeError> {
