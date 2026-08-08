@@ -85,6 +85,14 @@ mod tests {
             ],
             vec!["nanocodex", "eval", "status", "local-smoke"],
             vec!["nanocodex", "eval", "benchmark", "local-smoke"],
+            vec![
+                "nanocodex",
+                "eval",
+                "benchmark",
+                "local-smoke",
+                "--orchestrator-prompt-file",
+                "benchmark-policy.md",
+            ],
             vec!["nanocodex", "eval", "benchmark", "local-smoke", "--systemd"],
             vec![
                 "nanocodex",

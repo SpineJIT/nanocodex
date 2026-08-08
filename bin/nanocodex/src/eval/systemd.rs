@@ -22,6 +22,7 @@ pub(super) fn install(
     state_dir: Option<&Path>,
     coordinator: Option<&str>,
     runtime_dir: Option<&Path>,
+    orchestrator_prompt_file: Option<&Path>,
 ) -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!("--systemd is supported only on Linux");
@@ -30,6 +31,9 @@ pub(super) fn install(
     let invocation_directory =
         env::current_dir().wrap_err("failed to resolve current directory")?;
     let config = absolute_existing(config, &invocation_directory, "runtime helper config")?;
+    let orchestrator_prompt_file = orchestrator_prompt_file
+        .map(|path| absolute_existing(path, &invocation_directory, "orchestrator prompt"))
+        .transpose()?;
     let working_directory = config
         .parent()
         .ok_or_else(|| eyre!("runtime helper config has no parent directory"))?;
@@ -65,7 +69,11 @@ pub(super) fn install(
         })?)
     };
     let executable = env::current_exe().wrap_err("failed to resolve the nanocodex executable")?;
-    let arguments = service_arguments(&config, state_dir.as_deref())?;
+    let arguments = service_arguments(
+        &config,
+        state_dir.as_deref(),
+        orchestrator_prompt_file.as_deref(),
+    )?;
     let target = coordinator
         .map(OsStr::new)
         .or_else(|| state_dir.as_deref().map(Path::as_os_str))
@@ -98,11 +106,16 @@ pub(super) fn install(
     Ok(())
 }
 
-fn service_arguments(config: &Path, state_dir: Option<&Path>) -> Result<Vec<OsString>> {
+fn service_arguments(
+    config: &Path,
+    state_dir: Option<&Path>,
+    orchestrator_prompt_file: Option<&Path>,
+) -> Result<Vec<OsString>> {
     Ok(normalize_service_arguments(
         env::args_os().skip(1).collect(),
         config,
         state_dir,
+        orchestrator_prompt_file,
     ))
 }
 
@@ -110,12 +123,20 @@ fn normalize_service_arguments(
     mut arguments: Vec<OsString>,
     config: &Path,
     state_dir: Option<&Path>,
+    orchestrator_prompt_file: Option<&Path>,
 ) -> Vec<OsString> {
     arguments.retain(|argument| argument != "--systemd");
     remove_option(&mut arguments, "--runtime-dir");
     replace_option(&mut arguments, "--config", config.as_os_str());
     if let Some(state_dir) = state_dir {
         replace_option(&mut arguments, "--state-dir", state_dir.as_os_str());
+    }
+    if let Some(orchestrator_prompt_file) = orchestrator_prompt_file {
+        replace_option(
+            &mut arguments,
+            "--orchestrator-prompt-file",
+            orchestrator_prompt_file.as_os_str(),
+        );
     }
     if !arguments.iter().any(|argument| argument == "--headless") {
         arguments.push(OsString::from("--headless"));
@@ -418,6 +439,8 @@ mod tests {
                 "http://127.0.0.1:8788",
                 "--worker",
                 "dev-georgios-01",
+                "--orchestrator-prompt-file",
+                "relative-policy.md",
                 "--runtime-dir=/mnt/eval-runtime",
                 "--systemd",
             ]
@@ -425,6 +448,7 @@ mod tests {
             .into(),
             Path::new("/srv/nanocodex.toml"),
             None,
+            Some(Path::new("/srv/benchmark-policy.md")),
         );
 
         assert_eq!(
@@ -439,6 +463,8 @@ mod tests {
                 "http://127.0.0.1:8788",
                 "--worker",
                 "dev-georgios-01",
+                "--orchestrator-prompt-file",
+                "/srv/benchmark-policy.md",
                 "--headless",
             ]
             .map(OsString::from)

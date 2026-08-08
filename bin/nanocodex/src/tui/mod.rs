@@ -2792,6 +2792,7 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
             None,
             None,
             None,
+            crate::benchmark::DEFAULT_ORCHESTRATOR_POLICY,
         );
         input.set_display(display);
         input.set_instruction(instruction);

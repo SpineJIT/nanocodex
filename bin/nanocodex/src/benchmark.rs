@@ -1,5 +1,8 @@
 use std::path::Path;
 
+pub(crate) const DEFAULT_ORCHESTRATOR_POLICY: &str =
+    include_str!("../prompts/benchmark-orchestrator.md");
+
 pub(crate) fn prompt(
     profile: Option<&str>,
     config: &Path,
@@ -7,6 +10,7 @@ pub(crate) fn prompt(
     coordinator: Option<&str>,
     worker: Option<&str>,
     executable: Option<&Path>,
+    orchestration_policy: &str,
 ) -> String {
     let selected = profile.unwrap_or("the selected SQLite profile");
     let profile_argument =
@@ -41,16 +45,15 @@ The desired amount of work is already materialized in {ledger}. Do not infer it 
 
 You own task and treatment priority. Read the family records, choose exact pending task and harness treatments, and invoke one repetition with `{executable} eval run{profile_argument} --config {config_argument}{state_argument}{coordinator_argument}{worker_argument} --task <exact-profile-selector>` plus `--harness`, model, or thinking selectors required to identify that profile family. Omit `--harness` for built-in Nanocodex. The CLI atomically allocates the internal repetition; never pass or invent a trial number.
 
-Drive the host to its memory limit aggressively; there is no fixed run-slot ceiling. Start with at least one concurrent run per logical CPU, spread across already-prepared tasks and independent treatments so one preparation lock or failing family cannot stall the host. Then add runs in batches while pending work remains and host memory is healthy. On Linux, use `MemAvailable` from `/proc/meminfo`, swap activity, memory PSI, and OOM events as the pressure signals. Target a steady-state reserve of roughly five percent of physical RAM, never more than 4 GiB, so the benchmark deliberately runs close to OOM without continuously crossing it. Continue increasing fan-out while the reserve is materially above that target. When it falls below the target, stop launching replacements until completed runs return enough memory, then refill immediately. An isolated OOM or VM allocation failure means the latest ramp overshot: allow running work to drain, resume just below that level, and keep probing upward later as the workload mix changes. Sustained swap-in or memory PSI also requires a temporary backoff. Do not reduce fan-out for model failures, verifier failures, or one broken harness treatment.
+Orchestration policy:
 
-Time to first run is part of this contract. Immediately after the first status read and one host-pressure snapshot, use the next tool call to launch the initial CPU-sized fan-out directly. Do not spend another model turn designing a scheduler. Do not generate a scheduler script, background shell controller, temporary orchestration file, or long-lived child loop. Keep scheduling in this agent: invoke independent `eval run` commands through direct parallel tool calls, retain their process sessions, and make each later refill or ramp decision after observing those sessions and current host pressure.
-
-Do not operate in synchronized waves after startup. Keep every memory-safe slot occupied by replacing each process as soon as it exits, and re-evaluate pressure before every replacement and after each ramp batch. The live process count is an outcome of host pressure, not a configured maximum; it may grow far beyond the logical CPU count when runs are waiting on remote model work.
+{orchestration_policy}
 
 Task preparation is part of each task's durable state. One run process may prepare a task while another receives a temporary-unavailable result. Retry temporary contention after its suggested delay. Retry durable infrastructure failures, but treat accepted model and verifier outcomes as terminal even when the benchmark failed.
 
 Re-read the bounded ledger whenever a slot needs replacement and periodically while long runs are active. Continue until every desired coordinate is terminal or a concrete non-retryable blocker is established. Inspect retained evidence for infrastructure failures and representative accepted results. Do not modify Nanocodex source, benchmark tasks, verifier code, or expected outputs in this workflow. Finish with exact completed/running/pending counts, evidence locations, failures, exclusions, and any remaining blocker."#,
         config = config.display(),
+        orchestration_policy = orchestration_policy.trim(),
     )
 }
 
@@ -71,19 +74,20 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_ORCHESTRATOR_POLICY,
         );
 
         assert!(prompt.contains("choose exact pending task and harness treatments"));
         assert!(prompt.contains("Omit `--harness` for built-in Nanocodex"));
-        assert!(prompt.contains("there is no fixed run-slot ceiling"));
-        assert!(prompt.contains("at least one concurrent run per logical CPU"));
-        assert!(prompt.contains("Target a steady-state reserve of roughly five percent"));
-        assert!(prompt.contains("Time to first run is part of this contract"));
-        assert!(prompt.contains("Do not generate a scheduler script"));
+        assert!(prompt.contains("Ledger `running` is the number of unexpired leases"));
+        assert!(prompt.contains("Live runs are retained"));
+        assert!(prompt.contains("4 GiB for each such outstanding live run"));
+        assert!(prompt.contains("add at most four runs at a time"));
+        assert!(prompt.contains("at least 60 seconds"));
+        assert!(prompt.contains("greater of ten percent of physical RAM or"));
+        assert!(prompt.contains("kernel journal and `/proc/vmstat`"));
+        assert!(prompt.contains("never less than the last 30 minutes"));
         assert!(prompt.contains("direct parallel tool calls"));
-        assert!(prompt.contains("The live process count is an outcome of host pressure"));
-        assert!(prompt.contains("replacing each process as soon as it exits"));
-        assert!(prompt.contains("keep probing upward later as the workload mix changes"));
         assert!(prompt.contains("never pass or invent a trial number"));
         assert!(prompt.contains("--state-dir '/mnt/evals'"));
         assert!(!prompt.contains("eval work"));
@@ -98,6 +102,7 @@ mod tests {
             None,
             None,
             None,
+            DEFAULT_ORCHESTRATOR_POLICY,
         );
 
         assert!(prompt.contains("status 'release candidate' --state-dir '/mnt/eval state'"));
@@ -113,6 +118,7 @@ mod tests {
             Some("http://127.0.0.1:8789"),
             Some("dev-georgios-01"),
             Some(Path::new("/opt/nanocodex/bin/nanocodex")),
+            DEFAULT_ORCHESTRATOR_POLICY,
         );
 
         assert!(prompt.contains("status 'release' --coordinator 'http://127.0.0.1:8789'"));
@@ -123,5 +129,21 @@ mod tests {
         assert!(prompt.contains("do not open SQLite directly"));
         assert!(prompt.contains("not a software-development task"));
         assert!(!prompt.contains("--state-dir"));
+    }
+
+    #[test]
+    fn workflow_accepts_a_runtime_orchestration_policy() {
+        let prompt = prompt(
+            Some("release"),
+            Path::new("nanocodex.toml"),
+            None,
+            None,
+            None,
+            None,
+            "Keep exactly three observed sessions.",
+        );
+
+        assert!(prompt.contains("Orchestration policy:\n\nKeep exactly three observed sessions."));
+        assert!(!prompt.contains("add at most four runs at a time"));
     }
 }
