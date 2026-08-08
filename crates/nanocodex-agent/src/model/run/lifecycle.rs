@@ -14,7 +14,7 @@ pub(super) struct WarmupOutcome {
 }
 
 pub(super) enum ModelTaskOutcome {
-    Completed(String),
+    Completed(TurnCompletion),
     Cancelled,
 }
 

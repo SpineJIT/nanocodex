@@ -1034,7 +1034,12 @@ async fn handle_realtime_event(
                             }));
                         }
                         let output = match turn.result().await {
-                            Ok(result) => result.final_message().to_owned(),
+                            Ok(result) => result
+                                .final_message()
+                                .map(ToOwned::to_owned)
+                                .unwrap_or_else(|| {
+                                    "The coding agent completed with a terminal tool.".to_owned()
+                                }),
                             Err(error) => format!("The coding agent failed: {error}"),
                         };
                         agent_control.clear(generation);

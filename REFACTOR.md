@@ -208,8 +208,8 @@ Dropping the event receiver has no lifecycle effect.
 
 `TurnResult` has private fields and these accessors:
 
-- `final_message() -> &str`;
-- `into_final_message() -> String`;
+- `final_message() -> Option<&str>`;
+- `into_final_message() -> Option<String>`;
 - `usage() -> &TurnUsage`; and
 - `snapshot() -> SessionSnapshot`.
 

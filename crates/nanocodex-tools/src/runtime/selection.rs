@@ -270,6 +270,10 @@ pub enum ToolsBuildError {
     /// A custom tool collides with a host-owned routing tool.
     #[error("tool name `{0}` is reserved by the Code Mode host")]
     ReservedName(Box<str>),
+
+    /// A terminal tool would make a parallel tool batch ambiguous.
+    #[error("terminal tool `{0}` cannot support parallel tool calls")]
+    TerminalToolParallel(Box<str>),
 }
 
 impl ToolsBuilder {
@@ -432,6 +436,11 @@ impl ToolsBuilder {
             }
             if !names.insert(name.to_owned()) {
                 return Err(ToolsBuildError::DuplicateName(name.into()));
+            }
+            if tool.handler.turn_behavior() == ToolTurnBehavior::FinishTurnOnSuccess
+                && tool.handler.supports_parallel_tool_calls()
+            {
+                return Err(ToolsBuildError::TerminalToolParallel(name.into()));
             }
         }
         for tool in &self.tools.provider_direct {

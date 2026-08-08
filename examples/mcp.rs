@@ -34,6 +34,12 @@ async fn main() -> Result<()> {
         )
         .await?;
     events.write_turn_jsonl(std::io::stdout()).await?;
-    eprintln!("final result: {}", turn.result().await?.final_message());
+    eprintln!(
+        "final result: {}",
+        turn.result()
+            .await?
+            .final_message()
+            .expect("example expects a final assistant message")
+    );
     Ok(())
 }

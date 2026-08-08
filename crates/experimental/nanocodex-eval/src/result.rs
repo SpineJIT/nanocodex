@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, error::Error, path::PathBuf};
 
 use chrono::{DateTime, Utc};
 use nanocodex_oai_api::pricing::EstimatedUsdCost;
+use nanocodex_tools::TerminalToolReceipt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -435,6 +436,9 @@ impl EvalFailure {
 pub struct AgentResult {
     /// Final assistant message.
     pub final_message: String,
+    /// Typed receipt when a successful tool ended the turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_tool: Option<TerminalToolReceipt>,
     /// Model that produced the terminal result.
     pub model: String,
     /// Reasoning effort used by the agent.
@@ -683,6 +687,8 @@ fn format_error_chain(error: &(dyn Error + 'static)) -> String {
 
 #[cfg(test)]
 mod tests {
+    use nanocodex_tools::TerminalToolReceipt;
+    use nanocodex_tools::contract::ToolOutputBody;
     use serde_json::{Value, json};
 
     #[test]
@@ -698,6 +704,37 @@ mod tests {
             metadata.runtime_completeness,
             super::MeasurementCompleteness::ObservedLowerBound
         );
+    }
+
+    #[test]
+    fn agent_result_serializes_a_terminal_tool_receipt() {
+        let mut encoded = terminal_metadata("completed");
+        encoded["runtime_completeness"] = json!("complete");
+        let metadata: super::AgentMetadata = serde_json::from_value(encoded).unwrap();
+        let receipt = TerminalToolReceipt::new(
+            "call-finish".to_owned(),
+            "finish_turn".to_owned(),
+            ToolOutputBody::Text("validated result".to_owned()),
+            None,
+        )
+        .unwrap();
+        let result = super::AgentResult {
+            final_message: String::new(),
+            terminal_tool: Some(receipt),
+            model: metadata.model.clone(),
+            effort: metadata.effort.clone(),
+            model_calls: metadata.model_calls,
+            tool_calls: metadata.tool_calls,
+            usage: metadata.usage.clone(),
+            cost_usd: metadata.cost_usd,
+            billing_completeness: super::BillingCompleteness::Complete,
+            metadata,
+        };
+
+        let encoded = serde_json::to_value(result).unwrap();
+        assert_eq!(encoded["terminal_tool"]["call_id"], "call-finish");
+        assert_eq!(encoded["terminal_tool"]["tool_name"], "finish_turn");
+        assert_eq!(encoded["terminal_tool"]["output"], "validated result");
     }
 
     fn terminal_metadata(status: &str) -> Value {

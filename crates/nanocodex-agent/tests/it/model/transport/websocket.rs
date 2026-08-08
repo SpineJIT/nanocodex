@@ -51,7 +51,7 @@ async fn websocket_ephemeral_chains_on_connection_and_replays_a_fresh_fork() -> 
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     let (fork, fork_events) = agent.fork_from(&first).await?;
     assert_eq!(
@@ -60,7 +60,7 @@ async fn websocket_ephemeral_chains_on_connection_and_replays_a_fresh_fork() -> 
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     drop((agent, fork, root_events, fork_events));
     timeout(std::time::Duration::from_secs(5), server)
@@ -180,14 +180,14 @@ async fn model_is_fixed_at_creation_while_runtime_reasoning_policy_can_change() 
         .build()?;
 
     let first = agent.prompt(Prompt::new("first prompt")).await?;
-    assert_eq!(first.result().await?.final_message(), "done");
+    assert_eq!(first.result().await?.final_message(), Some("done"));
     agent.set_thinking(Thinking::High).await?;
     agent.set_fast_mode(true).await?;
     let second = agent.prompt(Prompt::new("second prompt")).await?;
-    assert_eq!(second.result().await?.final_message(), "done");
+    assert_eq!(second.result().await?.final_message(), Some("done"));
     agent.set_fast_mode(false).await?;
     let third = agent.prompt(Prompt::new("third prompt")).await?;
-    assert_eq!(third.result().await?.final_message(), "done");
+    assert_eq!(third.result().await?.final_message(), Some("done"));
     drop(agent);
 
     let mut completed = Vec::new();

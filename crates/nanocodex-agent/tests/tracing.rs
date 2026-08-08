@@ -471,7 +471,7 @@ fn steering_content_is_traced_in_prompt_order() {
             release.notify_one();
             assert_eq!(
                 turn.result().await.unwrap().into_final_message(),
-                "steering recorded"
+                Some("steering recorded".to_owned())
             );
             agent.shutdown().await.unwrap();
             drop((agent, events));

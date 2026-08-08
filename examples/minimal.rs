@@ -12,6 +12,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .prompt("Inspect this repository and summarize it.")
         .await?;
     let result = turn.result().await?;
-    println!("{}", result.final_message());
+    println!(
+        "{}",
+        result
+            .final_message()
+            .expect("example expects a final assistant message")
+    );
     Ok(())
 }

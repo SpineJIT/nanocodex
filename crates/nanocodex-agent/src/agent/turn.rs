@@ -1,5 +1,7 @@
 use super::*;
 
+use nanocodex_tools::TerminalToolReceipt;
+
 /// Completion handle for an accepted turn.
 ///
 /// A turn is both a [`Future`] for its final typed result and a [`Stream`] of
@@ -140,26 +142,68 @@ impl TurnControl {
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) struct TurnKey(pub(super) u64);
 
+/// Semantic completion for one successfully committed turn.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum TurnCompletion {
+    /// The model ended the turn with an assistant message.
+    Message {
+        /// Complete final assistant message.
+        final_message: String,
+    },
+    /// A terminal-capable tool completed the turn after its enclosing cell or batch succeeded.
+    TerminalTool {
+        /// Bounded receipt returned to the embedding application.
+        receipt: TerminalToolReceipt,
+    },
+}
+
+impl TurnCompletion {
+    pub(crate) fn run_completion(&self) -> nanocodex_oai_api::events::RunCompletion {
+        match self {
+            Self::Message { .. } => nanocodex_oai_api::events::RunCompletion::Message,
+            Self::TerminalTool { receipt } => {
+                nanocodex_oai_api::events::RunCompletion::TerminalTool {
+                    call_id: receipt.call_id().to_owned(),
+                    tool_name: receipt.tool_name().to_owned(),
+                }
+            }
+        }
+    }
+}
+
 /// Final result of a completed turn.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct TurnResult {
-    pub(super) final_message: String,
+    pub(super) completion: TurnCompletion,
     pub(super) usage: TurnUsage,
     pub(super) checkpoint: Arc<CommittedSession>,
 }
 
 impl TurnResult {
-    /// Returns the final assistant message for this completed turn.
+    /// Returns the semantic completion for this turn.
     #[must_use]
-    pub fn final_message(&self) -> &str {
-        &self.final_message
+    pub const fn completion(&self) -> &TurnCompletion {
+        &self.completion
     }
 
-    /// Consumes the result and returns its final assistant message.
+    /// Returns the final assistant message when the model ended this turn with text.
     #[must_use]
-    pub fn into_final_message(self) -> String {
-        self.final_message
+    pub fn final_message(&self) -> Option<&str> {
+        match &self.completion {
+            TurnCompletion::Message { final_message } => Some(final_message),
+            TurnCompletion::TerminalTool { .. } => None,
+        }
+    }
+
+    /// Consumes the result and returns its final assistant message when present.
+    #[must_use]
+    pub fn into_final_message(self) -> Option<String> {
+        match self.completion {
+            TurnCompletion::Message { final_message } => Some(final_message),
+            TurnCompletion::TerminalTool { .. } => None,
+        }
     }
 
     /// Returns exact aggregate token usage for this logical agent turn.
@@ -183,7 +227,7 @@ impl fmt::Debug for TurnResult {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TurnResult")
-            .field("final_message", &self.final_message)
+            .field("completion", &self.completion)
             .finish_non_exhaustive()
     }
 }

@@ -18,7 +18,8 @@ use super::{
     observe_cell, observer_yield_timeout, parse_exec_source,
 };
 use crate::{
-    Tool, ToolContext, ToolInput, ToolOutput, ToolOutputBody, ToolOutputContent, ToolResult, Tools,
+    Tool, ToolContext, ToolInput, ToolOutput, ToolOutputBody, ToolOutputContent, ToolResult,
+    ToolTurnBehavior, Tools,
     runtime::{ToolRuntime, WebSearchConfig},
 };
 
@@ -29,6 +30,8 @@ struct ConcurrencyProbe {
 struct SerialConcurrencyProbe {
     state: Arc<ConcurrencyProbeState>,
 }
+
+struct FinishesTurn;
 
 struct ConcurrencyProbeState {
     active: AtomicUsize,
@@ -90,6 +93,175 @@ impl Tool for SerialConcurrencyProbe {
         self.state.active.fetch_sub(1, Ordering::SeqCst);
         Ok(ToolOutput::text("completed"))
     }
+}
+
+#[async_trait::async_trait]
+impl Tool for FinishesTurn {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "finishes_turn",
+            "Completes the enclosing turn after its Code Mode cell succeeds.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    fn turn_behavior(&self) -> ToolTurnBehavior {
+        ToolTurnBehavior::FinishTurnOnSuccess
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        Ok(ToolOutput::text("finished"))
+    }
+}
+
+#[tokio::test]
+async fn completed_cell_selects_a_successful_terminal_tool() -> Result<()> {
+    let workspace = temporary_workspace("terminal-tool-completion")?;
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(FinishesTurn)
+        .build()?;
+    let runtime = ToolRuntime::new_with_tools(&workspace, None, None, &tools);
+    let execution = runtime
+        .execute_code(
+            r#"
+const result = await tools.finishes_turn({});
+text(result);
+"#,
+            ToolContext::new(
+                "test-model",
+                "test-session",
+                "test-call",
+                &[],
+                crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
+            ),
+        )
+        .await;
+
+    assert!(execution.success);
+    let terminal = execution
+        .terminal_tool()
+        .expect("a completed cell should retain its terminal tool");
+    assert_eq!(terminal.call_id(), "test-call/code-1");
+    assert_eq!(terminal.tool_name(), "finishes_turn");
+    assert!(matches!(
+        terminal.output(),
+        ToolOutputBody::Text(output) if output == "finished"
+    ));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_cell_discards_a_successful_terminal_tool() -> Result<()> {
+    let workspace = temporary_workspace("terminal-tool-failed-cell")?;
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(FinishesTurn)
+        .build()?;
+    let runtime = ToolRuntime::new_with_tools(&workspace, None, None, &tools);
+    let execution = runtime
+        .execute_code(
+            r#"
+await tools.finishes_turn({});
+throw new Error("fail after terminal tool");
+"#,
+            ToolContext::new(
+                "test-model",
+                "test-session",
+                "test-call",
+                &[],
+                crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
+            ),
+        )
+        .await;
+
+    assert!(!execution.success);
+    assert!(execution.terminal_tool().is_none());
+    assert!(!execution.has_ambiguous_terminal_tool());
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_cell_rejects_multiple_terminal_tools() -> Result<()> {
+    let workspace = temporary_workspace("multiple-terminal-tools")?;
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(FinishesTurn)
+        .build()?;
+    let runtime = ToolRuntime::new_with_tools(&workspace, None, None, &tools);
+    let execution = runtime
+        .execute_code(
+            r#"
+await tools.finishes_turn({});
+await tools.finishes_turn({});
+"#,
+            ToolContext::new(
+                "test-model",
+                "test-session",
+                "test-call",
+                &[],
+                crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
+            ),
+        )
+        .await;
+
+    assert!(execution.success);
+    assert!(execution.terminal_tool().is_none());
+    assert!(execution.has_ambiguous_terminal_tool());
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_intent_survives_a_yield_until_the_cell_completes() -> Result<()> {
+    let workspace = temporary_workspace("terminal-tool-yield")?;
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(FinishesTurn)
+        .build()?;
+    let runtime = ToolRuntime::new_with_tools(&workspace, None, None, &tools);
+    let history = Vec::new();
+    let initial = runtime
+        .execute_code(
+            r#"
+await yield_control();
+await tools.finishes_turn({});
+await yield_control();
+"#,
+            test_context(&history),
+        )
+        .await;
+    assert!(execution_output(&initial).contains("Script running with cell ID 1"));
+    assert!(initial.terminal_tool().is_none());
+
+    let yielded = runtime
+        .wait_for_code(
+            r#"{"cell_id":"1","yield_time_ms":5000}"#,
+            test_context(&history),
+        )
+        .await;
+    assert!(execution_output(&yielded).contains("Script running with cell ID 1"));
+    assert!(yielded.terminal_tool().is_none());
+
+    let completed = runtime
+        .wait_for_code(
+            r#"{"cell_id":"1","yield_time_ms":5000}"#,
+            test_context(&history),
+        )
+        .await;
+    assert!(completed.success, "{}", execution_output(&completed));
+    assert_eq!(
+        completed.terminal_tool().map(|receipt| receipt.tool_name()),
+        Some("finishes_turn")
+    );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
 }
 
 #[tokio::test]

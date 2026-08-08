@@ -395,6 +395,7 @@ function rawTurn(value) {
   return {
     async result() {
       return {
+        completion: { type: "message", finalMessage: value },
         finalMessage: value,
         snapshot() {
           return JSON.stringify({

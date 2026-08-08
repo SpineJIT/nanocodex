@@ -1,18 +1,20 @@
 use std::sync::{Arc, Mutex};
 
 use nanocodex::{
-    TurnControl as RustTurnControl, TurnResult as RustTurnResult, agent::Turn as RustTurn,
+    TurnCompletion, TurnControl as RustTurnControl, TurnResult as RustTurnResult,
+    agent::Turn as RustTurn,
 };
 use pyo3::{
     Py, PyResult, Python,
     exceptions::PyRuntimeError,
     prelude::{pyclass, pymethods},
-    types::PyDict,
+    types::{PyDict, PyDictMethods},
 };
 use tokio::runtime::Runtime;
 
 use crate::{
     error::{lock_error, runtime_error},
+    events::json_to_python,
     snapshot::SessionSnapshot,
     usage::usage_dict,
 };
@@ -115,10 +117,49 @@ pub(crate) struct TurnResult {
 
 #[pymethods]
 impl TurnResult {
-    /// Final assistant message for this completed turn.
+    /// Semantic completion for this completed turn.
     #[getter]
-    fn final_message(&self) -> String {
-        self.inner.final_message().to_owned()
+    fn completion(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let completion = PyDict::new(py);
+        match self.inner.completion() {
+            TurnCompletion::Message { final_message } => {
+                completion.set_item("type", "message")?;
+                completion.set_item("final_message", final_message)?;
+            }
+            TurnCompletion::TerminalTool { receipt } => {
+                completion.set_item("type", "terminal_tool")?;
+                let receipt_dict = PyDict::new(py);
+                receipt_dict.set_item("call_id", receipt.call_id())?;
+                receipt_dict.set_item("tool_name", receipt.tool_name())?;
+                receipt_dict.set_item(
+                    "output",
+                    json_to_python(
+                        py,
+                        &serde_json::to_value(receipt.output()).map_err(runtime_error)?,
+                    )?,
+                )?;
+                let metadata: Option<serde_json::Value> = receipt
+                    .metadata()
+                    .map(|metadata| serde_json::from_str(metadata.get()))
+                    .transpose()
+                    .map_err(runtime_error)?;
+                receipt_dict.set_item(
+                    "metadata",
+                    metadata
+                        .as_ref()
+                        .map_or_else(|| Ok(py.None()), |value| json_to_python(py, value))?,
+                )?;
+                completion.set_item("receipt", receipt_dict)?;
+            }
+            _ => return Err(runtime_error("unknown turn completion")),
+        }
+        Ok(completion.unbind())
+    }
+
+    /// Final assistant message for this completed turn, when present.
+    #[getter]
+    fn final_message(&self) -> Option<String> {
+        self.inner.final_message().map(ToOwned::to_owned)
     }
 
     /// Exact aggregate token usage and automatic USD estimate.
@@ -132,10 +173,15 @@ impl TurnResult {
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "TurnResult(final_message_bytes={})",
-            self.inner.final_message().len()
-        )
+        match self.inner.completion() {
+            TurnCompletion::Message { final_message } => {
+                format!("TurnResult(final_message_bytes={})", final_message.len())
+            }
+            TurnCompletion::TerminalTool { receipt } => {
+                format!("TurnResult(terminal_tool='{}')", receipt.tool_name())
+            }
+            _ => "TurnResult(unknown_completion)".to_owned(),
+        }
     }
 }
 

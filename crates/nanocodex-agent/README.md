@@ -25,7 +25,9 @@ let result = agent
     .prompt("Explain the cause of the failing parser test.")
     .await?
     .await?;
-println!("{}", result.final_message());
+if let Some(message) = result.final_message() {
+    println!("{message}");
+}
 agent.shutdown().await?;
 # Ok(())
 # }

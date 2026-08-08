@@ -213,8 +213,31 @@ impl RunStats {
     }
 }
 
+pub(super) enum TerminalOutcome<'a> {
+    Completed(&'a nanocodex_oai_api::events::RunCompletion),
+    Cancelled,
+    Failed,
+}
+
+impl<'a> TerminalOutcome<'a> {
+    const fn status(&self) -> &'static str {
+        match self {
+            Self::Completed(_) => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    const fn into_completion(self) -> Option<&'a nanocodex_oai_api::events::RunCompletion> {
+        match self {
+            Self::Completed(completion) => Some(completion),
+            Self::Cancelled | Self::Failed => None,
+        }
+    }
+}
+
 pub(super) fn terminal_payload<'a>(
-    terminal_status: &'static str,
+    outcome: TerminalOutcome<'a>,
     elapsed: Duration,
     config: &'a ModelConfig,
     model: nanocodex_oai_api::Model,
@@ -222,8 +245,10 @@ pub(super) fn terminal_payload<'a>(
     stats: &'a RunStats,
     usage: &'a TurnUsage,
 ) -> TerminalPayload<'a> {
+    let status = outcome.status();
+    let completion = outcome.into_completion();
     TerminalPayload {
-        status: terminal_status,
+        status,
         model: model.as_str(),
         reasoning_mode: config.reasoning_mode.as_str(),
         effort: thinking.as_str(),
@@ -235,6 +260,7 @@ pub(super) fn terminal_payload<'a>(
         estimated_cost: usage.estimated_cost(),
         cost_usd: usage.estimated_cost().map(|cost| cost.amount().as_f64()),
         cost_status: usage.cost_status(),
+        completion,
     }
 }
 
@@ -278,6 +304,8 @@ pub(super) struct TerminalPayload<'a> {
     estimated_cost: Option<&'a nanocodex_oai_api::pricing::EstimatedUsdCost>,
     cost_usd: Option<f64>,
     cost_status: nanocodex_oai_api::pricing::CostStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion: Option<&'a nanocodex_oai_api::events::RunCompletion>,
 }
 
 fn duration_ms(duration: Duration) -> u64 {

@@ -27,6 +27,9 @@ pub(super) struct CompletedToolCall {
     pub(super) output: ToolOutputBody,
     pub(super) metadata: Option<Box<RawValue>>,
     pub(super) response_items: Vec<ResponseItem>,
+    pub(super) terminal_receipt: Option<TerminalToolReceipt>,
+    pub(super) terminal_ambiguous: bool,
+    pub(super) terminal_receipt_error: Option<TerminalToolReceiptError>,
 }
 
 pub(super) struct NestedToolEventObserver<'a> {
@@ -150,7 +153,7 @@ where
         call_index: u32,
         calls: Vec<CodeCall>,
         history: Option<Arc<Vec<ResponseItem>>>,
-    ) -> Result<()> {
+    ) -> Result<Option<TerminalToolReceipt>> {
         self.active_tool_batch_started_at = Some(Instant::now());
         let mut prepared = Vec::with_capacity(calls.len());
         for call in calls {
@@ -164,6 +167,10 @@ where
         let tool_call_indices = self.tool_call_indices.clone();
         let session_id = events.request_id().to_owned();
         let model = self.model;
+        let mut terminal_receipts = Vec::new();
+        let mut terminal_ambiguous = false;
+        let mut terminal_receipt_error = None;
+        let mut all_succeeded = true;
         let mut executions = prepared
             .into_iter()
             .map(|(call, supports_parallel, active)| {
@@ -262,10 +269,25 @@ where
                 });
             };
             self.active_tool_calls.remove(active_index);
+            all_succeeded &= completed.success;
+            terminal_ambiguous |= completed.terminal_ambiguous;
+            terminal_receipt_error = terminal_receipt_error.or(completed.terminal_receipt_error);
+            if let Some(receipt) = completed.terminal_receipt.clone() {
+                terminal_receipts.push(receipt);
+            }
             conversation.append(self.finish_completed_tool_call(completed, &active.progress)?);
         }
         self.finish_active_tool_batch_wall();
-        Ok(())
+        if !all_succeeded {
+            return Ok(None);
+        }
+        if let Some(error) = terminal_receipt_error {
+            return Err(NanocodexError::TerminalToolReceipt(error));
+        }
+        if terminal_ambiguous || terminal_receipts.len() > 1 {
+            return Err(NanocodexError::AmbiguousTerminalTools);
+        }
+        Ok(terminal_receipts.pop())
     }
 
     pub(super) fn prepare_model_tool_call(
@@ -398,6 +420,9 @@ where
             output,
             metadata: None,
             response_items: vec![response_item],
+            terminal_receipt: None,
+            terminal_ambiguous: false,
+            terminal_receipt_error: None,
         }
     }
 
@@ -435,6 +460,9 @@ where
                 output,
                 metadata: None,
                 response_items: vec![response_item],
+                terminal_receipt: None,
+                terminal_ambiguous: false,
+                terminal_receipt_error: None,
             });
         }
         let code_mode_entrypoint =
@@ -483,6 +511,14 @@ where
             tool_span.record("status", status(execution.success));
             tool_span.record("otel.status_code", otel_status(execution.success));
             tool_span.record("duration_ns", duration_ns);
+            let (terminal_receipt, terminal_receipt_error) = terminal_receipt(
+                execution.success,
+                tools.turn_behavior(&qualified_name),
+                call.call_id.clone(),
+                qualified_name.clone(),
+                &execution.output,
+                execution.metadata.as_deref(),
+            );
             return Ok(CompletedToolCall {
                 call_id: call.call_id.clone(),
                 tool: qualified_name,
@@ -502,6 +538,9 @@ where
                 }],
                 output: execution.output,
                 metadata: execution.metadata,
+                terminal_receipt,
+                terminal_ambiguous: false,
+                terminal_receipt_error,
             });
         }
         if matches!(call.kind, CodeCallKind::ToolSearch) {
@@ -548,6 +587,9 @@ where
                 response_items: vec![tool_search_output(call.call_id, tools)],
                 output: execution.output,
                 metadata: execution.metadata,
+                terminal_receipt: None,
+                terminal_ambiguous: false,
+                terminal_receipt_error: None,
             });
         }
         let owned_context = owned_code_context(&call, history, session_id, model)?;
@@ -574,7 +616,24 @@ where
         if let Some(error) = update_error {
             return Err(error);
         }
+        let terminal_receipt = execution.terminal_tool().cloned();
+        let terminal_ambiguous = execution.has_ambiguous_terminal_tool();
+        let terminal_receipt_error = execution.terminal_receipt_error();
         prepare_output_images(&mut execution.output).await;
+        if let Some(receipt) = &terminal_receipt {
+            // The outer call is either `exec` or `wait`; its one paired output must retain the
+            // nested terminal result so a later full replay remains structurally valid.
+            let receipt = serde_json::to_string(receipt).expect("terminal receipt was validated");
+            match &mut execution.output {
+                ToolOutputBody::Text(output) => {
+                    output.push('\n');
+                    output.push_str(&receipt);
+                }
+                ToolOutputBody::Content(content) => {
+                    content.push(ToolOutputContent::InputText { text: receipt });
+                }
+            }
+        }
         if let Some(content) = serialize_trace_content(&execution.output) {
             record_span_content(tool_span, "tool.output", &content);
         }
@@ -609,6 +668,34 @@ where
             output: execution.output,
             metadata: None,
             response_items: outputs,
+            terminal_receipt,
+            terminal_ambiguous,
+            terminal_receipt_error,
         })
+    }
+}
+
+fn terminal_receipt(
+    success: bool,
+    turn_behavior: ToolTurnBehavior,
+    call_id: String,
+    tool_name: String,
+    output: &ToolOutputBody,
+    metadata: Option<&RawValue>,
+) -> (
+    Option<TerminalToolReceipt>,
+    Option<TerminalToolReceiptError>,
+) {
+    if !(success && turn_behavior == ToolTurnBehavior::FinishTurnOnSuccess) {
+        return (None, None);
+    }
+    match TerminalToolReceipt::new(
+        call_id,
+        tool_name,
+        output.clone(),
+        metadata.map(ToOwned::to_owned),
+    ) {
+        Ok(receipt) => (Some(receipt), None),
+        Err(error) => (None, Some(error)),
     }
 }

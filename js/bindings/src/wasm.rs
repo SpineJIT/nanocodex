@@ -1,15 +1,15 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use js_sys::Promise;
 use nanocodex::{
-    AgentEvents, Model, Nanocodex as RustNanocodex, OpenAi, ReasoningMode, Thinking, TurnControl,
-    TurnResult,
+    AgentEvents, Model, Nanocodex as RustNanocodex, OpenAi, ReasoningMode, Thinking,
+    TurnCompletion, TurnControl, TurnResult,
     agent::{
         input::{Prompt, UserInput},
         session::{SessionId, SessionSnapshot},
     },
     tools::{
-        ToolContext, ToolDefinition, ToolInput, ToolOutput,
+        ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolTurnBehavior,
         contract::ToolOutputWire,
         hosted::{
             CodeModeExecution, CodeModeHost, CodeModeHostError, HostFuture, HostedToolMode,
@@ -46,22 +46,39 @@ extern "C" {
     #[wasm_bindgen(js_namespace = ["globalThis", "nanocodexHost"], js_name = toolMode)]
     fn host_tool_mode(session_id: &str) -> String;
 
+    #[wasm_bindgen(js_namespace = ["globalThis", "nanocodexHost"], js_name = toolTurnBehaviors)]
+    fn host_tool_turn_behaviors() -> String;
+
     #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = toolDefinitions)]
     fn host_tool_definitions(session_id: &str) -> Result<String, JsValue>;
 }
 
 struct JavaScriptCodeModeHost {
     mode: HostedToolMode,
+    turn_behaviors: HashMap<String, ToolTurnBehavior>,
 }
 
 impl JavaScriptCodeModeHost {
     fn new() -> Self {
+        let turn_behaviors =
+            serde_json::from_str::<HashMap<String, String>>(&host_tool_turn_behaviors())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, behavior)| {
+                    let behavior = match behavior.as_str() {
+                        "finish_turn_on_success" => ToolTurnBehavior::FinishTurnOnSuccess,
+                        _ => ToolTurnBehavior::Continue,
+                    };
+                    (name, behavior)
+                })
+                .collect();
         Self {
             mode: if host_tool_mode("") == "direct" {
                 HostedToolMode::Direct
             } else {
                 HostedToolMode::Code
             },
+            turn_behaviors,
         }
     }
 }
@@ -69,6 +86,13 @@ impl JavaScriptCodeModeHost {
 impl CodeModeHost for JavaScriptCodeModeHost {
     fn tool_mode(&self) -> HostedToolMode {
         self.mode
+    }
+
+    fn turn_behavior(&self, name: &str) -> ToolTurnBehavior {
+        self.turn_behaviors
+            .get(name)
+            .copied()
+            .unwrap_or(ToolTurnBehavior::Continue)
     }
 
     fn tool_definitions(&self, session_id: &str) -> Result<Vec<ToolDefinition>, CodeModeHostError> {
@@ -494,11 +518,34 @@ pub struct WasmTurnResult {
 
 #[wasm_bindgen(js_class = TurnResult)]
 impl WasmTurnResult {
-    /// Returns the final assistant message.
+    /// Returns this turn's semantic completion as a JavaScript discriminated union.
+    #[wasm_bindgen(getter)]
+    pub fn completion(&self) -> Result<JsValue, JsValue> {
+        let completion = match self.inner.completion() {
+            TurnCompletion::Message { final_message } => serde_json::json!({
+                "type": "message",
+                "finalMessage": final_message,
+            }),
+            TurnCompletion::TerminalTool { receipt } => serde_json::json!({
+                "type": "terminalTool",
+                "receipt": {
+                    "callId": receipt.call_id(),
+                    "toolName": receipt.tool_name(),
+                    "output": receipt.output(),
+                    "metadata": receipt.metadata(),
+                },
+            }),
+            _ => return Err(js_error("unknown turn completion")),
+        };
+        let encoded = serde_json::to_string(&completion).map_err(js_error)?;
+        js_sys::JSON::parse(&encoded).map_err(|error| js_error(host_error_message(&error)))
+    }
+
+    /// Returns the final assistant message when the model ended this turn with text.
     #[wasm_bindgen(getter, js_name = finalMessage)]
     #[must_use]
-    pub fn final_message(&self) -> String {
-        self.inner.final_message().to_owned()
+    pub fn final_message(&self) -> Option<String> {
+        self.inner.final_message().map(ToOwned::to_owned)
     }
 
     /// Serializes this completed boundary's resumable session snapshot.

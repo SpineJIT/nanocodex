@@ -243,6 +243,14 @@ impl ToolRuntime {
         self.registry.supports_parallel_tool_calls(name)
     }
 
+    /// Returns the static behavior declared by a registered tool.
+    ///
+    /// Unknown and dynamically discovered tools continue the current turn.
+    #[must_use]
+    pub fn turn_behavior(&self, name: &str) -> ToolTurnBehavior {
+        self.registry.turn_behavior(name)
+    }
+
     /// Returns whether a registered or dynamically activated tool is callable.
     ///
     /// Deferred provider tools become visible here only after activation.

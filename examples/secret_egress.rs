@@ -106,7 +106,12 @@ async fn run_agent(tools: Tools) -> Result<(), AnyError> {
         .tools(tools)
         .build()?;
     let result = agent.prompt(prompt).await?.result().await?;
-    println!("{}", result.final_message());
+    println!(
+        "{}",
+        result
+            .final_message()
+            .expect("example expects a final assistant message")
+    );
     Ok(())
 }
 

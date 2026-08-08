@@ -1,5 +1,7 @@
 //! Dependency-light contract for caller-defined and runtime-provided tools.
 
+use std::{error::Error, fmt};
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{
@@ -13,6 +15,132 @@ use crate::{ImageDetail, ResponseItem};
 
 /// Default maximum model-visible output budget for one tool call.
 pub const DEFAULT_TOOL_OUTPUT_TOKENS: usize = 10_000;
+
+/// Static control-flow behavior requested by a successful tool invocation.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolTurnBehavior {
+    /// Continue the current model turn after the tool result is committed.
+    #[default]
+    Continue,
+    /// Return the successful tool result to the embedding host after the complete cell or batch
+    /// commits, without requesting another model response.
+    FinishTurnOnSuccess,
+}
+
+/// Bounded result retained when a tool completes the enclosing turn.
+#[derive(Clone, Debug, Serialize)]
+#[non_exhaustive]
+pub struct TerminalToolReceipt {
+    /// Stable invocation identity for the completed tool call.
+    call_id: String,
+    /// Canonical registered tool name.
+    tool_name: String,
+    /// Model-visible output returned by the tool.
+    output: ToolOutputBody,
+    /// Optional opaque application metadata attached by the tool.
+    metadata: Option<Box<RawValue>>,
+}
+
+/// Reason a successful tool result cannot safely finish the enclosing turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalToolReceiptError {
+    /// The JSON-encoded model-visible output exceeded the receipt budget.
+    OutputTooLarge,
+    /// The opaque metadata exceeded the receipt metadata budget.
+    MetadataTooLarge,
+    /// The complete receipt exceeded the receipt budget.
+    ReceiptTooLarge,
+    /// Receipt serialization failed before the size could be checked.
+    EncodingFailed,
+}
+
+impl fmt::Display for TerminalToolReceiptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::OutputTooLarge => "terminal tool output exceeded the receipt limit",
+            Self::MetadataTooLarge => "terminal tool metadata exceeded the receipt limit",
+            Self::ReceiptTooLarge => "terminal tool receipt exceeded the receipt limit",
+            Self::EncodingFailed => "terminal tool receipt could not be encoded",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl Error for TerminalToolReceiptError {}
+
+impl TerminalToolReceipt {
+    /// Maximum JSON-encoded bytes retained for a terminal tool output.
+    pub const MAX_OUTPUT_BYTES: usize = 128 * 1024;
+
+    /// Maximum JSON-encoded bytes retained for terminal tool metadata.
+    pub const MAX_METADATA_BYTES: usize = 64 * 1024;
+
+    /// Maximum JSON-encoded bytes retained for the complete terminal receipt.
+    pub const MAX_RECEIPT_BYTES: usize = 128 * 1024;
+
+    /// Validates and creates a bounded terminal receipt from one successful tool result.
+    pub fn new(
+        call_id: String,
+        tool_name: String,
+        output: ToolOutputBody,
+        metadata: Option<Box<RawValue>>,
+    ) -> Result<Self, TerminalToolReceiptError> {
+        if serialized_len(&output)? > Self::MAX_OUTPUT_BYTES {
+            return Err(TerminalToolReceiptError::OutputTooLarge);
+        }
+        if metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.get().len() > Self::MAX_METADATA_BYTES)
+        {
+            return Err(TerminalToolReceiptError::MetadataTooLarge);
+        }
+        let receipt = Self {
+            call_id,
+            tool_name,
+            output,
+            metadata,
+        };
+        if serialized_len(&receipt)? > Self::MAX_RECEIPT_BYTES {
+            return Err(TerminalToolReceiptError::ReceiptTooLarge);
+        }
+        Ok(receipt)
+    }
+
+    /// Returns the stable invocation identity for the completed tool call.
+    #[must_use]
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    /// Returns the canonical registered name of the completed tool.
+    #[must_use]
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+
+    /// Returns the model-visible output produced by the tool.
+    #[must_use]
+    pub const fn output(&self) -> &ToolOutputBody {
+        &self.output
+    }
+
+    /// Returns optional opaque application metadata attached by the tool.
+    #[must_use]
+    pub fn metadata(&self) -> Option<&RawValue> {
+        self.metadata.as_deref()
+    }
+}
+
+fn serialized_len(value: &impl Serialize) -> Result<usize, TerminalToolReceiptError> {
+    serde_json::to_vec(value)
+        .map(|encoded| encoded.len())
+        .map_err(|_| TerminalToolReceiptError::EncodingFailed)
+}
+
+#[cfg(test)]
+#[path = "terminal_receipt_tests.rs"]
+mod terminal_receipt_tests;
 
 /// Model-visible body returned by a tool.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -471,6 +599,15 @@ pub trait Tool: Send + Sync + 'static {
     /// effects are safe to overlap with other parallel-capable tools.
     fn supports_parallel_tool_calls(&self) -> bool {
         false
+    }
+
+    /// Returns how a successful invocation affects the enclosing model turn.
+    ///
+    /// The declaration is static and defaults to ordinary continuation. Tools
+    /// that finish a turn must remain serial so the runtime can settle one
+    /// unambiguous control result.
+    fn turn_behavior(&self) -> ToolTurnBehavior {
+        ToolTurnBehavior::Continue
     }
 
     /// Executes one invocation.

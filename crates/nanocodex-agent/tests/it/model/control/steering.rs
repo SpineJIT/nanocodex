@@ -59,7 +59,7 @@ async fn assistant_events_preserve_commentary_and_final_answer_phases() -> Resul
         .session_id(test_session_id())
         .build()?;
     let turn = agent.prompt("check the live state").await?;
-    assert_eq!(turn.result().await?.final_message(), "Done.");
+    assert_eq!(turn.result().await?.final_message(), Some("Done."));
     drop(agent);
 
     let mut deltas = Vec::new();
@@ -178,7 +178,7 @@ async fn steering_is_bounded_fifo_and_joins_at_the_next_model_boundary() -> Resu
     release_first
         .send(())
         .map_err(|()| eyre!("server release receiver dropped"))?;
-    assert_eq!(turn.result().await?.final_message(), "done");
+    assert_eq!(turn.result().await?.final_message(), Some("done"));
     drop(agent);
 
     let mut steered_events = 0;
@@ -277,7 +277,7 @@ async fn steering_during_a_tool_call_joins_after_the_tool_result() -> Result<()>
     ));
     assert!(!workspace.join("release-tool").exists());
     std::fs::write(workspace.join("release-tool"), [])?;
-    assert_eq!(turn.result().await?.final_message(), "done");
+    assert_eq!(turn.result().await?.final_message(), Some("done"));
     drop(agent);
 
     let mut saw_steer = false;
@@ -382,7 +382,7 @@ async fn compaction_resumes_tool_continuation_before_queued_steering() -> Result
     turn.steer("queued steer").await?;
     std::fs::write(workspace.join("release-tool"), [])?;
 
-    assert_eq!(turn.result().await?.final_message(), "done");
+    assert_eq!(turn.result().await?.final_message(), Some("done"));
     drop(agent);
     drop(events);
     timeout(std::time::Duration::from_secs(5), server)

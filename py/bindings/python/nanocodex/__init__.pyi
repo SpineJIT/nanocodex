@@ -1,4 +1,4 @@
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 class EstimatedCost(TypedDict):
     usd: str
@@ -18,6 +18,20 @@ class Usage(TypedDict):
     estimated_cost: EstimatedCost | None
     cost_status: str
 
+class TerminalToolReceipt(TypedDict):
+    call_id: str
+    tool_name: str
+    output: object
+    metadata: object | None
+
+class MessageCompletion(TypedDict):
+    type: Literal["message"]
+    final_message: str
+
+class TerminalToolCompletion(TypedDict):
+    type: Literal["terminal_tool"]
+    receipt: TerminalToolReceipt
+
 class SessionSnapshot:
     @staticmethod
     def from_json(encoded: str) -> SessionSnapshot: ...
@@ -29,7 +43,9 @@ class SessionSnapshot:
 
 class TurnResult:
     @property
-    def final_message(self) -> str: ...
+    def completion(self) -> MessageCompletion | TerminalToolCompletion: ...
+    @property
+    def final_message(self) -> str | None: ...
     def usage(self) -> Usage: ...
     def snapshot(self) -> SessionSnapshot: ...
 

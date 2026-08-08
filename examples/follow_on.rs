@@ -27,7 +27,12 @@ async fn main() -> Result<()> {
     eprintln!("first prompt accepted; the agent is running independently");
 
     let first = first.result().await?;
-    println!("first result: {}", first.final_message());
+    println!(
+        "first result: {}",
+        first
+            .final_message()
+            .expect("example expects a final assistant message")
+    );
 
     agent.set_thinking(Thinking::High).await?;
     let second = agent
@@ -36,7 +41,12 @@ async fn main() -> Result<()> {
         )
         .await?;
     let second = second.result().await?;
-    println!("second result: {}", second.final_message());
+    println!(
+        "second result: {}",
+        second
+            .final_message()
+            .expect("example expects a final assistant message")
+    );
 
     Ok(())
 }

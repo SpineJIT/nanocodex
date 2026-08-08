@@ -115,10 +115,22 @@ export type Turn<agent extends Agent<object> = Agent<object>> = Readonly<{
 }>;
 
 export type TurnResult = Readonly<{
-  finalMessage: string;
+  completion: TurnCompletion;
+  finalMessage: string | undefined;
   snapshot: SessionSnapshot;
   usage: TurnUsage;
 }>;
+
+export type TerminalToolReceipt = Readonly<{
+  callId: string;
+  toolName: string;
+  output: string | readonly Record<string, unknown>[];
+  metadata: Record<string, unknown> | null;
+}>;
+
+export type TurnCompletion =
+  | Readonly<{ type: "message"; finalMessage: string }>
+  | Readonly<{ type: "terminalTool"; receipt: TerminalToolReceipt }>;
 
 export type ToolContext = {
   callId: string;
@@ -129,6 +141,8 @@ export type ToolContext = {
 export type Tool = {
   description: string;
   parameters: Record<string, unknown>;
+  /** Ends the enclosing turn after a successful complete Code Mode cell or direct batch. */
+  turnBehavior?: "continue" | "finishTurnOnSuccess" | undefined;
   handler(input: unknown, context: ToolContext): unknown | Promise<unknown>;
 };
 

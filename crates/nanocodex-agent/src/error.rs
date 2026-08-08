@@ -1,7 +1,7 @@
 use std::{io, path::PathBuf, sync::Arc};
 
-use nanocodex_oai_api::ResponseError;
 pub use nanocodex_oai_api::transport::ResponsesError;
+use nanocodex_oai_api::{ResponseError, tools::TerminalToolReceiptError};
 
 /// Error returned by the Nanocodex library boundary.
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +56,14 @@ pub enum NanocodexError {
         /// Stable invalid-state description.
         detail: &'static str,
     },
+
+    /// More than one successful tool attempted to finish one cell or batch.
+    #[error("more than one successful tool attempted to finish the turn")]
+    AmbiguousTerminalTools,
+
+    /// A successful terminal tool result exceeded the bounded receipt contract.
+    #[error("terminal tool receipt is invalid: {0}")]
+    TerminalToolReceipt(#[source] TerminalToolReceiptError),
 
     /// The immutable request prefix could not be serialized for fingerprinting.
     #[error("failed to fingerprint the immutable prompt prefix: {0}")]

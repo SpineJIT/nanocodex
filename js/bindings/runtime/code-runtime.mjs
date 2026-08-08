@@ -8,7 +8,11 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     if (!tool || typeof tool.handler !== "function") {
       throw new TypeError(`tool ${name} requires a handler function`);
     }
-    configuredTools.push(Object.freeze({ handler: tool.handler, name }));
+    configuredTools.push(Object.freeze({
+      handler: tool.handler,
+      name,
+      turnBehavior: normalizeTurnBehavior(tool.turnBehavior),
+    }));
     definitions.push(deepFreeze({
       type: "function",
       name,
@@ -49,7 +53,9 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     stores.set(sessionId, stored);
     const nestedCalls = [];
     const tools = Object.create(null);
-    for (const { handler, name } of configuredTools) {
+    const activeNonTerminalTools = new Set();
+    let terminalBarrier = Promise.resolve();
+    for (const { handler, name, turnBehavior } of configuredTools) {
       tools[name] = async (input) => {
         const callId = `${parentCallId}/code-${nextCallId++}`;
         const toolStartedAt = performance.now();
@@ -59,13 +65,22 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
         );
         const recordedInput = clone(input) ?? null;
         try {
-          const result = await handler(input, { sessionId, parentCallId, callId });
+          const result = await executeHandler(
+            handler,
+            turnBehavior,
+            input,
+            { sessionId, parentCallId, callId },
+            activeNonTerminalTools,
+            () => terminalBarrier,
+            (barrier) => { terminalBarrier = barrier; },
+          );
           nestedCalls.push({
             call_id: callId,
             name,
             input: recordedInput,
             output: outputBody(result),
             success: true,
+            turn_behavior: turnBehavior,
             started_after_ns: startedAfterNs,
             duration_ns: elapsedNs(toolStartedAt),
           });
@@ -77,6 +92,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
             input: recordedInput,
             output: errorMessage(error),
             success: false,
+            turn_behavior: turnBehavior,
             started_after_ns: startedAfterNs,
             duration_ns: elapsedNs(toolStartedAt),
           });
@@ -171,10 +187,56 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     executeCode,
     executeTool,
     toolDefinitions: () => encodedDefinitions,
+    toolTurnBehavior: (name) => toolByName.get(name)?.turnBehavior ?? "continue",
+    toolTurnBehaviors: () => JSON.stringify(Object.fromEntries(
+      configuredTools.map((tool) => [tool.name, tool.turnBehavior]),
+    )),
     reset() {
       stores.clear();
     },
   });
+}
+
+async function executeHandler(
+  handler,
+  turnBehavior,
+  input,
+  context,
+  activeNonTerminalTools,
+  currentTerminalBarrier,
+  setTerminalBarrier,
+) {
+  if (turnBehavior === "finish_turn_on_success") {
+    const priorTerminal = currentTerminalBarrier();
+    const priorNonTerminal = [...activeNonTerminalTools];
+    let releaseTerminal;
+    setTerminalBarrier(new Promise((resolve) => { releaseTerminal = resolve; }));
+    await priorTerminal;
+    await Promise.all(priorNonTerminal);
+    try {
+      return await handler(input, context);
+    } finally {
+      releaseTerminal();
+    }
+  }
+
+  const barrier = currentTerminalBarrier();
+  const execution = (async () => {
+    await barrier;
+    return handler(input, context);
+  })();
+  activeNonTerminalTools.add(execution);
+  try {
+    return await execution;
+  } finally {
+    activeNonTerminalTools.delete(execution);
+  }
+}
+
+function normalizeTurnBehavior(value) {
+  if (value === undefined || value === "continue") return "continue";
+  if (value === "finishTurnOnSuccess") return "finish_turn_on_success";
+  throw new TypeError("tool turnBehavior must be continue or finishTurnOnSuccess");
 }
 
 function encodeToolOutput(output, success, codeModeValue) {

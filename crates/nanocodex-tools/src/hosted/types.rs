@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use nanocodex_oai_api::{
     responses::ResponseItem,
-    tools::{ToolContext, ToolOutputBody},
+    tools::{
+        TerminalToolReceipt, TerminalToolReceiptError, ToolContext, ToolOutputBody,
+        ToolTurnBehavior,
+    },
 };
 use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
@@ -84,6 +87,116 @@ pub struct CodeModeExecution {
     /// Application notifications emitted by the cell.
     #[serde(default)]
     pub notifications: Vec<CodeModeNotification>,
+    #[serde(skip)]
+    pub(crate) terminal_selection: TerminalToolSelection,
+}
+
+impl CodeModeExecution {
+    /// Creates one complete Code Mode execution result with no terminal tool selected.
+    #[must_use]
+    pub const fn new(
+        output: ToolOutputBody,
+        success: bool,
+        nested_calls: Vec<NestedToolCall>,
+        notifications: Vec<CodeModeNotification>,
+    ) -> Self {
+        Self {
+            output,
+            success,
+            nested_calls,
+            notifications,
+            terminal_selection: TerminalToolSelection::None,
+        }
+    }
+
+    /// Returns the one successful terminal tool selected after this cell completed.
+    #[must_use]
+    pub const fn terminal_tool(&self) -> Option<&TerminalToolReceipt> {
+        match &self.terminal_selection {
+            TerminalToolSelection::None
+            | TerminalToolSelection::Ambiguous
+            | TerminalToolSelection::Invalid(_) => None,
+            TerminalToolSelection::Selected(receipt) => Some(receipt),
+        }
+    }
+
+    /// Returns whether this cell selected more than one successful terminal tool.
+    #[must_use]
+    pub const fn has_ambiguous_terminal_tool(&self) -> bool {
+        matches!(self.terminal_selection, TerminalToolSelection::Ambiguous)
+    }
+
+    /// Returns the receipt validation error that prevented terminal completion, if any.
+    #[must_use]
+    pub const fn terminal_receipt_error(&self) -> Option<TerminalToolReceiptError> {
+        match self.terminal_selection {
+            TerminalToolSelection::Invalid(error) => Some(error),
+            TerminalToolSelection::None
+            | TerminalToolSelection::Selected(_)
+            | TerminalToolSelection::Ambiguous => None,
+        }
+    }
+
+    pub(crate) fn select_terminal_tools(
+        &mut self,
+        candidates: Vec<Result<TerminalToolReceipt, TerminalToolReceiptError>>,
+    ) {
+        let mut receipts = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            match candidate {
+                Ok(receipt) => receipts.push(receipt),
+                Err(error) => {
+                    self.terminal_selection = TerminalToolSelection::Invalid(error);
+                    return;
+                }
+            }
+        }
+        self.terminal_selection = match receipts.len() {
+            0 => TerminalToolSelection::None,
+            1 => match receipts.into_iter().next() {
+                Some(receipt) => TerminalToolSelection::Selected(receipt),
+                None => TerminalToolSelection::None,
+            },
+            _ => TerminalToolSelection::Ambiguous,
+        };
+    }
+
+    pub(crate) fn apply_host_turn_behaviors(
+        &mut self,
+        turn_behavior: impl Fn(&str) -> ToolTurnBehavior,
+    ) {
+        for call in &mut self.nested_calls {
+            call.turn_behavior = turn_behavior(&call.name);
+        }
+        let candidates = if self.success {
+            self.nested_calls
+                .iter()
+                .filter(|call| {
+                    call.success && call.turn_behavior == ToolTurnBehavior::FinishTurnOnSuccess
+                })
+                .map(|call| {
+                    TerminalToolReceipt::new(
+                        call.call_id.clone(),
+                        call.name.clone(),
+                        call.output.clone(),
+                        call.metadata.clone(),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.select_terminal_tools(candidates);
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) enum TerminalToolSelection {
+    #[default]
+    None,
+    Selected(TerminalToolReceipt),
+    Ambiguous,
+    Invalid(TerminalToolReceiptError),
 }
 
 /// One notification emitted by a Code Mode cell.
@@ -144,6 +257,9 @@ pub struct NestedToolCall {
     pub output: ToolOutputBody,
     /// Whether the nested operation succeeded.
     pub success: bool,
+    /// Static turn behavior declared by the invoked tool.
+    #[serde(default)]
+    pub turn_behavior: ToolTurnBehavior,
     /// Nanoseconds from cell start until this call started.
     pub started_after_ns: u64,
     /// Nanoseconds spent executing this call.

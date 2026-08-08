@@ -32,6 +32,13 @@ impl ToolRegistry {
             .is_some_and(|provider| provider.supports_parallel_tool_calls(name))
     }
 
+    pub(crate) fn turn_behavior(&self, name: &str) -> ToolTurnBehavior {
+        self.get(name)
+            .map_or(ToolTurnBehavior::Continue, |(handler, _)| {
+                handler.turn_behavior()
+            })
+    }
+
     pub(super) async fn execute_direct(
         &self,
         name: &str,

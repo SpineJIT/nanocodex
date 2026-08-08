@@ -123,7 +123,7 @@ async fn missing_stored_checkpoint_replays_local_history_once() -> Result<()> {
         .await?;
     let (fork, mut fork_events) = agent.fork_from(&first).await?;
     let branch = fork.prompt("branch after eviction").await?;
-    assert_eq!(branch.result().await?.final_message(), "done");
+    assert_eq!(branch.result().await?.final_message(), Some("done"));
 
     drop((agent, fork, root_events));
     let mut observed_checkpoint_retry = false;
@@ -329,7 +329,7 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     resumed.flush_rollout().await?;
     assert_eq!(
@@ -424,7 +424,7 @@ async fn serialized_session_resumes_over_ephemeral_https() -> Result<()> {
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
 
     drop((resumed, resumed_events));
@@ -515,7 +515,7 @@ async fn failed_accepted_prompt_is_durable_without_partial_assistant_output() ->
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     resumed.shutdown().await?;
     drop((resumed, resumed_events));
@@ -573,7 +573,7 @@ async fn accepted_prompt_survives_a_fatal_warmup_boundary() -> Result<()> {
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     resumed.shutdown().await?;
     drop((resumed, resumed_events));

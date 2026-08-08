@@ -6,12 +6,12 @@ use std::{
 
 use nanocodex_oai_api::{
     responses::CustomToolFormat,
-    tools::{ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolOutputBody},
+    tools::{ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolOutputBody, ToolTurnBehavior},
 };
 
 use super::{
-    CodeModeExecution, CodeModeHost, CodeModeNotification, CodeModeObserver, CodeModeUpdate,
-    HostedToolMode, NestedToolCall, OwnedToolContext,
+    CodeModeExecution, CodeModeHost, CodeModeObserver, CodeModeUpdate, HostedToolMode,
+    OwnedToolContext,
 };
 use crate::runtime_config::{ImageGenerationConfig, WebSearchConfig};
 
@@ -214,6 +214,14 @@ impl HostedToolRuntime {
         false
     }
 
+    /// Returns the static behavior declared by the embedding host.
+    #[must_use]
+    pub fn turn_behavior(&self, name: &str) -> ToolTurnBehavior {
+        self.host
+            .as_ref()
+            .map_or(ToolTurnBehavior::Continue, |host| host.turn_behavior(name))
+    }
+
     /// Returns `false`; hosted tools are callable only inside Code Mode.
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
@@ -260,7 +268,10 @@ impl HostedToolRuntime {
             return failed("no hosted Code Mode adapter is configured");
         };
         match host.execute(source, context).await {
-            Ok(execution) => execution,
+            Ok(mut execution) => {
+                execution.apply_host_turn_behaviors(|name| host.turn_behavior(name));
+                execution
+            }
             Err(error) => failed(&error.to_string()),
         }
     }
@@ -363,17 +374,17 @@ fn replay_nested_updates(execution: &CodeModeExecution, observer: &mut dyn CodeM
 }
 
 fn failed(message: &str) -> CodeModeExecution {
-    CodeModeExecution {
-        output: ToolOutputBody::Text(format!("Script failed\nOutput:\n{message}")),
-        success: false,
-        nested_calls: Vec::<NestedToolCall>::new(),
-        notifications: Vec::<CodeModeNotification>::new(),
-    }
+    CodeModeExecution::new(
+        ToolOutputBody::Text(format!("Script failed\nOutput:\n{message}")),
+        false,
+        Vec::new(),
+        Vec::new(),
+    )
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use nanocodex_oai_api::tools::ToolOutputBody;
+    use nanocodex_oai_api::tools::{ToolOutputBody, ToolTurnBehavior};
     use serde_json::json;
 
     use super::{HostedToolRuntime, HostedTools};
@@ -383,6 +394,8 @@ mod tests {
     };
 
     struct EchoHost;
+
+    struct TerminalHost;
 
     impl CodeModeHost for EchoHost {
         fn tool_definitions(
@@ -402,16 +415,62 @@ mod tests {
             context: ToolContext<'a>,
         ) -> HostFuture<'a, Result<CodeModeExecution, CodeModeHostError>> {
             Box::pin(async move {
-                Ok(CodeModeExecution {
-                    output: ToolOutputBody::Text(format!(
+                Ok(CodeModeExecution::new(
+                    ToolOutputBody::Text(format!(
                         "{source}:{}:{}",
                         context.session_id(),
                         context.call_id()
                     )),
-                    success: true,
-                    nested_calls: Vec::<NestedToolCall>::new(),
-                    notifications: Vec::new(),
-                })
+                    true,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            })
+        }
+    }
+
+    impl CodeModeHost for TerminalHost {
+        fn tool_definitions(
+            &self,
+            _session_id: &str,
+        ) -> Result<Vec<ToolDefinition>, CodeModeHostError> {
+            Ok(vec![ToolDefinition::function(
+                "finish",
+                "Finishes the current turn.",
+                json!({"type": "object", "properties": {}}),
+            )])
+        }
+
+        fn turn_behavior(&self, name: &str) -> ToolTurnBehavior {
+            if name == "finish" {
+                ToolTurnBehavior::FinishTurnOnSuccess
+            } else {
+                ToolTurnBehavior::Continue
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _source: &'a str,
+            _context: ToolContext<'a>,
+        ) -> HostFuture<'a, Result<CodeModeExecution, CodeModeHostError>> {
+            Box::pin(async {
+                Ok(CodeModeExecution::new(
+                    ToolOutputBody::Text("done".to_owned()),
+                    true,
+                    vec![NestedToolCall {
+                        call_id: "call-exec/code-1".to_owned(),
+                        name: "finish".to_owned(),
+                        input: json!({}),
+                        output: ToolOutputBody::Text("done".to_owned()),
+                        success: true,
+                        turn_behavior: ToolTurnBehavior::Continue,
+                        started_after_ns: 0,
+                        duration_ns: 0,
+                        metadata: None,
+                    }],
+                    Vec::new(),
+                ))
             })
         }
     }
@@ -424,6 +483,24 @@ mod tests {
             HostedToolRuntime::new_with_tools(".", None, None, &tools).model_specs("session-1");
         let description = specs[0].description();
         assert!(description.find("tools.alpha").unwrap() < description.find("tools.zeta").unwrap());
+    }
+
+    #[tokio::test]
+    async fn hosted_code_mode_uses_static_terminal_behavior() {
+        let tools = HostedTools::new(TerminalHost);
+        let runtime = HostedToolRuntime::new_with_tools(".", None, None, &tools);
+        let execution = runtime
+            .execute_code(
+                "await tools.finish({});",
+                ToolContext::new("model", "session", "call-exec", &[], 1_000),
+            )
+            .await;
+
+        let receipt = execution
+            .terminal_tool()
+            .expect("host-declared terminal tool should complete the cell");
+        assert_eq!(receipt.call_id(), "call-exec/code-1");
+        assert_eq!(receipt.tool_name(), "finish");
     }
 
     #[tokio::test]

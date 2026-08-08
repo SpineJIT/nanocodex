@@ -352,7 +352,9 @@ async fn run_prompt(
         .wrap_err("agent turn failed")?;
     persist_snapshot(state_file, &result.snapshot()).await?;
     Ok(PromptResponse {
-        final_message: result.into_final_message(),
+        final_message: result.into_final_message().ok_or_else(|| {
+            eyre::eyre!("agent completed with a terminal tool instead of a final message")
+        })?,
     })
 }
 

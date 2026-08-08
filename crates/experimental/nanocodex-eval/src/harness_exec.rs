@@ -975,6 +975,7 @@ impl HarnessTranscript {
         };
         Some(AgentResult {
             final_message: self.final_message.clone(),
+            terminal_tool: None,
             model: config.model.clone(),
             effort: config.effort.clone(),
             model_calls: 0,

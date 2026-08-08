@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::CostStatus;
@@ -234,6 +234,22 @@ pub struct RunMetrics {
 }
 
 /// Complete terminal projection for one accepted turn.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RunCompletion {
+    /// The model ended the turn with an assistant message.
+    Message,
+    /// A terminal-capable tool completed the turn.
+    TerminalTool {
+        /// Stable invocation identity for the terminal tool.
+        call_id: String,
+        /// Canonical registered tool name.
+        tool_name: String,
+    },
+}
+
+/// Complete terminal projection for one accepted turn.
 #[derive(Clone, Debug, Deserialize)]
 pub struct RunTerminal {
     /// Terminal outcome.
@@ -262,7 +278,14 @@ pub struct RunTerminal {
     /// Why an exact local estimate is present or unavailable.
     #[serde(default)]
     pub cost_status: CostStatus,
+    /// Completion identity when produced by a current runtime.
+    #[serde(default)]
+    pub completion: Option<RunCompletion>,
 }
+
+#[cfg(test)]
+#[path = "data_tests.rs"]
+mod tests;
 
 /// Lifecycle state for one model-requested tool call.
 #[derive(Clone, Debug)]

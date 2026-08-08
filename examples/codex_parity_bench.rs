@@ -263,10 +263,17 @@ async fn finish_measurement(
     latency_ms: f64,
     expected: &str,
 ) -> Result<TurnMeasurement> {
-    if result.final_message().trim() != expected {
+    if result
+        .final_message()
+        .expect("example expects a final assistant message")
+        .trim()
+        != expected
+    {
         bail!(
             "unexpected response: expected {expected:?}, got {:?}",
-            result.final_message()
+            result
+                .final_message()
+                .expect("example expects a final assistant message")
         );
     }
     let calls = drain_turn(events).await?;
@@ -290,7 +297,10 @@ async fn finish_measurement(
         model_duration_ms: nanos_ms(model_duration_ns),
         time_to_first_event_ms: nanos_ms(time_to_first_event_ns),
         time_to_first_output_ms: time_to_first_output_ns.map(nanos_ms),
-        final_message: result.final_message().to_owned(),
+        final_message: result
+            .final_message()
+            .expect("example expects a final assistant message")
+            .to_owned(),
         usage,
     })
 }

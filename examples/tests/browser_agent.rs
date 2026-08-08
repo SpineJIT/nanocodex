@@ -115,7 +115,12 @@ async fn run_agent(browser: BrowserTool) -> Result<Value> {
     let result = timeout(Duration::from_secs(20), turn.result())
         .await
         .map_err(|_| eyre!("Nanocodex did not complete the browser turn"))??;
-    assert_eq!(result.final_message(), "browser complete");
+    assert_eq!(
+        result
+            .final_message()
+            .expect("example expects a final assistant message"),
+        "browser complete"
+    );
     drop((agent, events));
 
     timeout(Duration::from_secs(5), server)

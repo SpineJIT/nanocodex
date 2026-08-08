@@ -85,7 +85,9 @@ implements both `Future<Output = Result<TurnResult, NanocodexError>>` and
 ```rust,ignore
 let turn = agent.prompt("Explain the failing parser test.").await?;
 let result = turn.await?;
-println!("{}", result.final_message());
+if let Some(message) = result.final_message() {
+    println!("{message}");
+}
 ```
 
 `turn.result().await` remains the equivalent convenience method. Result
@@ -103,7 +105,9 @@ println!("{}", result.final_message);
 with:
 
 ```rust,ignore
-println!("{}", result.final_message());
+if let Some(message) = result.final_message() {
+    println!("{message}");
+}
 ```
 
 ## Use canonical component paths

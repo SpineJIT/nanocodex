@@ -60,7 +60,7 @@ async fn agent_session_id_overrides_the_caller_shell_environment() -> Result<()>
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
 
     drop((agent, events));

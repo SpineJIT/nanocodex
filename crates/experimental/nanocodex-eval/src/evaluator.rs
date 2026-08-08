@@ -16,7 +16,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use nanocodex_agent::{
-    Nanocodex, NanocodexBuilder, NanocodexError,
+    Nanocodex, NanocodexBuilder, NanocodexError, TurnCompletion,
     events::{
         AgentEvent, AgentEventKind, AgentEvents, CompactionCompleted, CompactionFailed,
         ModelCallCompleted, ModelCallFailed, ModelWarmupCompleted, ModelWarmupFailed, RunStarted,
@@ -759,16 +759,32 @@ impl Evaluator {
             .await;
             match event_result {
                 Ok(Ok(terminal)) => {
-                    let (primary, final_message) = match turn.result().await {
-                        Ok(result) => (None, result.into_final_message()),
+                    let (primary, final_message, terminal_tool) = match turn.result().await {
+                        Ok(result) => {
+                            let terminal_tool = match result.completion() {
+                                TurnCompletion::TerminalTool { receipt } => Some(receipt.clone()),
+                                TurnCompletion::Message { .. } | _ => None,
+                            };
+                            (
+                                None,
+                                result
+                                    .into_final_message()
+                                    .unwrap_or_else(|| observation.final_message.clone()),
+                                terminal_tool,
+                            )
+                        }
                         Err(error) => (
                             Some(EvalError::Nanocodex(error)),
                             observation.final_message.clone(),
+                            None,
                         ),
                     };
                     let completeness = observation.billing_completeness();
                     observation.final_message = final_message;
-                    let selection = observation.select_result(Some(&terminal), completeness);
+                    let mut selection = observation.select_result(Some(&terminal), completeness);
+                    if let Some(result) = &mut selection.result {
+                        result.terminal_tool = terminal_tool;
+                    }
                     if let Some(error) = &selection.terminal_error {
                         tracing::warn!(
                             target: "nanocodex_eval",
@@ -1712,6 +1728,7 @@ impl AgentObservation {
         };
         Some(AgentResult {
             final_message: self.final_message.clone(),
+            terminal_tool: None,
             model,
             effort,
             model_calls,
@@ -2651,6 +2668,7 @@ impl AgentResult {
         };
         Ok(Self {
             final_message,
+            terminal_tool: None,
             model: metadata.model.clone(),
             effort: metadata.effort.clone(),
             model_calls: metadata.model_calls,

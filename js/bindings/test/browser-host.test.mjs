@@ -33,12 +33,78 @@ test("browser host carries ordered frames and application tools", async () => {
   assert.equal(execution.success, true);
   assert.match(JSON.stringify(execution.output), /42/);
   assert.equal(execution.nested_calls[0].name, "double");
+  assert.equal(execution.nested_calls[0].turn_behavior, "continue");
   assert.equal(execution.nested_calls[0].call_id, "call-exec/code-1");
   assert.equal(Number.isSafeInteger(execution.nested_calls[0].started_after_ns), true);
   assert.ok(execution.nested_calls[0].started_after_ns >= 0);
   assert.equal(JSON.parse(host.toolDefinitions())[0].name, "double");
   host.emitEvent("event");
   assert.deepEqual(events, ["event"]);
+});
+
+test("browser host exposes statically declared terminal tool behavior", async () => {
+  const host = createBrowserHost({
+    WebSocketImpl: FakeWebSocket,
+    tools: {
+      finish: {
+        description: "Finish the current turn.",
+        parameters: { type: "object" },
+        turnBehavior: "finishTurnOnSuccess",
+        handler: () => "done",
+      },
+    },
+  });
+
+  const execution = JSON.parse(await host.executeCode(
+    "await tools.finish({});",
+    "session",
+    "call-exec",
+  ));
+  assert.equal(execution.nested_calls[0].turn_behavior, "finish_turn_on_success");
+  assert.equal(host.toolTurnBehavior("finish"), "finish_turn_on_success");
+  assert.deepEqual(JSON.parse(host.toolTurnBehaviors()), {
+    finish: "finish_turn_on_success",
+  });
+});
+
+test("browser host serializes terminal tools against Promise.all siblings", async () => {
+  const running = new Set();
+  let overlapped = false;
+  const host = createBrowserHost({
+    WebSocketImpl: FakeWebSocket,
+    tools: {
+      normal: {
+        description: "Run ordinary work.",
+        parameters: { type: "object" },
+        async handler() {
+          running.add("normal");
+          overlapped ||= running.size > 1;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          running.delete("normal");
+          return "normal";
+        },
+      },
+      finish: {
+        description: "Finish the turn.",
+        parameters: { type: "object" },
+        turnBehavior: "finishTurnOnSuccess",
+        async handler() {
+          running.add("finish");
+          overlapped ||= running.size > 1;
+          running.delete("finish");
+          return "finished";
+        },
+      },
+    },
+  });
+
+  const execution = JSON.parse(await host.executeCode(
+    "await Promise.all([tools.normal({}), tools.finish({})]);",
+    "session",
+    "call-exec",
+  ));
+  assert.equal(execution.success, true);
+  assert.equal(overlapped, false);
 });
 
 test("browser host directly dispatches tools without dynamic code evaluation", async () => {

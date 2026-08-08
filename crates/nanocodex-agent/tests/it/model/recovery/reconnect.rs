@@ -365,7 +365,7 @@ async fn sol_compacts_before_sampling_a_follow_on_turn() -> Result<()> {
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     assert_eq!(
         agent
@@ -374,7 +374,7 @@ async fn sol_compacts_before_sampling_a_follow_on_turn() -> Result<()> {
             .result()
             .await?
             .final_message(),
-        "done"
+        Some("done")
     );
     drop((agent, events));
     timeout(std::time::Duration::from_secs(5), server)
