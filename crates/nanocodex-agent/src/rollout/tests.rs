@@ -829,6 +829,64 @@ async fn fork_metadata_retains_parent_identity() {
 }
 
 #[tokio::test]
+async fn fork_seed_preserves_the_order_of_multiple_inherited_items() {
+    let home = tempdir().expect("temporary Codex home");
+    let parent = "019c0d31-c308-7d91-bff4-5dca82d15ac5";
+    let recorder = RolloutRecorder::create(
+        &Handle::current(),
+        &RolloutConfig::new(home.path()),
+        "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+        RolloutIdentity {
+            lineage_id: parent,
+            prompt_cache_key: parent,
+        },
+        Path::new("/worktree"),
+        "base instructions",
+        RolloutOrigin {
+            kind: "fork",
+            parent_thread_id: Some(parent),
+        },
+        None,
+    )
+    .expect("create fork rollout");
+    let history = vec![
+        message("first inherited item"),
+        message("second inherited item"),
+    ];
+
+    recorder
+        .seed_initial_history(ResponseHistory::new(history.clone()), 0, Thinking::High)
+        .await
+        .expect("seed fork rollout");
+
+    let lines = lines(&recorder);
+    let item_types = lines
+        .iter()
+        .map(|line| line["type"].as_str().expect("rollout item type"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        item_types,
+        [
+            "session_meta",
+            "turn_context",
+            "response_item",
+            "response_item",
+            "world_state",
+        ]
+    );
+    let seeded_items = lines
+        .iter()
+        .filter(|line| line["type"] == "response_item")
+        .map(|line| line["payload"].clone())
+        .collect::<Vec<_>>();
+    let expected_items = history
+        .iter()
+        .map(|item| serde_json::to_value(item).expect("encode inherited item"))
+        .collect::<Vec<_>>();
+    assert_eq!(seeded_items, expected_items);
+}
+
+#[tokio::test]
 async fn failed_fork_seed_is_not_published_as_a_resume_target() {
     let home = tempdir().expect("temporary Codex home");
     let config = RolloutConfig::new(home.path());

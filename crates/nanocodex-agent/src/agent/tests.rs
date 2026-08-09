@@ -7,12 +7,14 @@ use std::{
 };
 
 use nanocodex_oai_api::{
+    ResponseError,
     events::{AgentEventData, AgentEventKind, RunEvent, RunStatus},
     responses::{ContentItem, MessageRole, ResponseItem, ResponseItemId, Usage, WarmupResponse},
     tower::{
         CompactionOutput, GenerationOutput, ResponsePipelineStats, ResponsesAttemptKind,
         ResponsesOutput,
     },
+    transport::ResponsesError,
 };
 use nanocodex_tools::{
     Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult, ToolTurnBehavior,
@@ -83,6 +85,56 @@ impl Tool for FinishTurnTool {
 
 #[derive(Clone)]
 struct TerminalToolService;
+
+#[derive(Clone, Copy)]
+enum FailingAttempt {
+    Generation,
+    Compaction,
+}
+
+#[derive(Clone, Copy)]
+struct FailingAttemptService {
+    attempt: FailingAttempt,
+}
+
+impl Service<ResponsesAttempt> for FailingAttemptService {
+    type Response = ResponsesServiceResponse;
+    type Error = ResponseError;
+    type Future = Pin<
+        Box<
+            dyn Future<Output = std::result::Result<ResponsesServiceResponse, ResponseError>>
+                + Send,
+        >,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _context: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
+        let fails = matches!(
+            (self.attempt, request.kind()),
+            (FailingAttempt::Generation, ResponsesAttemptKind::Generation)
+                | (FailingAttempt::Compaction, ResponsesAttemptKind::Compaction)
+        );
+        if fails {
+            return Box::pin(ready(Err(ResponseError::from(
+                ResponsesError::UnexpectedEnd,
+            ))));
+        }
+        let output = match request.kind() {
+            ResponsesAttemptKind::Warmup => ResponsesOutput::Warmup(WarmupResponse {
+                id: "resp-warmup".to_owned(),
+                usage: None,
+            }),
+            _ => panic!("failing-attempt test received an unsupported attempt"),
+        };
+        Box::pin(ready(Ok(ResponsesServiceResponse::new(output))))
+    }
+}
 
 impl Service<ResponsesAttempt> for TerminalToolService {
     type Response = ResponsesServiceResponse;
@@ -233,33 +285,32 @@ impl Service<ResponsesAttempt> for DelayedCompactionService {
                 use std::sync::atomic::Ordering;
 
                 self.compaction_calls.fetch_add(1, Ordering::Relaxed);
+                let output = || {
+                    ResponsesServiceResponse::new(ResponsesOutput::Compaction(CompactionOutput {
+                        id: "resp-compaction".to_owned(),
+                        status: "completed".to_owned(),
+                        item: ResponseItem::Compaction {
+                            id: Some(ResponseItemId::from("cmp-persist-failure")),
+                            encrypted_content: "opaque-summary".into(),
+                            created_by: None,
+                            internal_chat_message_metadata_passthrough: None,
+                        },
+                        usage: None,
+                        time_to_first_event_ns: 0,
+                        time_to_first_output_ns: None,
+                        pipeline_stats: ResponsePipelineStats::default(),
+                    }))
+                };
+                let release = self.release.lock().expect("release lock").take();
+                let Some(release) = release else {
+                    return Box::pin(ready(Ok(output())));
+                };
                 self.compaction_started
                     .send(())
-                    .expect("test observes the compaction attempt");
-                let release = self
-                    .release
-                    .lock()
-                    .expect("release lock")
-                    .take()
-                    .expect("one compaction waits for release");
+                    .expect("test observes the delayed compaction attempt");
                 Box::pin(async move {
                     release.await.expect("test releases compaction");
-                    Ok(ResponsesServiceResponse::new(ResponsesOutput::Compaction(
-                        CompactionOutput {
-                            id: "resp-compaction".to_owned(),
-                            status: "completed".to_owned(),
-                            item: ResponseItem::Compaction {
-                                id: Some(ResponseItemId::from("cmp-persist-failure")),
-                                encrypted_content: "opaque-summary".into(),
-                                created_by: None,
-                                internal_chat_message_metadata_passthrough: None,
-                            },
-                            usage: None,
-                            time_to_first_event_ns: 0,
-                            time_to_first_output_ns: None,
-                            pipeline_stats: ResponsePipelineStats::default(),
-                        },
-                    )))
+                    Ok(output())
                 })
             }
             ResponsesAttemptKind::Warmup => Box::pin(ready(Ok(ResponsesServiceResponse::new(
@@ -579,6 +630,67 @@ async fn terminal_tool_persistence_failure_fails_the_turn() {
             _ => {}
         }
     }
+    assert_eq!(completed, 0);
+    assert_eq!(failed, 1);
+    assert!(matches!(
+        agent.prompt("must not run after failed durability").await,
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+    assert!(matches!(
+        agent.shutdown().await,
+        Err(NanocodexError::Shutdown(error))
+            if matches!(error.as_ref(), NanocodexError::PersistRollout { .. })
+    ));
+}
+
+#[tokio::test]
+async fn failed_provider_turn_persistence_failure_fail_stops_the_agent() {
+    let home = tempdir().expect("temporary rollout home");
+    let openai = OpenAi::builder("test")
+        .service(|| FailingAttemptService {
+            attempt: FailingAttempt::Generation,
+        })
+        .build()
+        .expect("test OpenAI client");
+    let tools = Tools::builder()
+        .without_defaults()
+        .build()
+        .expect("empty tools");
+    let (agent, mut events) = Nanocodex::builder(openai)
+        .tools(tools)
+        .rollout(RolloutConfig::new(home.path()))
+        .build()
+        .expect("agent with rollout");
+    agent.durability.inject_write_failures(1).await;
+
+    let result = agent
+        .prompt("provider failure must still persist its safe boundary")
+        .await
+        .expect("accepted turn")
+        .result()
+        .await;
+
+    assert!(matches!(result, Err(NanocodexError::PersistRollout { .. })));
+
+    let mut model_failed = false;
+    let mut completed = 0;
+    let mut failed = 0;
+    while failed == 0 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("failed provider turn emits lifecycle events")
+            .expect("agent event stream remains open");
+        match event.kind {
+            AgentEventKind::ModelCallFailed => model_failed = true,
+            AgentEventKind::RunCompleted => completed += 1,
+            AgentEventKind::RunFailed => failed += 1,
+            _ => {}
+        }
+    }
+    assert!(
+        model_failed,
+        "the provider failure must reach the model lifecycle"
+    );
     assert_eq!(completed, 0);
     assert_eq!(failed, 1);
     assert!(matches!(
@@ -993,6 +1105,104 @@ async fn compaction_persistence_failure_fail_stops_current_and_queued_turns() {
     assert!(matches!(
         flush.await.expect("flush task joins"),
         Err(NanocodexError::PersistRollout { .. })
+    ));
+    drop(events);
+}
+
+#[tokio::test]
+async fn cancelled_compaction_persistence_failure_fail_stops_replacement() {
+    use std::sync::atomic::Ordering;
+
+    let home = tempdir().expect("temporary rollout home");
+    let (compaction_started, mut compaction_started_rx) = mpsc::unbounded_channel();
+    let (_release, release_rx) = oneshot::channel();
+    let compaction_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let openai = OpenAi::builder("test")
+        .service({
+            let compaction_started = compaction_started.clone();
+            let release = Arc::new(Mutex::new(Some(release_rx)));
+            let compaction_calls = Arc::clone(&compaction_calls);
+            move || DelayedCompactionService {
+                compaction_started: compaction_started.clone(),
+                release: Arc::clone(&release),
+                compaction_calls: Arc::clone(&compaction_calls),
+            }
+        })
+        .build()
+        .expect("test OpenAI client");
+    let tools = Tools::builder()
+        .without_defaults()
+        .build()
+        .expect("empty tools");
+    let (agent, events) = Nanocodex::builder(openai)
+        .tools(tools)
+        .rollout(RolloutConfig::new(home.path()))
+        .build()
+        .expect("agent with rollout");
+    agent.durability.inject_write_failures(1).await;
+
+    let first_agent = agent.clone();
+    let first = tokio::spawn(async move { first_agent.compact().await });
+    compaction_started_rx
+        .recv()
+        .await
+        .expect("first compaction reaches the provider");
+    let second_agent = agent.clone();
+    let second = tokio::spawn(async move { second_agent.compact().await });
+
+    assert!(matches!(
+        first.await.expect("cancelled compaction task joins"),
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+    assert!(matches!(
+        second.await.expect("replacement compaction task joins"),
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+    assert_eq!(compaction_calls.load(Ordering::Relaxed), 1);
+    assert!(matches!(
+        agent.compact().await,
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+    assert!(matches!(
+        agent.shutdown().await,
+        Err(NanocodexError::Shutdown(error))
+            if matches!(error.as_ref(), NanocodexError::PersistRollout { .. })
+    ));
+    drop(events);
+}
+
+#[tokio::test]
+async fn failed_provider_compaction_persistence_failure_fail_stops_the_agent() {
+    let home = tempdir().expect("temporary rollout home");
+    let openai = OpenAi::builder("test")
+        .service(|| FailingAttemptService {
+            attempt: FailingAttempt::Compaction,
+        })
+        .build()
+        .expect("test OpenAI client");
+    let tools = Tools::builder()
+        .without_defaults()
+        .build()
+        .expect("empty tools");
+    let (agent, events) = Nanocodex::builder(openai)
+        .tools(tools)
+        .rollout(RolloutConfig::new(home.path()))
+        .build()
+        .expect("agent with rollout");
+    agent.durability.inject_write_failures(1).await;
+
+    assert!(matches!(
+        agent.compact().await,
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+    assert!(matches!(
+        agent.prompt("must not run after failed durability").await,
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+    assert!(matches!(
+        agent.shutdown().await,
+        Err(NanocodexError::Shutdown(error))
+            if matches!(error.as_ref(), NanocodexError::PersistRollout { .. })
     ));
     drop(events);
 }
