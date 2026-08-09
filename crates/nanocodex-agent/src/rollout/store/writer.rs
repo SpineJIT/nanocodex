@@ -119,6 +119,11 @@ impl RolloutWriter {
                     self.inject_publish_reopen_failure();
                     let _ = result.send(());
                 }
+                #[cfg(test)]
+                RolloutCommand::InjectRollbackFailure { result } => {
+                    self.inject_rollback_failure();
+                    let _ = result.send(());
+                }
             }
         }
         (self.flush().await, None)
@@ -516,17 +521,7 @@ impl RolloutWriter {
     async fn rollback_or_poison(&mut self, write_error: io::Error, len: u64) -> io::Error {
         match self.rollback(len).await {
             Ok(()) => write_error,
-            Err(rollback_error) => {
-                let corruption = io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    RolloutCorruption {
-                        write_error,
-                        rollback_error,
-                    },
-                );
-                self.poison(&corruption);
-                corruption
-            }
+            Err(rollback_error) => self.poison(write_error, rollback_error).await,
         }
     }
 
@@ -537,10 +532,25 @@ impl RolloutWriter {
         }
     }
 
-    fn poison(&mut self, error: &io::Error) {
+    async fn poison(&mut self, write_error: io::Error, rollback_error: io::Error) -> io::Error {
         self.file.take();
         self.pending = None;
-        self.poisoned = Some(PoisonedWriter::from_error(error));
+        let quarantine_error = if self.staged {
+            None
+        } else {
+            let quarantined = self.path.with_extension("jsonl.corrupt");
+            tokio::fs::rename(&self.path, quarantined).await.err()
+        };
+        let error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            RolloutCorruption {
+                write_error,
+                rollback_error,
+                quarantine_error,
+            },
+        );
+        self.poisoned = Some(PoisonedWriter::from_error(&error));
+        error
     }
 
     fn file(&mut self) -> io::Result<&mut tokio::fs::File> {
@@ -614,6 +624,7 @@ impl PoisonedWriter {
 struct RolloutCorruption {
     write_error: io::Error,
     rollback_error: io::Error,
+    quarantine_error: Option<io::Error>,
 }
 
 impl std::fmt::Display for RolloutCorruption {
@@ -622,7 +633,14 @@ impl std::fmt::Display for RolloutCorruption {
             formatter,
             "rollout corruption: failed to rollback after write error ({}) because rollback failed ({})",
             self.write_error, self.rollback_error
-        )
+        )?;
+        if let Some(error) = &self.quarantine_error {
+            write!(
+                formatter,
+                "; failed to quarantine the corrupted rollout ({error})"
+            )?;
+        }
+        Ok(())
     }
 }
 

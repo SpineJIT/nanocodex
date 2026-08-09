@@ -76,6 +76,8 @@ enum RolloutCommand {
     },
     #[cfg(test)]
     InjectPublishReopenFailure { result: oneshot::Sender<()> },
+    #[cfg(test)]
+    InjectRollbackFailure { result: oneshot::Sender<()> },
 }
 
 pub(super) struct RolloutCommit {
@@ -575,6 +577,18 @@ impl RolloutRecorder {
         let (result, receiver) = oneshot::channel();
         self.commands
             .send(RolloutCommand::InjectPublishReopenFailure { result })
+            .await
+            .expect("test rollout writer remains available");
+        receiver
+            .await
+            .expect("test rollout writer accepts injection");
+    }
+
+    #[cfg(test)]
+    pub(in crate::rollout) async fn inject_rollback_failure(&self) {
+        let (result, receiver) = oneshot::channel();
+        self.commands
+            .send(RolloutCommand::InjectRollbackFailure { result })
             .await
             .expect("test rollout writer remains available");
         receiver

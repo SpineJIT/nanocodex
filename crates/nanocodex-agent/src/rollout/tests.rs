@@ -1124,3 +1124,42 @@ async fn rollback_failure_marks_the_writer_corrupted_and_poisoned() {
         "corrupted writer stays poisoned"
     );
 }
+
+#[tokio::test]
+async fn rollback_corruption_quarantines_a_partially_persisted_root_rollout() {
+    let home = tempdir().expect("temporary rollout home");
+    let config = RolloutConfig::new(home.path());
+    let recorder = recorder(home.path());
+    let thread_id = recorder.info().thread_id().to_owned();
+    let path = recorder.info().path().to_path_buf();
+    recorder.inject_write_failure_after(4).await;
+    recorder.inject_rollback_failure().await;
+
+    let error = recorder
+        .persist_history(
+            ResponseHistory::new(vec![message("partially persisted root")]),
+            0,
+            completed_turn("persist root", "final"),
+        )
+        .await
+        .expect_err("failed rollback must report corruption");
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        config
+            .list_sessions()
+            .expect("list rollout candidates")
+            .is_empty(),
+        "a partially written root rollout must not be discoverable"
+    );
+    assert!(
+        config.load_session(&thread_id).is_err(),
+        "a partially written root rollout must not be resumable"
+    );
+    assert!(
+        !path.exists(),
+        "the normal rollout path must be removed from discovery"
+    );
+
+    let _ = recorder.shutdown().await;
+}
