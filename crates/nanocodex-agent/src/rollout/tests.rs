@@ -754,9 +754,68 @@ async fn fork_metadata_retains_parent_identity() {
     )
     .expect("create fork rollout");
 
+    recorder
+        .seed_initial_history(ResponseHistory::new(Vec::new()), 0, Thinking::High)
+        .await
+        .expect("seed and publish fork rollout");
+
     let lines = lines(&recorder);
     assert_eq!(lines[0]["payload"]["forked_from_id"], parent);
     assert_eq!(lines[0]["payload"]["parent_thread_id"], parent);
+}
+
+#[tokio::test]
+async fn failed_fork_seed_is_not_published_as_a_resume_target() {
+    let home = tempdir().expect("temporary Codex home");
+    let config = RolloutConfig::new(home.path());
+    let child = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    let recorder = RolloutRecorder::create(
+        &Handle::current(),
+        &config,
+        child,
+        RolloutIdentity {
+            lineage_id: "019c0d31-c308-7d91-bff4-5dca82d15ac5",
+            prompt_cache_key: "019c0d31-c308-7d91-bff4-5dca82d15ac5",
+        },
+        Path::new("/worktree"),
+        "base instructions",
+        RolloutOrigin {
+            kind: "fork",
+            parent_thread_id: Some("019c0d31-c308-7d91-bff4-5dca82d15ac5"),
+        },
+        None,
+    )
+    .expect("create unpublished fork rollout");
+    let path = recorder.info().path().to_path_buf();
+
+    assert!(
+        !path.exists(),
+        "fork rollout is unpublished before its seed"
+    );
+    recorder.inject_write_failures(1).await;
+    assert!(
+        recorder
+            .seed_initial_history(
+                ResponseHistory::new(vec![message("inherited boundary")]),
+                0,
+                Thinking::High,
+            )
+            .await
+            .is_err()
+    );
+    recorder.shutdown().await.expect("shutdown staged recorder");
+
+    assert!(
+        !path.exists(),
+        "failed seed must not publish a standard rollout"
+    );
+    assert!(config.load_session(child).is_err());
+    assert!(
+        config
+            .list_sessions()
+            .expect("list session candidates")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -766,26 +825,58 @@ async fn failed_append_is_discarded_and_later_flush_does_not_retry_it() {
     let file = File::create(&path).expect("create temporary rollout");
     let mut writer = RolloutWriter::new(
         tokio::fs::File::from_std(file),
+        path.clone(),
+        false,
         uuid::Uuid::now_v7().to_string(),
         PathBuf::from("/worktree"),
     );
+    let prefix = std::fs::read(&path).expect("read empty rollout prefix");
     writer.pending = Some(RolloutCommit::from_history(
         ResponseHistory::new(vec![message("retry me")]),
         0,
         completed_turn("retry me", "retried"),
     ));
-    writer.inject_write_failures(2);
+    writer.inject_write_failure_after(1);
 
     assert!(writer.persist_pending().await.is_err());
     assert!(writer.pending.is_none());
     writer.flush().await.expect("flush after discarded append");
     drop(writer);
 
-    let lines = BufReader::new(File::open(path).expect("open discarded rollout"))
+    let lines = BufReader::new(File::open(&path).expect("open discarded rollout"))
         .lines()
         .collect::<io::Result<Vec<_>>>()
         .expect("read discarded rollout");
     assert!(lines.is_empty());
+    assert_eq!(
+        std::fs::read(path).expect("read rolled-back rollout"),
+        prefix
+    );
+}
+
+#[tokio::test]
+async fn failed_flush_is_reported_without_appending_a_rollout_record() {
+    let home = tempdir().expect("temporary rollout directory");
+    let path = home.path().join("rollout.jsonl");
+    let file = File::create(&path).expect("create temporary rollout");
+    let mut writer = RolloutWriter::new(
+        tokio::fs::File::from_std(file),
+        path.clone(),
+        false,
+        uuid::Uuid::now_v7().to_string(),
+        PathBuf::from("/worktree"),
+    );
+    writer.inject_write_failure_after(0);
+
+    assert!(writer.flush().await.is_err());
+    drop(writer);
+    assert!(
+        BufReader::new(File::open(path).expect("open rollout"))
+            .lines()
+            .collect::<io::Result<Vec<_>>>()
+            .expect("read rollout")
+            .is_empty()
+    );
 }
 
 #[tokio::test]

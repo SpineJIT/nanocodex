@@ -383,6 +383,56 @@ async fn rollout_persistence_failure_fail_stops_current_and_queued_turns() {
 }
 
 #[tokio::test]
+async fn explicit_rollout_flush_failure_fail_stops_the_agent() {
+    let home = tempdir().expect("temporary rollout home");
+    let generation_inputs = Arc::new(Mutex::new(Vec::new()));
+    let openai = OpenAi::builder("test")
+        .service({
+            let generation_inputs = Arc::clone(&generation_inputs);
+            move || CheckpointLifecycleService {
+                generation_inputs: Arc::clone(&generation_inputs),
+            }
+        })
+        .build()
+        .expect("test OpenAI client");
+    let tools = Tools::builder()
+        .without_defaults()
+        .build()
+        .expect("empty tools");
+    let (agent, events) = Nanocodex::builder(openai)
+        .tools(tools)
+        .rollout(RolloutConfig::new(home.path()))
+        .build()
+        .expect("agent with rollout");
+    agent.durability.inject_write_failures(1).await;
+
+    assert!(matches!(
+        agent.flush_rollout().await,
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+    assert!(matches!(
+        agent.prompt("must not run after failed flush").await,
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+    assert!(
+        generation_inputs
+            .lock()
+            .expect("generation input lock")
+            .is_empty()
+    );
+    assert!(matches!(
+        agent.flush_rollout().await,
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+    assert!(matches!(
+        agent.shutdown().await,
+        Err(NanocodexError::Shutdown(error))
+            if matches!(error.as_ref(), NanocodexError::PersistRollout { .. })
+    ));
+    drop(events);
+}
+
+#[tokio::test]
 async fn compaction_persistence_failure_fail_stops_current_and_queued_turns() {
     use std::sync::atomic::Ordering;
 

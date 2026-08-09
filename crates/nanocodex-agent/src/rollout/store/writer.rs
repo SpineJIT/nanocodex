@@ -2,7 +2,9 @@ use super::super::{load::validate_legacy_history_mode, wire::*};
 use super::*;
 
 pub(in crate::rollout) struct RolloutWriter {
-    file: tokio::fs::File,
+    file: Option<tokio::fs::File>,
+    path: PathBuf,
+    staged: bool,
     pub(in crate::rollout) pending: Option<RolloutCommit>,
     written_revision: Option<u64>,
     written_len: usize,
@@ -20,11 +22,15 @@ pub(in crate::rollout) struct RolloutWriter {
 impl RolloutWriter {
     pub(in crate::rollout) fn new(
         file: tokio::fs::File,
+        path: PathBuf,
+        staged: bool,
         initial_window_id: String,
         workspace: PathBuf,
     ) -> Self {
         Self {
-            file,
+            file: Some(file),
+            path,
+            staged,
             pending: None,
             written_revision: None,
             written_len: 0,
@@ -40,9 +46,11 @@ impl RolloutWriter {
         }
     }
 
-    pub(super) fn resumed(file: tokio::fs::File, state: ResumeWriterState) -> Self {
+    pub(super) fn resumed(file: tokio::fs::File, path: PathBuf, state: ResumeWriterState) -> Self {
         Self {
-            file,
+            file: Some(file),
+            path,
+            staged: false,
             pending: None,
             written_revision: Some(0),
             written_len: state.written_len,
@@ -74,6 +82,9 @@ impl RolloutWriter {
                 RolloutCommand::Flush { result } => {
                     drop(result.send(self.flush().await));
                 }
+                RolloutCommand::Publish { path, result } => {
+                    drop(result.send(self.publish(path).await));
+                }
                 RolloutCommand::Shutdown { result } => {
                     commands.close();
                     return (self.flush().await, Some(result));
@@ -97,8 +108,10 @@ impl RolloutWriter {
         if self.pending.is_some() {
             self.persist_pending().await
         } else {
-            self.file.flush().await?;
-            self.file.sync_data().await
+            self.check_injected_write_failure()?;
+            let file = self.file()?;
+            file.flush().await?;
+            file.sync_data().await
         }
     }
 
@@ -106,7 +119,7 @@ impl RolloutWriter {
         let Some(commit) = self.pending.take() else {
             return Ok(());
         };
-        self.append_with_retry(&commit).await
+        self.append(&commit).await
     }
 
     async fn seed_initial_checkpoint(&mut self, seed: RolloutSeed) -> io::Result<()> {
@@ -116,7 +129,7 @@ impl RolloutWriter {
                 "initial checkpoint seed requires an empty rollout writer",
             ));
         }
-        let original_len = self.file.metadata().await?.len();
+        let original_len = self.file()?.metadata().await?.len();
         match self.write_initial_seed(&seed).await {
             Ok(()) => {
                 self.written_revision = Some(seed.revision);
@@ -131,31 +144,58 @@ impl RolloutWriter {
         }
     }
 
-    async fn append_with_retry(&mut self, commit: &RolloutCommit) -> io::Result<()> {
+    async fn append(&mut self, commit: &RolloutCommit) -> io::Result<()> {
         let prepared = self.prepare_append(commit)?;
-        let original_len = self.file.metadata().await?.len();
-        let first_error = match self.write_prepared(&prepared).await {
-            Ok(()) => {
-                self.apply_prepared(prepared);
-                return Ok(());
-            }
-            Err(source) => source,
-        };
-
-        self.rollback(original_len).await?;
+        let original_len = self.file()?.metadata().await?.len();
         match self.write_prepared(&prepared).await {
             Ok(()) => {
                 self.apply_prepared(prepared);
                 Ok(())
             }
-            Err(second) => {
+            Err(error) => {
                 self.rollback(original_len).await?;
-                Err(io::Error::new(
-                    second.kind(),
-                    format!(
-                        "failed to append Codex rollout after retry; first error: {first_error}; final error: {second}"
-                    ),
-                ))
+                Err(error)
+            }
+        }
+    }
+
+    async fn publish(&mut self, path: PathBuf) -> io::Result<()> {
+        if !self.staged {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rollout writer has no staged file to publish",
+            ));
+        }
+        self.flush().await?;
+        let file = self.file.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "Codex rollout writer is closed")
+        })?;
+        drop(file);
+        if let Err(error) = tokio::fs::rename(&self.path, &path).await {
+            self.file = Some(
+                tokio::fs::OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .open(&self.path)
+                    .await?,
+            );
+            return Err(error);
+        }
+        match tokio::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .await
+        {
+            Ok(file) => {
+                self.file = Some(file);
+                self.path = path;
+                self.staged = false;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = tokio::fs::remove_file(path).await;
+                Err(error)
             }
         }
     }
@@ -253,7 +293,6 @@ impl RolloutWriter {
     }
 
     async fn write_prepared(&mut self, prepared: &PreparedAppend) -> io::Result<()> {
-        self.check_injected_write_failure()?;
         let turn = &prepared.turn;
         self.write_event(CodexEvent::TaskStarted {
             turn_id: &turn.turn_id,
@@ -270,25 +309,16 @@ impl RolloutWriter {
             PreparedRecords::Items { history, start } => {
                 self.write_turn_context(turn.effort, prepared.model).await?;
                 for item in history.iter_from(*start) {
-                    write_async_line(
-                        &mut self.file,
-                        &RolloutLine {
-                            timestamp: timestamp(),
-                            item: RolloutItem::ResponseItem(item),
-                        },
-                    )
-                    .await?;
+                    self.write_response_item(item).await?;
                 }
             }
             PreparedRecords::Compacted(compacted) => {
-                write_async_line(
-                    &mut self.file,
-                    &RolloutLine {
-                        timestamp: timestamp(),
-                        item: RolloutItem::Compacted(compacted),
-                    },
-                )
-                .await?;
+                self.check_injected_write_failure()?;
+                let line = RolloutLine {
+                    timestamp: timestamp(),
+                    item: RolloutItem::Compacted(compacted),
+                };
+                write_async_line(self.file()?, &line).await?;
                 self.write_turn_context(turn.effort, prepared.model).await?;
             }
         }
@@ -353,78 +383,71 @@ impl RolloutWriter {
                 ));
             }
         }
-        self.file.flush().await?;
-        self.file.sync_data().await
+        let file = self.file()?;
+        file.flush().await?;
+        file.sync_data().await
     }
 
     async fn write_initial_seed(&mut self, seed: &RolloutSeed) -> io::Result<()> {
-        #[cfg(test)]
-        self.check_injected_write_failure()?;
         self.write_turn_context(seed.effort, seed.model).await?;
         for item in seed.history.iter_from(0) {
-            #[cfg(test)]
-            self.check_injected_write_failure()?;
-            write_async_line(
-                &mut self.file,
-                &RolloutLine {
-                    timestamp: timestamp(),
-                    item: RolloutItem::ResponseItem(item),
-                },
-            )
-            .await?;
+            self.write_response_item(item).await?;
         }
-        #[cfg(test)]
-        self.check_injected_write_failure()?;
         self.write_context_state(&seed.context_baseline).await?;
-        self.file.flush().await?;
-        self.file.sync_data().await
+        let file = self.file()?;
+        file.flush().await?;
+        file.sync_data().await
     }
 
     async fn write_context_state(&mut self, context_baseline: &ContextBaseline) -> io::Result<()> {
-        write_async_line(
-            &mut self.file,
-            &RolloutLine {
-                timestamp: timestamp(),
-                item: RolloutItem::WorldState(&WorldStateItem {
-                    full: true,
-                    state: PersistedContextState {
-                        nanocodex_context: context_baseline,
-                    },
-                }),
-            },
-        )
-        .await
+        self.check_injected_write_failure()?;
+        let line = RolloutLine {
+            timestamp: timestamp(),
+            item: RolloutItem::WorldState(&WorldStateItem {
+                full: true,
+                state: PersistedContextState {
+                    nanocodex_context: context_baseline,
+                },
+            }),
+        };
+        write_async_line(self.file()?, &line).await
     }
 
     async fn write_event(&mut self, event: CodexEvent<'_>) -> io::Result<()> {
-        write_async_line(
-            &mut self.file,
-            &RolloutLine {
-                timestamp: timestamp(),
-                item: RolloutItem::Event(&event),
-            },
-        )
-        .await
+        self.check_injected_write_failure()?;
+        let line = RolloutLine {
+            timestamp: timestamp(),
+            item: RolloutItem::Event(&event),
+        };
+        write_async_line(self.file()?, &line).await
     }
 
     async fn write_turn_context(&mut self, effort: Thinking, model: Model) -> io::Result<()> {
-        write_async_line(
-            &mut self.file,
-            &RolloutLine {
-                timestamp: timestamp(),
-                item: RolloutItem::TurnContext(&TurnContext {
-                    cwd: &self.workspace,
-                    approval_policy: "never",
-                    sandbox_policy: SandboxPolicy {
-                        kind: "danger-full-access",
-                    },
-                    model: model.as_str(),
-                    effort: effort.as_str(),
-                    summary: "auto",
-                }),
-            },
-        )
-        .await
+        self.check_injected_write_failure()?;
+        let workspace = self.workspace.clone();
+        let line = RolloutLine {
+            timestamp: timestamp(),
+            item: RolloutItem::TurnContext(&TurnContext {
+                cwd: &workspace,
+                approval_policy: "never",
+                sandbox_policy: SandboxPolicy {
+                    kind: "danger-full-access",
+                },
+                model: model.as_str(),
+                effort: effort.as_str(),
+                summary: "auto",
+            }),
+        };
+        write_async_line(self.file()?, &line).await
+    }
+
+    async fn write_response_item(&mut self, item: &ResponseItem) -> io::Result<()> {
+        self.check_injected_write_failure()?;
+        let line = RolloutLine {
+            timestamp: timestamp(),
+            item: RolloutItem::ResponseItem(item),
+        };
+        write_async_line(self.file()?, &line).await
     }
 
     fn apply_prepared(&mut self, prepared: PreparedAppend) {
@@ -440,9 +463,16 @@ impl RolloutWriter {
     }
 
     async fn rollback(&mut self, len: u64) -> io::Result<()> {
-        self.file.set_len(len).await?;
-        self.file.seek(std::io::SeekFrom::Start(len)).await?;
-        self.file.sync_data().await
+        let file = self.file()?;
+        file.set_len(len).await?;
+        file.seek(std::io::SeekFrom::Start(len)).await?;
+        file.sync_data().await
+    }
+
+    fn file(&mut self) -> io::Result<&mut tokio::fs::File> {
+        self.file.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "Codex rollout writer is closed")
+        })
     }
 
     #[cfg(test)]

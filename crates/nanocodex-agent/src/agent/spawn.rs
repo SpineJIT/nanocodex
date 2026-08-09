@@ -215,10 +215,13 @@ where
         durability: durability.clone(),
         failure,
     };
+    let driver_failure = agent.failure.clone();
     let driver_task = async move {
         let outcome = driver.run().await;
         if shutdown.requested() {
-            let outcome = outcome.and(durability.shutdown().await);
+            let outcome = outcome
+                .and(durability.shutdown().await)
+                .and(driver_failure.check());
             shutdown.complete(outcome);
         } else if let Err(error) = outcome {
             tracing::error!(

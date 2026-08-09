@@ -28,6 +28,7 @@ impl RolloutInfo {
 #[derive(Clone, Debug)]
 pub(crate) struct RolloutRecorder {
     info: RolloutInfo,
+    unpublished_path: Option<PathBuf>,
     commands: mpsc::Sender<RolloutCommand>,
 }
 
@@ -54,6 +55,10 @@ enum RolloutCommand {
         result: oneshot::Sender<io::Result<()>>,
     },
     Flush {
+        result: oneshot::Sender<io::Result<()>>,
+    },
+    Publish {
+        path: PathBuf,
         result: oneshot::Sender<io::Result<()>>,
     },
     Shutdown {
@@ -269,6 +274,9 @@ impl RolloutRecorder {
         std::fs::create_dir_all(&directory)?;
         let filename_timestamp = local.format("%Y-%m-%dT%H-%M-%S");
         let path = directory.join(format!("rollout-{filename_timestamp}-{thread_id}.jsonl"));
+        let unpublished_path = (origin.kind == "fork")
+            .then(|| directory.join(format!(".rollout-{filename_timestamp}-{thread_id}.pending")));
+        let writer_path = unpublished_path.as_ref().unwrap_or(&path);
         let initial_window_id = uuid::Uuid::now_v7().to_string();
         let timestamp = timestamp();
         let parent_thread_id = origin.parent_thread_id.map(ToOwned::to_owned);
@@ -296,7 +304,10 @@ impl RolloutRecorder {
                 window_id: initial_window_id.clone(),
             },
         };
-        let mut file = File::options().write(true).create_new(true).open(&path)?;
+        let mut file = File::options()
+            .write(true)
+            .create_new(true)
+            .open(writer_path)?;
         write_line(
             &mut file,
             &RolloutLine {
@@ -309,10 +320,18 @@ impl RolloutRecorder {
 
         let writer = RolloutWriter::new(
             tokio::fs::File::from_std(file),
+            writer_path.to_path_buf(),
+            unpublished_path.is_some(),
             initial_window_id,
             cwd.to_path_buf(),
         );
-        Ok(Self::spawn(runtime, thread_id, path, writer))
+        Ok(Self::spawn(
+            runtime,
+            thread_id,
+            path,
+            unpublished_path,
+            writer,
+        ))
     }
 
     fn resume(
@@ -329,11 +348,24 @@ impl RolloutRecorder {
             ));
         }
         let file = File::options().read(true).append(true).open(path)?;
-        let writer = RolloutWriter::resumed(tokio::fs::File::from_std(file), state);
-        Ok(Self::spawn(runtime, thread_id, path.to_path_buf(), writer))
+        let writer =
+            RolloutWriter::resumed(tokio::fs::File::from_std(file), path.to_path_buf(), state);
+        Ok(Self::spawn(
+            runtime,
+            thread_id,
+            path.to_path_buf(),
+            None,
+            writer,
+        ))
     }
 
-    fn spawn(runtime: &Handle, thread_id: &str, path: PathBuf, writer: RolloutWriter) -> Self {
+    fn spawn(
+        runtime: &Handle,
+        thread_id: &str,
+        path: PathBuf,
+        unpublished_path: Option<PathBuf>,
+        writer: RolloutWriter,
+    ) -> Self {
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let writer_path = path.clone();
         drop(runtime.spawn(async move {
@@ -355,6 +387,7 @@ impl RolloutRecorder {
                 thread_id: thread_id.to_owned(),
                 path,
             },
+            unpublished_path,
             commands,
         }
     }
@@ -396,7 +429,8 @@ impl RolloutRecorder {
             .map_err(|_| io::Error::other("Codex rollout writer stopped during initial seed"))?;
         receiver
             .await
-            .map_err(|_| io::Error::other("Codex rollout writer stopped during initial seed"))?
+            .map_err(|_| io::Error::other("Codex rollout writer stopped during initial seed"))??;
+        self.publish().await
     }
 
     #[cfg(test)]
@@ -416,7 +450,8 @@ impl RolloutRecorder {
             .expect("test rollout writer remains available");
         receiver
             .await
-            .expect("test rollout writer accepts initial seed")
+            .expect("test rollout writer accepts initial seed")?;
+        self.publish().await
     }
 
     async fn persist_commit(&self, commit: RolloutCommit) -> io::Result<()> {
@@ -465,9 +500,30 @@ impl RolloutRecorder {
         {
             return Ok(());
         }
+        let outcome = receiver
+            .await
+            .map_err(|_| io::Error::other("Codex rollout writer stopped during shutdown"))?;
+        if let Some(path) = &self.unpublished_path {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+        outcome
+    }
+
+    async fn publish(&self) -> io::Result<()> {
+        if self.unpublished_path.is_none() {
+            return Ok(());
+        }
+        let (result, receiver) = oneshot::channel();
+        self.commands
+            .send(RolloutCommand::Publish {
+                path: self.info.path.clone(),
+                result,
+            })
+            .await
+            .map_err(|_| io::Error::other("Codex rollout writer stopped during publish"))?;
         receiver
             .await
-            .map_err(|_| io::Error::other("Codex rollout writer stopped during shutdown"))?
+            .map_err(|_| io::Error::other("Codex rollout writer stopped during publish"))?
     }
 
     #[cfg(test)]

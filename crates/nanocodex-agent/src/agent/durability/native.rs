@@ -151,17 +151,13 @@ impl Durability {
             })
     }
 
-    pub(crate) async fn flush(&self) -> Result<()> {
+    pub(crate) async fn flush(&self) -> std::result::Result<(), PersistRolloutFailure> {
         let Some(recorder) = &self.recorder else {
             return Ok(());
         };
-        recorder
-            .flush()
-            .await
-            .map_err(|source| NanocodexError::PersistRollout {
-                path: recorder.info().path().to_path_buf(),
-                source,
-            })
+        recorder.flush().await.map_err(|source| {
+            PersistRolloutFailure::new(recorder.info().path().to_path_buf(), source)
+        })
     }
 
     pub(crate) async fn shutdown(&self) -> Result<()> {

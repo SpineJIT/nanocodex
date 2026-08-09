@@ -124,7 +124,9 @@ impl Nanocodex {
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     pub async fn flush_rollout(&self) -> Result<()> {
         self.failure.check()?;
-        self.durability.flush().await?;
+        if let Err(failure) = self.durability.flush().await {
+            self.failure.record(failure);
+        }
         self.failure.check()
     }
 
