@@ -194,6 +194,9 @@ pub enum WorkerEvent {
     SpineTreeFailed {
         error: String,
     },
+    SpineStatus {
+        message: String,
+    },
     TurnTraceStarted {
         target: PaneId,
         id: u64,
@@ -1138,6 +1141,7 @@ fn handle_worker_update_with_capabilities(
         WorkerEvent::SpineTreeFailed { error } => {
             app.push_active_error(format!("Spine tree unavailable: {error}"));
         }
+        WorkerEvent::SpineStatus { message } => app.push_active_error(message),
         WorkerEvent::TurnFinished {
             target,
             main_branch_id,

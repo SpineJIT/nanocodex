@@ -53,7 +53,7 @@ impl AgentHandle {
     pub async fn spawn(&self) -> Result<(Nanocodex, AgentEvents)> {
         self.failure.check()?;
         let commands = self.commands()?;
-        request_spawn(&commands, &self.failure).await
+        request_spawn(&commands, &self.failure, ToolProfile::Child).await
     }
 
     /// Forks the containing agent's latest safe model boundary.
@@ -65,7 +65,7 @@ impl AgentHandle {
     pub async fn fork(&self) -> Result<(Nanocodex, AgentEvents)> {
         self.failure.check()?;
         let commands = self.commands()?;
-        request_fork(&commands, &self.failure, None).await
+        request_fork(&commands, &self.failure, None, ToolProfile::Child).await
     }
 
     fn commands(&self) -> Result<mpsc::Sender<Command>> {
@@ -391,7 +391,7 @@ impl Nanocodex {
     ///
     /// Returns an error after this agent's driver has stopped.
     pub async fn spawn(&self) -> Result<(Self, AgentEvents)> {
-        request_spawn(&self.commands, &self.failure).await
+        request_spawn(&self.commands, &self.failure, ToolProfile::Primary).await
     }
 
     /// Forks from the latest safe model boundary into an independently driven
@@ -430,7 +430,13 @@ impl Nanocodex {
         &self,
         checkpoint: Option<Arc<CommittedSession>>,
     ) -> Result<(Self, AgentEvents)> {
-        request_fork(&self.commands, &self.failure, checkpoint).await
+        request_fork(
+            &self.commands,
+            &self.failure,
+            checkpoint,
+            ToolProfile::Primary,
+        )
+        .await
     }
 }
 
@@ -438,9 +444,11 @@ async fn request_fork(
     commands: &mpsc::Sender<Command>,
     failure: &DriverFailure,
     checkpoint: Option<Arc<CommittedSession>>,
+    tool_profile: ToolProfile,
 ) -> Result<(Nanocodex, AgentEvents)> {
     request_command(commands, failure, |result| Command::Fork {
         checkpoint,
+        tool_profile,
         result,
     })
     .await
@@ -449,8 +457,13 @@ async fn request_fork(
 async fn request_spawn(
     commands: &mpsc::Sender<Command>,
     failure: &DriverFailure,
+    tool_profile: ToolProfile,
 ) -> Result<(Nanocodex, AgentEvents)> {
-    request_command(commands, failure, |result| Command::Spawn { result }).await
+    request_command(commands, failure, |result| Command::Spawn {
+        tool_profile,
+        result,
+    })
+    .await
 }
 
 pub(super) async fn request_command<T>(

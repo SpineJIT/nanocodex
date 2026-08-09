@@ -237,10 +237,6 @@ impl AgentArgs {
         self.fast_mode
     }
 
-    pub(crate) const fn subagents_enabled(&self) -> bool {
-        self.subagents
-    }
-
     pub(crate) const fn rollouts_enabled(&self) -> bool {
         self.rollouts
     }
@@ -390,21 +386,32 @@ impl AgentArgs {
         if let Some(rollout) = session.rollout {
             builder = builder.rollout(rollout);
         }
-        let builder = if child_agents.is_some() || customizer.is_some() {
-            let tools = tools;
-            let child_agents = child_agents.as_ref().map(Arc::downgrade);
-            builder.tools_factory(move |agent| {
-                let tools = if let Some(child_agents) = &child_agents {
-                    subagents::with_subagents(tools.clone(), agent.clone(), child_agents.clone())?
-                } else {
-                    tools.clone()
-                };
-                if let Some(customizer) = &customizer {
+        let builder = if let Some(child_agents) = child_agents.as_ref() {
+            let child_agents = Arc::downgrade(child_agents);
+            let root_child_agents = child_agents.clone();
+            let root_tools = tools.clone();
+            let root_customizer = customizer.clone();
+            let builder = builder.tools_factory(move |agent| {
+                let tools = subagents::with_subagents(
+                    root_tools.clone(),
+                    agent.clone(),
+                    root_child_agents.clone(),
+                )?;
+                if let Some(customizer) = &root_customizer {
                     customizer(tools, agent)
                 } else {
                     Ok(tools)
                 }
-            })
+            });
+            if customizer.is_some() {
+                builder.child_tools_factory(move |agent| {
+                    subagents::with_subagents(tools.clone(), agent, child_agents.clone())
+                })
+            } else {
+                builder
+            }
+        } else if let Some(customizer) = customizer {
+            builder.tools_factory(move |agent| customizer(tools.clone(), agent))
         } else {
             builder.tools(tools)
         };

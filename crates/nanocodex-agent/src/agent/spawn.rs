@@ -127,6 +127,7 @@ where
             depth: 0,
             parent_session_id: None,
         },
+        ToolProfile::Primary,
     )
 }
 
@@ -137,6 +138,7 @@ pub(super) fn spawn_agent_driver<S>(
     service: S,
     initial_resume: Option<InitialResume>,
     origin: AgentOrigin,
+    tool_profile: ToolProfile,
 ) -> Result<(Nanocodex, AgentEvents)>
 where
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
@@ -148,10 +150,13 @@ where
     let failure = DriverFailure::default();
     let tools = spawner
         .tools
-        .materialize(AgentHandle {
-            commands: commands.downgrade(),
-            failure: failure.clone(),
-        })?
+        .materialize(
+            AgentHandle {
+                commands: commands.downgrade(),
+                failure: failure.clone(),
+            },
+            tool_profile,
+        )?
         .for_session(&session_id_text);
     let rollout_prompt_cache_key = initial_resume
         .as_ref()

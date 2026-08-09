@@ -1209,6 +1209,82 @@ async fn failed_provider_compaction_persistence_failure_fail_stops_the_agent() {
 }
 
 #[tokio::test]
+async fn agent_handle_children_use_the_child_tool_profile() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let home = tempdir().expect("temporary rollout home");
+    let generation_requests = Arc::new(Mutex::new(Vec::new()));
+    let openai = {
+        let generation_requests = Arc::clone(&generation_requests);
+        OpenAi::builder("test")
+            .service(move || CheckpointLifecycleService {
+                generation_requests: Arc::clone(&generation_requests),
+            })
+            .build()
+            .expect("test OpenAI client")
+    };
+    let primary_calls = Arc::new(AtomicUsize::new(0));
+    let child_calls = Arc::new(AtomicUsize::new(0));
+    let root_handle = Arc::new(Mutex::new(None));
+    let (root, _events) = Nanocodex::builder(openai)
+        .tools_factory({
+            let primary_calls = Arc::clone(&primary_calls);
+            let root_handle = Arc::clone(&root_handle);
+            move |handle| {
+                primary_calls.fetch_add(1, Ordering::Relaxed);
+                let mut slot = root_handle.lock().expect("root tool handle lock");
+                if slot.is_none() {
+                    *slot = Some(handle);
+                }
+                Tools::builder().without_defaults().build()
+            }
+        })
+        .child_tools_factory({
+            let child_calls = Arc::clone(&child_calls);
+            move |_handle| {
+                child_calls.fetch_add(1, Ordering::Relaxed);
+                Tools::builder().without_defaults().build()
+            }
+        })
+        .rollout(RolloutConfig::new(home.path()))
+        .build()
+        .expect("root agent");
+    let root_handle = root_handle
+        .lock()
+        .expect("root tool handle lock")
+        .clone()
+        .expect("primary factory receives the root handle");
+
+    root.prompt("establish a durable parent boundary")
+        .await
+        .expect("root turn")
+        .result()
+        .await
+        .expect("completed root turn");
+
+    let (coordinator_child, _events) = root.fork().await.expect("coordinator fork");
+    let (ordinary_fork, _events) = root_handle.fork().await.expect("ordinary child fork");
+    let (ordinary_spawn, _events) = root_handle.spawn().await.expect("ordinary child spawn");
+
+    assert_eq!(primary_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(child_calls.load(Ordering::Relaxed), 2);
+
+    coordinator_child
+        .shutdown()
+        .await
+        .expect("coordinator child shutdown");
+    ordinary_fork
+        .shutdown()
+        .await
+        .expect("ordinary fork shutdown");
+    ordinary_spawn
+        .shutdown()
+        .await
+        .expect("ordinary spawn shutdown");
+    root.shutdown().await.expect("root shutdown");
+}
+
+#[tokio::test]
 async fn fork_seeds_a_resumable_child_rollout_with_the_inherited_identity() {
     let home = tempdir().expect("temporary rollout home");
     let generation_requests = Arc::new(Mutex::new(Vec::new()));

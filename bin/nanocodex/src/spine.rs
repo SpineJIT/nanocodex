@@ -73,11 +73,6 @@ enum Command {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    if cli.agent.subagents_enabled() {
-        return Err(eyre!(
-            "nanocodex-spine does not support --subagents; use the synchronous Spine continuation tools instead"
-        ));
-    }
     if !cli.agent.rollouts_enabled() {
         return Err(eyre!(
             "nanocodex-spine requires standard rollout recording; remove --rollouts false"
@@ -102,6 +97,10 @@ async fn run(cli: Cli) -> Result<()> {
             cli.prompt.map(InitialPrompt::plain),
         ),
     };
+    eprintln!(
+        "Spine root: {}; resume with: nanocodex-spine resume {}",
+        factory.root_session_id, factory.root_session_id
+    );
     let initial = factory.initial.clone();
     tui::run_with_worker(
         factory,
@@ -124,6 +123,7 @@ struct SpineWorkerFactory {
     active_session_id: String,
     initial_delivery: Option<SpineDelivery>,
     manual_continuation: Option<String>,
+    initial_status: Option<String>,
     initial: SpineInitial,
 }
 
@@ -171,6 +171,7 @@ impl SpineWorkerFactory {
             active_session_id: root_session_id,
             initial_delivery: None,
             manual_continuation: None,
+            initial_status: None,
             initial,
         })
     }
@@ -188,10 +189,11 @@ impl SpineWorkerFactory {
             )
             .map_err(|error| eyre!(error))?,
         );
-        if let Some(pending) = runtime.pending_transition().map_err(|error| eyre!(error))? {
+        let recovered_pending = runtime.pending_transition().map_err(|error| eyre!(error))?;
+        if let Some(pending) = &recovered_pending {
             runtime
                 .abort_prepared(
-                    &pending,
+                    pending,
                     "the previous process stopped before this Spine transition committed",
                     Some(format!("recovery-{}", uuid::Uuid::now_v7())),
                 )
@@ -203,7 +205,17 @@ impl SpineWorkerFactory {
         let fast_mode = config.fast_mode();
         let (intent_sink, intents) = SpineIntentChannel::new();
         let session_recipe = SpineSessionRecipe::new(config, vm, intent_sink, codex_home);
-        let durable = session_recipe.load(&active_session_id)?;
+        let projection = runtime.projection().map_err(|error| eyre!(error))?;
+        let durable = match session_recipe.load(&active_session_id) {
+            Ok(durable) => durable,
+            Err(error) if root_session_id == active_session_id && projection.nodes.len() == 1 => {
+                return Err(error.wrap_err(format!(
+                    "Spine root {root_session_id} has no durable Nanocodex boundary yet; \
+                     resume is available after the first completed Spine transition"
+                )));
+            }
+            Err(error) => return Err(error),
+        };
         let cache_key = durable_prompt_cache_key(&durable)?;
         if cache_key != runtime.prompt_cache_key().map_err(|error| eyre!(error))? {
             return Err(eyre!(
@@ -236,6 +248,16 @@ impl SpineWorkerFactory {
                 .transpose()
                 .map_err(|error| eyre!(error))?
         };
+        let initial_status = manual_continuation.as_ref().map(|_| {
+            "Spine recovery needs confirmation: the previous continuation was claimed but not accepted. \
+             Review the prefilled prompt and submit it to continue."
+                .to_owned()
+        }).or_else(|| {
+            recovered_pending.map(|_| {
+                "Recovered an uncommitted Spine transition; continuing from the last durable node."
+                    .to_owned()
+            })
+        });
         Ok(Self {
             configured,
             runtime,
@@ -245,6 +267,7 @@ impl SpineWorkerFactory {
             active_session_id,
             initial_delivery,
             manual_continuation,
+            initial_status,
             initial,
         })
     }
@@ -262,6 +285,7 @@ impl WorkerFactory for SpineWorkerFactory {
             self.session_recipe,
             SpineWorkerInitial {
                 initial_delivery: self.initial_delivery,
+                initial_status: self.initial_status,
                 root_session_id: self.root_session_id,
                 active_session_id: self.active_session_id,
                 capabilities: capabilities(),
@@ -332,16 +356,11 @@ mod tests {
         assert!(cli.is_ok());
     }
 
-    #[tokio::test]
-    async fn spine_cli_rejects_legacy_subagents_before_startup() {
-        let cli = Cli::try_parse_from(["nanocodex-spine", "--subagents", "true"]).unwrap();
+    #[test]
+    fn spine_cli_accepts_subagents_for_the_active_node() {
+        let cli = Cli::try_parse_from(["nanocodex-spine", "--subagents", "true"]);
 
-        let error = run(cli).await.unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "nanocodex-spine does not support --subagents; use the synchronous Spine continuation tools instead"
-        );
+        assert!(cli.is_ok());
     }
 
     #[tokio::test]
@@ -429,6 +448,7 @@ mod tests {
             session_recipe,
             SpineWorkerInitial {
                 initial_delivery: None,
+                initial_status: None,
                 root_session_id: root_session_id.clone(),
                 active_session_id: root_session_id.clone(),
                 capabilities: capabilities(),
@@ -599,6 +619,7 @@ mod tests {
             session_recipe,
             SpineWorkerInitial {
                 initial_delivery: None,
+                initial_status: None,
                 root_session_id: root_session_id.clone(),
                 active_session_id: child_session_id,
                 capabilities: capabilities(),
@@ -762,6 +783,7 @@ mod tests {
             session_recipe,
             SpineWorkerInitial {
                 initial_delivery: None,
+                initial_status: None,
                 root_session_id: root_session_id.clone(),
                 active_session_id: child_session_id,
                 capabilities: capabilities(),

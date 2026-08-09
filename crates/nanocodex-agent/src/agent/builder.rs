@@ -97,7 +97,27 @@ impl<F> NanocodexBuilder<F> {
     where
         T: Fn(AgentHandle) -> std::result::Result<Tools, ToolsBuildError> + Send + Sync + 'static,
     {
-        self.tools = ToolsConfiguration::PerAgent(Arc::new(factory));
+        self.tools = ToolsConfiguration::PerAgent {
+            factory: Arc::new(factory),
+            child_factory: None,
+        };
+        self
+    }
+
+    /// Builds the tools for children started through an [`AgentHandle`].
+    ///
+    /// Without this override, agent-relative children use the same tool
+    /// factory as their parent. Applications can use a narrower child profile
+    /// for parent-only terminal controls while ordinary [`Nanocodex::fork`]
+    /// keeps the primary profile.
+    #[cfg(not(target_family = "wasm"))]
+    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+    #[must_use]
+    pub fn child_tools_factory<T>(mut self, factory: T) -> Self
+    where
+        T: Fn(AgentHandle) -> std::result::Result<Tools, ToolsBuildError> + Send + Sync + 'static,
+    {
+        self.tools = self.tools.with_child_factory(Arc::new(factory));
         self
     }
 

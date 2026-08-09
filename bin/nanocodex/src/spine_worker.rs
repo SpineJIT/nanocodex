@@ -159,6 +159,7 @@ pub(crate) struct SpineWorker {
     family: SpineFamily,
     active_session_id: String,
     initial_delivery: Option<SpineDelivery>,
+    initial_status: Option<String>,
     commands: mpsc::UnboundedReceiver<WorkerCommand>,
     intents: mpsc::UnboundedReceiver<IntentCommand>,
     updates: mpsc::UnboundedSender<WorkerEvent>,
@@ -177,6 +178,7 @@ pub(crate) struct IntentCommand {
 
 pub(crate) struct SpineWorkerInitial {
     pub(crate) initial_delivery: Option<SpineDelivery>,
+    pub(crate) initial_status: Option<String>,
     pub(crate) root_session_id: String,
     pub(crate) active_session_id: String,
     pub(crate) capabilities: WorkerCapabilities,
@@ -192,6 +194,7 @@ impl SpineWorker {
     ) -> WorkerHandle<WorkerCommand, WorkerEvent> {
         let SpineWorkerInitial {
             initial_delivery,
+            initial_status,
             root_session_id,
             active_session_id,
             capabilities,
@@ -214,6 +217,7 @@ impl SpineWorker {
             family,
             active_session_id,
             initial_delivery,
+            initial_status,
             commands: command_receiver,
             intents,
             updates,
@@ -239,6 +243,9 @@ impl SpineWorker {
     }
 
     async fn run(mut self) -> Result<()> {
+        if let Some(message) = self.initial_status.take() {
+            let _ = self.updates.send(WorkerEvent::SpineStatus { message });
+        }
         if let Some(delivery) = self.initial_delivery.take() {
             self.deliver(delivery).await?;
         }

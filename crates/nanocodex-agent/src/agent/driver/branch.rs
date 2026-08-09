@@ -50,6 +50,7 @@ where
         model: Model,
         thinking: Thinking,
         fast_mode: bool,
+        tool_profile: ToolProfile,
     ) -> Result<(Nanocodex, AgentEvents)> {
         let session_id = SessionId::new();
         let workspace = Some(Arc::<str>::from(checkpoint.model().workspace()));
@@ -73,6 +74,7 @@ where
                 depth: self.depth.saturating_add(1),
                 parent_session_id: Some(Arc::from(parent_session_id)),
             },
+            tool_profile,
         )?;
         if let Err(error) = child.seed_initial_checkpoint(&checkpoint, thinking).await {
             let _ = child.shutdown().await;
@@ -89,6 +91,7 @@ where
         model: Model,
         thinking: Thinking,
         fast_mode: bool,
+        tool_profile: ToolProfile,
     ) -> Result<(Nanocodex, AgentEvents)> {
         let session_id = SessionId::new();
         let session_id_text = session_id.to_string();
@@ -125,6 +128,7 @@ where
                 depth,
                 parent_session_id: Some(Arc::from(parent_session_id)),
             },
+            tool_profile,
         )
     }
 }
