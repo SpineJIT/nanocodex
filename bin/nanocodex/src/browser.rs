@@ -36,7 +36,7 @@ enum CookieSource {
 }
 
 /// Local browser configuration for normal agent sessions.
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub(crate) struct BrowserArgs {
     /// Select the private browser exposed to Code Mode as `tools.browser`.
     ///

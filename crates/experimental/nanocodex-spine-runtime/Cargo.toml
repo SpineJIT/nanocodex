@@ -12,6 +12,7 @@ description = "Experimental synchronous Spine continuation runtime for Nanocodex
 
 [dependencies]
 codex-spine-core = { git = "https://github.com/GhabiX/SpineCodex.git", rev = "ef5e19a7eaece34fe9d752759b33f9ae90d62a91" }
+fs2.workspace = true
 nanocodex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -19,6 +20,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 pretty_assertions = "1"
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 tower.workspace = true
 

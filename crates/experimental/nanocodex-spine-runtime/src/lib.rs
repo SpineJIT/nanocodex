@@ -1,27 +1,97 @@
-//! Experimental synchronous continuation runtime backed by `codex-spine-core`.
+//! Experimental durable Spine continuation runtime backed by `codex-spine-core`.
 
 use std::{
-    collections::BTreeSet,
+    future::Future,
+    path::Path,
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 
-use codex_spine_core::{
-    NodeId, NodeKind, NodeStatus, RawBoundary, RolloutEvent, SpineProjection, SpineReducer,
-    ToolCallGroup, ToolOutcome, ToolUse,
-};
+use codex_spine_core::{NodeKind, NodeStatus, SpineProjection};
 use nanocodex::TerminalToolReceipt;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
+use crate::journal::{
+    DeliveryKind, DeliveryStatus, Journal, JournalError, JournalHeader, TransitionIntent,
+    TransitionKind,
+};
+
+mod journal;
 mod tools;
+
+#[cfg(test)]
+#[path = "journal_tests.rs"]
+mod journal_tests;
 
 pub use tools::with_spine_tools;
 
 const MAX_CONTINUATION_CONTEXT_BYTES: usize = 1_000;
 const MAX_HANDOFF_MEMORY_BYTES: usize = 900;
+const MAX_DELIVERY_ID_BYTES: usize = 64;
 
 /// A receiver for reducer-derived tree snapshots suitable for a live UI.
 pub type SpineTreeObserver = Arc<dyn Fn(SpineTreeSnapshot) + Send + Sync>;
+
+/// A future returned by a coordinator-owned Spine intent capability.
+pub type SpinePrepareFuture =
+    Pin<Box<dyn Future<Output = Result<(), SpineRuntimeError>> + Send + 'static>>;
+
+/// Weak model-tool capability that durably prepares one terminal Spine control.
+///
+/// The application coordinator implements this trait. Tools can request a
+/// prepared transition but cannot fork, switch the active session, or mutate
+/// the reducer themselves.
+pub trait SpineIntentSink: Send + Sync {
+    /// Appends and syncs a validated prepared intent before the tool succeeds.
+    fn prepare(&self, request: SpineIntentRequest) -> SpinePrepareFuture;
+}
+
+/// One model-tool request to prepare a terminal Spine transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpineIntentRequest {
+    source_session_id: String,
+    terminal_call_id: String,
+    control: SpineTerminalControl,
+}
+
+impl SpineIntentRequest {
+    /// Creates one request from the executing session and nested tool call.
+    #[must_use]
+    pub fn new(
+        source_session_id: impl Into<String>,
+        terminal_call_id: impl Into<String>,
+        control: SpineTerminalControl,
+    ) -> Self {
+        Self {
+            source_session_id: source_session_id.into(),
+            terminal_call_id: terminal_call_id.into(),
+            control,
+        }
+    }
+}
+
+/// The bounded payload committed by a terminal Spine tool.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SpineTerminalControl {
+    /// Park the active node and activate one child scope.
+    Open {
+        /// Concise child-scope goal.
+        summary: String,
+    },
+    /// Close the active child and return compact state to its parent.
+    Close {
+        /// Compact continuation handoff.
+        memory: String,
+    },
+    /// Close the active child and activate a sibling from its frozen parent.
+    Next {
+        /// Concise sibling-scope goal.
+        summary: String,
+        /// Compact state from the closed sibling.
+        memory: String,
+    },
+}
 
 /// A presentation-safe snapshot of the logical Spine tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,9 +120,9 @@ pub struct SpineTreeNode {
 /// The display-relevant class of a Spine node.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SpineTreeNodeKind {
-    /// The synthetic root epoch for one user session.
+    /// The synthetic root epoch.
     RootEpoch,
-    /// A model-owned semantic task scope.
+    /// A model-owned task scope.
     Task,
 }
 
@@ -69,20 +139,16 @@ pub enum SpineTreeNodeStatus {
     Compacted,
 }
 
-/// Hard bounds for one synchronous continuation tree.
+/// Hard bounds for one durable Spine tree.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpineRuntimeLimits {
     /// Maximum number of live task scopes below the root epoch.
     pub max_depth: u32,
     /// Maximum number of task scopes accepted during the root session.
     pub max_nodes: u32,
-    /// Maximum UTF-8 byte length of one child-scope summary. The rendered
-    /// continuation context, including its instruction and sibling handoff,
-    /// remains subject to the runtime's non-overridable context budget.
+    /// Maximum UTF-8 byte length of one child-scope summary.
     pub max_summary_bytes: usize,
-    /// Maximum UTF-8 byte length of one model-visible compact handoff. The
-    /// rendered continuation context, including its instruction and scope
-    /// summary, remains subject to the runtime's non-overridable context budget.
+    /// Maximum UTF-8 byte length of one model-visible compact handoff.
     pub max_memory_bytes: usize,
 }
 
@@ -97,37 +163,109 @@ impl Default for SpineRuntimeLimits {
     }
 }
 
-/// Result of closing a continuation scope.
+/// One journal-prepared or journal-committed semantic transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SpineHandoff {
-    /// The task node whose compact memory was committed.
-    pub closed_node: NodeId,
-    /// The task or parent node that is live after the transition.
-    pub live_node: NodeId,
+pub struct SpineTransition {
+    intent: TransitionIntent,
 }
 
-/// A committed terminal control transition for the continuation owner.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SpineTerminalTransition {
-    /// The current child ended and control returns to its frozen parent.
-    Closed {
-        /// Logical reducer state after the transition.
-        handoff: SpineHandoff,
-        /// Model-authored compact state returned to the parent tool call.
-        memory: String,
-    },
-    /// The current child ended and its parent must start a sibling continuation.
-    Next {
-        /// Logical reducer state after the transition.
-        handoff: SpineHandoff,
-        /// The sibling task's concise goal.
-        summary: String,
-        /// Model-authored compact state from the closed sibling.
-        memory: String,
-    },
+impl SpineTransition {
+    /// Returns the control kind selected by the model.
+    #[must_use]
+    pub const fn kind(&self) -> SpineTransitionKind {
+        match self.intent.kind() {
+            TransitionKind::Open => SpineTransitionKind::Open,
+            TransitionKind::Close => SpineTransitionKind::Close,
+            TransitionKind::Next => SpineTransitionKind::Next,
+        }
+    }
+
+    /// Returns the source session that issued the terminal tool call.
+    #[must_use]
+    pub fn source_session_id(&self) -> &str {
+        self.intent.source_session_id()
+    }
+
+    /// Returns the nested terminal tool call ID.
+    #[must_use]
+    pub fn terminal_call_id(&self) -> &str {
+        self.intent.terminal_call_id()
+    }
+
+    /// Returns the frozen parent session for close or next.
+    #[must_use]
+    pub fn parent_session_id(&self) -> Option<&str> {
+        self.intent.parent_session_id()
+    }
 }
 
-/// Validation errors from the continuation state machine.
+/// The semantic operation selected by one terminal control.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpineTransitionKind {
+    /// Park the source and activate a durable child.
+    Open,
+    /// Close the source and reactivate its parent.
+    Close,
+    /// Close the source and activate a sibling forked from its parent.
+    Next,
+}
+
+/// A durable at-most-once continuation or recovery delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpineDelivery {
+    id: String,
+    target_session_id: String,
+    kind: SpineDeliveryKind,
+    transition: SpineTransition,
+}
+
+impl SpineDelivery {
+    /// Returns the durable delivery identity.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the only session allowed to receive this delivery.
+    #[must_use]
+    pub fn target_session_id(&self) -> &str {
+        &self.target_session_id
+    }
+
+    /// Returns the delivery's semantic purpose.
+    #[must_use]
+    pub const fn kind(&self) -> SpineDeliveryKind {
+        self.kind
+    }
+
+    /// Returns the transition whose context this delivery carries.
+    #[must_use]
+    pub const fn transition(&self) -> &SpineTransition {
+        &self.transition
+    }
+}
+
+/// Whether a delivery advances a committed transition or repairs an aborted one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpineDeliveryKind {
+    /// Continue at the target selected by a committed transition.
+    Continuation,
+    /// Explain an aborted prepared transition and ask the source to continue.
+    Recovery,
+}
+
+/// Durable progress for one continuation or recovery prompt delivery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpineDeliveryStatus {
+    /// The target has not yet been asked to accept the prompt.
+    Unclaimed,
+    /// The prompt may have been submitted but its acceptance was not synced.
+    Claimed,
+    /// Nano accepted the prompt command and its future is now ordinary work.
+    Accepted,
+}
+
+/// Validation and durability errors from the Spine runtime.
 #[derive(Debug, thiserror::Error)]
 pub enum SpineRuntimeError {
     /// The model tried to open an unnamed scope.
@@ -151,246 +289,286 @@ pub enum SpineRuntimeError {
     /// The configured task-node cap would be exceeded.
     #[error("spine continuation node limit of {0} reached")]
     NodeLimit(u32),
-    /// One Code Mode cell attempted to return more than one parent handoff.
-    #[error("spine__open may emit only one handoff per Code Mode cell")]
-    MultipleOpenHandoffs,
     /// A close or next transition had no live task scope to finish.
     #[error("spine transition requires a live task scope")]
     NoLiveTask,
-    /// An internal state mutex was poisoned by a previous panic.
-    #[error("spine continuation state is unavailable")]
-    StateUnavailable,
+    /// No prepared operation corresponds to the terminal receipt.
+    #[error("spine terminal receipt has no prepared transition")]
+    MissingPreparedTransition,
+    /// The terminal receipt differs from its prepared control.
+    #[error("spine terminal receipt does not match its prepared control")]
+    PreparedTransitionMismatch,
     /// The terminal receipt had no valid Spine control payload.
     #[error("spine terminal receipt has no valid control metadata")]
     InvalidTerminalReceipt,
     /// The terminal receipt name did not agree with its control payload.
     #[error("spine terminal receipt does not match its tool name")]
     ReceiptToolMismatch,
-    /// A synthetic successful control event could not be encoded for the reducer.
-    #[error("spine control event could not be encoded")]
-    ControlEncoding,
+    /// A parked session attempted to control the active continuation stack.
+    #[error("spine transition must originate from the active session")]
+    InactiveSession,
+    /// The journal owner stopped before an intent could be prepared.
+    #[error("spine coordinator is no longer available")]
+    CoordinatorStopped,
+    /// The coordinator is durably switching the active node.
+    #[error("spine continuation transition is in progress")]
+    TransitionInProgress,
+    /// A runtime mutex was poisoned by a previous panic.
+    #[error("spine continuation state is unavailable")]
+    StateUnavailable,
+    /// An application-private journal operation failed.
+    #[error("spine journal failed: {0}")]
+    Journal(String),
 }
 
-/// Thread-safe event adapter around the canonical Spine reducer.
+/// Durable logical state for one Spine root session.
 ///
-/// This type owns only logical Spine state. The application runtime owns the
-/// parent/child Nanocodex sessions that execute each continuation scope.
+/// The runtime owns only the sidecar journal, reducer projection, validation,
+/// and UI observation. The binary-level coordinator owns Nano sessions and
+/// routes commands to exactly one active session.
 pub struct SpineRuntime {
     limits: SpineRuntimeLimits,
-    state: Mutex<RuntimeState>,
+    journal: Mutex<Journal>,
     tree_observer: Mutex<Option<SpineTreeObserver>>,
 }
 
-#[derive(Clone)]
-struct RuntimeState {
-    reducer: SpineReducer,
-    next_boundary: u64,
-    task_nodes: u32,
-    open_handoff_cells: BTreeSet<String>,
-}
-
-pub(crate) struct SpineRuntimeCheckpoint(RuntimeState);
-
-/// One bounded model-visible continuation request.
-///
-/// This stays local to the Spine runtime rather than extending Nano's internal
-/// conversation state: it owns only the scoped context injected into a child.
-pub(crate) struct ContinuationContext {
-    summary: String,
-    prior_memory: Option<String>,
-}
-
-impl ContinuationContext {
-    fn new(summary: &str, prior_memory: Option<&str>) -> Self {
-        Self {
-            summary: summary.trim().to_owned(),
-            prior_memory: prior_memory.map(|memory| memory.trim().to_owned()),
-        }
-    }
-
-    fn summary(&self) -> &str {
-        &self.summary
-    }
-
-    pub(crate) fn render(&self) -> String {
-        let prior_memory = self
-            .prior_memory
-            .as_deref()
-            .map_or_else(String::new, |memory| {
-                format!("\n\nPrevious sibling handoff:\n<spine_memory>\n{memory}\n</spine_memory>")
-            });
-        format!(
-            "You now own one focused Spine continuation scope. Work only on this scope, then call \
-             tools.spine__close({{memory: ...}}) with a compact, evidence-backed handoff. If the \
-             scope genuinely changes but its frozen parent should remain blocked, call \
-             tools.spine__next({{summary: ..., memory: ...}}). Do not finish with a normal assistant \
-             message.\n\nScope:\n{}{prior_memory}",
-            self.summary
-        )
-    }
-}
-
 impl SpineRuntime {
-    /// Starts a fresh logical Spine root epoch.
-    #[must_use]
-    pub fn new(limits: SpineRuntimeLimits) -> Self {
-        Self {
+    /// Creates and synchronizes a fresh sidecar journal for one root session.
+    pub fn create(
+        limits: SpineRuntimeLimits,
+        directory: &Path,
+        root_session_id: impl Into<String>,
+        prompt_cache_key: impl Into<String>,
+        created_at: impl Into<String>,
+    ) -> Result<Self, SpineRuntimeError> {
+        let header = JournalHeader::new(root_session_id, prompt_cache_key, created_at);
+        let journal = Journal::create(directory, header).map_err(journal_error)?;
+        Ok(Self {
             limits,
-            state: Mutex::new(RuntimeState {
-                reducer: SpineReducer::new(),
-                next_boundary: 1,
-                task_nodes: 0,
-                open_handoff_cells: BTreeSet::new(),
-            }),
+            journal: Mutex::new(journal),
             tree_observer: Mutex::new(None),
-        }
+        })
     }
 
-    /// Commits a successful `spine.open` tool call and returns its child node.
-    pub fn open(&self, call_id: &str, summary: &str) -> Result<NodeId, SpineRuntimeError> {
-        let context = self.continuation_context(summary, None)?;
-        let summary = context.summary();
-        let (node, tree) = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| SpineRuntimeError::StateUnavailable)?;
-            let projection = state.reducer.projection();
-            let depth = projection.cursor.parts().len().saturating_sub(1);
-            if depth >= self.limits.max_depth as usize {
-                return Err(SpineRuntimeError::DepthLimit(self.limits.max_depth));
-            }
-            if state.task_nodes >= self.limits.max_nodes {
-                return Err(SpineRuntimeError::NodeLimit(self.limits.max_nodes));
-            }
-            let parent_call_id = code_mode_cell_call_id(call_id);
-            if state.open_handoff_cells.contains(parent_call_id) {
-                return Err(SpineRuntimeError::MultipleOpenHandoffs);
-            }
-
-            apply_control(
-                &mut state,
-                call_id,
-                "spine.open",
-                json!({ "summary": summary }),
-            )?;
-            state.task_nodes = state.task_nodes.saturating_add(1);
-            state.open_handoff_cells.insert(parent_call_id.to_owned());
-            let projection = state.reducer.projection();
-            (projection.cursor.clone(), spine_tree_snapshot(&projection))
-        };
-        self.publish_tree(tree)?;
-        Ok(node)
+    /// Opens and strictly replays one existing Spine sidecar journal.
+    pub fn open(
+        limits: SpineRuntimeLimits,
+        directory: &Path,
+        root_session_id: &str,
+    ) -> Result<Self, SpineRuntimeError> {
+        let journal = Journal::open(directory, root_session_id).map_err(journal_error)?;
+        Ok(Self {
+            limits,
+            journal: Mutex::new(journal),
+            tree_observer: Mutex::new(None),
+        })
     }
 
-    /// Commits a successful `spine.close` terminal receipt.
-    pub fn close(&self, call_id: &str, memory: &str) -> Result<SpineHandoff, SpineRuntimeError> {
-        self.validate_memory(memory)?;
-        let memory = memory.trim();
-        let (handoff, tree) = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| SpineRuntimeError::StateUnavailable)?;
-            let closed_node = live_task(&state.reducer.projection())?;
-            apply_control(
-                &mut state,
-                call_id,
-                "spine.close",
-                json!({ "memory": memory }),
-            )?;
-            let projection = state.reducer.projection();
-            (
-                SpineHandoff {
-                    closed_node,
-                    live_node: projection.cursor.clone(),
-                },
-                spine_tree_snapshot(&projection),
-            )
-        };
-        self.publish_tree(tree)?;
-        Ok(handoff)
+    /// Returns the durable Spine root session ID.
+    pub fn root_session_id(&self) -> Result<String, SpineRuntimeError> {
+        self.with_journal(|journal| Ok(journal.state().header().root_session_id().to_owned()))
     }
 
-    /// Commits a successful `spine.next` terminal receipt.
-    pub fn next(
+    /// Returns the durable root prompt-cache key.
+    pub fn prompt_cache_key(&self) -> Result<String, SpineRuntimeError> {
+        self.with_journal(|journal| Ok(journal.state().header().prompt_cache_key().to_owned()))
+    }
+
+    /// Returns the only Nano session eligible to accept ordinary commands.
+    pub fn active_session_id(&self) -> Result<String, SpineRuntimeError> {
+        self.with_journal(|journal| Ok(journal.state().active_session_id().to_owned()))
+    }
+
+    /// Validates and synchronizes a prepared terminal control without moving
+    /// the reducer cursor or the active Nano session.
+    pub fn prepare(
         &self,
-        call_id: &str,
-        summary: &str,
-        memory: &str,
-    ) -> Result<SpineHandoff, SpineRuntimeError> {
-        let context = self.continuation_context(summary, Some(memory))?;
-        let summary = context.summary();
-        let memory = memory.trim();
-        let (handoff, tree) = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| SpineRuntimeError::StateUnavailable)?;
-            let closed_node = live_task(&state.reducer.projection())?;
-            if state.task_nodes >= self.limits.max_nodes {
-                return Err(SpineRuntimeError::NodeLimit(self.limits.max_nodes));
+        request: SpineIntentRequest,
+    ) -> Result<SpineTransition, SpineRuntimeError> {
+        let transition = self.with_journal_mut(|journal| {
+            if request.source_session_id != journal.state().active_session_id() {
+                return Err(SpineRuntimeError::InactiveSession);
             }
-
-            apply_control(
-                &mut state,
-                call_id,
-                "spine.next",
-                json!({ "summary": summary, "memory": memory }),
-            )?;
-            state.task_nodes = state.task_nodes.saturating_add(1);
-            let projection = state.reducer.projection();
-            (
-                SpineHandoff {
-                    closed_node,
-                    live_node: projection.cursor.clone(),
-                },
-                spine_tree_snapshot(&projection),
-            )
-        };
-        self.publish_tree(tree)?;
-        Ok(handoff)
+            let intent = self.intent_for_request(journal, request)?;
+            self.validate_prepared_context(journal, &intent)?;
+            journal.prepare(intent.clone()).map_err(journal_error)?;
+            Ok(SpineTransition { intent })
+        })?;
+        Ok(transition)
     }
 
-    /// Validates and commits a terminal tool receipt after its enclosing Code
-    /// Mode cell has succeeded.
-    pub fn accept_terminal_receipt(
+    /// Returns the prepared transition represented by a durable terminal receipt.
+    pub fn transition_for_receipt(
         &self,
+        source_session_id: &str,
         receipt: &TerminalToolReceipt,
-    ) -> Result<SpineTerminalTransition, SpineRuntimeError> {
-        let metadata = receipt
-            .metadata()
-            .ok_or(SpineRuntimeError::InvalidTerminalReceipt)?;
-        let control = serde_json::from_str::<TerminalControl>(metadata.get())
-            .map_err(|_| SpineRuntimeError::InvalidTerminalReceipt)?;
-        match (receipt.tool_name(), control) {
-            ("spine__close", TerminalControl::Close { memory }) => {
-                let handoff = self.close(receipt.call_id(), &memory)?;
-                Ok(SpineTerminalTransition::Closed { handoff, memory })
+    ) -> Result<SpineTransition, SpineRuntimeError> {
+        let control = terminal_control_from_receipt(receipt)?;
+        self.with_journal(|journal| {
+            let pending = journal
+                .state()
+                .pending()
+                .cloned()
+                .ok_or(SpineRuntimeError::MissingPreparedTransition)?;
+            if pending.source_session_id() != source_session_id
+                || pending.terminal_call_id() != receipt.call_id()
+                || !intent_matches_control(&pending, &control)
+            {
+                return Err(SpineRuntimeError::PreparedTransitionMismatch);
             }
-            ("spine__next", TerminalControl::Next { summary, memory }) => {
-                let handoff = self.next(receipt.call_id(), &summary, &memory)?;
-                Ok(SpineTerminalTransition::Next {
-                    handoff,
-                    summary,
-                    memory,
-                })
+            Ok(SpineTransition { intent: pending })
+        })
+    }
+
+    /// Commits a previously prepared transition after the target Nano session
+    /// is durably available.
+    pub fn commit(
+        &self,
+        transition: &SpineTransition,
+        active_session_id: impl Into<String>,
+        closed_session_id: Option<String>,
+        delivery_id: impl Into<String>,
+    ) -> Result<SpineDelivery, SpineRuntimeError> {
+        let active_session_id = active_session_id.into();
+        let delivery_id = delivery_id.into();
+        self.render_continuation(&transition.intent, &delivery_id)?;
+        let (delivery, tree) = self.with_journal_mut(|journal| {
+            journal
+                .commit(
+                    transition.intent.clone(),
+                    active_session_id.clone(),
+                    closed_session_id,
+                    delivery_id.clone(),
+                )
+                .map_err(journal_error)?;
+            let tree = spine_tree_snapshot(&journal.state().projection());
+            Ok((
+                SpineDelivery {
+                    id: delivery_id,
+                    target_session_id: active_session_id,
+                    kind: SpineDeliveryKind::Continuation,
+                    transition: transition.clone(),
+                },
+                tree,
+            ))
+        })?;
+        self.publish_tree(tree)?;
+        Ok(delivery)
+    }
+
+    /// Resolves the sole prepared transition without changing the active node.
+    pub fn abort_prepared(
+        &self,
+        transition: &SpineTransition,
+        reason: impl Into<String>,
+        recovery_delivery_id: Option<String>,
+    ) -> Result<Option<SpineDelivery>, SpineRuntimeError> {
+        let reason = reason.into();
+        let (delivery, tree) = self.with_journal_mut(|journal| {
+            let target_session_id = journal.state().active_session_id().to_owned();
+            journal
+                .abort(
+                    transition.intent.clone(),
+                    reason,
+                    recovery_delivery_id.clone(),
+                )
+                .map_err(journal_error)?;
+            let delivery = recovery_delivery_id.map(|id| SpineDelivery {
+                id,
+                target_session_id,
+                kind: SpineDeliveryKind::Recovery,
+                transition: transition.clone(),
+            });
+            let tree = spine_tree_snapshot(&journal.state().projection());
+            Ok((delivery, tree))
+        })?;
+        self.publish_tree(tree)?;
+        Ok(delivery)
+    }
+
+    /// Returns the unresolved prepared transition, if a crash interrupted one.
+    pub fn pending_transition(&self) -> Result<Option<SpineTransition>, SpineRuntimeError> {
+        self.with_journal(|journal| {
+            Ok(journal
+                .state()
+                .pending()
+                .cloned()
+                .map(|intent| SpineTransition { intent }))
+        })
+    }
+
+    /// Synchronizes the claim made before accepting the delivery prompt.
+    pub fn claim_delivery(&self, delivery: &SpineDelivery) -> Result<(), SpineRuntimeError> {
+        self.with_journal_mut(|journal| {
+            journal
+                .claim_delivery(
+                    delivery.id.clone(),
+                    &delivery.transition.intent,
+                    delivery.target_session_id.clone(),
+                    delivery_kind(delivery.kind),
+                )
+                .map_err(journal_error)
+        })
+    }
+
+    /// Synchronizes that Nano accepted the delivery prompt command.
+    pub fn accept_delivery(&self, delivery: &SpineDelivery) -> Result<(), SpineRuntimeError> {
+        self.with_journal_mut(|journal| {
+            journal
+                .accept_delivery(delivery.id.clone(), delivery.target_session_id.clone())
+                .map_err(journal_error)
+        })
+    }
+
+    /// Returns the durable delivery progress for one known delivery ID.
+    pub fn delivery_status(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<SpineDeliveryStatus>, SpineRuntimeError> {
+        self.with_journal(|journal| {
+            Ok(journal
+                .state()
+                .delivery_status(delivery_id)
+                .map(delivery_status))
+        })
+    }
+
+    /// Returns the sole undelivered prompt targeting the current active node.
+    pub fn unclaimed_active_delivery(&self) -> Result<Option<SpineDelivery>, SpineRuntimeError> {
+        self.with_journal(|journal| {
+            Ok(journal.state().unclaimed_active_delivery().map(
+                |(id, target_session_id, intent, kind)| SpineDelivery {
+                    id,
+                    target_session_id,
+                    kind: match kind {
+                        DeliveryKind::Continuation => SpineDeliveryKind::Continuation,
+                        DeliveryKind::Recovery => SpineDeliveryKind::Recovery,
+                    },
+                    transition: SpineTransition { intent },
+                },
+            ))
+        })
+    }
+
+    /// Renders the bounded application-generated continuation prompt.
+    pub fn delivery_prompt(&self, delivery: &SpineDelivery) -> Result<String, SpineRuntimeError> {
+        match delivery.kind {
+            SpineDeliveryKind::Continuation => {
+                self.render_continuation(&delivery.transition.intent, &delivery.id)
             }
-            _ => Err(SpineRuntimeError::ReceiptToolMismatch),
+            SpineDeliveryKind::Recovery => self.render_recovery(&delivery.id),
         }
     }
 
-    /// Returns the current reducer-owned logical tree and visible context.
+    /// Returns the journal-derived reducer projection.
     pub fn projection(&self) -> Result<SpineProjection, SpineRuntimeError> {
-        self.state
-            .lock()
-            .map_err(|_| SpineRuntimeError::StateUnavailable)
-            .map(|state| state.reducer.projection())
+        self.with_journal(|journal| Ok(journal.state().projection()))
     }
 
     /// Replaces the live UI observer and immediately sends it the current tree.
     pub fn set_tree_observer(&self, observer: SpineTreeObserver) -> Result<(), SpineRuntimeError> {
-        let tree = self.tree_snapshot()?;
+        let tree =
+            self.with_journal(|journal| Ok(spine_tree_snapshot(&journal.state().projection())))?;
         let mut stored = self
             .tree_observer
             .lock()
@@ -401,79 +579,165 @@ impl SpineRuntime {
         Ok(())
     }
 
-    pub(crate) fn checkpoint(&self) -> Result<SpineRuntimeCheckpoint, SpineRuntimeError> {
-        self.state
-            .lock()
-            .map_err(|_| SpineRuntimeError::StateUnavailable)
-            .map(|state| SpineRuntimeCheckpoint(state.clone()))
+    fn intent_for_request(
+        &self,
+        journal: &Journal,
+        request: SpineIntentRequest,
+    ) -> Result<TransitionIntent, SpineRuntimeError> {
+        let parent_session_id = || {
+            journal
+                .state()
+                .active_parent_session_id()
+                .ok_or(SpineRuntimeError::NoLiveTask)
+        };
+        match request.control {
+            SpineTerminalControl::Open { summary } => Ok(TransitionIntent::open(
+                request.source_session_id,
+                request.terminal_call_id,
+                summary,
+            )),
+            SpineTerminalControl::Close { memory } => Ok(TransitionIntent::close(
+                request.source_session_id,
+                request.terminal_call_id,
+                parent_session_id()?,
+                memory,
+            )),
+            SpineTerminalControl::Next { summary, memory } => Ok(TransitionIntent::next(
+                request.source_session_id,
+                request.terminal_call_id,
+                parent_session_id()?,
+                summary,
+                memory,
+            )),
+        }
     }
 
-    pub(crate) fn restore(
+    fn validate_prepared_context(
         &self,
-        checkpoint: SpineRuntimeCheckpoint,
+        journal: &Journal,
+        intent: &TransitionIntent,
     ) -> Result<(), SpineRuntimeError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| SpineRuntimeError::StateUnavailable)?;
-        *state = checkpoint.0;
-        let tree = spine_tree_snapshot(&state.reducer.projection());
-        drop(state);
-        self.publish_tree(tree)?;
+        match intent.kind() {
+            TransitionKind::Open => {
+                self.validate_summary(intent.summary().unwrap_or_default())?;
+                self.ensure_capacity(journal, true)?;
+            }
+            TransitionKind::Close => {
+                self.validate_memory(intent.memory().unwrap_or_default())?;
+            }
+            TransitionKind::Next => {
+                self.validate_summary(intent.summary().unwrap_or_default())?;
+                self.validate_memory(intent.memory().unwrap_or_default())?;
+                self.ensure_capacity(journal, false)?;
+            }
+        }
+        self.render_continuation(intent, &"d".repeat(MAX_DELIVERY_ID_BYTES))?;
         Ok(())
     }
 
-    pub(crate) fn ensure_live_task(&self) -> Result<(), SpineRuntimeError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| SpineRuntimeError::StateUnavailable)?;
-        live_task(&state.reducer.projection()).map(|_| ())
-    }
-
-    pub(crate) fn validate_summary(&self, summary: &str) -> Result<(), SpineRuntimeError> {
-        let summary = required(summary, SpineRuntimeError::EmptySummary)?;
-        let limit = self.context_byte_limit(self.limits.max_summary_bytes);
-        bounded(summary, limit, SpineRuntimeError::SummaryTooLarge(limit))
-    }
-
-    pub(crate) fn validate_memory(&self, memory: &str) -> Result<(), SpineRuntimeError> {
-        let memory = required(memory, SpineRuntimeError::EmptyMemory)?;
-        let limit = self.handoff_memory_byte_limit(self.limits.max_memory_bytes);
-        bounded(memory, limit, SpineRuntimeError::MemoryTooLarge(limit))
-    }
-
-    pub(crate) fn continuation_context(
+    fn ensure_capacity(
         &self,
-        summary: &str,
-        prior_memory: Option<&str>,
-    ) -> Result<ContinuationContext, SpineRuntimeError> {
-        self.validate_summary(summary)?;
-        if let Some(memory) = prior_memory {
-            self.validate_memory(memory)?;
+        journal: &Journal,
+        opening_child: bool,
+    ) -> Result<(), SpineRuntimeError> {
+        let projection = journal.state().projection();
+        let depth = projection.cursor.parts().len().saturating_sub(1);
+        if opening_child && depth >= self.limits.max_depth as usize {
+            return Err(SpineRuntimeError::DepthLimit(self.limits.max_depth));
         }
-        let context = ContinuationContext::new(summary, prior_memory);
+        if journal.state().task_node_count() >= self.limits.max_nodes {
+            return Err(SpineRuntimeError::NodeLimit(self.limits.max_nodes));
+        }
+        Ok(())
+    }
+
+    fn validate_summary(&self, summary: &str) -> Result<(), SpineRuntimeError> {
+        let summary = required(summary, SpineRuntimeError::EmptySummary)?;
         bounded(
-            &context.render(),
+            summary,
+            self.limits
+                .max_summary_bytes
+                .min(MAX_CONTINUATION_CONTEXT_BYTES),
+            SpineRuntimeError::SummaryTooLarge(
+                self.limits
+                    .max_summary_bytes
+                    .min(MAX_CONTINUATION_CONTEXT_BYTES),
+            ),
+        )
+    }
+
+    fn validate_memory(&self, memory: &str) -> Result<(), SpineRuntimeError> {
+        let memory = required(memory, SpineRuntimeError::EmptyMemory)?;
+        bounded(
+            memory,
+            self.limits.max_memory_bytes.min(MAX_HANDOFF_MEMORY_BYTES),
+            SpineRuntimeError::MemoryTooLarge(
+                self.limits.max_memory_bytes.min(MAX_HANDOFF_MEMORY_BYTES),
+            ),
+        )
+    }
+
+    fn render_continuation(
+        &self,
+        intent: &TransitionIntent,
+        delivery_id: &str,
+    ) -> Result<String, SpineRuntimeError> {
+        let marker = format!("<spine_delivery id=\"{delivery_id}\">");
+        let prompt = match intent.kind() {
+            TransitionKind::Open => format!(
+                "{marker}\nYou now own one focused Spine continuation scope. Work only on this scope, then call tools.spine__close({{memory: ...}}) with a compact, evidence-backed handoff. If the scope genuinely changes but its frozen parent should remain blocked, call tools.spine__next({{summary: ..., memory: ...}}). Do not finish with a normal assistant message.\n\nScope:\n{}\n</spine_delivery>",
+                intent.summary().unwrap_or_default().trim()
+            ),
+            TransitionKind::Close => format!(
+                "{marker}\nYou resumed the parent Spine scope. A child finished with this compact handoff:\n<spine_memory>\n{}\n</spine_memory>\nContinue the parent scope.\n</spine_delivery>",
+                intent.memory().unwrap_or_default().trim()
+            ),
+            TransitionKind::Next => format!(
+                "{marker}\nYou now own a sibling Spine continuation scope. The previous sibling handed off:\n<spine_memory>\n{}\n</spine_memory>\nWork only on this scope, then call tools.spine__close({{memory: ...}}) or tools.spine__next({{summary: ..., memory: ...}}). Do not finish with a normal assistant message.\n\nScope:\n{}\n</spine_delivery>",
+                intent.memory().unwrap_or_default().trim(),
+                intent.summary().unwrap_or_default().trim()
+            ),
+        };
+        bounded(
+            &prompt,
             MAX_CONTINUATION_CONTEXT_BYTES,
             SpineRuntimeError::ContinuationContextTooLarge(MAX_CONTINUATION_CONTEXT_BYTES),
         )?;
-        Ok(context)
+        Ok(prompt)
     }
 
-    fn context_byte_limit(&self, configured_limit: usize) -> usize {
-        configured_limit.min(MAX_CONTINUATION_CONTEXT_BYTES)
+    fn render_recovery(&self, delivery_id: &str) -> Result<String, SpineRuntimeError> {
+        let prompt = format!(
+            "<spine_delivery id=\"{delivery_id}\">\nThe previous Spine control did not commit. Continue from this current scope, and issue a new Spine control only if it is still needed.\n</spine_delivery>"
+        );
+        bounded(
+            &prompt,
+            MAX_CONTINUATION_CONTEXT_BYTES,
+            SpineRuntimeError::ContinuationContextTooLarge(MAX_CONTINUATION_CONTEXT_BYTES),
+        )?;
+        Ok(prompt)
     }
 
-    fn handoff_memory_byte_limit(&self, configured_limit: usize) -> usize {
-        configured_limit.min(MAX_HANDOFF_MEMORY_BYTES)
-    }
-
-    fn tree_snapshot(&self) -> Result<SpineTreeSnapshot, SpineRuntimeError> {
-        self.state
+    fn with_journal<T>(
+        &self,
+        operation: impl FnOnce(&Journal) -> Result<T, SpineRuntimeError>,
+    ) -> Result<T, SpineRuntimeError> {
+        let journal = self
+            .journal
             .lock()
-            .map_err(|_| SpineRuntimeError::StateUnavailable)
-            .map(|state| spine_tree_snapshot(&state.reducer.projection()))
+            .map_err(|_| SpineRuntimeError::StateUnavailable)?;
+        operation(&journal)
+    }
+
+    fn with_journal_mut<T>(
+        &self,
+        operation: impl FnOnce(&mut Journal) -> Result<T, SpineRuntimeError>,
+    ) -> Result<T, SpineRuntimeError> {
+        let mut journal = self
+            .journal
+            .lock()
+            .map_err(|_| SpineRuntimeError::StateUnavailable)?;
+        operation(&mut journal)
     }
 
     fn publish_tree(&self, tree: SpineTreeSnapshot) -> Result<(), SpineRuntimeError> {
@@ -489,11 +753,57 @@ impl SpineRuntime {
     }
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum TerminalControl {
-    Close { memory: String },
-    Next { summary: String, memory: String },
+fn terminal_control_from_receipt(
+    receipt: &TerminalToolReceipt,
+) -> Result<SpineTerminalControl, SpineRuntimeError> {
+    let metadata = receipt
+        .metadata()
+        .ok_or(SpineRuntimeError::InvalidTerminalReceipt)?;
+    let control = serde_json::from_str::<SpineTerminalControl>(metadata.get())
+        .map_err(|_| SpineRuntimeError::InvalidTerminalReceipt)?;
+    let tool_matches = matches!(
+        (receipt.tool_name(), &control),
+        ("spine__open", SpineTerminalControl::Open { .. })
+            | ("spine__close", SpineTerminalControl::Close { .. })
+            | ("spine__next", SpineTerminalControl::Next { .. })
+    );
+    tool_matches
+        .then_some(control)
+        .ok_or(SpineRuntimeError::ReceiptToolMismatch)
+}
+
+fn intent_matches_control(intent: &TransitionIntent, control: &SpineTerminalControl) -> bool {
+    match (intent.kind(), control) {
+        (TransitionKind::Open, SpineTerminalControl::Open { summary }) => {
+            intent.summary() == Some(summary)
+        }
+        (TransitionKind::Close, SpineTerminalControl::Close { memory }) => {
+            intent.memory() == Some(memory)
+        }
+        (TransitionKind::Next, SpineTerminalControl::Next { summary, memory }) => {
+            intent.summary() == Some(summary) && intent.memory() == Some(memory)
+        }
+        _ => false,
+    }
+}
+
+const fn delivery_kind(kind: SpineDeliveryKind) -> DeliveryKind {
+    match kind {
+        SpineDeliveryKind::Continuation => DeliveryKind::Continuation,
+        SpineDeliveryKind::Recovery => DeliveryKind::Recovery,
+    }
+}
+
+const fn delivery_status(status: DeliveryStatus) -> SpineDeliveryStatus {
+    match status {
+        DeliveryStatus::Unclaimed => SpineDeliveryStatus::Unclaimed,
+        DeliveryStatus::Claimed => SpineDeliveryStatus::Claimed,
+        DeliveryStatus::Accepted => SpineDeliveryStatus::Accepted,
+    }
+}
+
+fn journal_error(error: JournalError) -> SpineRuntimeError {
+    SpineRuntimeError::Journal(error.to_string())
 }
 
 fn required(value: &str, error: SpineRuntimeError) -> Result<&str, SpineRuntimeError> {
@@ -502,21 +812,6 @@ fn required(value: &str, error: SpineRuntimeError) -> Result<&str, SpineRuntimeE
 
 fn bounded(value: &str, maximum: usize, error: SpineRuntimeError) -> Result<(), SpineRuntimeError> {
     (value.len() <= maximum).then_some(()).ok_or(error)
-}
-
-fn code_mode_cell_call_id(call_id: &str) -> &str {
-    call_id
-        .rsplit_once("/code-")
-        .map_or(call_id, |(parent, _)| parent)
-}
-
-fn live_task(projection: &SpineProjection) -> Result<NodeId, SpineRuntimeError> {
-    projection
-        .nodes
-        .iter()
-        .find(|node| node.id == projection.cursor && node.kind == NodeKind::Task)
-        .map(|node| node.id.clone())
-        .ok_or(SpineRuntimeError::NoLiveTask)
 }
 
 fn spine_tree_snapshot(projection: &SpineProjection) -> SpineTreeSnapshot {
@@ -542,33 +837,4 @@ fn spine_tree_snapshot(projection: &SpineProjection) -> SpineTreeSnapshot {
             })
             .collect(),
     }
-}
-
-fn apply_control(
-    state: &mut RuntimeState,
-    call_id: &str,
-    name: &str,
-    arguments: serde_json::Value,
-) -> Result<(), SpineRuntimeError> {
-    let arguments =
-        serde_json::to_string(&arguments).map_err(|_| SpineRuntimeError::ControlEncoding)?;
-    let start = RawBoundary(state.next_boundary);
-    state.next_boundary = state.next_boundary.saturating_add(1);
-    let end = RawBoundary(state.next_boundary);
-    state.next_boundary = state.next_boundary.saturating_add(1);
-    state.reducer.apply(RolloutEvent::ToolCall(ToolCallGroup {
-        start,
-        end,
-        leading_assistant_messages: Vec::new(),
-        calls: vec![ToolUse {
-            call_id: call_id.to_owned(),
-            name: name.to_owned(),
-            arguments,
-            call_ordinal: None,
-            outcome: Some(ToolOutcome::Succeeded),
-            output: Some(r#"{"accepted":true}"#.to_owned()),
-            output_boundary: Some(end),
-        }],
-    }));
-    Ok(())
 }

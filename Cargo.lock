@@ -5081,6 +5081,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.30.0",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "two-face",
@@ -5290,10 +5291,12 @@ name = "nanocodex-spine-runtime"
 version = "0.3.0"
 dependencies = [
  "codex-spine-core",
+ "fs2",
  "nanocodex",
  "pretty_assertions",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tower",

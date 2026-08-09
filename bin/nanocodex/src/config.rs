@@ -54,7 +54,7 @@ struct SessionBuild {
 }
 
 /// Authentication flags shared by every direct-OpenAI CLI consumer.
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub(crate) struct AuthArgs {
     /// Explicit `OpenAI` API key override.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
@@ -66,7 +66,7 @@ pub(crate) struct AuthArgs {
 }
 
 /// Model-facing flags shared by normal agents and evaluator agents.
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub(crate) struct ModelArgs {
     /// Reasoning effort: none, low, medium, high, xhigh, or max.
     #[arg(long, env = "OPENAI_REASONING_EFFORT")]
@@ -100,7 +100,7 @@ pub(crate) struct EvalAgentArgs {
     model_policy: ModelArgs,
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent CLI feature toggles are not one state machine"
@@ -241,6 +241,10 @@ impl AgentArgs {
         self.subagents
     }
 
+    pub(crate) const fn rollouts_enabled(&self) -> bool {
+        self.rollouts
+    }
+
     pub(crate) const fn model(&self) -> Model {
         self.model
     }
@@ -272,6 +276,15 @@ impl AgentArgs {
         vm: VmArgs,
     ) -> Result<ConfiguredAgent> {
         self.build_inner(Some(session), vm, None).await
+    }
+
+    pub(crate) async fn build_resumed_with_tool_customizer(
+        self,
+        session: DurableSession,
+        vm: VmArgs,
+        customizer: ToolCustomizer,
+    ) -> Result<ConfiguredAgent> {
+        self.build_inner(Some(session), vm, Some(customizer)).await
     }
 
     async fn build_inner(

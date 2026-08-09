@@ -22,6 +22,7 @@ mod mpp;
 mod observability;
 mod run;
 pub mod spine;
+mod spine_worker;
 mod subagents;
 mod tui;
 mod update;
