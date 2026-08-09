@@ -231,8 +231,7 @@ impl Service<ResponsesAttempt> for CheckpointLifecycleService {
                 pipeline_stats: ResponsePipelineStats::default(),
             }),
             ResponsesAttemptKind::Generation => {
-                let profile =
-                    nanocodex_oai_api::__private::test_support::request_profile(&request);
+                let profile = nanocodex_oai_api::__private::test_support::request_profile(&request);
                 self.generation_requests
                     .lock()
                     .expect("generation request lock")
