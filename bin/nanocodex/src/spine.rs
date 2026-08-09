@@ -72,7 +72,8 @@ enum Command {
     },
 }
 
-async fn run(cli: Cli) -> Result<()> {
+async fn run(mut cli: Cli) -> Result<()> {
+    cli.agent.enable_subagents_by_default();
     if !cli.agent.rollouts_enabled() {
         return Err(eyre!(
             "nanocodex-spine requires standard rollout recording; remove --rollouts false"
@@ -357,10 +358,21 @@ mod tests {
     }
 
     #[test]
-    fn spine_cli_accepts_subagents_for_the_active_node() {
-        let cli = Cli::try_parse_from(["nanocodex-spine", "--subagents", "true"]);
+    fn spine_cli_enables_subagents_for_the_active_node_by_default() {
+        let mut cli = Cli::try_parse_from(["nanocodex-spine"])
+            .expect("Spine CLI accepts its default subagent policy");
+        cli.agent.enable_subagents_by_default();
 
-        assert!(cli.is_ok());
+        assert!(cli.agent.subagents_enabled());
+    }
+
+    #[test]
+    fn spine_cli_respects_an_explicit_subagent_opt_out() {
+        let mut cli = Cli::try_parse_from(["nanocodex-spine", "--subagents", "false"])
+            .expect("Spine CLI accepts an explicit subagent policy");
+        cli.agent.enable_subagents_by_default();
+
+        assert!(!cli.agent.subagents_enabled());
     }
 
     #[tokio::test]

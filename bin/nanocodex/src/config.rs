@@ -157,10 +157,9 @@ pub(crate) struct AgentArgs {
     #[arg(
         long,
         env = "NANOCODEX_SUBAGENTS",
-        default_value_t = false,
         action = ArgAction::Set
     )]
-    subagents: bool,
+    subagents: Option<bool>,
 
     /// Write Codex-compatible rollout records beneath `CODEX_HOME`.
     #[arg(
@@ -237,6 +236,16 @@ impl AgentArgs {
         self.fast_mode
     }
 
+    pub(crate) fn subagents_enabled(&self) -> bool {
+        self.subagents.unwrap_or(false)
+    }
+
+    /// Makes a specialized CLI opt into ordinary child agents unless the
+    /// caller explicitly selected a value through its flag or environment.
+    pub(crate) fn enable_subagents_by_default(&mut self) {
+        self.subagents.get_or_insert(true);
+    }
+
     pub(crate) const fn rollouts_enabled(&self) -> bool {
         self.rollouts
     }
@@ -298,6 +307,7 @@ impl AgentArgs {
     ) -> Result<ConfiguredAgent> {
         let thinking = self.thinking();
         let web_search = self.web_search();
+        let subagents_enabled = self.subagents_enabled();
         let responses_transport = self.responses_transport();
         let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
         let configured_browser = self.browser.configure(&session.workspace)?;
@@ -369,7 +379,7 @@ impl AgentArgs {
             tools = tools.provider(browser.tool());
         }
         let tools = tools.build()?;
-        let child_agents = self.subagents.then(|| Arc::new(ChildAgents::default()));
+        let child_agents = subagents_enabled.then(|| Arc::new(ChildAgents::default()));
         let mut builder = Nanocodex::builder(openai)
             .model(self.model)
             .reasoning_mode(self.reasoning_mode)
@@ -753,7 +763,7 @@ mod tests {
             .find(|argument| argument.get_id() == "subagents")
             .expect("the CLI should expose the subagents argument");
 
-        assert_eq!(subagents.get_default_values(), ["false"]);
+        assert!(subagents.get_default_values().is_empty());
     }
 
     #[test]
