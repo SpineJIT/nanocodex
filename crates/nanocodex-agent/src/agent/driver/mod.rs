@@ -963,6 +963,11 @@ where
             drop(result.send(outcome));
             if failed_persistence {
                 fail_pending_rollout_flushes(&mut pending_rollout_flushes, &self.failure);
+                if let Some(cancel_result) = cancel_result {
+                    drop(cancel_result.send(Err(
+                        self.failure.error().expect("persistence failure recorded"),
+                    )));
+                }
                 let error = self.failure.error().expect("persistence failure recorded");
                 finish_fail_stop(
                     FailStopContext {

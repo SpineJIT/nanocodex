@@ -7,7 +7,7 @@ use std::{
 };
 
 use nanocodex_oai_api::{
-    events::{AgentEventData, RunEvent, RunStatus},
+    events::{AgentEventData, AgentEventKind, RunEvent, RunStatus},
     responses::{ContentItem, MessageRole, ResponseItem, ResponseItemId, Usage, WarmupResponse},
     tower::{
         CompactionOutput, GenerationOutput, ResponsePipelineStats, ResponsesAttemptKind,
@@ -295,6 +295,130 @@ async fn closed_command_channel_returns_recorded_persistence_failure() {
         request.await.expect("request task completes"),
         Err(NanocodexError::PersistRollout { .. })
     ));
+}
+
+#[tokio::test]
+async fn run_completed_event_makes_the_rollout_immediately_resumable() {
+    let home = tempdir().expect("temporary rollout home");
+    let generation_inputs = Arc::new(Mutex::new(Vec::new()));
+    let openai = OpenAi::builder("test")
+        .service({
+            let generation_inputs = Arc::clone(&generation_inputs);
+            move || CheckpointLifecycleService {
+                generation_inputs: Arc::clone(&generation_inputs),
+            }
+        })
+        .build()
+        .expect("test OpenAI client");
+    let tools = Tools::builder()
+        .without_defaults()
+        .build()
+        .expect("empty tools");
+    let session_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    let (agent, mut events) = Nanocodex::builder(openai)
+        .tools(tools)
+        .session_id(session_id.parse().expect("valid session ID"))
+        .rollout(RolloutConfig::new(home.path()))
+        .build()
+        .expect("agent with rollout");
+    let turn = agent.prompt("durable event boundary").await.expect("turn");
+
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("turn emits a terminal event")
+            .expect("event stream remains open");
+        if event.kind == AgentEventKind::RunCompleted {
+            break;
+        }
+    }
+
+    let durable = RolloutConfig::new(home.path())
+        .load_session(session_id)
+        .expect("RunCompleted exposes a resumable rollout");
+    assert!(
+        serde_json::to_value(durable.snapshot()).expect("encode durable snapshot")["history"]
+            .to_string()
+            .contains("durable event boundary")
+    );
+    turn.result().await.expect("turn result remains available");
+
+    agent.shutdown().await.expect("shutdown agent");
+}
+
+#[tokio::test]
+async fn active_cancellation_persistence_failure_fails_the_turn_once() {
+    use std::sync::atomic::Ordering;
+
+    let home = tempdir().expect("temporary rollout home");
+    let (generation_started, mut generation_started_rx) = mpsc::unbounded_channel();
+    let (release, release_rx) = oneshot::channel();
+    let generation_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let openai = OpenAi::builder("test")
+        .service({
+            let generation_started = generation_started.clone();
+            let release = Arc::new(Mutex::new(Some(release_rx)));
+            let generation_calls = Arc::clone(&generation_calls);
+            move || DelayedCompletedService {
+                generation_started: generation_started.clone(),
+                release: Arc::clone(&release),
+                generation_calls: Arc::clone(&generation_calls),
+            }
+        })
+        .build()
+        .expect("test OpenAI client");
+    let tools = Tools::builder()
+        .without_defaults()
+        .build()
+        .expect("empty tools");
+    let (agent, mut events) = Nanocodex::builder(openai)
+        .tools(tools)
+        .rollout(RolloutConfig::new(home.path()))
+        .build()
+        .expect("agent with rollout");
+    agent.durability.inject_write_failures(1).await;
+
+    let turn = agent.prompt("cancelled durable turn").await.expect("turn");
+    let control = turn.control();
+    generation_started_rx
+        .recv()
+        .await
+        .expect("generation starts");
+
+    assert!(matches!(
+        control.cancel().await,
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+    assert!(matches!(
+        turn.result().await,
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+
+    let mut completed = 0;
+    let mut failed = 0;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("active cancellation emits a terminal event")
+            .expect("agent event stream remains open");
+        match event.kind {
+            AgentEventKind::RunCompleted => completed += 1,
+            AgentEventKind::RunFailed => {
+                failed += 1;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(completed, 0);
+    assert_eq!(failed, 1);
+    assert_eq!(generation_calls.load(Ordering::Relaxed), 1);
+    assert!(matches!(
+        agent.shutdown().await,
+        Err(NanocodexError::Shutdown(error))
+            if matches!(error.as_ref(), NanocodexError::PersistRollout { .. })
+    ));
+    drop(release);
 }
 
 #[tokio::test]
