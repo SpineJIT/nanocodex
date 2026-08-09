@@ -114,9 +114,8 @@ impl Nanocodex {
     /// This is a no-op when rollout recording is disabled. CLI consumers call
     /// it at idle completed-turn boundaries so persistence failures are user-visible.
     /// A failed commit is never retried by flushing; it fail-stops the driver.
-    /// Requests while a model turn or compaction is active are rejected with
-    /// [`NanocodexError::InvalidRequest`] rather than racing that operation's
-    /// durability commit.
+    /// Requests while a model turn or compaction is active wait for that
+    /// operation to reach its durable boundary before flushing.
     /// Flushing does not stop the live writer; call [`Self::shutdown`] at an
     /// explicit application or session boundary.
     ///

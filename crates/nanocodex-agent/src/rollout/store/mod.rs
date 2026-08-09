@@ -333,6 +333,10 @@ impl RolloutRecorder {
         if config.fail_fork_seed && origin.kind == "fork" {
             writer.inject_write_failures(1);
         }
+        #[cfg(test)]
+        if config.fail_fork_publish && origin.kind == "fork" {
+            writer.inject_publish_reopen_failure();
+        }
         Ok(Self::spawn(
             runtime,
             thread_id,

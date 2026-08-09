@@ -84,6 +84,7 @@ where
         let mut queued_turns = VecDeque::new();
         let mut pending_compact = None;
         let mut pending_developer_messages = Vec::new();
+        let mut pending_rollout_flushes = Vec::new();
         let mut commands_open = true;
         loop {
             let command = loop {
@@ -398,9 +399,7 @@ where
                                         )));
                                     }
                                     Some(Command::FlushRollout { result }) => {
-                                        drop(result.send(Err(NanocodexError::InvalidRequest(
-                                            "cannot flush a rollout while a turn is active".to_owned(),
-                                        ))));
+                                        pending_rollout_flushes.push(result);
                                     }
                                     Some(Command::Shutdown) => {
                                         if let Some(cancel) = cancel_compaction.take() {
@@ -538,8 +537,20 @@ where
                         }
                     }
                     let failed_persistence = self.failure.error().is_some();
+                    if failed_persistence {
+                        fail_pending_rollout_flushes(&mut pending_rollout_flushes, &self.failure);
+                    } else if let Err(failure) = resolve_pending_rollout_flushes(
+                        &self.durability,
+                        &mut pending_rollout_flushes,
+                    )
+                    .await
+                    {
+                        self.failure.record(failure);
+                    }
+                    let failed_persistence = self.failure.error().is_some();
                     drop(result.send(outcome));
                     if failed_persistence {
+                        fail_pending_rollout_flushes(&mut pending_rollout_flushes, &self.failure);
                         let error = self.failure.error().expect("persistence failure recorded");
                         finish_fail_stop(
                             FailStopContext {
@@ -781,9 +792,7 @@ where
                                 )));
                             }
                             Some(Command::FlushRollout { result }) => {
-                                drop(result.send(Err(NanocodexError::InvalidRequest(
-                                    "cannot flush a rollout while a turn is active".to_owned(),
-                                ))));
+                                pending_rollout_flushes.push(result);
                             }
                             Some(Command::Compact { parent, result }) => {
                                 pending_compact = Some((parent, result));
@@ -942,8 +951,18 @@ where
                 if outcome.is_ok() { "OK" } else { "ERROR" },
             );
             let failed_persistence = self.failure.error().is_some();
+            if failed_persistence {
+                fail_pending_rollout_flushes(&mut pending_rollout_flushes, &self.failure);
+            } else if let Err(failure) =
+                resolve_pending_rollout_flushes(&self.durability, &mut pending_rollout_flushes)
+                    .await
+            {
+                self.failure.record(failure);
+            }
+            let failed_persistence = self.failure.error().is_some();
             drop(result.send(outcome));
             if failed_persistence {
+                fail_pending_rollout_flushes(&mut pending_rollout_flushes, &self.failure);
                 let error = self.failure.error().expect("persistence failure recorded");
                 finish_fail_stop(
                     FailStopContext {
@@ -979,6 +998,42 @@ where
                 drop(cancel_result.send(outcome));
             }
         }
+    }
+}
+
+async fn resolve_pending_rollout_flushes(
+    durability: &Durability,
+    pending_flushes: &mut Vec<oneshot::Sender<Result<()>>>,
+) -> std::result::Result<(), crate::error::PersistRolloutFailure> {
+    if pending_flushes.is_empty() {
+        return Ok(());
+    }
+    match durability.flush().await {
+        Ok(()) => {
+            for result in pending_flushes.drain(..) {
+                drop(result.send(Ok(())));
+            }
+            Ok(())
+        }
+        Err(failure) => {
+            for result in pending_flushes.drain(..) {
+                drop(result.send(Err(failure.clone().into_error())));
+            }
+            Err(failure)
+        }
+    }
+}
+
+fn fail_pending_rollout_flushes(
+    pending_flushes: &mut Vec<oneshot::Sender<Result<()>>>,
+    failure: &DriverFailure,
+) {
+    for result in pending_flushes.drain(..) {
+        drop(
+            result.send(Err(failure.error().expect(
+                "a failed agent driver always records its persistence error",
+            ))),
+        );
     }
 }
 

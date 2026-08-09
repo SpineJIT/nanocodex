@@ -43,6 +43,8 @@ pub struct RolloutConfig {
     resume_path: Option<PathBuf>,
     #[cfg(test)]
     fail_fork_seed: bool,
+    #[cfg(test)]
+    fail_fork_publish: bool,
 }
 
 impl RolloutConfig {
@@ -54,6 +56,8 @@ impl RolloutConfig {
             resume_path: None,
             #[cfg(test)]
             fail_fork_seed: false,
+            #[cfg(test)]
+            fail_fork_publish: false,
         }
     }
 
@@ -97,12 +101,20 @@ impl RolloutConfig {
             resume_path: None,
             #[cfg(test)]
             fail_fork_seed: self.fail_fork_seed,
+            #[cfg(test)]
+            fail_fork_publish: self.fail_fork_publish,
         }
     }
 
     #[cfg(test)]
     pub(crate) const fn fail_fork_seed_for_test(mut self) -> Self {
         self.fail_fork_seed = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn fail_fork_publish_for_test(mut self) -> Self {
+        self.fail_fork_publish = true;
         self
     }
 }

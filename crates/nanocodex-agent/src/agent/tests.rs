@@ -7,7 +7,7 @@ use std::{
 };
 
 use nanocodex_oai_api::{
-    events::AgentEventKind,
+    events::{AgentEventData, AgentEventKind, RunEvent, RunStatus},
     responses::{ContentItem, MessageRole, ResponseItem, ResponseItemId, Usage, WarmupResponse},
     tower::{
         CompactionOutput, GenerationOutput, ResponsePipelineStats, ResponsesAttemptKind,
@@ -373,19 +373,33 @@ async fn rollout_persistence_failure_fail_stops_current_and_queued_turns() {
     ));
     assert_eq!(generation_calls.load(Ordering::Relaxed), 1);
 
-    let mut terminals = Vec::new();
-    while terminals.len() < 2 {
+    let mut terminal_statuses = Vec::new();
+    let mut failure_messages = Vec::new();
+    while terminal_statuses.len() < 2 {
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
             .await
             .expect("every accepted turn emits a terminal event")
             .expect("agent event stream remains open");
-        if event.kind.is_terminal() {
-            terminals.push(event.kind);
+        if let AgentEventData::Run(RunEvent::Error(error)) =
+            event.data().expect("decode run error event")
+        {
+            failure_messages.push(error.message);
+        }
+        if let AgentEventData::Run(RunEvent::Failed(terminal)) =
+            event.data().expect("decode run terminal event")
+        {
+            terminal_statuses.push(terminal.status);
         }
     }
     assert_eq!(
-        terminals,
-        vec![AgentEventKind::RunFailed, AgentEventKind::RunFailed]
+        terminal_statuses,
+        vec![RunStatus::Failed, RunStatus::Failed]
+    );
+    assert_eq!(failure_messages.len(), 2);
+    assert!(
+        failure_messages
+            .iter()
+            .all(|message| message.contains("failed to persist Codex rollout"))
     );
     assert!(matches!(
         agent.flush_rollout().await,
@@ -449,7 +463,7 @@ async fn explicit_rollout_flush_failure_fail_stops_the_agent() {
 }
 
 #[tokio::test]
-async fn rollout_flush_is_rejected_while_a_turn_is_active() {
+async fn rollout_flush_waits_for_an_active_turns_durable_boundary() {
     let home = tempdir().expect("temporary rollout home");
     let (generation_started, mut generation_started_rx) = mpsc::unbounded_channel();
     let (release, release_rx) = oneshot::channel();
@@ -476,22 +490,25 @@ async fn rollout_flush_is_rejected_while_a_turn_is_active() {
         .rollout(RolloutConfig::new(home.path()))
         .build()
         .expect("agent with rollout");
-    agent.durability.inject_write_failures(1).await;
-
     let turn = agent.prompt("durable turn").await.expect("accepted turn");
     generation_started_rx
         .recv()
         .await
         .expect("generation starts");
-    assert!(matches!(
-        agent.flush_rollout().await,
-        Err(NanocodexError::InvalidRequest(_))
-    ));
+    let flush_agent = agent.clone();
+    let mut flush = tokio::spawn(async move { flush_agent.flush_rollout().await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), &mut flush)
+            .await
+            .is_err(),
+        "flush must wait for the active turn's durability boundary"
+    );
     release.send(()).expect("release generation");
-    assert!(matches!(
-        turn.result().await,
-        Err(NanocodexError::PersistRollout { .. })
-    ));
+    turn.result().await.expect("durable completed turn");
+    flush
+        .await
+        .expect("flush task joins")
+        .expect("flush succeeds after the durable boundary");
     drop(events);
 }
 
@@ -537,10 +554,14 @@ async fn compaction_persistence_failure_fail_stops_current_and_queued_turns() {
         .prompt("must not run after compaction persistence failure")
         .await
         .expect("queued turn");
-    assert!(matches!(
-        agent.flush_rollout().await,
-        Err(NanocodexError::InvalidRequest(_))
-    ));
+    let flush_agent = agent.clone();
+    let mut flush = tokio::spawn(async move { flush_agent.flush_rollout().await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), &mut flush)
+            .await
+            .is_err(),
+        "flush must wait for the active compaction durability boundary"
+    );
     release.send(()).expect("release compaction");
 
     assert!(matches!(
@@ -566,6 +587,10 @@ async fn compaction_persistence_failure_fail_stops_current_and_queued_turns() {
         agent.shutdown().await,
         Err(NanocodexError::Shutdown(error))
             if matches!(error.as_ref(), NanocodexError::PersistRollout { .. })
+    ));
+    assert!(matches!(
+        flush.await.expect("flush task joins"),
+        Err(NanocodexError::PersistRollout { .. })
     ));
     drop(events);
 }
@@ -594,7 +619,7 @@ async fn fork_seeds_a_resumable_child_rollout_with_the_inherited_identity() {
         .build()
         .expect("empty tools");
     let root_session_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
-    let (root, root_events) = Nanocodex::builder(openai)
+    let (root, mut root_events) = Nanocodex::builder(openai)
         .tools(tools)
         .session_id(root_session_id.parse().expect("valid root session ID"))
         .rollout(RolloutConfig::new(home.path()))
@@ -609,17 +634,26 @@ async fn fork_seeds_a_resumable_child_rollout_with_the_inherited_identity() {
         .await
         .expect("root generation starts");
     release.send(()).expect("release root generation");
-    root_turn.result().await.expect("completed root turn");
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), root_events.recv())
+            .await
+            .expect("completed root turn emits an event")
+            .expect("root event stream remains open");
+        if event.kind == AgentEventKind::RunCompleted {
+            break;
+        }
+    }
 
     let persisted_parent = RolloutConfig::new(home.path())
         .load_session(root_session_id)
-        .expect("completed turn is resumable before any explicit flush");
+        .expect("run completion is emitted only after the rollout is resumable");
     assert!(
         serde_json::to_value(persisted_parent.snapshot()).expect("encode durable parent snapshot")
             ["history"]
             .to_string()
             .contains("durable parent boundary")
     );
+    root_turn.result().await.expect("completed root turn");
 
     let (child, child_events) = root.fork().await.expect("durable fork");
     let child_rollout = child
@@ -669,10 +703,7 @@ async fn fork_seeds_a_resumable_child_rollout_with_the_inherited_identity() {
     drop((child_events, root_events));
 }
 
-#[tokio::test]
-async fn failed_public_fork_seed_does_not_publish_a_child_rollout() {
-    let home = tempdir().expect("temporary rollout home");
-    let config = RolloutConfig::new(home.path()).fail_fork_seed_for_test();
+async fn assert_failed_public_fork_does_not_publish_a_child_rollout(config: RolloutConfig) {
     let generation_inputs = Arc::new(Mutex::new(Vec::new()));
     let openai = OpenAi::builder("test")
         .service({
@@ -719,6 +750,24 @@ async fn failed_public_fork_seed_does_not_publish_a_child_rollout() {
 
     root.shutdown().await.expect("shutdown root");
     drop(root_events);
+}
+
+#[tokio::test]
+async fn failed_public_fork_seed_does_not_publish_a_child_rollout() {
+    let home = tempdir().expect("temporary rollout home");
+    assert_failed_public_fork_does_not_publish_a_child_rollout(
+        RolloutConfig::new(home.path()).fail_fork_seed_for_test(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn failed_public_fork_publish_does_not_publish_a_child_rollout() {
+    let home = tempdir().expect("temporary rollout home");
+    assert_failed_public_fork_does_not_publish_a_child_rollout(
+        RolloutConfig::new(home.path()).fail_fork_publish_for_test(),
+    )
+    .await;
 }
 
 #[tokio::test]
