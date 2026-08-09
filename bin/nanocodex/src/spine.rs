@@ -11,7 +11,8 @@ use crate::{
     config::{AgentArgs, ConfiguredAgent, default_codex_home},
     observability::ObservabilityArgs,
     spine_worker::{
-        SpineIntentChannel, SpineSessionRecipe, SpineWorker, capabilities, durable_prompt_cache_key,
+        SpineIntentChannel, SpineSessionRecipe, SpineWorker, SpineWorkerInitial, capabilities,
+        durable_prompt_cache_key,
     },
     tui::{self, InitialPrompt, WorkerCommand, WorkerEvent},
     vm::VmArgs,
@@ -259,10 +260,12 @@ impl WorkerFactory for SpineWorkerFactory {
             self.runtime,
             self.intents,
             self.session_recipe,
-            self.initial_delivery,
-            self.root_session_id,
-            self.active_session_id,
-            capabilities(),
+            SpineWorkerInitial {
+                initial_delivery: self.initial_delivery,
+                root_session_id: self.root_session_id,
+                active_session_id: self.active_session_id,
+                capabilities: capabilities(),
+            },
         )
     }
 }
@@ -271,6 +274,7 @@ impl WorkerFactory for SpineWorkerFactory {
 mod tests {
     use std::{
         future::{Ready, ready},
+        path::PathBuf,
         sync::{
             Arc,
             atomic::{AtomicU32, Ordering},
@@ -280,6 +284,7 @@ mod tests {
     };
 
     use clap::Parser;
+    use eyre::eyre;
     use nanocodex::{
         Nanocodex, OpenAi, Thinking, Tools,
         agent::{rollout::RolloutConfig, session::SessionId},
@@ -293,7 +298,7 @@ mod tests {
         },
     };
     use nanocodex_spine_runtime::{
-        SpineIntentSink, SpineRuntime, SpineRuntimeLimits, with_spine_tools,
+        SpineIntentRequest, SpineIntentSink, SpineRuntime, SpineRuntimeLimits, with_spine_tools,
     };
     use tempfile::tempdir;
     use tokio::{sync::Notify, time::timeout};
@@ -303,8 +308,8 @@ mod tests {
     use crate::{
         config::ConfiguredAgent,
         spine_worker::{
-            SpineIntentChannel, SpineSessionRecipe, SpineWorker, capabilities,
-            durable_prompt_cache_key,
+            SpineIntentChannel, SpineSessionRecipe, SpineWorker, SpineWorkerInitial,
+            TestResumedAgentBuilder, capabilities, durable_prompt_cache_key,
         },
         tui::{PaneId, WorkerCommand, WorkerEvent},
     };
@@ -341,7 +346,14 @@ mod tests {
 
     #[tokio::test]
     async fn spine_cli_requires_standard_rollout_recording() {
-        let cli = Cli::try_parse_from(["nanocodex-spine", "--rollouts", "false"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "nanocodex-spine",
+            "--subagents",
+            "false",
+            "--rollouts",
+            "false",
+        ])
+        .unwrap();
 
         let error = run(cli).await.unwrap_err();
 
@@ -385,7 +397,14 @@ mod tests {
             &root_session_id,
             "2026-08-09T00:00:00Z",
         )?);
-        let cli = Cli::try_parse_from(["nanocodex-spine", "--api-key", "test-key"])?;
+        let cli = Cli::try_parse_from([
+            "nanocodex-spine",
+            "--api-key",
+            "test-key",
+            "--browser=none",
+            "--subagents",
+            "false",
+        ])?;
         let session_recipe = SpineSessionRecipe::new(
             cli.agent,
             cli.vm,
@@ -408,10 +427,12 @@ mod tests {
             Arc::clone(&runtime),
             intents,
             session_recipe,
-            None,
-            root_session_id.clone(),
-            root_session_id.clone(),
-            capabilities(),
+            SpineWorkerInitial {
+                initial_delivery: None,
+                root_session_id: root_session_id.clone(),
+                active_session_id: root_session_id.clone(),
+                capabilities: capabilities(),
+            },
         );
 
         worker.commands().send(WorkerCommand::Prompt {
@@ -462,10 +483,427 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn cold_close_releases_the_child_bundle_before_restoring_the_parent() -> eyre::Result<()>
+    {
+        let directory = tempdir()?;
+        let generation_calls = Arc::new(AtomicU32::new(0));
+        let parent_resumed = Arc::new(Notify::new());
+        let openai = OpenAi::builder("test-key")
+            .service({
+                let generation_calls = Arc::clone(&generation_calls);
+                let parent_resumed = Arc::clone(&parent_resumed);
+                move || ColdCloseService {
+                    generation_calls: Arc::clone(&generation_calls),
+                    parent_resumed: Arc::clone(&parent_resumed),
+                }
+            })
+            .build()?;
+        let tools = Tools::builder().without_defaults().build()?;
+        let (intent_sink, intents) = SpineIntentChannel::new();
+        let tool_sink: Arc<dyn SpineIntentSink> = intent_sink.clone();
+        let (root, _root_events) = Nanocodex::builder(openai.clone())
+            .thinking(Thinking::Low)
+            .workspace(directory.path())
+            .rollout(RolloutConfig::new(directory.path()))
+            .tools_factory({
+                let tools = tools.clone();
+                let tool_sink = Arc::clone(&tool_sink);
+                move |_agent| with_spine_tools(tools.clone(), Arc::clone(&tool_sink))
+            })
+            .build()?;
+        let root_session_id = root.session_id().to_string();
+        let root_turn = root.prompt("make the parent durable").await?;
+        root_turn.result().await?;
+        root.flush_rollout().await?;
+        let (child, child_events) = root.fork().await?;
+        let child_session_id = child.session_id().to_string();
+        root.shutdown().await?;
+
+        let runtime = Arc::new(SpineRuntime::create(
+            SpineRuntimeLimits::default(),
+            directory.path().join("spine").as_path(),
+            &root_session_id,
+            &root_session_id,
+            "2026-08-09T00:00:00Z",
+        )?);
+        let open = runtime.prepare(SpineIntentRequest::new(
+            root_session_id.clone(),
+            "call-open",
+            nanocodex_spine_runtime::SpineTerminalControl::Open {
+                summary: "inspect the parser".to_owned(),
+            },
+        ))?;
+        let open_delivery =
+            runtime.commit(&open, child_session_id.clone(), None, "delivery-open")?;
+        runtime.claim_delivery(&open_delivery)?;
+        runtime.accept_delivery(&open_delivery)?;
+
+        let cli = Cli::try_parse_from(["nanocodex-spine", "--api-key", "test-key"])?;
+        let resumed_openai = openai.clone();
+        let resumed_tools = tools.clone();
+        let resumed_sink = Arc::clone(&tool_sink);
+        let resumed_builder: TestResumedAgentBuilder = Arc::new(move |durable| {
+            let openai = resumed_openai.clone();
+            let tools = resumed_tools.clone();
+            let tool_sink = Arc::clone(&resumed_sink);
+            Box::pin(async move {
+                let workspace = PathBuf::from(durable.workspace());
+                let (thread_id, snapshot, rollout) = durable.into_parts();
+                let session_id = thread_id
+                    .parse::<SessionId>()
+                    .map_err(|error| eyre!(error))?;
+                let (handle, events) = Nanocodex::builder(openai)
+                    .thinking(Thinking::Low)
+                    .workspace(workspace)
+                    .session_id(session_id)
+                    .resume(snapshot)
+                    .rollout(rollout)
+                    .tools_factory(move |_agent| {
+                        with_spine_tools(tools.clone(), Arc::clone(&tool_sink))
+                    })
+                    .build()?;
+                Ok(ConfiguredAgent {
+                    handle,
+                    events,
+                    realtime: None,
+                    child_agents: None,
+                    mpp_adapter: None,
+                    mcp: None,
+                    browser: None,
+                    vm: None,
+                })
+            })
+        });
+        let session_recipe = SpineSessionRecipe::with_resumed_builder(
+            cli.agent,
+            cli.vm,
+            Arc::clone(&intent_sink),
+            directory.path().to_path_buf(),
+            resumed_builder,
+        );
+        let configured = ConfiguredAgent {
+            handle: child,
+            events: child_events,
+            realtime: None,
+            child_agents: None,
+            mpp_adapter: None,
+            mcp: None,
+            browser: None,
+            vm: None,
+        };
+        let mut worker = SpineWorker::start(
+            configured,
+            Arc::clone(&runtime),
+            intents,
+            session_recipe,
+            SpineWorkerInitial {
+                initial_delivery: None,
+                root_session_id: root_session_id.clone(),
+                active_session_id: child_session_id,
+                capabilities: capabilities(),
+            },
+        );
+
+        worker.commands().send(WorkerCommand::Prompt {
+            target: PaneId::Main,
+            prompt_id: 1,
+            prompt: "finish the child".into(),
+        })?;
+        let child_result = match timeout(Duration::from_secs(5), async {
+            loop {
+                match worker.events_mut().recv().await {
+                    Some(WorkerEvent::TurnFinished {
+                        target: PaneId::Main,
+                        main_branch_id: Some(0),
+                        error,
+                    }) => return error,
+                    Some(_) => {}
+                    None => panic!("Spine worker stopped before the child turn finished"),
+                }
+            }
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let error = worker
+                    .shutdown()
+                    .await
+                    .expect_err("the cold-close worker should report its failed transition");
+                return Err(eyre!("cold-close worker stopped: {error}"));
+            }
+        };
+        if let Some(error) = child_result {
+            return Err(eyre!("cold child close failed: {error}"));
+        }
+        timeout(Duration::from_secs(5), parent_resumed.notified()).await?;
+
+        assert_eq!(runtime.active_session_id()?, root_session_id);
+        assert_eq!(runtime.projection()?.cursor.to_string(), "1");
+        assert_eq!(generation_calls.load(Ordering::Relaxed), 3);
+        worker.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cold_next_rebuilds_the_frozen_parent_before_committing_a_sibling() -> eyre::Result<()>
+    {
+        let directory = tempdir()?;
+        let generation_calls = Arc::new(AtomicU32::new(0));
+        let parent_resumed = Arc::new(Notify::new());
+        let openai = OpenAi::builder("test-key")
+            .service({
+                let generation_calls = Arc::clone(&generation_calls);
+                let parent_resumed = Arc::clone(&parent_resumed);
+                move || ColdNextService {
+                    generation_calls: Arc::clone(&generation_calls),
+                    parent_resumed: Arc::clone(&parent_resumed),
+                }
+            })
+            .build()?;
+        let tools = Tools::builder().without_defaults().build()?;
+        let (intent_sink, intents) = SpineIntentChannel::new();
+        let tool_sink: Arc<dyn SpineIntentSink> = intent_sink.clone();
+        let (root, _root_events) = Nanocodex::builder(openai.clone())
+            .thinking(Thinking::Low)
+            .workspace(directory.path())
+            .rollout(RolloutConfig::new(directory.path()))
+            .tools_factory({
+                let tools = tools.clone();
+                let tool_sink = Arc::clone(&tool_sink);
+                move |_agent| with_spine_tools(tools.clone(), Arc::clone(&tool_sink))
+            })
+            .build()?;
+        let root_session_id = root.session_id().to_string();
+        let root_turn = root.prompt("make the parent durable").await?;
+        root_turn.result().await?;
+        root.flush_rollout().await?;
+        let (child, child_events) = root.fork().await?;
+        let child_session_id = child.session_id().to_string();
+        root.shutdown().await?;
+
+        let runtime = Arc::new(SpineRuntime::create(
+            SpineRuntimeLimits::default(),
+            directory.path().join("spine").as_path(),
+            &root_session_id,
+            &root_session_id,
+            "2026-08-09T00:00:00Z",
+        )?);
+        let open = runtime.prepare(SpineIntentRequest::new(
+            root_session_id.clone(),
+            "call-open",
+            nanocodex_spine_runtime::SpineTerminalControl::Open {
+                summary: "inspect the parser".to_owned(),
+            },
+        ))?;
+        let open_delivery =
+            runtime.commit(&open, child_session_id.clone(), None, "delivery-open")?;
+        runtime.claim_delivery(&open_delivery)?;
+        runtime.accept_delivery(&open_delivery)?;
+
+        let cli = Cli::try_parse_from(["nanocodex-spine", "--api-key", "test-key"])?;
+        let resumed_openai = openai.clone();
+        let resumed_tools = tools.clone();
+        let resumed_sink = Arc::clone(&tool_sink);
+        let resumed_builder: TestResumedAgentBuilder = Arc::new(move |durable| {
+            let openai = resumed_openai.clone();
+            let tools = resumed_tools.clone();
+            let tool_sink = Arc::clone(&resumed_sink);
+            Box::pin(async move {
+                let workspace = PathBuf::from(durable.workspace());
+                let (thread_id, snapshot, rollout) = durable.into_parts();
+                let session_id = thread_id
+                    .parse::<SessionId>()
+                    .map_err(|error| eyre!(error))?;
+                let (handle, events) = Nanocodex::builder(openai)
+                    .thinking(Thinking::Low)
+                    .workspace(workspace)
+                    .session_id(session_id)
+                    .resume(snapshot)
+                    .rollout(rollout)
+                    .tools_factory(move |_agent| {
+                        with_spine_tools(tools.clone(), Arc::clone(&tool_sink))
+                    })
+                    .build()?;
+                Ok(ConfiguredAgent {
+                    handle,
+                    events,
+                    realtime: None,
+                    child_agents: None,
+                    mpp_adapter: None,
+                    mcp: None,
+                    browser: None,
+                    vm: None,
+                })
+            })
+        });
+        let session_recipe = SpineSessionRecipe::with_resumed_builder(
+            cli.agent,
+            cli.vm,
+            Arc::clone(&intent_sink),
+            directory.path().to_path_buf(),
+            resumed_builder,
+        );
+        let configured = ConfiguredAgent {
+            handle: child,
+            events: child_events,
+            realtime: None,
+            child_agents: None,
+            mpp_adapter: None,
+            mcp: None,
+            browser: None,
+            vm: None,
+        };
+        let mut worker = SpineWorker::start(
+            configured,
+            Arc::clone(&runtime),
+            intents,
+            session_recipe,
+            SpineWorkerInitial {
+                initial_delivery: None,
+                root_session_id: root_session_id.clone(),
+                active_session_id: child_session_id,
+                capabilities: capabilities(),
+            },
+        );
+
+        worker.commands().send(WorkerCommand::Prompt {
+            target: PaneId::Main,
+            prompt_id: 1,
+            prompt: "replace the child scope".into(),
+        })?;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    worker.events_mut().recv().await,
+                    Some(WorkerEvent::TurnFinished {
+                        target: PaneId::Main,
+                        main_branch_id: Some(0),
+                        error: None,
+                    })
+                ) {
+                    return;
+                }
+            }
+        })
+        .await?;
+        timeout(Duration::from_secs(5), parent_resumed.notified()).await?;
+
+        let projection = runtime.projection()?;
+        assert_eq!(runtime.active_session_id()?, root_session_id);
+        assert_eq!(projection.cursor.to_string(), "1");
+        assert_eq!(projection.nodes.len(), 3);
+        assert_eq!(generation_calls.load(Ordering::Relaxed), 4);
+        worker.shutdown().await?;
+        Ok(())
+    }
+
     #[derive(Clone)]
     struct TerminalSpineService {
         calls: Arc<AtomicU32>,
         parent_finished: Arc<Notify>,
+    }
+
+    #[derive(Clone)]
+    struct ColdCloseService {
+        generation_calls: Arc<AtomicU32>,
+        parent_resumed: Arc<Notify>,
+    }
+
+    #[derive(Clone)]
+    struct ColdNextService {
+        generation_calls: Arc<AtomicU32>,
+        parent_resumed: Arc<Notify>,
+    }
+
+    impl Service<ResponsesAttempt> for ColdCloseService {
+        type Response = ResponsesServiceResponse;
+        type Error = ResponseError;
+        type Future = Ready<Result<ResponsesServiceResponse, ResponseError>>;
+
+        fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
+            let output = match request.kind() {
+                ResponsesAttemptKind::Warmup => ResponsesOutput::Warmup(WarmupResponse {
+                    id: "resp-warmup".to_owned(),
+                    usage: None,
+                }),
+                ResponsesAttemptKind::Generation => {
+                    match self.generation_calls.fetch_add(1, Ordering::Relaxed) {
+                        0 => final_generation("resp-root-ready", "the parent is durable"),
+                        1 => code_generation(
+                            "resp-child-close",
+                            "call-child-close",
+                            "await tools.spine__close({memory: 'the parser needs one-token lookahead'});",
+                        ),
+                        2 => {
+                            assert_request_contains(
+                                &request,
+                                "the parser needs one-token lookahead",
+                            );
+                            self.parent_resumed.notify_one();
+                            final_generation("resp-parent-resumed", "parent resumed after restart")
+                        }
+                        call => panic!("unexpected scripted generation {call}"),
+                    }
+                }
+                _ => panic!("unexpected scripted Responses attempt"),
+            };
+            ready(Ok(ResponsesServiceResponse::new(output)))
+        }
+    }
+
+    impl Service<ResponsesAttempt> for ColdNextService {
+        type Response = ResponsesServiceResponse;
+        type Error = ResponseError;
+        type Future = Ready<Result<ResponsesServiceResponse, ResponseError>>;
+
+        fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
+            let output = match request.kind() {
+                ResponsesAttemptKind::Warmup => ResponsesOutput::Warmup(WarmupResponse {
+                    id: "resp-warmup".to_owned(),
+                    usage: None,
+                }),
+                ResponsesAttemptKind::Generation => {
+                    match self.generation_calls.fetch_add(1, Ordering::Relaxed) {
+                        0 => final_generation("resp-root-ready", "the parent is durable"),
+                        1 => code_generation(
+                            "resp-child-next",
+                            "call-child-next",
+                            "await tools.spine__next({summary: 'write a parser fix', memory: 'the parser needs one-token lookahead'});",
+                        ),
+                        2 => {
+                            assert_request_contains(&request, "Scope:\\nwrite a parser fix");
+                            assert_request_contains(
+                                &request,
+                                "the parser needs one-token lookahead",
+                            );
+                            code_generation(
+                                "resp-sibling-close",
+                                "call-sibling-close",
+                                "await tools.spine__close({memory: 'the parser fix is complete'});",
+                            )
+                        }
+                        3 => {
+                            assert_request_contains(&request, "the parser fix is complete");
+                            self.parent_resumed.notify_one();
+                            final_generation("resp-parent-resumed", "parent resumed after restart")
+                        }
+                        call => panic!("unexpected scripted generation {call}"),
+                    }
+                }
+                _ => panic!("unexpected scripted Responses attempt"),
+            };
+            ready(Ok(ResponsesServiceResponse::new(output)))
+        }
     }
 
     impl Service<ResponsesAttempt> for TerminalSpineService {

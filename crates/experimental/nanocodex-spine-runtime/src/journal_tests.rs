@@ -543,9 +543,7 @@ fn strict_replay_rejects_unknown_fields_versions_types_and_sequence_gaps() {
     let cases = [
         (
             "unknown envelope field",
-            format!(
-                r#"{{"seq":0,"type":"header","payload":{{"schema_version":1,"root_session_id":"root-session","prompt_cache_key":"root-cache-key","created_at":"2026-08-09T00:00:00Z"}},"extra":true}}"#
-            ),
+            r#"{"seq":0,"type":"header","payload":{"schema_version":1,"root_session_id":"root-session","prompt_cache_key":"root-cache-key","created_at":"2026-08-09T00:00:00Z"},"extra":true}"#.to_owned(),
         ),
         (
             "unknown schema version",

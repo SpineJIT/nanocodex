@@ -201,7 +201,7 @@ struct JournalWriter {
 }
 
 impl JournalWriter {
-    fn new(file: File) -> Self {
+    const fn new(file: File) -> Self {
         Self {
             file,
             #[cfg(test)]
@@ -312,12 +312,12 @@ impl JournalWriter {
     }
 
     #[cfg(test)]
-    fn fail_next_sync(&mut self) {
+    const fn fail_next_sync(&mut self) {
         self.fail_next_sync = true;
     }
 
     #[cfg(test)]
-    fn fail_next_truncate(&mut self) {
+    const fn fail_next_truncate(&mut self) {
         self.fail_next_truncate = true;
     }
 }
@@ -356,7 +356,7 @@ struct Delivery {
 }
 
 impl JournalState {
-    pub(crate) fn header(&self) -> &JournalHeader {
+    pub(crate) const fn header(&self) -> &JournalHeader {
         &self.header
     }
 
@@ -368,7 +368,7 @@ impl JournalState {
         self.reducer.projection()
     }
 
-    pub(crate) fn pending(&self) -> Option<&TransitionIntent> {
+    pub(crate) const fn pending(&self) -> Option<&TransitionIntent> {
         self.pending.as_ref()
     }
 
@@ -775,7 +775,7 @@ impl Journal {
         })
     }
 
-    pub(crate) fn state(&self) -> &JournalState {
+    pub(crate) const fn state(&self) -> &JournalState {
         &self.state
     }
 
@@ -854,12 +854,12 @@ impl Journal {
     }
 
     #[cfg(test)]
-    pub(crate) fn fail_next_sync_for_test(&mut self) {
+    pub(crate) const fn fail_next_sync_for_test(&mut self) {
         self.writer.fail_next_sync();
     }
 
     #[cfg(test)]
-    pub(crate) fn fail_next_truncate_for_test(&mut self) {
+    pub(crate) const fn fail_next_truncate_for_test(&mut self) {
         self.writer.fail_next_truncate();
     }
 }
@@ -916,6 +916,7 @@ fn acquire_lock(directory: &Path, root_session_id: &str) -> Result<File, Journal
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&path)
         .map_err(|source| JournalError::Io {
             action: "opening journal lock",
