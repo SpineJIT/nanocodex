@@ -504,9 +504,22 @@ where
                     let failed_persistence = self.failure.error().is_some();
                     drop(result.send(outcome));
                     if failed_persistence {
-                        begin_fail_stop(&mut self.commands, &mut queued_turns, &self.failure).await;
+                        let error = self.failure.error().expect("persistence failure recorded");
+                        finish_fail_stop(
+                            FailStopContext {
+                                commands: &mut self.commands,
+                                failure: &self.failure,
+                                workspace: self.workspace.as_deref(),
+                                session_events: &self.events,
+                                default_thinking,
+                                default_fast_mode,
+                            },
+                            &mut model,
+                            &mut queued_turns,
+                        )
+                        .await?;
                         model.shutdown().await;
-                        return Ok(());
+                        return Err(error);
                     }
                     continue;
                 }
@@ -763,7 +776,6 @@ where
                 }
             };
             drop(execution);
-            model.set_events(self.events.clone());
             let (outcome, was_cancelled): (Result<TurnResult>, bool) = match completed {
                 Ok(ModelTurnOutcome::Completed(completed)) => {
                     let CompletedModelTurn {
@@ -792,6 +804,7 @@ where
                     {
                         Ok(()) => {
                             latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                            model.emit_completed(&completion, &usage)?;
                             (
                                 Ok(TurnResult {
                                     completion,
@@ -803,10 +816,9 @@ where
                         }
                         Err(failure) => {
                             self.failure.record(failure);
-                            (
-                                Err(self.failure.error().expect("persistence failure recorded")),
-                                false,
-                            )
+                            let error = self.failure.error().expect("persistence failure recorded");
+                            model.emit_failed(&error, &usage)?;
+                            (Err(error), false)
                         }
                     }
                 }
@@ -825,6 +837,8 @@ where
                     {
                         Ok(()) => {
                             latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                            let usage = model.current_turn_usage();
+                            model.emit_cancelled(&usage)?;
                             model.replace_client(ResponsesClient::new((self
                                 .spawner
                                 .service_factory)(
@@ -834,10 +848,10 @@ where
                         }
                         Err(failure) => {
                             self.failure.record(failure);
-                            (
-                                Err(self.failure.error().expect("persistence failure recorded")),
-                                false,
-                            )
+                            let error = self.failure.error().expect("persistence failure recorded");
+                            let usage = model.current_turn_usage();
+                            model.emit_failed(&error, &usage)?;
+                            (Err(error), false)
                         }
                     }
                 }
@@ -856,19 +870,22 @@ where
                     {
                         Ok(()) => {
                             latest_fork_checkpoint = Some(checkpoint);
+                            let usage = model.current_turn_usage();
+                            model.emit_failed(&error, &usage)?;
                             (Err(error), false)
                         }
                         Err(failure) => {
                             self.failure.record(failure);
-                            (
-                                Err(self.failure.error().expect("persistence failure recorded")),
-                                false,
-                            )
+                            let error = self.failure.error().expect("persistence failure recorded");
+                            let usage = model.current_turn_usage();
+                            model.emit_failed(&error, &usage)?;
+                            (Err(error), false)
                         }
                     }
                 }
                 Err(error) => (Err(error), false),
             };
+            model.set_events(self.events.clone());
             turn_span.record(
                 "status",
                 if was_cancelled {
@@ -886,9 +903,22 @@ where
             let failed_persistence = self.failure.error().is_some();
             drop(result.send(outcome));
             if failed_persistence {
-                begin_fail_stop(&mut self.commands, &mut queued_turns, &self.failure).await;
+                let error = self.failure.error().expect("persistence failure recorded");
+                finish_fail_stop(
+                    FailStopContext {
+                        commands: &mut self.commands,
+                        failure: &self.failure,
+                        workspace: self.workspace.as_deref(),
+                        session_events: &self.events,
+                        default_thinking,
+                        default_fast_mode,
+                    },
+                    &mut model,
+                    &mut queued_turns,
+                )
+                .await?;
                 model.shutdown().await;
-                return Ok(());
+                return Err(error);
             }
             for text in pending_developer_messages.drain(..) {
                 if let Some(checkpoint) = model.append_developer_message(text) {
@@ -909,6 +939,69 @@ where
             }
         }
     }
+}
+
+struct FailStopContext<'a> {
+    commands: &'a mut mpsc::Receiver<Command>,
+    failure: &'a DriverFailure,
+    workspace: Option<&'a str>,
+    session_events: &'a EventSink,
+    default_thinking: Thinking,
+    default_fast_mode: bool,
+}
+
+async fn finish_fail_stop<S>(
+    context: FailStopContext<'_>,
+    model: &mut ModelRun<S>,
+    queued_turns: &mut VecDeque<QueuedTurn>,
+) -> Result<()>
+where
+    S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
+    S::Error: Into<ResponseError> + AgentSend + 'static,
+    S::Future: AgentSend,
+{
+    let failed_turns = begin_fail_stop(
+        context.commands,
+        queued_turns,
+        context.failure,
+        context.default_thinking,
+        context.default_fast_mode,
+    )
+    .await;
+    let mut event_error = None;
+    for queued in failed_turns {
+        let (prompt, thinking, fast_mode, events, result) = match queued {
+            QueuedTurn::Pending {
+                prompt,
+                thinking,
+                fast_mode,
+                events,
+                result,
+                ..
+            }
+            | QueuedTurn::Cancelled {
+                prompt,
+                thinking,
+                fast_mode,
+                events,
+                result,
+                ..
+            } => (prompt, thinking, fast_mode, events, result),
+        };
+        let error = context
+            .failure
+            .error()
+            .expect("a failed agent driver always records its persistence error");
+        model.set_events(events);
+        let terminal =
+            model.emit_failed_before_start(&prompt, context.workspace, thinking, fast_mode, &error);
+        model.set_events(context.session_events.clone());
+        drop(result.send(Err(error)));
+        if event_error.is_none() {
+            event_error = terminal.err();
+        }
+    }
+    event_error.map_or(Ok(()), Err)
 }
 
 fn agent_session_context(

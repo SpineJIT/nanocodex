@@ -13,6 +13,8 @@ pub(in crate::rollout) struct RolloutWriter {
     current_window_id: String,
     #[cfg(test)]
     injected_write_failures: usize,
+    #[cfg(test)]
+    injected_write_failure_after: Option<usize>,
 }
 
 impl RolloutWriter {
@@ -33,6 +35,8 @@ impl RolloutWriter {
             current_window_id: initial_window_id,
             #[cfg(test)]
             injected_write_failures: 0,
+            #[cfg(test)]
+            injected_write_failure_after: None,
         }
     }
 
@@ -49,6 +53,8 @@ impl RolloutWriter {
             current_window_id: state.current_window_id,
             #[cfg(test)]
             injected_write_failures: 0,
+            #[cfg(test)]
+            injected_write_failure_after: None,
         }
     }
 
@@ -75,6 +81,11 @@ impl RolloutWriter {
                 #[cfg(test)]
                 RolloutCommand::InjectWriteFailures { count, result } => {
                     self.inject_write_failures(count);
+                    let _ = result.send(());
+                }
+                #[cfg(test)]
+                RolloutCommand::InjectWriteFailureAfter { writes, result } => {
+                    self.inject_write_failure_after(writes);
                     let _ = result.send(());
                 }
             }
@@ -351,6 +362,8 @@ impl RolloutWriter {
         self.check_injected_write_failure()?;
         self.write_turn_context(seed.effort, seed.model).await?;
         for item in seed.history.iter_from(0) {
+            #[cfg(test)]
+            self.check_injected_write_failure()?;
             write_async_line(
                 &mut self.file,
                 &RolloutLine {
@@ -360,6 +373,8 @@ impl RolloutWriter {
             )
             .await?;
         }
+        #[cfg(test)]
+        self.check_injected_write_failure()?;
         self.write_context_state(&seed.context_baseline).await?;
         self.file.flush().await?;
         self.file.sync_data().await
@@ -436,10 +451,22 @@ impl RolloutWriter {
     }
 
     #[cfg(test)]
+    pub(in crate::rollout) const fn inject_write_failure_after(&mut self, writes: usize) {
+        self.injected_write_failure_after = Some(writes);
+    }
+
+    #[cfg(test)]
     fn check_injected_write_failure(&mut self) -> io::Result<()> {
         if self.injected_write_failures > 0 {
             self.injected_write_failures -= 1;
             return Err(io::Error::other("injected rollout write failure"));
+        }
+        if let Some(writes) = &mut self.injected_write_failure_after {
+            if *writes == 0 {
+                self.injected_write_failure_after = None;
+                return Err(io::Error::other("injected rollout write failure"));
+            }
+            *writes -= 1;
         }
         Ok(())
     }

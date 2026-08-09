@@ -64,6 +64,11 @@ enum RolloutCommand {
         count: usize,
         result: oneshot::Sender<()>,
     },
+    #[cfg(test)]
+    InjectWriteFailureAfter {
+        writes: usize,
+        result: oneshot::Sender<()>,
+    },
 }
 
 pub(super) struct RolloutCommit {
@@ -470,6 +475,18 @@ impl RolloutRecorder {
         let (result, receiver) = oneshot::channel();
         self.commands
             .send(RolloutCommand::InjectWriteFailures { count, result })
+            .await
+            .expect("test rollout writer remains available");
+        receiver
+            .await
+            .expect("test rollout writer accepts injection");
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn inject_write_failure_after(&self, writes: usize) {
+        let (result, receiver) = oneshot::channel();
+        self.commands
+            .send(RolloutCommand::InjectWriteFailureAfter { writes, result })
             .await
             .expect("test rollout writer remains available");
         receiver

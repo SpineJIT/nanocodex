@@ -160,18 +160,36 @@ pub(super) async fn begin_fail_stop(
     commands: &mut mpsc::Receiver<Command>,
     queued_turns: &mut VecDeque<QueuedTurn>,
     failure: &DriverFailure,
-) {
+    default_thinking: Thinking,
+    default_fast_mode: bool,
+) -> VecDeque<QueuedTurn> {
+    let mut failed_turns = std::mem::take(queued_turns);
     commands.close();
     while let Some(command) = commands.recv().await {
-        fail_command(command, failure);
-    }
-    for queued in std::mem::take(queued_turns) {
-        match queued {
-            QueuedTurn::Pending { result, .. } | QueuedTurn::Cancelled { result, .. } => {
-                drop(result.send(Err(failure_error(failure))));
+        match command {
+            Command::Prompt {
+                key,
+                prompt,
+                thinking,
+                fast_mode,
+                parent,
+                events,
+                result,
+            } => {
+                failed_turns.push_back(QueuedTurn::Pending {
+                    key,
+                    prompt,
+                    thinking: thinking.unwrap_or(default_thinking),
+                    fast_mode: fast_mode.unwrap_or(default_fast_mode),
+                    parent,
+                    events,
+                    result,
+                });
             }
+            command => fail_command(command, failure),
         }
     }
+    failed_turns
 }
 
 fn fail_command(command: Command, failure: &DriverFailure) {

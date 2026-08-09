@@ -121,7 +121,9 @@ impl Nanocodex {
     #[cfg(not(target_family = "wasm"))]
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     pub async fn flush_rollout(&self) -> Result<()> {
-        self.durability.flush().await
+        self.failure.check()?;
+        self.durability.flush().await?;
+        self.failure.check()
     }
 
     pub(super) async fn seed_initial_checkpoint(

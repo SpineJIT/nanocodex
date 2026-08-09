@@ -813,3 +813,29 @@ async fn failed_initial_seed_is_discarded_without_a_partial_checkpoint() {
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0]["type"], "session_meta");
 }
+
+#[tokio::test]
+async fn partial_initial_seed_is_rolled_back_to_session_metadata() {
+    let home = tempdir().expect("temporary rollout directory");
+    let recorder = recorder(home.path());
+    recorder.inject_write_failure_after(1).await;
+
+    assert!(
+        recorder
+            .seed_initial_history(
+                ResponseHistory::new(vec![message("inherited boundary")]),
+                0,
+                Thinking::High,
+            )
+            .await
+            .is_err()
+    );
+    recorder
+        .flush()
+        .await
+        .expect("flush cannot retry a partially written seed");
+
+    let lines = lines(&recorder);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["type"], "session_meta");
+}
