@@ -339,6 +339,24 @@ impl ResponsesAttempt {
         self.input().iter()
     }
 
+    /// Returns the client-owned session identity sent with this attempt.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        self.profile.session_id()
+    }
+
+    /// Returns the stable prompt-cache identity sent with this attempt.
+    #[must_use]
+    pub fn prompt_cache_key(&self) -> &str {
+        self.profile.prompt_cache_key()
+    }
+
+    /// Returns the immutable prefix shared by all attempts in this session.
+    #[must_use]
+    pub fn request_prefix(&self) -> &[ResponseItem] {
+        self.profile.prefix()
+    }
+
     /// Emits one normalized event for callers streaming this attempt.
     ///
     /// Custom Tower services installed with [`crate::OpenAiBuilder::service`]

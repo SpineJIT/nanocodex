@@ -5,6 +5,7 @@ pub(in crate::rollout) struct RolloutWriter {
     file: Option<tokio::fs::File>,
     path: PathBuf,
     staged: bool,
+    poisoned: Option<PoisonedWriter>,
     pub(in crate::rollout) pending: Option<RolloutCommit>,
     written_revision: Option<u64>,
     written_len: usize,
@@ -19,6 +20,8 @@ pub(in crate::rollout) struct RolloutWriter {
     injected_write_failure_after: Option<usize>,
     #[cfg(test)]
     injected_publish_reopen_failure: bool,
+    #[cfg(test)]
+    injected_rollback_failure: bool,
 }
 
 impl RolloutWriter {
@@ -33,6 +36,7 @@ impl RolloutWriter {
             file: Some(file),
             path,
             staged,
+            poisoned: None,
             pending: None,
             written_revision: None,
             written_len: 0,
@@ -47,6 +51,8 @@ impl RolloutWriter {
             injected_write_failure_after: None,
             #[cfg(test)]
             injected_publish_reopen_failure: false,
+            #[cfg(test)]
+            injected_rollback_failure: false,
         }
     }
 
@@ -55,6 +61,7 @@ impl RolloutWriter {
             file: Some(file),
             path,
             staged: false,
+            poisoned: None,
             pending: None,
             written_revision: Some(0),
             written_len: state.written_len,
@@ -69,6 +76,8 @@ impl RolloutWriter {
             injected_write_failure_after: None,
             #[cfg(test)]
             injected_publish_reopen_failure: false,
+            #[cfg(test)]
+            injected_rollback_failure: false,
         }
     }
 
@@ -116,6 +125,7 @@ impl RolloutWriter {
     }
 
     pub(in crate::rollout) async fn flush(&mut self) -> io::Result<()> {
+        self.ensure_healthy()?;
         if self.pending.is_some() {
             self.persist_pending().await
         } else {
@@ -127,6 +137,7 @@ impl RolloutWriter {
     }
 
     pub(in crate::rollout) async fn persist_pending(&mut self) -> io::Result<()> {
+        self.ensure_healthy()?;
         let Some(commit) = self.pending.take() else {
             return Ok(());
         };
@@ -134,10 +145,17 @@ impl RolloutWriter {
     }
 
     async fn seed_initial_checkpoint(&mut self, seed: RolloutSeed) -> io::Result<()> {
+        self.ensure_healthy()?;
         if self.pending.is_some() || self.written_revision.is_some() || self.written_len != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "initial checkpoint seed requires an empty rollout writer",
+            ));
+        }
+        if seed.history.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "initial checkpoint seed requires committed history",
             ));
         }
         let original_len = self.file()?.metadata().await?.len();
@@ -148,14 +166,12 @@ impl RolloutWriter {
                 self.written_context_baseline = Some(seed.context_baseline);
                 Ok(())
             }
-            Err(error) => {
-                self.rollback(original_len).await?;
-                Err(error)
-            }
+            Err(error) => Err(self.rollback_or_poison(error, original_len).await),
         }
     }
 
     async fn append(&mut self, commit: &RolloutCommit) -> io::Result<()> {
+        self.ensure_healthy()?;
         let prepared = self.prepare_append(commit)?;
         let original_len = self.file()?.metadata().await?.len();
         match self.write_prepared(&prepared).await {
@@ -163,14 +179,12 @@ impl RolloutWriter {
                 self.apply_prepared(prepared);
                 Ok(())
             }
-            Err(error) => {
-                self.rollback(original_len).await?;
-                Err(error)
-            }
+            Err(error) => Err(self.rollback_or_poison(error, original_len).await),
         }
     }
 
     async fn publish(&mut self, path: PathBuf) -> io::Result<()> {
+        self.ensure_healthy()?;
         if !self.staged {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -488,10 +502,45 @@ impl RolloutWriter {
     }
 
     async fn rollback(&mut self, len: u64) -> io::Result<()> {
+        #[cfg(test)]
+        if self.injected_rollback_failure {
+            self.injected_rollback_failure = false;
+            return Err(io::Error::other("injected rollback failure"));
+        }
         let file = self.file()?;
         file.set_len(len).await?;
         file.seek(std::io::SeekFrom::Start(len)).await?;
         file.sync_data().await
+    }
+
+    async fn rollback_or_poison(&mut self, write_error: io::Error, len: u64) -> io::Error {
+        match self.rollback(len).await {
+            Ok(()) => write_error,
+            Err(rollback_error) => {
+                let corruption = io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    RolloutCorruption {
+                        write_error,
+                        rollback_error,
+                    },
+                );
+                self.poison(&corruption);
+                corruption
+            }
+        }
+    }
+
+    fn ensure_healthy(&self) -> io::Result<()> {
+        match &self.poisoned {
+            Some(writer) => Err(writer.as_error()),
+            None => Ok(()),
+        }
+    }
+
+    fn poison(&mut self, error: &io::Error) {
+        self.file.take();
+        self.pending = None;
+        self.poisoned = Some(PoisonedWriter::from_error(error));
     }
 
     fn file(&mut self) -> io::Result<&mut tokio::fs::File> {
@@ -516,6 +565,11 @@ impl RolloutWriter {
     }
 
     #[cfg(test)]
+    pub(in crate::rollout) const fn inject_rollback_failure(&mut self) {
+        self.injected_rollback_failure = true;
+    }
+
+    #[cfg(test)]
     fn check_injected_write_failure(&mut self) -> io::Result<()> {
         if self.injected_write_failures > 0 {
             self.injected_write_failures -= 1;
@@ -534,6 +588,47 @@ impl RolloutWriter {
     #[cfg(not(test))]
     const fn check_injected_write_failure(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct PoisonedWriter {
+    kind: io::ErrorKind,
+    message: String,
+}
+
+impl PoisonedWriter {
+    fn from_error(error: &io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
+    fn as_error(&self) -> io::Error {
+        io::Error::new(self.kind, self.message.clone())
+    }
+}
+
+#[derive(Debug)]
+struct RolloutCorruption {
+    write_error: io::Error,
+    rollback_error: io::Error,
+}
+
+impl std::fmt::Display for RolloutCorruption {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "rollout corruption: failed to rollback after write error ({}) because rollback failed ({})",
+            self.write_error, self.rollback_error
+        )
+    }
+}
+
+impl std::error::Error for RolloutCorruption {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.write_error)
     }
 }
 

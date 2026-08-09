@@ -14,6 +14,10 @@ use nanocodex_oai_api::{
         ResponsesOutput,
     },
 };
+use nanocodex_tools::{
+    Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult, ToolTurnBehavior,
+    contract::async_trait,
+};
 use tempfile::tempdir;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tower::Service;
@@ -37,7 +41,104 @@ struct DelayedCompactionService {
 
 #[derive(Clone)]
 struct CheckpointLifecycleService {
-    generation_inputs: Arc<Mutex<Vec<Vec<ResponseItem>>>>,
+    generation_requests: Arc<Mutex<Vec<GenerationRequest>>>,
+}
+
+struct GenerationRequest {
+    session_id: String,
+    prompt_cache_key: String,
+    prefix: Vec<ResponseItem>,
+    input: Vec<ResponseItem>,
+}
+
+struct FinishTurnTool {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for FinishTurnTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "finish_turn",
+            "Ends the enclosing turn after the Code Mode cell commits.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    fn turn_behavior(&self) -> ToolTurnBehavior {
+        ToolTurnBehavior::FinishTurnOnSuccess
+    }
+
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        use std::sync::atomic::Ordering;
+
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(ToolOutput::text("terminal result"))
+    }
+}
+
+#[derive(Clone)]
+struct TerminalToolService;
+
+impl Service<ResponsesAttempt> for TerminalToolService {
+    type Response = ResponsesServiceResponse;
+    type Error = ResponseError;
+    type Future = Pin<
+        Box<
+            dyn Future<Output = std::result::Result<ResponsesServiceResponse, ResponseError>>
+                + Send,
+        >,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _context: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
+        let output = match request.kind() {
+            ResponsesAttemptKind::Warmup => ResponsesOutput::Warmup(WarmupResponse {
+                id: "resp-warmup".to_owned(),
+                usage: None,
+            }),
+            ResponsesAttemptKind::Generation => {
+                let input = "await tools.finish_turn({});";
+                let output_item = serde_json::from_value(serde_json::json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call-exec",
+                    "name": "exec",
+                    "input": input,
+                }))
+                .expect("terminal Code Mode call decodes");
+                ResponsesOutput::Generation(GenerationOutput {
+                    id: "resp-terminal".to_owned(),
+                    status: "completed".to_owned(),
+                    end_turn: Some(false),
+                    final_message: None,
+                    output_items: vec![output_item],
+                    code_calls: vec![nanocodex_oai_api::tower::CodeCall {
+                        call_id: "call-exec".to_owned(),
+                        name: "exec".to_owned(),
+                        namespace: None,
+                        input: input.to_owned(),
+                        kind: nanocodex_oai_api::tower::CodeCallKind::Custom,
+                    }],
+                    usage: None,
+                    time_to_first_event_ns: 0,
+                    time_to_first_output_ns: None,
+                    pipeline_stats: ResponsePipelineStats::default(),
+                })
+            }
+            _ => panic!("terminal durability test received an unsupported attempt"),
+        };
+        Box::pin(ready(Ok(ResponsesServiceResponse::new(output))))
+    }
 }
 
 impl Service<ResponsesAttempt> for CheckpointLifecycleService {
@@ -78,10 +179,15 @@ impl Service<ResponsesAttempt> for CheckpointLifecycleService {
                 pipeline_stats: ResponsePipelineStats::default(),
             }),
             ResponsesAttemptKind::Generation => {
-                self.generation_inputs
+                self.generation_requests
                     .lock()
-                    .expect("generation input lock")
-                    .push(request.input_items().cloned().collect());
+                    .expect("generation request lock")
+                    .push(GenerationRequest {
+                        session_id: request.session_id().to_owned(),
+                        prompt_cache_key: request.prompt_cache_key().to_owned(),
+                        prefix: request.request_prefix().to_vec(),
+                        input: request.input_items().cloned().collect(),
+                    });
                 ResponsesOutput::Generation(GenerationOutput {
                     id: "resp-generation".to_owned(),
                     status: "completed".to_owned(),
@@ -300,12 +406,12 @@ async fn closed_command_channel_returns_recorded_persistence_failure() {
 #[tokio::test]
 async fn run_completed_event_makes_the_rollout_immediately_resumable() {
     let home = tempdir().expect("temporary rollout home");
-    let generation_inputs = Arc::new(Mutex::new(Vec::new()));
+    let generation_requests = Arc::new(Mutex::new(Vec::new()));
     let openai = OpenAi::builder("test")
         .service({
-            let generation_inputs = Arc::clone(&generation_inputs);
+            let generation_requests = Arc::clone(&generation_requests);
             move || CheckpointLifecycleService {
-                generation_inputs: Arc::clone(&generation_inputs),
+                generation_requests: Arc::clone(&generation_requests),
             }
         })
         .build()
@@ -419,6 +525,71 @@ async fn active_cancellation_persistence_failure_fails_the_turn_once() {
             if matches!(error.as_ref(), NanocodexError::PersistRollout { .. })
     ));
     drop(release);
+}
+
+#[tokio::test]
+async fn terminal_tool_persistence_failure_fails_the_turn() {
+    use std::sync::atomic::Ordering;
+
+    let home = tempdir().expect("temporary rollout home");
+    let workspace = tempdir().expect("temporary workspace");
+    let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let openai = OpenAi::builder("test")
+        .service(|| TerminalToolService)
+        .build()
+        .expect("test OpenAI client");
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(FinishTurnTool {
+            calls: Arc::clone(&tool_calls),
+        })
+        .build()
+        .expect("terminal tool");
+    let (agent, mut events) = Nanocodex::builder(openai)
+        .tools(tools)
+        .workspace(workspace.path())
+        .rollout(RolloutConfig::new(home.path()))
+        .build()
+        .expect("agent with rollout");
+    agent.durability.inject_write_failures(1).await;
+
+    let result = agent
+        .prompt("finish through the application tool")
+        .await
+        .expect("accepted turn")
+        .result()
+        .await;
+
+    assert!(matches!(result, Err(NanocodexError::PersistRollout { .. })));
+    assert_eq!(tool_calls.load(Ordering::Relaxed), 1);
+
+    let mut completed = 0;
+    let mut failed = 0;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("terminal tool emits a terminal event")
+            .expect("agent event stream remains open");
+        match event.kind {
+            AgentEventKind::RunCompleted => completed += 1,
+            AgentEventKind::RunFailed => {
+                failed += 1;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(completed, 0);
+    assert_eq!(failed, 1);
+    assert!(matches!(
+        agent.prompt("must not run after failed durability").await,
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+    assert!(matches!(
+        agent.shutdown().await,
+        Err(NanocodexError::Shutdown(error))
+            if matches!(error.as_ref(), NanocodexError::PersistRollout { .. })
+    ));
 }
 
 #[tokio::test]
@@ -556,12 +727,12 @@ async fn rollout_persistence_failure_fail_stops_current_and_queued_turns() {
 #[tokio::test]
 async fn explicit_rollout_flush_failure_fail_stops_the_agent() {
     let home = tempdir().expect("temporary rollout home");
-    let generation_inputs = Arc::new(Mutex::new(Vec::new()));
+    let generation_requests = Arc::new(Mutex::new(Vec::new()));
     let openai = OpenAi::builder("test")
         .service({
-            let generation_inputs = Arc::clone(&generation_inputs);
+            let generation_requests = Arc::clone(&generation_requests);
             move || CheckpointLifecycleService {
-                generation_inputs: Arc::clone(&generation_inputs),
+                generation_requests: Arc::clone(&generation_requests),
             }
         })
         .build()
@@ -586,7 +757,7 @@ async fn explicit_rollout_flush_failure_fail_stops_the_agent() {
         Err(NanocodexError::PersistRollout { .. })
     ));
     assert!(
-        generation_inputs
+        generation_requests
             .lock()
             .expect("generation input lock")
             .is_empty()
@@ -829,12 +1000,12 @@ async fn compaction_persistence_failure_fail_stops_current_and_queued_turns() {
 #[tokio::test]
 async fn fork_seeds_a_resumable_child_rollout_with_the_inherited_identity() {
     let home = tempdir().expect("temporary rollout home");
-    let generation_inputs = Arc::new(Mutex::new(Vec::new()));
+    let generation_requests = Arc::new(Mutex::new(Vec::new()));
     let openai = || {
-        let generation_inputs = Arc::clone(&generation_inputs);
+        let generation_requests = Arc::clone(&generation_requests);
         OpenAi::builder("test")
             .service(move || CheckpointLifecycleService {
-                generation_inputs: Arc::clone(&generation_inputs),
+                generation_requests: Arc::clone(&generation_requests),
             })
             .build()
             .expect("test OpenAI client")
@@ -910,6 +1081,14 @@ async fn fork_seeds_a_resumable_child_rollout_with_the_inherited_identity() {
             .contains("durable parent boundary")
     );
 
+    child
+        .prompt("live child continuation")
+        .await
+        .expect("live child turn")
+        .result()
+        .await
+        .expect("completed live child turn");
+
     child.shutdown().await.expect("shutdown child");
     drop((child, child_events));
 
@@ -924,7 +1103,6 @@ async fn fork_seeds_a_resumable_child_rollout_with_the_inherited_identity() {
     let (resumed, resumed_events) = Nanocodex::builder(openai())
         .tools(resumed_tools)
         .session_id(thread_id.parse().expect("valid child session ID"))
-        .prompt_cache_key("durable-root-cache-key")
         .resume(snapshot)
         .rollout(rollout)
         .build()
@@ -939,16 +1117,172 @@ async fn fork_seeds_a_resumable_child_rollout_with_the_inherited_identity() {
 
     resumed.shutdown().await.expect("shutdown resumed child");
     root.shutdown().await.expect("shutdown root");
+    let generation_requests = generation_requests.lock().expect("generation request lock");
+    assert_eq!(generation_requests.len(), 3);
+    let live_child_request = &generation_requests[1];
+    let resumed_child_request = &generation_requests[2];
+    assert_eq!(live_child_request.session_id, child_session_id);
+    assert_eq!(resumed_child_request.session_id, child_session_id);
+    assert_eq!(
+        live_child_request.prompt_cache_key,
+        "durable-root-cache-key"
+    );
+    assert_eq!(
+        resumed_child_request.prompt_cache_key,
+        "durable-root-cache-key"
+    );
+    assert_eq!(
+        serde_json::to_vec(&live_child_request.prefix).expect("encode live child prefix"),
+        serde_json::to_vec(&resumed_child_request.prefix).expect("encode resumed child prefix")
+    );
+    assert!(
+        serde_json::to_string(&resumed_child_request.input)
+            .expect("encode resumed child input")
+            .contains("live child continuation")
+    );
     drop((resumed, resumed_events, root_events));
 }
 
+#[tokio::test]
+async fn nested_fork_seeds_a_grandchild_rollout_before_its_first_prompt() {
+    let home = tempdir().expect("temporary rollout home");
+    let generation_requests = Arc::new(Mutex::new(Vec::new()));
+    let openai = || {
+        let generation_requests = Arc::clone(&generation_requests);
+        OpenAi::builder("test")
+            .service(move || CheckpointLifecycleService {
+                generation_requests: Arc::clone(&generation_requests),
+            })
+            .build()
+            .expect("test OpenAI client")
+    };
+    let tools = Tools::builder()
+        .without_defaults()
+        .build()
+        .expect("empty tools");
+    let root_session_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    let (root, root_events) = Nanocodex::builder(openai())
+        .tools(tools)
+        .session_id(root_session_id.parse().expect("valid root session ID"))
+        .prompt_cache_key("durable-root-cache-key")
+        .rollout(RolloutConfig::new(home.path()))
+        .build()
+        .expect("root agent with rollout");
+    root.prompt("durable root boundary")
+        .await
+        .expect("root turn")
+        .result()
+        .await
+        .expect("completed root turn");
+
+    let (child, child_events) = root.fork().await.expect("durable child fork");
+    child
+        .prompt("durable child boundary")
+        .await
+        .expect("child turn")
+        .result()
+        .await
+        .expect("completed child turn");
+    let (grandchild, grandchild_events) = child.fork().await.expect("durable grandchild fork");
+    let grandchild_session_id = grandchild.session_id().to_string();
+    let grandchild_rollout = grandchild
+        .rollout()
+        .expect("grandchild records its own rollout")
+        .path()
+        .to_path_buf();
+
+    grandchild
+        .shutdown()
+        .await
+        .expect("shutdown unprompted grandchild");
+    drop((grandchild, grandchild_events));
+
+    let durable = RolloutConfig::new(home.path())
+        .load_session(&grandchild_session_id)
+        .expect("grandchild rollout is resumable before its first prompt");
+    let snapshot = serde_json::to_value(durable.snapshot()).expect("encode grandchild snapshot");
+    assert_eq!(snapshot["lineage_id"], root_session_id);
+    assert_eq!(snapshot["prompt_cache_key"], "durable-root-cache-key");
+    assert!(
+        snapshot["history"]
+            .to_string()
+            .contains("durable root boundary")
+    );
+    assert!(
+        snapshot["history"]
+            .to_string()
+            .contains("durable child boundary")
+    );
+    let seeded_grandchild_lines = std::fs::read_to_string(&grandchild_rollout)
+        .expect("read seeded grandchild rollout")
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<serde_json::Result<Vec<_>>>()
+        .expect("decode seeded grandchild rollout");
+    assert!(
+        !seeded_grandchild_lines
+            .iter()
+            .any(|line| line["type"] == "event_msg"),
+        "the seed must not manufacture an unprompted grandchild task"
+    );
+
+    let (thread_id, snapshot, rollout) = durable.into_parts();
+    let resumed_tools = Tools::builder()
+        .without_defaults()
+        .build()
+        .expect("empty resumed tools");
+    let (resumed, resumed_events) = Nanocodex::builder(openai())
+        .tools(resumed_tools)
+        .session_id(thread_id.parse().expect("valid grandchild session ID"))
+        .resume(snapshot)
+        .rollout(rollout)
+        .build()
+        .expect("resume grandchild from its own rollout");
+    resumed
+        .prompt("resumed grandchild continuation")
+        .await
+        .expect("resumed grandchild turn")
+        .result()
+        .await
+        .expect("completed resumed grandchild turn");
+
+    resumed
+        .shutdown()
+        .await
+        .expect("shutdown resumed grandchild");
+    child.shutdown().await.expect("shutdown child");
+    root.shutdown().await.expect("shutdown root");
+    let generation_requests = generation_requests.lock().expect("generation request lock");
+    let resumed_grandchild_request = generation_requests
+        .iter()
+        .find(|request| request.session_id == grandchild_session_id)
+        .expect("resumed grandchild request");
+    assert_eq!(
+        resumed_grandchild_request.prompt_cache_key,
+        "durable-root-cache-key"
+    );
+    assert!(
+        serde_json::to_string(&resumed_grandchild_request.input)
+            .expect("encode resumed grandchild input")
+            .contains("durable child boundary")
+    );
+    drop((
+        resumed,
+        resumed_events,
+        child,
+        child_events,
+        root,
+        root_events,
+    ));
+}
+
 async fn assert_failed_public_fork_does_not_publish_a_child_rollout(config: RolloutConfig) {
-    let generation_inputs = Arc::new(Mutex::new(Vec::new()));
+    let generation_requests = Arc::new(Mutex::new(Vec::new()));
     let openai = OpenAi::builder("test")
         .service({
-            let generation_inputs = Arc::clone(&generation_inputs);
+            let generation_requests = Arc::clone(&generation_requests);
             move || CheckpointLifecycleService {
-                generation_inputs: Arc::clone(&generation_inputs),
+                generation_requests: Arc::clone(&generation_requests),
             }
         })
         .build()
@@ -1012,12 +1346,12 @@ async fn failed_public_fork_publish_does_not_publish_a_child_rollout() {
 #[tokio::test]
 async fn compacted_parent_fork_runs_and_resumes_from_the_child_rollout() {
     let home = tempdir().expect("temporary rollout home");
-    let generation_inputs = Arc::new(Mutex::new(Vec::new()));
+    let generation_requests = Arc::new(Mutex::new(Vec::new()));
     let openai = || {
-        let generation_inputs = Arc::clone(&generation_inputs);
+        let generation_requests = Arc::clone(&generation_requests);
         OpenAi::builder("test")
             .service(move || CheckpointLifecycleService {
-                generation_inputs: Arc::clone(&generation_inputs),
+                generation_requests: Arc::clone(&generation_requests),
             })
             .build()
             .expect("test OpenAI client")
@@ -1152,12 +1486,13 @@ async fn compacted_parent_fork_runs_and_resumes_from_the_child_rollout() {
     root.shutdown().await.expect("shutdown root");
     drop((resumed, resumed_events, root, root_events));
 
-    let generations = generation_inputs.lock().expect("generation input lock");
+    let generations = generation_requests.lock().expect("generation request lock");
     assert_eq!(generations.len(), 3);
-    let child_input = serde_json::to_string(&generations[1]).expect("encode child request");
+    let child_input = serde_json::to_string(&generations[1].input).expect("encode child request");
     assert_eq!(child_input.matches("child continuation").count(), 1);
     assert!(child_input.contains("opaque-summary"));
-    let resumed_input = serde_json::to_string(&generations[2]).expect("encode resumed request");
+    let resumed_input =
+        serde_json::to_string(&generations[2].input).expect("encode resumed request");
     assert_eq!(
         resumed_input.matches("resumed child continuation").count(),
         1
