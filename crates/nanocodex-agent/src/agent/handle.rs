@@ -69,7 +69,9 @@ impl AgentHandle {
     }
 
     fn commands(&self) -> Result<mpsc::Sender<Command>> {
-        self.commands.upgrade().ok_or(NanocodexError::AgentStopped)
+        self.commands
+            .upgrade()
+            .ok_or_else(|| self.failure.error_or_stopped())
     }
 }
 
@@ -203,7 +205,7 @@ impl Nanocodex {
             .await
             .is_err()
         {
-            return Err(NanocodexError::AgentStopped);
+            return Err(self.failure.error_or_stopped());
         }
         Ok(Turn {
             control: TurnControl {
@@ -257,11 +259,11 @@ impl Nanocodex {
             .await
             .is_err()
         {
-            return Err(NanocodexError::AgentStopped);
+            return Err(self.failure.error_or_stopped());
         }
         match route_receiver
             .await
-            .map_err(|_| NanocodexError::AgentStopped)??
+            .map_err(|_| self.failure.error_or_stopped())??
         {
             PromptRouteKind::Started => Ok(PromptRoute::Started(Turn {
                 control: TurnControl {
@@ -454,6 +456,6 @@ pub(super) async fn request_command<T>(
     commands
         .send(command(result))
         .await
-        .map_err(|_| NanocodexError::AgentStopped)?;
-    receiver.await.map_err(|_| NanocodexError::AgentStopped)?
+        .map_err(|_| failure.error_or_stopped())?;
+    receiver.await.map_err(|_| failure.error_or_stopped())?
 }

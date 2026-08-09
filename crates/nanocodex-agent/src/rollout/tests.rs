@@ -818,6 +818,7 @@ async fn failed_initial_seed_is_discarded_without_a_partial_checkpoint() {
 async fn partial_initial_seed_is_rolled_back_to_session_metadata() {
     let home = tempdir().expect("temporary rollout directory");
     let recorder = recorder(home.path());
+    let prefix = std::fs::read(recorder.info().path()).expect("read session metadata prefix");
     recorder.inject_write_failure_after(1).await;
 
     assert!(
@@ -838,4 +839,8 @@ async fn partial_initial_seed_is_rolled_back_to_session_metadata() {
     let lines = lines(&recorder);
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0]["type"], "session_meta");
+    assert_eq!(
+        std::fs::read(recorder.info().path()).expect("read rolled-back rollout"),
+        prefix
+    );
 }

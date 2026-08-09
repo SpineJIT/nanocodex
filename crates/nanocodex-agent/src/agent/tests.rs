@@ -1,5 +1,6 @@
 use std::{
     future::{Future, ready},
+    path::PathBuf,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -14,7 +15,7 @@ use nanocodex_oai_api::{
     },
 };
 use tempfile::tempdir;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tower::Service;
 
 use super::*;
@@ -239,6 +240,47 @@ impl Service<ResponsesAttempt> for DelayedCompletedService {
 }
 
 #[tokio::test]
+async fn closed_command_channel_returns_recorded_persistence_failure() {
+    let (commands, receiver) = mpsc::channel(1);
+    let (blocked_result, _blocked_receiver) = oneshot::channel();
+    commands
+        .send(Command::SetFastMode {
+            enabled: true,
+            result: blocked_result,
+        })
+        .await
+        .expect("fill the command channel");
+    let failure = DriverFailure::default();
+    let attempted_send = Arc::new(Notify::new());
+    let request = tokio::spawn({
+        let commands = commands.clone();
+        let failure = failure.clone();
+        let attempted_send = Arc::clone(&attempted_send);
+        async move {
+            request_command(&commands, &failure, move |result| {
+                attempted_send.notify_one();
+                Command::SetFastMode {
+                    enabled: true,
+                    result,
+                }
+            })
+            .await
+        }
+    });
+    attempted_send.notified().await;
+    failure.record(crate::error::PersistRolloutFailure::new(
+        PathBuf::from("rollout.jsonl"),
+        std::io::Error::other("durability failed"),
+    ));
+    drop(receiver);
+
+    assert!(matches!(
+        request.await.expect("request task completes"),
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+}
+
+#[tokio::test]
 async fn rollout_persistence_failure_fail_stops_current_and_queued_turns() {
     use std::sync::atomic::Ordering;
 
@@ -283,6 +325,10 @@ async fn rollout_persistence_failure_fail_stops_current_and_queued_turns() {
         .prompt("must not run after persistence failure")
         .await
         .expect("queued turn");
+    queued
+        .cancel()
+        .await
+        .expect("cancel queued turn before persistence failure");
     release.send(()).expect("release first generation");
 
     assert!(matches!(
@@ -530,6 +576,11 @@ async fn compacted_parent_fork_runs_and_resumes_from_the_child_rollout() {
 
     let (child, child_events) = root.fork().await.expect("durable fork");
     let child_session_id = child.session_id().to_string();
+    let child_rollout = child
+        .rollout()
+        .expect("fork records its own rollout")
+        .path()
+        .to_path_buf();
     child
         .prompt("child continuation")
         .await
@@ -537,6 +588,34 @@ async fn compacted_parent_fork_runs_and_resumes_from_the_child_rollout() {
         .result()
         .await
         .expect("completed child turn");
+    let child_records = std::fs::read_to_string(&child_rollout)
+        .expect("read child rollout")
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<serde_json::Result<Vec<_>>>()
+        .expect("decode child rollout");
+    assert_eq!(
+        child_records
+            .iter()
+            .filter(|record| {
+                record["type"] == "response_item"
+                    && record["payload"]["type"] == "compaction"
+                    && record["payload"]["encrypted_content"] == "opaque-summary"
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        child_records
+            .iter()
+            .filter(|record| {
+                record["type"] == "event_msg"
+                    && record["payload"]["type"] == "user_message"
+                    && record["payload"]["message"] == "child continuation"
+            })
+            .count(),
+        1
+    );
     child.shutdown().await.expect("shutdown child");
     drop((child, child_events));
 
@@ -563,6 +642,45 @@ async fn compacted_parent_fork_runs_and_resumes_from_the_child_rollout() {
         .result()
         .await
         .expect("completed resumed child turn");
+    let resumed_records = std::fs::read_to_string(&child_rollout)
+        .expect("read resumed rollout")
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<serde_json::Result<Vec<_>>>()
+        .expect("decode resumed rollout");
+    assert_eq!(
+        resumed_records
+            .iter()
+            .filter(|record| {
+                record["type"] == "response_item"
+                    && record["payload"]["type"] == "compaction"
+                    && record["payload"]["encrypted_content"] == "opaque-summary"
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        resumed_records
+            .iter()
+            .filter(|record| {
+                record["type"] == "event_msg"
+                    && record["payload"]["type"] == "user_message"
+                    && record["payload"]["message"] == "child continuation"
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        resumed_records
+            .iter()
+            .filter(|record| {
+                record["type"] == "event_msg"
+                    && record["payload"]["type"] == "user_message"
+                    && record["payload"]["message"] == "resumed child continuation"
+            })
+            .count(),
+        1
+    );
     resumed.shutdown().await.expect("shutdown resumed child");
     root.shutdown().await.expect("shutdown root");
     drop((resumed, resumed_events, root, root_events));

@@ -26,6 +26,10 @@ impl DriverFailure {
         };
         state.clone().map(PersistRolloutFailure::into_error)
     }
+
+    pub(in crate::agent) fn error_or_stopped(&self) -> NanocodexError {
+        self.error().unwrap_or(NanocodexError::AgentStopped)
+    }
 }
 
 type SharedShutdownResult = std::result::Result<(), Arc<NanocodexError>>;
