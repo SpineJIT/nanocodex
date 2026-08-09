@@ -293,7 +293,7 @@ async function runPrompt(
     const completed: TurnCompleted = {
       type: "turn_completed",
       id: request.id,
-      final_message: result.finalMessage,
+      final_message: result.completion.type === "message" ? result.completion.finalMessage : "",
       usage: result.usage,
     };
     const payload = JSON.stringify(completed);
