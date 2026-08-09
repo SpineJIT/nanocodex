@@ -303,7 +303,6 @@ impl RolloutRecorder {
             base_instructions: BaseInstructions {
                 text: instructions.to_owned(),
             },
-            nanocodex_resume_policy: config.audit_only.then_some("audit_only"),
             history_mode: "legacy",
             context_window: SessionContextWindow {
                 window_id: initial_window_id.clone(),

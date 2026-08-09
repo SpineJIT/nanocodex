@@ -98,29 +98,6 @@ fn discovery_prefers_an_active_copy_of_a_duplicate_thread() {
     assert!(!sessions[0].is_archived());
 }
 
-#[test]
-fn audit_only_rollout_is_not_discoverable_or_resumable() {
-    let home = tempdir().expect("temporary Codex home");
-    let thread_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
-    write_audit_only_rollout(home.path(), thread_id);
-    let rollouts = RolloutConfig::new(home.path());
-
-    assert!(
-        rollouts
-            .list_sessions()
-            .expect("discover rollouts")
-            .is_empty()
-    );
-    let error = rollouts
-        .load_session(thread_id)
-        .expect_err("audit-only rollouts must not resume");
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    assert_eq!(
-        error.to_string(),
-        "this Nanocodex rollout is audit-only and cannot be resumed"
-    );
-}
-
 fn write_discoverable_rollout(home: &Path, relative: &str, thread_id: &str) -> PathBuf {
     let directory = home.join(relative);
     std::fs::create_dir_all(&directory).expect("create rollout directory");
@@ -166,43 +143,6 @@ fn write_discoverable_rollout(home: &Path, relative: &str, thread_id: &str) -> P
     )
     .expect("write committed history");
     file.flush().expect("flush discoverable rollout");
-    path
-}
-
-fn write_audit_only_rollout(home: &Path, thread_id: &str) -> PathBuf {
-    let directory = home.join("sessions/2026/08/04");
-    std::fs::create_dir_all(&directory).expect("create rollout directory");
-    let path = directory.join(format!("rollout-2026-08-04T12-00-00-{thread_id}.jsonl"));
-    let mut file = File::create(&path).expect("create audit-only rollout");
-    write_line(
-        &mut file,
-        &serde_json::json!({
-            "timestamp": "2026-08-04T12:00:00Z",
-            "type": "session_meta",
-            "payload": {
-                "id": thread_id,
-                "cwd": home,
-                "history_mode": "legacy",
-                "context_window": {"window_id": "window-1"},
-                "nanocodex_resume_policy": "audit_only"
-            }
-        }),
-    )
-    .expect("write session metadata");
-    write_line(
-        &mut file,
-        &serde_json::json!({
-            "timestamp": "2026-08-04T12:00:01Z",
-            "type": "response_item",
-            "payload": {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "audit only"}]
-            }
-        }),
-    )
-    .expect("write response item");
-    file.flush().expect("flush audit-only rollout");
     path
 }
 
@@ -268,19 +208,6 @@ fn lines(recorder: &RolloutRecorder) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(&line.expect("read line")).expect("parse line"))
         .collect()
-}
-
-#[tokio::test]
-async fn audit_only_rollout_writes_a_nonresumable_session_marker() {
-    let home = tempdir().expect("temporary Codex home");
-    let recorder = recorder_with_config(RolloutConfig::new(home.path()).audit_only());
-
-    assert_eq!(
-        lines(&recorder)[0]["payload"]["nanocodex_resume_policy"],
-        "audit_only"
-    );
-
-    recorder.shutdown().await.expect("shutdown rollout");
 }
 
 #[test]

@@ -137,8 +137,6 @@ pub(super) struct SessionMeta {
     pub(super) thread_source: &'static str,
     pub(super) model_provider: &'static str,
     pub(super) base_instructions: BaseInstructions,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) nanocodex_resume_policy: Option<&'static str>,
     pub(super) history_mode: &'static str,
     pub(super) context_window: SessionContextWindow,
 }

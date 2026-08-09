@@ -11,7 +11,7 @@ use crate::{
     app_core::{
         WorkerCapabilities, WorkerCapability, WorkerFactory, WorkerHandle, start_configured_worker,
     },
-    config::{AgentArgs, ConfiguredAgent, RolloutPolicy, ToolCustomizer},
+    config::{AgentArgs, ConfiguredAgent, ToolCustomizer},
     observability::ObservabilityArgs,
     tui::{self, InitialPrompt, WorkerCommand, WorkerEvent},
     vm::VmArgs,
@@ -96,9 +96,7 @@ impl SpineWorkerFactory {
             with_spine_tools(tools, agent, Arc::clone(&runtime_for_tools))
         });
         Ok(Self {
-            configured: config
-                .build_with_tool_customizer(vm, customizer, RolloutPolicy::AuditOnly)
-                .await?,
+            configured: config.build_with_tool_customizer(vm, customizer).await?,
             runtime,
         })
     }
