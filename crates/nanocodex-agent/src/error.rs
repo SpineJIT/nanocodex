@@ -148,6 +148,34 @@ pub enum NanocodexError {
     Tools(#[from] nanocodex_tools::ToolsBuildError),
 }
 
+/// Cloneable description of a failed durable rollout append.
+///
+/// The native driver keeps this after a persistence failure so every command
+/// accepted before the fail-stop boundary receives the same public error
+/// variant without retaining a mutable writer error object.
+#[derive(Clone)]
+pub(crate) struct PersistRolloutFailure {
+    path: PathBuf,
+    source: Arc<io::Error>,
+}
+
+impl PersistRolloutFailure {
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn new(path: PathBuf, source: io::Error) -> Self {
+        Self {
+            path,
+            source: Arc::new(source),
+        }
+    }
+
+    pub(crate) fn into_error(self) -> NanocodexError {
+        NanocodexError::PersistRollout {
+            path: self.path,
+            source: io::Error::new(self.source.kind(), self.source),
+        }
+    }
+}
+
 impl NanocodexError {
     /// Returns the underlying Responses transport/API error, including when a
     /// caller-provided Tower middleware boxed the standard service error.

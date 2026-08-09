@@ -1,4 +1,4 @@
-use crate::{Result, session::CommittedSession};
+use crate::{Result, error::PersistRolloutFailure, session::CommittedSession};
 
 #[derive(Clone, Default)]
 pub(crate) struct DurabilityConfig;
@@ -12,6 +12,8 @@ impl DurabilityConfig {
     pub(crate) const fn start(
         &self,
         _session_id: &str,
+        _lineage_id: &str,
+        _prompt_cache_key: &str,
         _workspace: Option<&str>,
         _instructions: &str,
         _origin_kind: &'static str,
@@ -41,18 +43,36 @@ impl Durability {
         DurabilityTurn
     }
 
-    pub(crate) async fn persist(&self, _checkpoint: &CommittedSession, _turn: DurabilityTurn) {}
+    pub(crate) async fn persist(
+        &self,
+        _checkpoint: &CommittedSession,
+        _turn: DurabilityTurn,
+    ) -> std::result::Result<(), PersistRolloutFailure> {
+        Ok(())
+    }
 
     pub(crate) async fn persist_compaction(
         &self,
         _checkpoint: &CommittedSession,
         _turn: DurabilityTurn,
-    ) {
+    ) -> std::result::Result<(), PersistRolloutFailure> {
+        Ok(())
+    }
+
+    pub(crate) async fn seed_initial_checkpoint(
+        &self,
+        _checkpoint: &CommittedSession,
+        _effort: nanocodex_oai_api::Thinking,
+    ) -> std::result::Result<(), PersistRolloutFailure> {
+        Ok(())
     }
 
     pub(crate) async fn shutdown(&self) -> Result<()> {
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) async fn inject_write_failures(&self, _count: usize) {}
 }
 
 pub(crate) struct DurabilityTurn;

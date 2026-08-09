@@ -75,7 +75,8 @@ impl DurableSession {
         let materialized = materialize_rollout(&rollout_path, thread_id)?;
         let snapshot = SessionSnapshot::from_rollout(
             materialized.model,
-            thread_id.to_owned(),
+            materialized.lineage_id,
+            materialized.prompt_cache_key,
             materialized.workspace,
             materialized.base_instructions,
             materialized.history,
@@ -372,6 +373,7 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
     let mut history = Vec::new();
     let mut transcript = Vec::new();
     let mut context_baseline = None;
+    let mut nanocodex_identity = None;
     let mut model = Model::Sol;
     for (index, line) in BufReader::new(File::open(path)?).lines().enumerate() {
         let line = line?;
@@ -395,6 +397,7 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
                         "Codex rollout thread ID does not match its filename",
                     ));
                 }
+                nanocodex_identity = Some(read_nanocodex_identity(payload, thread_id)?);
                 base_instructions = payload["base_instructions"]["text"]
                     .as_str()
                     .map(str::to_owned);
@@ -488,8 +491,14 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
             ),
         )
     })?;
+    let (lineage_id, prompt_cache_key) = nanocodex_identity.unwrap_or_else(|| {
+        let thread_id = thread_id.to_owned();
+        (thread_id.clone(), thread_id)
+    });
     Ok(MaterializedRollout {
         model,
+        lineage_id,
+        prompt_cache_key,
         workspace,
         base_instructions,
         history,
@@ -500,11 +509,37 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
 
 struct MaterializedRollout {
     model: Model,
+    lineage_id: String,
+    prompt_cache_key: String,
     workspace: String,
     base_instructions: Option<String>,
     history: Vec<ResponseItem>,
     transcript: Vec<RolloutTranscriptItem>,
     context_baseline: Option<ContextBaseline>,
+}
+
+fn read_nanocodex_identity(
+    payload: &serde_json::Value,
+    thread_id: &str,
+) -> io::Result<(String, String)> {
+    let lineage_id = payload.get("nanocodex_lineage_id");
+    let prompt_cache_key = payload.get("nanocodex_prompt_cache_key");
+    match (lineage_id, prompt_cache_key) {
+        (None, None) => Ok((thread_id.to_owned(), thread_id.to_owned())),
+        (Some(serde_json::Value::String(lineage_id)), Some(serde_json::Value::String(key)))
+            if !lineage_id.trim().is_empty() && !key.trim().is_empty() =>
+        {
+            Ok((lineage_id.to_owned(), key.to_owned()))
+        }
+        (Some(_), Some(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Nanocodex rollout lineage and prompt cache key must be non-empty strings",
+        )),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Nanocodex rollout lineage and prompt cache key must be recorded together",
+        )),
+    }
 }
 
 pub(in crate::rollout) fn visible_rollout_event(

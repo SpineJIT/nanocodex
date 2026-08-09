@@ -100,6 +100,7 @@ impl Future for Turn {
 pub struct TurnControl {
     pub(super) key: TurnKey,
     pub(super) commands: mpsc::Sender<Command>,
+    pub(super) failure: DriverFailure,
 }
 
 impl TurnControl {
@@ -116,7 +117,7 @@ impl TurnControl {
                 "steer instruction must not be empty".to_owned(),
             ));
         }
-        request_command(&self.commands, |result| Command::Steer {
+        request_command(&self.commands, &self.failure, |result| Command::Steer {
             key: self.key,
             prompt,
             result,
@@ -131,7 +132,7 @@ impl TurnControl {
     /// Returns an error when the turn has already finished or if the driver
     /// stops.
     pub async fn cancel(&self) -> Result<()> {
-        request_command(&self.commands, |result| Command::Cancel {
+        request_command(&self.commands, &self.failure, |result| Command::Cancel {
             key: self.key,
             result,
         })

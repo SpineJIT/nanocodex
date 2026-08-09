@@ -4,9 +4,9 @@ mod telemetry;
 
 use super::*;
 pub(super) use branch::{AgentOrigin, BranchSpawner};
-pub(super) use control::DriverShutdown;
+pub(super) use control::{DriverFailure, DriverShutdown};
 use control::{
-    TurnDefaults, begin_shutdown, cancel_queued_turn, handle_idle_command,
+    TurnDefaults, begin_fail_stop, begin_shutdown, cancel_queued_turn, handle_idle_command,
     mark_all_queued_turns_cancelled,
 };
 use telemetry::{ReasoningSettings, agent_compact_span, agent_turn_span};
@@ -23,6 +23,7 @@ pub(super) struct AgentDriver<S> {
     pub(super) initial_model: Option<PreparedCheckpoint>,
     pub(super) origin: AgentOrigin,
     pub(super) durability: Durability,
+    pub(super) failure: DriverFailure,
 }
 
 impl<S> AgentDriver<S>
@@ -346,7 +347,8 @@ where
                                             },
                                             session_id.as_str(),
                                             self.workspace.clone(),
-                                        );
+                                        )
+                                        .await;
                                     }
                                     Some(Command::SetThinking { thinking, result }) => {
                                         default_thinking = thinking;
@@ -398,18 +400,23 @@ where
                                 thread_model,
                                 checkpoint,
                             ));
-                            // The installed in-memory boundary is authoritative.
-                            // Rollout writes follow the same retry-on-flush
-                            // contract as completed prompt turns and must not
-                            // roll back or hide the safe fork checkpoint.
-                            latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
-                            self.durability
+                            match self
+                                .durability
                                 .persist_compaction(
                                     &checkpoint,
                                     durability_turn.completed_without_message(),
                                 )
-                                .await;
-                            Ok(())
+                                .await
+                            {
+                                Ok(()) => {
+                                    latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                                    Ok(())
+                                }
+                                Err(failure) => {
+                                    self.failure.record(failure);
+                                    Err(self.failure.error().expect("persistence failure recorded"))
+                                }
+                            }
                         }
                         Ok(ModelCompactOutcome::Cancelled(checkpoint)) => {
                             let checkpoint = Arc::new(CommittedSession::new(
@@ -417,22 +424,31 @@ where
                                 thread_model,
                                 checkpoint,
                             ));
-                            latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
                             let durability_turn = if compact_replaced {
                                 durability_turn.replaced()
                             } else {
                                 durability_turn.interrupted()
                             };
-                            self.durability
+                            match self
+                                .durability
                                 .persist(&checkpoint, durability_turn)
                                 .instrument(span.clone())
-                                .await;
-                            model.replace_client(ResponsesClient::new((self
-                                .spawner
-                                .service_factory)(
-                                Arc::clone(&self.spawner.config),
-                            )));
-                            Err(NanocodexError::TurnCancelled)
+                                .await
+                            {
+                                Ok(()) => {
+                                    latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                                    model.replace_client(ResponsesClient::new((self
+                                        .spawner
+                                        .service_factory)(
+                                        Arc::clone(&self.spawner.config),
+                                    )));
+                                    Err(NanocodexError::TurnCancelled)
+                                }
+                                Err(failure) => {
+                                    self.failure.record(failure);
+                                    Err(self.failure.error().expect("persistence failure recorded"))
+                                }
+                            }
                         }
                         Ok(ModelCompactOutcome::Failed { error, checkpoint }) => {
                             let checkpoint = Arc::new(CommittedSession::new(
@@ -440,12 +456,21 @@ where
                                 thread_model,
                                 checkpoint,
                             ));
-                            latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
-                            self.durability
+                            match self
+                                .durability
                                 .persist(&checkpoint, durability_turn.failed())
                                 .instrument(span.clone())
-                                .await;
-                            Err(error)
+                                .await
+                            {
+                                Ok(()) => {
+                                    latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                                    Err(error)
+                                }
+                                Err(failure) => {
+                                    self.failure.record(failure);
+                                    Err(self.failure.error().expect("persistence failure recorded"))
+                                }
+                            }
                         }
                         Err(error) => Err(error),
                     };
@@ -476,7 +501,13 @@ where
                             )));
                         }
                     }
+                    let failed_persistence = self.failure.error().is_some();
                     drop(result.send(outcome));
+                    if failed_persistence {
+                        begin_fail_stop(&mut self.commands, &mut queued_turns, &self.failure).await;
+                        model.shutdown().await;
+                        return Ok(());
+                    }
                     continue;
                 }
                 handle_idle_command(
@@ -490,7 +521,8 @@ where
                     },
                     session_id.as_str(),
                     self.workspace.clone(),
-                );
+                )
+                .await;
                 continue;
             };
             let thinking = thinking.unwrap_or(default_thinking);
@@ -669,7 +701,8 @@ where
                                     },
                                     session_id.as_str(),
                                     self.workspace.clone(),
-                                );
+                                )
+                                .await;
                             }
                             Some(Command::SetThinking { thinking, result }) => {
                                 default_thinking = thinking;
@@ -751,19 +784,31 @@ where
                             durability_turn.completed_without_message()
                         }
                     };
-                    self.durability
+                    match self
+                        .durability
                         .persist(&checkpoint, durability_turn)
                         .instrument(turn_span.clone())
-                        .await;
-                    latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
-                    (
-                        Ok(TurnResult {
-                            completion,
-                            usage,
-                            checkpoint,
-                        }),
-                        false,
-                    )
+                        .await
+                    {
+                        Ok(()) => {
+                            latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                            (
+                                Ok(TurnResult {
+                                    completion,
+                                    usage,
+                                    checkpoint,
+                                }),
+                                false,
+                            )
+                        }
+                        Err(failure) => {
+                            self.failure.record(failure);
+                            (
+                                Err(self.failure.error().expect("persistence failure recorded")),
+                                false,
+                            )
+                        }
+                    }
                 }
                 Ok(ModelTurnOutcome::Cancelled(checkpoint)) => {
                     let checkpoint = Arc::new(CommittedSession::new(
@@ -772,15 +817,29 @@ where
                         checkpoint,
                     ));
                     let durability_turn = durability_turn.interrupted();
-                    self.durability
+                    match self
+                        .durability
                         .persist(&checkpoint, durability_turn)
                         .instrument(turn_span.clone())
-                        .await;
-                    latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
-                    model.replace_client(ResponsesClient::new((self.spawner.service_factory)(
-                        Arc::clone(&self.spawner.config),
-                    )));
-                    (Err(NanocodexError::TurnCancelled), true)
+                        .await
+                    {
+                        Ok(()) => {
+                            latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                            model.replace_client(ResponsesClient::new((self
+                                .spawner
+                                .service_factory)(
+                                Arc::clone(&self.spawner.config),
+                            )));
+                            (Err(NanocodexError::TurnCancelled), true)
+                        }
+                        Err(failure) => {
+                            self.failure.record(failure);
+                            (
+                                Err(self.failure.error().expect("persistence failure recorded")),
+                                false,
+                            )
+                        }
+                    }
                 }
                 Ok(ModelTurnOutcome::Failed { error, checkpoint }) => {
                     let checkpoint = Arc::new(CommittedSession::new(
@@ -789,12 +848,24 @@ where
                         checkpoint,
                     ));
                     let durability_turn = durability_turn.failed();
-                    self.durability
+                    match self
+                        .durability
                         .persist(&checkpoint, durability_turn)
                         .instrument(turn_span.clone())
-                        .await;
-                    latest_fork_checkpoint = Some(checkpoint);
-                    (Err(error), false)
+                        .await
+                    {
+                        Ok(()) => {
+                            latest_fork_checkpoint = Some(checkpoint);
+                            (Err(error), false)
+                        }
+                        Err(failure) => {
+                            self.failure.record(failure);
+                            (
+                                Err(self.failure.error().expect("persistence failure recorded")),
+                                false,
+                            )
+                        }
+                    }
                 }
                 Err(error) => (Err(error), false),
             };
@@ -812,7 +883,13 @@ where
                 "otel.status_code",
                 if outcome.is_ok() { "OK" } else { "ERROR" },
             );
+            let failed_persistence = self.failure.error().is_some();
             drop(result.send(outcome));
+            if failed_persistence {
+                begin_fail_stop(&mut self.commands, &mut queued_turns, &self.failure).await;
+                model.shutdown().await;
+                return Ok(());
+            }
             for text in pending_developer_messages.drain(..) {
                 if let Some(checkpoint) = model.append_developer_message(text) {
                     latest_fork_checkpoint = Some(Arc::new(CommittedSession::new(

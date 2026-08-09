@@ -1,4 +1,32 @@
 use super::*;
+use crate::error::PersistRolloutFailure;
+
+#[derive(Clone, Default)]
+pub(in crate::agent) struct DriverFailure {
+    state: Arc<std::sync::Mutex<Option<PersistRolloutFailure>>>,
+}
+
+impl DriverFailure {
+    pub(in crate::agent) fn check(&self) -> Result<()> {
+        self.error().map_or(Ok(()), Err)
+    }
+
+    pub(in crate::agent) fn record(&self, failure: PersistRolloutFailure) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.get_or_insert(failure);
+    }
+
+    pub(in crate::agent) fn error(&self) -> Option<NanocodexError> {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.clone().map(PersistRolloutFailure::into_error)
+    }
+}
 
 type SharedShutdownResult = std::result::Result<(), Arc<NanocodexError>>;
 
@@ -128,6 +156,60 @@ pub(super) fn mark_all_queued_turns_cancelled(queued_turns: &mut VecDeque<Queued
     }));
 }
 
+pub(super) async fn begin_fail_stop(
+    commands: &mut mpsc::Receiver<Command>,
+    queued_turns: &mut VecDeque<QueuedTurn>,
+    failure: &DriverFailure,
+) {
+    commands.close();
+    while let Some(command) = commands.recv().await {
+        fail_command(command, failure);
+    }
+    for queued in std::mem::take(queued_turns) {
+        match queued {
+            QueuedTurn::Pending { result, .. } | QueuedTurn::Cancelled { result, .. } => {
+                drop(result.send(Err(failure_error(failure))));
+            }
+        }
+    }
+}
+
+fn fail_command(command: Command, failure: &DriverFailure) {
+    match command {
+        Command::Prompt { result, .. } => {
+            drop(result.send(Err(failure_error(failure))));
+        }
+        Command::RoutePrompt {
+            route_result,
+            turn_result,
+            ..
+        } => {
+            drop(route_result.send(Err(failure_error(failure))));
+            drop(turn_result.send(Err(failure_error(failure))));
+        }
+        Command::Fork { result, .. } | Command::Spawn { result } => {
+            drop(result.send(Err(failure_error(failure))));
+        }
+        Command::Steer { result, .. }
+        | Command::Cancel { result, .. }
+        | Command::SetThinking { result, .. }
+        | Command::SetFastMode { result, .. }
+        | Command::Compact { result, .. } => {
+            drop(result.send(Err(failure_error(failure))));
+        }
+        Command::AppendDeveloperMessage { result, .. } => {
+            drop(result.send(Err(failure_error(failure))));
+        }
+        Command::Shutdown => {}
+    }
+}
+
+fn failure_error(failure: &DriverFailure) -> NanocodexError {
+    failure
+        .error()
+        .expect("a failed agent driver always records its persistence error")
+}
+
 pub(super) async fn begin_shutdown(
     commands: &mut mpsc::Receiver<Command>,
     queued_turns: &mut VecDeque<QueuedTurn>,
@@ -190,7 +272,7 @@ pub(super) struct TurnDefaults {
     pub(super) fast_mode: bool,
 }
 
-pub(super) fn handle_idle_command<S>(
+pub(super) async fn handle_idle_command<S>(
     command: Command,
     latest: Option<&Arc<CommittedSession>>,
     spawner: &BranchSpawner<S>,
@@ -205,17 +287,20 @@ pub(super) fn handle_idle_command<S>(
     match command {
         Command::Fork { checkpoint, result } => {
             let checkpoint = checkpoint.or_else(|| latest.cloned());
-            let outcome = checkpoint
-                .ok_or(NanocodexError::ForkBeforeCompletedTurn)
-                .and_then(|checkpoint| {
-                    spawner.spawn_fork(
-                        &checkpoint,
-                        session_id,
-                        defaults.model,
-                        defaults.thinking,
-                        defaults.fast_mode,
-                    )
-                });
+            let outcome = match checkpoint {
+                Some(checkpoint) => {
+                    spawner
+                        .spawn_fork(
+                            checkpoint,
+                            session_id,
+                            defaults.model,
+                            defaults.thinking,
+                            defaults.fast_mode,
+                        )
+                        .await
+                }
+                None => Err(NanocodexError::ForkBeforeCompletedTurn),
+            };
             drop(result.send(outcome));
         }
         Command::Spawn { result } => {

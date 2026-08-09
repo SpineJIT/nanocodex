@@ -7,7 +7,7 @@ mod tests;
 
 pub use load::{DurableSession, RolloutSessionInfo, RolloutTranscriptItem};
 pub use store::RolloutInfo;
-pub(crate) use store::{RolloutOrigin, RolloutRecorder, RolloutTurn};
+pub(crate) use store::{RolloutIdentity, RolloutOrigin, RolloutRecorder, RolloutTurn};
 
 use std::{
     fs::File,

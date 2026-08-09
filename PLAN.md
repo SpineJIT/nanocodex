@@ -114,6 +114,11 @@ not let an unreviewed upstream change silently redefine Nanocodex behavior.
 
 ### 3. Application-owned terminals and managed sessions
 
+- Keep the generic native session boundary durable: do not return a completed
+  turn before its paired rollout boundary is synced; fail-stop instead of
+  retrying a failed append. A fork must seed its own standard rollout before it
+  becomes addressable, preserving its unique session ID while retaining the
+  lineage and prompt-cache key needed for correct durable resume.
 - Rebase and finish the narrow application-owned terminal contract in
   [PR #79](https://github.com/gakonst/nanocodex/pull/79). Retained process state,
   cancellation, output bounds, and descendant cleanup remain owned by the

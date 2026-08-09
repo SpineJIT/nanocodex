@@ -184,6 +184,10 @@ fn recorder(home: &Path) -> RolloutRecorder {
         &Handle::current(),
         &RolloutConfig::new(home),
         "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+        RolloutIdentity {
+            lineage_id: "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+            prompt_cache_key: "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+        },
         Path::new("/worktree"),
         "base instructions",
         RolloutOrigin {
@@ -298,6 +302,8 @@ fn loads_codex_rollout_without_a_nanocodex_sidecar() {
     assert_eq!(session.model(), Model::Sol);
     let snapshot = serde_json::to_value(session.snapshot()).expect("encode snapshot");
     assert!(snapshot.get("request_prefix").is_none());
+    assert_eq!(snapshot["lineage_id"], thread_id);
+    assert_eq!(snapshot["prompt_cache_key"], thread_id);
     assert_eq!(snapshot["history"].as_array().map(Vec::len), Some(2));
     let history = snapshot["history"].to_string();
     assert!(history.contains("retained"));
@@ -311,6 +317,47 @@ fn loads_codex_rollout_without_a_nanocodex_sidecar() {
             RolloutTranscriptItem::Assistant("visible answer".to_owned()),
         ]
     );
+}
+
+#[test]
+fn rejects_partial_nanocodex_session_identity_metadata() {
+    let home = tempdir().expect("temporary Codex home");
+    let thread_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    let directory = home.path().join("sessions/2026/08/09");
+    std::fs::create_dir_all(&directory).expect("create rollout directory");
+    let path = directory.join(format!("rollout-2026-08-09T12-00-00-{thread_id}.jsonl"));
+    let mut file = File::create(&path).expect("create rollout");
+    for value in [
+        serde_json::json!({
+            "timestamp": "2026-08-09T12:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "cwd": home.path(),
+                "history_mode": "legacy",
+                "context_window": {"window_id": "window-1"},
+                "nanocodex_lineage_id": "019c0d31-c308-7d91-bff4-5dca82d15ac5"
+            }
+        }),
+        serde_json::json!({
+            "timestamp": "2026-08-09T12:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "resume"}]
+            }
+        }),
+    ] {
+        write_line(&mut file, &value).expect("write rollout line");
+    }
+    file.flush().expect("flush rollout");
+
+    let error = RolloutConfig::new(home.path())
+        .load_session(thread_id)
+        .expect_err("partial Nanocodex identity must not silently change cache lineage");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("must be recorded together"));
 }
 
 #[test]
@@ -495,6 +542,14 @@ async fn writes_codex_rollout_envelope_and_committed_items() {
         lines[0]["payload"]["id"],
         "019c0d31-c308-7d91-bff4-5dca82d15ac6"
     );
+    assert_eq!(
+        lines[0]["payload"]["nanocodex_lineage_id"],
+        "019c0d31-c308-7d91-bff4-5dca82d15ac6"
+    );
+    assert_eq!(
+        lines[0]["payload"]["nanocodex_prompt_cache_key"],
+        "019c0d31-c308-7d91-bff4-5dca82d15ac6"
+    );
     assert_eq!(lines[0]["payload"]["source"], "cli");
     assert_eq!(lines[0]["payload"]["history_mode"], "legacy");
     assert!(lines[0]["payload"]["context_window"]["window_id"].is_string());
@@ -603,6 +658,10 @@ async fn resumed_writer_repairs_a_rollout_behind_the_durable_boundary() {
         &Handle::current(),
         &config,
         "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+        RolloutIdentity {
+            lineage_id: "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+            prompt_cache_key: "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+        },
         Path::new("/worktree"),
         "base instructions",
         RolloutOrigin {
@@ -681,6 +740,10 @@ async fn fork_metadata_retains_parent_identity() {
         &Handle::current(),
         &RolloutConfig::new(home.path()),
         "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+        RolloutIdentity {
+            lineage_id: parent,
+            prompt_cache_key: parent,
+        },
         Path::new("/worktree"),
         "base instructions",
         RolloutOrigin {
@@ -697,7 +760,7 @@ async fn fork_metadata_retains_parent_identity() {
 }
 
 #[tokio::test]
-async fn failed_append_remains_pending_and_retries_without_duplicates() {
+async fn failed_append_is_discarded_and_later_flush_does_not_retry_it() {
     let home = tempdir().expect("temporary rollout directory");
     let path = home.path().join("rollout.jsonl");
     let file = File::create(&path).expect("create temporary rollout");
@@ -714,13 +777,39 @@ async fn failed_append_remains_pending_and_retries_without_duplicates() {
     writer.inject_write_failures(2);
 
     assert!(writer.persist_pending().await.is_err());
-    assert!(writer.pending.is_some());
-    writer.flush().await.expect("retry pending append");
+    assert!(writer.pending.is_none());
+    writer.flush().await.expect("flush after discarded append");
     drop(writer);
 
-    let lines = BufReader::new(File::open(path).expect("open retried rollout"))
+    let lines = BufReader::new(File::open(path).expect("open discarded rollout"))
         .lines()
         .collect::<io::Result<Vec<_>>>()
-        .expect("read retried rollout");
-    assert_eq!(lines.len(), 7);
+        .expect("read discarded rollout");
+    assert!(lines.is_empty());
+}
+
+#[tokio::test]
+async fn failed_initial_seed_is_discarded_without_a_partial_checkpoint() {
+    let home = tempdir().expect("temporary rollout directory");
+    let recorder = recorder(home.path());
+    recorder.inject_write_failures(1).await;
+
+    assert!(
+        recorder
+            .seed_initial_history(
+                ResponseHistory::new(vec![message("inherited boundary")]),
+                0,
+                Thinking::High,
+            )
+            .await
+            .is_err()
+    );
+    recorder
+        .flush()
+        .await
+        .expect("flush cannot retry a failed seed");
+
+    let lines = lines(&recorder);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["type"], "session_meta");
 }

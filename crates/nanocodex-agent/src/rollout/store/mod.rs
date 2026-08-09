@@ -37,7 +37,18 @@ pub(crate) struct RolloutOrigin<'a> {
     pub(crate) parent_thread_id: Option<&'a str>,
 }
 
+/// Nanocodex identity retained in otherwise Codex-compatible session metadata.
+#[derive(Clone, Copy)]
+pub(crate) struct RolloutIdentity<'a> {
+    pub(crate) lineage_id: &'a str,
+    pub(crate) prompt_cache_key: &'a str,
+}
+
 enum RolloutCommand {
+    SeedInitialCheckpoint {
+        seed: Box<RolloutSeed>,
+        result: oneshot::Sender<io::Result<()>>,
+    },
     Commit {
         commit: Box<RolloutCommit>,
         result: oneshot::Sender<io::Result<()>>,
@@ -48,6 +59,11 @@ enum RolloutCommand {
     Shutdown {
         result: oneshot::Sender<io::Result<()>>,
     },
+    #[cfg(test)]
+    InjectWriteFailures {
+        count: usize,
+        result: oneshot::Sender<()>,
+    },
 }
 
 pub(super) struct RolloutCommit {
@@ -56,6 +72,41 @@ pub(super) struct RolloutCommit {
     turn: RolloutTurn,
     model: Model,
     context_baseline: ContextBaseline,
+}
+
+pub(super) struct RolloutSeed {
+    history: ResponseHistory,
+    revision: u64,
+    model: Model,
+    context_baseline: ContextBaseline,
+    effort: Thinking,
+}
+
+impl RolloutSeed {
+    fn from_session(session: &CommittedSession, effort: Thinking) -> Self {
+        Self {
+            history: session.rollout_history(),
+            revision: session.history_revision(),
+            model: session.selected_model(),
+            context_baseline: session.context_baseline().clone(),
+            effort,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn from_history(
+        history: ResponseHistory,
+        revision: u64,
+        effort: Thinking,
+    ) -> Self {
+        Self {
+            history,
+            revision,
+            model: Model::Sol,
+            context_baseline: ContextBaseline::Missing,
+            effort,
+        }
+    }
 }
 
 impl RolloutCommit {
@@ -183,10 +234,12 @@ impl RolloutTurn {
 }
 
 impl RolloutRecorder {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create(
         runtime: &Handle,
         config: &RolloutConfig,
         thread_id: &str,
+        identity: RolloutIdentity<'_>,
         cwd: &Path,
         instructions: &str,
         origin: RolloutOrigin<'_>,
@@ -217,6 +270,8 @@ impl RolloutRecorder {
         let meta = SessionMeta {
             session_id: thread_id.to_owned(),
             id: thread_id.to_owned(),
+            nanocodex_lineage_id: identity.lineage_id.to_owned(),
+            nanocodex_prompt_cache_key: identity.prompt_cache_key.to_owned(),
             forked_from_id: (origin.kind == "fork")
                 .then(|| parent_thread_id.clone())
                 .flatten(),
@@ -321,6 +376,44 @@ impl RolloutRecorder {
             .await
     }
 
+    pub(crate) async fn seed_initial_checkpoint(
+        &self,
+        checkpoint: &CommittedSession,
+        effort: Thinking,
+    ) -> io::Result<()> {
+        let (result, receiver) = oneshot::channel();
+        self.commands
+            .send(RolloutCommand::SeedInitialCheckpoint {
+                seed: Box::new(RolloutSeed::from_session(checkpoint, effort)),
+                result,
+            })
+            .await
+            .map_err(|_| io::Error::other("Codex rollout writer stopped during initial seed"))?;
+        receiver
+            .await
+            .map_err(|_| io::Error::other("Codex rollout writer stopped during initial seed"))?
+    }
+
+    #[cfg(test)]
+    pub(in crate::rollout) async fn seed_initial_history(
+        &self,
+        history: ResponseHistory,
+        revision: u64,
+        effort: Thinking,
+    ) -> io::Result<()> {
+        let (result, receiver) = oneshot::channel();
+        self.commands
+            .send(RolloutCommand::SeedInitialCheckpoint {
+                seed: Box::new(RolloutSeed::from_history(history, revision, effort)),
+                result,
+            })
+            .await
+            .expect("test rollout writer remains available");
+        receiver
+            .await
+            .expect("test rollout writer accepts initial seed")
+    }
+
     async fn persist_commit(&self, commit: RolloutCommit) -> io::Result<()> {
         let (result, receiver) = oneshot::channel();
         self.commands
@@ -370,5 +463,17 @@ impl RolloutRecorder {
         receiver
             .await
             .map_err(|_| io::Error::other("Codex rollout writer stopped during shutdown"))?
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn inject_write_failures(&self, count: usize) {
+        let (result, receiver) = oneshot::channel();
+        self.commands
+            .send(RolloutCommand::InjectWriteFailures { count, result })
+            .await
+            .expect("test rollout writer remains available");
+        receiver
+            .await
+            .expect("test rollout writer accepts injection");
     }
 }

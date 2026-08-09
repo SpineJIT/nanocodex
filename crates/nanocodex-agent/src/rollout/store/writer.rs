@@ -58,6 +58,9 @@ impl RolloutWriter {
     ) -> (io::Result<()>, Option<oneshot::Sender<io::Result<()>>>) {
         while let Some(command) = commands.recv().await {
             match command {
+                RolloutCommand::SeedInitialCheckpoint { seed, result } => {
+                    drop(result.send(self.seed_initial_checkpoint(*seed).await));
+                }
                 RolloutCommand::Commit { commit, result } => {
                     self.pending = Some(*commit);
                     drop(result.send(self.persist_pending().await));
@@ -68,6 +71,11 @@ impl RolloutWriter {
                 RolloutCommand::Shutdown { result } => {
                     commands.close();
                     return (self.flush().await, Some(result));
+                }
+                #[cfg(test)]
+                RolloutCommand::InjectWriteFailures { count, result } => {
+                    self.inject_write_failures(count);
+                    let _ = result.send(());
                 }
             }
         }
@@ -87,12 +95,27 @@ impl RolloutWriter {
         let Some(commit) = self.pending.take() else {
             return Ok(());
         };
-        let persisted = self.append_with_retry(&commit).await;
-        match persisted {
-            Ok(()) => Ok(()),
-            Err(source) => {
-                self.pending = Some(commit);
-                Err(source)
+        self.append_with_retry(&commit).await
+    }
+
+    async fn seed_initial_checkpoint(&mut self, seed: RolloutSeed) -> io::Result<()> {
+        if self.pending.is_some() || self.written_revision.is_some() || self.written_len != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "initial checkpoint seed requires an empty rollout writer",
+            ));
+        }
+        let original_len = self.file.metadata().await?.len();
+        match self.write_initial_seed(&seed).await {
+            Ok(()) => {
+                self.written_revision = Some(seed.revision);
+                self.written_len = seed.history.len();
+                self.written_context_baseline = Some(seed.context_baseline);
+                Ok(())
+            }
+            Err(error) => {
+                self.rollback(original_len).await?;
+                Err(error)
             }
         }
     }
@@ -219,11 +242,7 @@ impl RolloutWriter {
     }
 
     async fn write_prepared(&mut self, prepared: &PreparedAppend) -> io::Result<()> {
-        #[cfg(test)]
-        if self.injected_write_failures > 0 {
-            self.injected_write_failures -= 1;
-            return Err(io::Error::other("injected rollout write failure"));
-        }
+        self.check_injected_write_failure()?;
         let turn = &prepared.turn;
         self.write_event(CodexEvent::TaskStarted {
             turn_id: &turn.turn_id,
@@ -238,7 +257,7 @@ impl RolloutWriter {
         }
         match &prepared.records {
             PreparedRecords::Items { history, start } => {
-                self.write_turn_context(turn, prepared.model).await?;
+                self.write_turn_context(turn.effort, prepared.model).await?;
                 for item in history.iter_from(*start) {
                     write_async_line(
                         &mut self.file,
@@ -259,23 +278,11 @@ impl RolloutWriter {
                     },
                 )
                 .await?;
-                self.write_turn_context(turn, prepared.model).await?;
+                self.write_turn_context(turn.effort, prepared.model).await?;
             }
         }
         if prepared.write_state {
-            write_async_line(
-                &mut self.file,
-                &RolloutLine {
-                    timestamp: timestamp(),
-                    item: RolloutItem::WorldState(&WorldStateItem {
-                        full: true,
-                        state: PersistedContextState {
-                            nanocodex_context: &prepared.context_baseline,
-                        },
-                    }),
-                },
-            )
-            .await?;
+            self.write_context_state(&prepared.context_baseline).await?;
         }
         if let Some(message) = turn.final_message.as_deref() {
             self.write_event(CodexEvent::AgentMessage {
@@ -339,6 +346,41 @@ impl RolloutWriter {
         self.file.sync_data().await
     }
 
+    async fn write_initial_seed(&mut self, seed: &RolloutSeed) -> io::Result<()> {
+        #[cfg(test)]
+        self.check_injected_write_failure()?;
+        self.write_turn_context(seed.effort, seed.model).await?;
+        for item in seed.history.iter_from(0) {
+            write_async_line(
+                &mut self.file,
+                &RolloutLine {
+                    timestamp: timestamp(),
+                    item: RolloutItem::ResponseItem(item),
+                },
+            )
+            .await?;
+        }
+        self.write_context_state(&seed.context_baseline).await?;
+        self.file.flush().await?;
+        self.file.sync_data().await
+    }
+
+    async fn write_context_state(&mut self, context_baseline: &ContextBaseline) -> io::Result<()> {
+        write_async_line(
+            &mut self.file,
+            &RolloutLine {
+                timestamp: timestamp(),
+                item: RolloutItem::WorldState(&WorldStateItem {
+                    full: true,
+                    state: PersistedContextState {
+                        nanocodex_context: context_baseline,
+                    },
+                }),
+            },
+        )
+        .await
+    }
+
     async fn write_event(&mut self, event: CodexEvent<'_>) -> io::Result<()> {
         write_async_line(
             &mut self.file,
@@ -350,7 +392,7 @@ impl RolloutWriter {
         .await
     }
 
-    async fn write_turn_context(&mut self, turn: &RolloutTurn, model: Model) -> io::Result<()> {
+    async fn write_turn_context(&mut self, effort: Thinking, model: Model) -> io::Result<()> {
         write_async_line(
             &mut self.file,
             &RolloutLine {
@@ -362,7 +404,7 @@ impl RolloutWriter {
                         kind: "danger-full-access",
                     },
                     model: model.as_str(),
-                    effort: turn.effort.as_str(),
+                    effort: effort.as_str(),
                     summary: "auto",
                 }),
             },
@@ -391,6 +433,20 @@ impl RolloutWriter {
     #[cfg(test)]
     pub(in crate::rollout) const fn inject_write_failures(&mut self, count: usize) {
         self.injected_write_failures = count;
+    }
+
+    #[cfg(test)]
+    fn check_injected_write_failure(&mut self) -> io::Result<()> {
+        if self.injected_write_failures > 0 {
+            self.injected_write_failures -= 1;
+            return Err(io::Error::other("injected rollout write failure"));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    const fn check_injected_write_failure(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
