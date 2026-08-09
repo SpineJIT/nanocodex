@@ -7,7 +7,7 @@ mod tests;
 
 pub use load::{DurableSession, RolloutSessionInfo, RolloutTranscriptItem};
 pub use store::RolloutInfo;
-pub(crate) use store::{RolloutOrigin, RolloutRecorder, RolloutTurn};
+pub(crate) use store::{RolloutIdentity, RolloutOrigin, RolloutRecorder, RolloutTurn};
 
 use std::{
     fs::File,
@@ -41,6 +41,10 @@ const COMMAND_CAPACITY: usize = 8;
 pub struct RolloutConfig {
     codex_home: PathBuf,
     resume_path: Option<PathBuf>,
+    #[cfg(test)]
+    fail_fork_seed: bool,
+    #[cfg(test)]
+    fail_fork_publish: bool,
 }
 
 impl RolloutConfig {
@@ -50,6 +54,10 @@ impl RolloutConfig {
         Self {
             codex_home: codex_home.into(),
             resume_path: None,
+            #[cfg(test)]
+            fail_fork_seed: false,
+            #[cfg(test)]
+            fail_fork_publish: false,
         }
     }
 
@@ -88,6 +96,25 @@ impl RolloutConfig {
     }
 
     pub(crate) fn for_new_thread(&self) -> Self {
-        Self::new(self.codex_home.clone())
+        Self {
+            codex_home: self.codex_home.clone(),
+            resume_path: None,
+            #[cfg(test)]
+            fail_fork_seed: self.fail_fork_seed,
+            #[cfg(test)]
+            fail_fork_publish: self.fail_fork_publish,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn fail_fork_seed_for_test(mut self) -> Self {
+        self.fail_fork_seed = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn fail_fork_publish_for_test(mut self) -> Self {
+        self.fail_fork_publish = true;
+        self
     }
 }

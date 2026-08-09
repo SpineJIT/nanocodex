@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use tracing::error;
-
 use crate::{
     NanocodexError, Result,
-    rollout::{RolloutConfig, RolloutInfo, RolloutOrigin, RolloutRecorder, RolloutTurn},
+    error::PersistRolloutFailure,
+    rollout::{
+        RolloutConfig, RolloutIdentity, RolloutInfo, RolloutOrigin, RolloutRecorder, RolloutTurn,
+    },
     session::CommittedSession,
 };
 
@@ -28,6 +29,8 @@ impl DurabilityConfig {
     pub(crate) fn start(
         &self,
         session_id: &str,
+        lineage_id: &str,
+        prompt_cache_key: &str,
         workspace: Option<&str>,
         instructions: &str,
         origin_kind: &'static str,
@@ -48,6 +51,10 @@ impl DurabilityConfig {
             &runtime,
             config,
             session_id,
+            RolloutIdentity {
+                lineage_id,
+                prompt_cache_key,
+            },
             &cwd,
             instructions,
             RolloutOrigin {
@@ -99,49 +106,64 @@ impl Durability {
         )
     }
 
-    pub(crate) async fn persist(&self, checkpoint: &CommittedSession, turn: DurabilityTurn) {
+    pub(crate) async fn persist(
+        &self,
+        checkpoint: &CommittedSession,
+        turn: DurabilityTurn,
+    ) -> std::result::Result<(), PersistRolloutFailure> {
         let (Some(recorder), Some(turn)) = (&self.recorder, turn.0) else {
-            return;
+            return Ok(());
         };
-        if let Err(source) = recorder.persist(checkpoint, turn).await {
-            error!(
-                target: "nanocodex",
-                rollout_path = %recorder.info().path().display(),
-                error = %source,
-                "failed to persist Codex rollout"
-            );
-        }
+        recorder.persist(checkpoint, turn).await.map_err(|source| {
+            PersistRolloutFailure::new(recorder.info().path().to_path_buf(), source)
+        })
     }
 
     pub(crate) async fn persist_compaction(
         &self,
         checkpoint: &CommittedSession,
         turn: DurabilityTurn,
-    ) {
+    ) -> std::result::Result<(), PersistRolloutFailure> {
         let (Some(recorder), Some(turn)) = (&self.recorder, turn.0) else {
-            return;
+            return Ok(());
         };
-        if let Err(source) = recorder.persist_compaction(checkpoint, turn).await {
-            error!(
-                target: "nanocodex",
-                rollout_path = %recorder.info().path().display(),
-                error = %source,
-                "failed to persist Codex compaction boundary"
-            );
-        }
+        recorder
+            .persist_compaction(checkpoint, turn)
+            .await
+            .map_err(|source| {
+                PersistRolloutFailure::new(recorder.info().path().to_path_buf(), source)
+            })
     }
 
-    pub(crate) async fn flush(&self) -> Result<()> {
+    pub(crate) async fn seed_initial_checkpoint(
+        &self,
+        checkpoint: &CommittedSession,
+        effort: nanocodex_oai_api::Thinking,
+    ) -> std::result::Result<(), PersistRolloutFailure> {
         let Some(recorder) = &self.recorder else {
             return Ok(());
         };
         recorder
-            .flush()
+            .seed_initial_checkpoint(checkpoint, effort)
             .await
-            .map_err(|source| NanocodexError::PersistRollout {
-                path: recorder.info().path().to_path_buf(),
-                source,
+            .map_err(|source| {
+                PersistRolloutFailure::new(recorder.info().path().to_path_buf(), source)
             })
+    }
+
+    pub(crate) async fn discard_unpublished_rollout(&self) {
+        if let Some(recorder) = &self.recorder {
+            recorder.discard_unpublished_rollout().await;
+        }
+    }
+
+    pub(crate) async fn flush(&self) -> std::result::Result<(), PersistRolloutFailure> {
+        let Some(recorder) = &self.recorder else {
+            return Ok(());
+        };
+        recorder.flush().await.map_err(|source| {
+            PersistRolloutFailure::new(recorder.info().path().to_path_buf(), source)
+        })
     }
 
     pub(crate) async fn shutdown(&self) -> Result<()> {
@@ -155,6 +177,13 @@ impl Durability {
                 path: recorder.info().path().to_path_buf(),
                 source,
             })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn inject_write_failures(&self, count: usize) {
+        if let Some(recorder) = &self.recorder {
+            recorder.inject_write_failures(count).await;
+        }
     }
 }
 

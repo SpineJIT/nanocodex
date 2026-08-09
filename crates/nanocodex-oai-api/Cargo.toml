@@ -29,6 +29,7 @@ client = [
     "dep:url",
 ]
 realtime = ["client", "dep:opusic-c", "dep:webrtc"]
+test-support = ["client"]
 
 [dependencies]
 async-trait.workspace = true

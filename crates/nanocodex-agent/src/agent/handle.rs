@@ -6,6 +6,7 @@ use crate::rollout::RolloutInfo;
 /// Cheap, cloneable command handle for an owned agent driver.
 pub struct Nanocodex {
     pub(super) commands: mpsc::Sender<Command>,
+    pub(super) failure: DriverFailure,
     pub(super) events: EventSink,
     pub(super) next_turn: Arc<AtomicU64>,
     pub(super) lineage_id: Arc<str>,
@@ -18,6 +19,7 @@ impl Clone for Nanocodex {
     fn clone(&self) -> Self {
         Self {
             commands: self.commands.clone(),
+            failure: self.failure.clone(),
             events: self.events.clone(),
             next_turn: Arc::clone(&self.next_turn),
             lineage_id: Arc::clone(&self.lineage_id),
@@ -35,6 +37,7 @@ impl Clone for Nanocodex {
 #[derive(Clone)]
 pub struct AgentHandle {
     pub(super) commands: mpsc::WeakSender<Command>,
+    pub(super) failure: DriverFailure,
 }
 
 impl AgentHandle {
@@ -48,8 +51,9 @@ impl AgentHandle {
     ///
     /// Returns an error after the containing driver has stopped.
     pub async fn spawn(&self) -> Result<(Nanocodex, AgentEvents)> {
+        self.failure.check()?;
         let commands = self.commands()?;
-        request_spawn(&commands).await
+        request_spawn(&commands, &self.failure).await
     }
 
     /// Forks the containing agent's latest safe model boundary.
@@ -59,12 +63,15 @@ impl AgentHandle {
     /// Returns an error before the first prompt reaches a safe boundary, or
     /// after the containing agent driver has stopped.
     pub async fn fork(&self) -> Result<(Nanocodex, AgentEvents)> {
+        self.failure.check()?;
         let commands = self.commands()?;
-        request_fork(&commands, None).await
+        request_fork(&commands, &self.failure, None).await
     }
 
     fn commands(&self) -> Result<mpsc::Sender<Command>> {
-        self.commands.upgrade().ok_or(NanocodexError::AgentStopped)
+        self.commands
+            .upgrade()
+            .ok_or_else(|| self.failure.error_or_stopped())
     }
 }
 
@@ -102,10 +109,13 @@ impl Nanocodex {
         self.durability.info()
     }
 
-    /// Retries any pending rollout write and waits for a durable file flush.
+    /// Waits for the rollout writer to flush its durable file state.
     ///
     /// This is a no-op when rollout recording is disabled. CLI consumers call
-    /// it at completed turn boundaries so persistence failures are user-visible.
+    /// it at idle completed-turn boundaries so persistence failures are user-visible.
+    /// A failed commit is never retried by flushing; it fail-stops the driver.
+    /// Requests while a model turn or compaction is active wait for that
+    /// operation to reach its durable boundary before flushing.
     /// Flushing does not stop the live writer; call [`Self::shutdown`] at an
     /// explicit application or session boundary.
     ///
@@ -115,7 +125,25 @@ impl Nanocodex {
     #[cfg(not(target_family = "wasm"))]
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     pub async fn flush_rollout(&self) -> Result<()> {
-        self.durability.flush().await
+        request_command(&self.commands, &self.failure, |result| {
+            Command::FlushRollout { result }
+        })
+        .await
+    }
+
+    pub(super) async fn seed_initial_checkpoint(
+        &self,
+        checkpoint: &CommittedSession,
+        effort: Thinking,
+    ) -> Result<()> {
+        self.durability
+            .seed_initial_checkpoint(checkpoint, effort)
+            .await
+            .map_err(crate::error::PersistRolloutFailure::into_error)
+    }
+
+    pub(super) async fn discard_unpublished_rollout(&self) {
+        self.durability.discard_unpublished_rollout().await;
     }
 
     /// Gracefully stops this agent and waits for all owned resources to close.
@@ -138,10 +166,11 @@ impl Nanocodex {
     pub async fn shutdown(&self) -> Result<()> {
         let (initiate, receiver) = self.shutdown.request();
         if initiate && self.commands.send(Command::Shutdown).await.is_err() {
-            let outcome = match self.durability.shutdown().await {
-                Ok(()) => Err(NanocodexError::AgentStopped),
-                Err(error) => Err(error),
-            };
+            let outcome = self.durability.shutdown().await.and_then(|()| {
+                self.failure
+                    .error()
+                    .map_or(Err(NanocodexError::AgentStopped), Err)
+            });
             self.shutdown.complete(outcome);
         }
         match receiver.await {
@@ -157,6 +186,7 @@ impl Nanocodex {
     ///
     /// Returns an error for an empty prompt or if the driver stopped.
     pub async fn prompt(&self, prompt: impl Into<Prompt>) -> Result<Turn> {
+        self.failure.check()?;
         let prompt = prompt.into();
         if prompt.instruction.is_empty() {
             return Err(NanocodexError::InvalidRequest(
@@ -182,12 +212,13 @@ impl Nanocodex {
             .await
             .is_err()
         {
-            return Err(NanocodexError::AgentStopped);
+            return Err(self.failure.error_or_stopped());
         }
         Ok(Turn {
             control: TurnControl {
                 key,
                 commands: self.commands.clone(),
+                failure: self.failure.clone(),
             },
             events: event_stream,
             result: receiver,
@@ -209,6 +240,7 @@ impl Nanocodex {
     /// Returns an error for an empty prompt, a full steering queue, or if the
     /// agent driver stopped.
     pub async fn route_prompt(&self, prompt: impl Into<Prompt>) -> Result<PromptRoute> {
+        self.failure.check()?;
         let prompt = prompt.into();
         if prompt.instruction.is_empty() {
             return Err(NanocodexError::InvalidRequest(
@@ -234,16 +266,17 @@ impl Nanocodex {
             .await
             .is_err()
         {
-            return Err(NanocodexError::AgentStopped);
+            return Err(self.failure.error_or_stopped());
         }
         match route_receiver
             .await
-            .map_err(|_| NanocodexError::AgentStopped)??
+            .map_err(|_| self.failure.error_or_stopped())??
         {
             PromptRouteKind::Started => Ok(PromptRoute::Started(Turn {
                 control: TurnControl {
                     key,
                     commands: self.commands.clone(),
+                    failure: self.failure.clone(),
                 },
                 events: event_stream,
                 result: turn_receiver,
@@ -261,9 +294,8 @@ impl Nanocodex {
     ///
     /// Returns an error if the agent driver has stopped.
     pub async fn set_thinking(&self, thinking: Thinking) -> Result<()> {
-        request_command(&self.commands, |result| Command::SetThinking {
-            thinking,
-            result,
+        request_command(&self.commands, &self.failure, |result| {
+            Command::SetThinking { thinking, result }
         })
         .await
     }
@@ -277,9 +309,8 @@ impl Nanocodex {
     ///
     /// Returns an error if the agent driver has stopped.
     pub async fn set_fast_mode(&self, enabled: bool) -> Result<()> {
-        request_command(&self.commands, |result| Command::SetFastMode {
-            enabled,
-            result,
+        request_command(&self.commands, &self.failure, |result| {
+            Command::SetFastMode { enabled, result }
         })
         .await
     }
@@ -313,12 +344,15 @@ impl Nanocodex {
     ///
     /// # Errors
     ///
-    /// Returns a model or driver-stopped error. Rollout writes follow the same
-    /// retry-on-[`Self::flush_rollout`] contract as prompt turns.
+    /// Returns a model, durability, or driver-stopped error.
     pub async fn compact(&self) -> Result<()> {
         let parent = tracing::Span::current();
         let parent = (!parent.is_disabled()).then_some(parent);
-        request_command(&self.commands, |result| Command::Compact { parent, result }).await
+        request_command(&self.commands, &self.failure, |result| Command::Compact {
+            parent,
+            result,
+        })
+        .await
     }
 
     /// Appends adapter-owned developer context at the next safe model boundary.
@@ -341,9 +375,8 @@ impl Nanocodex {
                 "developer message must not be empty".to_owned(),
             ));
         }
-        request_command(&self.commands, |result| Command::AppendDeveloperMessage {
-            text,
-            result,
+        request_command(&self.commands, &self.failure, |result| {
+            Command::AppendDeveloperMessage { text, result }
         })
         .await
     }
@@ -358,7 +391,7 @@ impl Nanocodex {
     ///
     /// Returns an error after this agent's driver has stopped.
     pub async fn spawn(&self) -> Result<(Self, AgentEvents)> {
-        request_spawn(&self.commands).await
+        request_spawn(&self.commands, &self.failure).await
     }
 
     /// Forks from the latest safe model boundary into an independently driven
@@ -366,7 +399,9 @@ impl Nanocodex {
     ///
     /// The child receives a fresh WebSocket and tool runtime while sharing the
     /// immutable transcript, inherited incremental delta, and prompt-cache
-    /// lineage. Partial model output and unmatched tool calls are excluded.
+    /// lineage. With native rollout recording, this method returns only after
+    /// the child has persisted that inherited boundary in its own rollout.
+    /// Partial model output and unmatched tool calls are excluded.
     ///
     /// # Errors
     ///
@@ -395,29 +430,39 @@ impl Nanocodex {
         &self,
         checkpoint: Option<Arc<CommittedSession>>,
     ) -> Result<(Self, AgentEvents)> {
-        request_fork(&self.commands, checkpoint).await
+        request_fork(&self.commands, &self.failure, checkpoint).await
     }
 }
 
 async fn request_fork(
     commands: &mpsc::Sender<Command>,
+    failure: &DriverFailure,
     checkpoint: Option<Arc<CommittedSession>>,
 ) -> Result<(Nanocodex, AgentEvents)> {
-    request_command(commands, |result| Command::Fork { checkpoint, result }).await
+    request_command(commands, failure, |result| Command::Fork {
+        checkpoint,
+        result,
+    })
+    .await
 }
 
-async fn request_spawn(commands: &mpsc::Sender<Command>) -> Result<(Nanocodex, AgentEvents)> {
-    request_command(commands, |result| Command::Spawn { result }).await
+async fn request_spawn(
+    commands: &mpsc::Sender<Command>,
+    failure: &DriverFailure,
+) -> Result<(Nanocodex, AgentEvents)> {
+    request_command(commands, failure, |result| Command::Spawn { result }).await
 }
 
 pub(super) async fn request_command<T>(
     commands: &mpsc::Sender<Command>,
+    failure: &DriverFailure,
     command: impl FnOnce(oneshot::Sender<Result<T>>) -> Command,
 ) -> Result<T> {
+    failure.check()?;
     let (result, receiver) = oneshot::channel();
     commands
         .send(command(result))
         .await
-        .map_err(|_| NanocodexError::AgentStopped)?;
-    receiver.await.map_err(|_| NanocodexError::AgentStopped)?
+        .map_err(|_| failure.error_or_stopped())?;
+    receiver.await.map_err(|_| failure.error_or_stopped())?
 }

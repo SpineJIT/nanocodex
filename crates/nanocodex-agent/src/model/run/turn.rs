@@ -101,6 +101,33 @@ where
         thinking: Thinking,
         fast_mode: bool,
     ) -> Result<()> {
+        self.begin_terminal_without_execution(task, workspace, thinking, fast_mode)?;
+        let usage = self.stats.turn_usage(self.model, self.fast_mode);
+        record_turn_usage(&tracing::Span::current(), &usage);
+        self.emit_cancelled(&usage)
+    }
+
+    pub(crate) fn emit_failed_before_start(
+        &mut self,
+        task: &Prompt,
+        workspace: Option<&str>,
+        thinking: Thinking,
+        fast_mode: bool,
+        error: &NanocodexError,
+    ) -> Result<()> {
+        self.begin_terminal_without_execution(task, workspace, thinking, fast_mode)?;
+        let usage = self.stats.turn_usage(self.model, self.fast_mode);
+        record_turn_usage(&tracing::Span::current(), &usage);
+        self.emit_failed(error, &usage)
+    }
+
+    fn begin_terminal_without_execution(
+        &mut self,
+        task: &Prompt,
+        workspace: Option<&str>,
+        thinking: Thinking,
+        fast_mode: bool,
+    ) -> Result<()> {
         self.thinking = thinking;
         self.fast_mode = fast_mode;
         self.started_at = Instant::now();
@@ -119,12 +146,35 @@ where
                 instruction_bytes: task.instruction.text_bytes(),
             },
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn emit_completed(
+        &self,
+        completion: &TurnCompletion,
+        usage: &TurnUsage,
+    ) -> Result<()> {
+        let completion = completion.run_completion();
+        self.events.emit(
+            AgentEventKind::RunCompleted,
+            terminal_payload(
+                TerminalOutcome::Completed(&completion),
+                self.started_at.elapsed(),
+                &self.config,
+                self.model,
+                self.thinking,
+                &self.stats,
+                usage,
+            ),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn emit_cancelled(&self, usage: &TurnUsage) -> Result<()> {
         let error = NanocodexError::TurnCancelled;
         let message = error.to_string();
         self.events
             .emit(AgentEventKind::RunError, RunError { message: &message })?;
-        let usage = self.stats.turn_usage(self.model, self.fast_mode);
-        record_turn_usage(&tracing::Span::current(), &usage);
         self.events.emit(
             AgentEventKind::RunFailed,
             terminal_payload(
@@ -134,10 +184,33 @@ where
                 self.model,
                 self.thinking,
                 &self.stats,
-                &usage,
+                usage,
             ),
         )?;
         Ok(())
+    }
+
+    pub(crate) fn emit_failed(&self, error: &NanocodexError, usage: &TurnUsage) -> Result<()> {
+        let message = error.to_string();
+        self.events
+            .emit(AgentEventKind::RunError, RunError { message: &message })?;
+        self.events.emit(
+            AgentEventKind::RunFailed,
+            terminal_payload(
+                TerminalOutcome::Failed,
+                self.started_at.elapsed(),
+                &self.config,
+                self.model,
+                self.thinking,
+                &self.stats,
+                usage,
+            ),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn current_turn_usage(&self) -> TurnUsage {
+        self.stats.turn_usage(self.model, self.fast_mode)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -185,31 +258,17 @@ where
                 &fork_snapshots,
             )
             .await;
-        let elapsed = self.started_at.elapsed();
         match outcome {
             Ok(ModelTaskOutcome::Completed(completion)) => {
                 self.stats
                     .apply_transport(self.transport_stats.since(transport_before));
                 let usage = self.stats.turn_usage(self.model, self.fast_mode);
                 record_turn_usage(&tracing::Span::current(), &usage);
-                let event_completion = completion.run_completion();
                 let checkpoint = if matches!(&completion, TurnCompletion::TerminalTool { .. }) {
                     self.commit_terminal_checkpoint()?
                 } else {
                     self.commit_checkpoint()?
                 };
-                self.events.emit(
-                    AgentEventKind::RunCompleted,
-                    terminal_payload(
-                        TerminalOutcome::Completed(&event_completion),
-                        elapsed,
-                        &self.config,
-                        self.model,
-                        self.thinking,
-                        &self.stats,
-                        &usage,
-                    ),
-                )?;
                 Ok(ModelTurnOutcome::Completed(CompletedModelTurn {
                     completion,
                     usage,
@@ -221,27 +280,10 @@ where
                     tools.cancel_turn().await;
                 }
                 let checkpoint = self.commit_interrupted_checkpoint()?;
-                let elapsed = self.started_at.elapsed();
-                let error = NanocodexError::TurnCancelled;
-                let message = error.to_string();
-                self.events
-                    .emit(AgentEventKind::RunError, RunError { message: &message })?;
                 self.stats
                     .apply_transport(self.transport_stats.since(transport_before));
                 let usage = self.stats.turn_usage(self.model, self.fast_mode);
                 record_turn_usage(&tracing::Span::current(), &usage);
-                self.events.emit(
-                    AgentEventKind::RunFailed,
-                    terminal_payload(
-                        TerminalOutcome::Cancelled,
-                        elapsed,
-                        &self.config,
-                        self.model,
-                        self.thinking,
-                        &self.stats,
-                        &usage,
-                    ),
-                )?;
                 Ok(ModelTurnOutcome::Cancelled(checkpoint))
             }
             Err(error) => {
@@ -281,28 +323,16 @@ where
                     }
                     Some(self.commit_interrupted_checkpoint()?)
                 };
-                let message = error.to_string();
-                self.events
-                    .emit(AgentEventKind::RunError, RunError { message: &message })?;
                 self.stats
                     .apply_transport(self.transport_stats.since(transport_before));
                 let usage = self.stats.turn_usage(self.model, self.fast_mode);
                 record_turn_usage(&tracing::Span::current(), &usage);
-                self.events.emit(
-                    AgentEventKind::RunFailed,
-                    terminal_payload(
-                        TerminalOutcome::Failed,
-                        elapsed,
-                        &self.config,
-                        self.model,
-                        self.thinking,
-                        &self.stats,
-                        &usage,
-                    ),
-                )?;
                 match checkpoint {
                     Some(checkpoint) => Ok(ModelTurnOutcome::Failed { error, checkpoint }),
-                    None => Err(error),
+                    None => {
+                        self.emit_failed(&error, &usage)?;
+                        Err(error)
+                    }
                 }
             }
         }

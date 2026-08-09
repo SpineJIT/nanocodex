@@ -1,4 +1,36 @@
 use super::*;
+use crate::error::PersistRolloutFailure;
+
+#[derive(Clone, Default)]
+pub(in crate::agent) struct DriverFailure {
+    state: Arc<std::sync::Mutex<Option<PersistRolloutFailure>>>,
+}
+
+impl DriverFailure {
+    pub(in crate::agent) fn check(&self) -> Result<()> {
+        self.error().map_or(Ok(()), Err)
+    }
+
+    pub(in crate::agent) fn record(&self, failure: PersistRolloutFailure) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.get_or_insert(failure);
+    }
+
+    pub(in crate::agent) fn error(&self) -> Option<NanocodexError> {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.clone().map(PersistRolloutFailure::into_error)
+    }
+
+    pub(in crate::agent) fn error_or_stopped(&self) -> NanocodexError {
+        self.error().unwrap_or(NanocodexError::AgentStopped)
+    }
+}
 
 type SharedShutdownResult = std::result::Result<(), Arc<NanocodexError>>;
 
@@ -128,6 +160,79 @@ pub(super) fn mark_all_queued_turns_cancelled(queued_turns: &mut VecDeque<Queued
     }));
 }
 
+pub(super) async fn begin_fail_stop(
+    commands: &mut mpsc::Receiver<Command>,
+    queued_turns: &mut VecDeque<QueuedTurn>,
+    failure: &DriverFailure,
+    default_thinking: Thinking,
+    default_fast_mode: bool,
+) -> VecDeque<QueuedTurn> {
+    let mut failed_turns = std::mem::take(queued_turns);
+    commands.close();
+    while let Some(command) = commands.recv().await {
+        match command {
+            Command::Prompt {
+                key,
+                prompt,
+                thinking,
+                fast_mode,
+                parent,
+                events,
+                result,
+            } => {
+                failed_turns.push_back(QueuedTurn::Pending {
+                    key,
+                    prompt,
+                    thinking: thinking.unwrap_or(default_thinking),
+                    fast_mode: fast_mode.unwrap_or(default_fast_mode),
+                    parent,
+                    events,
+                    result,
+                });
+            }
+            command => fail_command(command, failure),
+        }
+    }
+    failed_turns
+}
+
+fn fail_command(command: Command, failure: &DriverFailure) {
+    match command {
+        Command::Prompt { result, .. } => {
+            drop(result.send(Err(failure_error(failure))));
+        }
+        Command::RoutePrompt {
+            route_result,
+            turn_result,
+            ..
+        } => {
+            drop(route_result.send(Err(failure_error(failure))));
+            drop(turn_result.send(Err(failure_error(failure))));
+        }
+        Command::Fork { result, .. } | Command::Spawn { result } => {
+            drop(result.send(Err(failure_error(failure))));
+        }
+        Command::Steer { result, .. }
+        | Command::Cancel { result, .. }
+        | Command::SetThinking { result, .. }
+        | Command::SetFastMode { result, .. }
+        | Command::Compact { result, .. }
+        | Command::FlushRollout { result } => {
+            drop(result.send(Err(failure_error(failure))));
+        }
+        Command::AppendDeveloperMessage { result, .. } => {
+            drop(result.send(Err(failure_error(failure))));
+        }
+        Command::Shutdown => {}
+    }
+}
+
+fn failure_error(failure: &DriverFailure) -> NanocodexError {
+    failure
+        .error()
+        .expect("a failed agent driver always records its persistence error")
+}
+
 pub(super) async fn begin_shutdown(
     commands: &mut mpsc::Receiver<Command>,
     queued_turns: &mut VecDeque<QueuedTurn>,
@@ -174,7 +279,8 @@ pub(super) async fn begin_shutdown(
             | Command::Cancel { result, .. }
             | Command::SetThinking { result, .. }
             | Command::SetFastMode { result, .. }
-            | Command::Compact { result, .. } => {
+            | Command::Compact { result, .. }
+            | Command::FlushRollout { result } => {
                 drop(result.send(Err(NanocodexError::AgentStopped)));
             }
             Command::Shutdown => {}
@@ -190,7 +296,7 @@ pub(super) struct TurnDefaults {
     pub(super) fast_mode: bool,
 }
 
-pub(super) fn handle_idle_command<S>(
+pub(super) async fn handle_idle_command<S>(
     command: Command,
     latest: Option<&Arc<CommittedSession>>,
     spawner: &BranchSpawner<S>,
@@ -205,17 +311,20 @@ pub(super) fn handle_idle_command<S>(
     match command {
         Command::Fork { checkpoint, result } => {
             let checkpoint = checkpoint.or_else(|| latest.cloned());
-            let outcome = checkpoint
-                .ok_or(NanocodexError::ForkBeforeCompletedTurn)
-                .and_then(|checkpoint| {
-                    spawner.spawn_fork(
-                        &checkpoint,
-                        session_id,
-                        defaults.model,
-                        defaults.thinking,
-                        defaults.fast_mode,
-                    )
-                });
+            let outcome = match checkpoint {
+                Some(checkpoint) => {
+                    spawner
+                        .spawn_fork(
+                            checkpoint,
+                            session_id,
+                            defaults.model,
+                            defaults.thinking,
+                            defaults.fast_mode,
+                        )
+                        .await
+                }
+                None => Err(NanocodexError::ForkBeforeCompletedTurn),
+            };
             drop(result.send(outcome));
         }
         Command::Spawn { result } => {
@@ -246,6 +355,9 @@ pub(super) fn handle_idle_command<S>(
         }
         Command::Shutdown => {}
         Command::Compact { result, .. } => {
+            drop(result.send(Err(NanocodexError::AgentStopped)));
+        }
+        Command::FlushRollout { result } => {
             drop(result.send(Err(NanocodexError::AgentStopped)));
         }
         Command::AppendDeveloperMessage { result, .. } => {

@@ -117,6 +117,18 @@ pub mod __private {
         tower::attempt::ResponsesAttemptFactory,
     };
 
+    /// Test-only inspection helpers for higher-level crate integration tests.
+    #[cfg(feature = "test-support")]
+    pub mod test_support {
+        /// Returns the request profile selected for one attempted provider operation.
+        #[must_use]
+        pub fn request_profile(
+            attempt: &crate::tower::ResponsesAttempt,
+        ) -> &crate::responses::RequestProfile {
+            &attempt.profile
+        }
+    }
+
     /// Agent-owned context accounting and compaction policy primitives.
     pub mod compaction {
         pub use crate::session::compaction::{

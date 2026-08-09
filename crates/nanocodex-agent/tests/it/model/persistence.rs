@@ -162,10 +162,7 @@ async fn serialized_session_and_codex_rollout_share_committed_history() -> Resul
         let mut resumed = accept_async(stream).await?;
         let replay = next_json(&mut resumed).await?;
         assert!(replay.get("previous_response_id").is_none());
-        assert_eq!(
-            replay["prompt_cache_key"],
-            "019c0d31-c308-7d91-bff4-5dca82d15ac6"
-        );
+        assert_eq!(replay["prompt_cache_key"], "durable-cache");
         assert_eq!(replay["input"][0]["type"], "additional_tools");
         assert!(replay["input"][0].get("id").is_none());
         assert_eq!(replay["input"][1]["role"], "developer");
