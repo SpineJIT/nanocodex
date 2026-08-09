@@ -231,13 +231,15 @@ impl Service<ResponsesAttempt> for CheckpointLifecycleService {
                 pipeline_stats: ResponsePipelineStats::default(),
             }),
             ResponsesAttemptKind::Generation => {
+                let profile =
+                    nanocodex_oai_api::__private::test_support::request_profile(&request);
                 self.generation_requests
                     .lock()
                     .expect("generation request lock")
                     .push(GenerationRequest {
-                        session_id: request.session_id().to_owned(),
-                        prompt_cache_key: request.prompt_cache_key().to_owned(),
-                        prefix: request.request_prefix().to_vec(),
+                        session_id: profile.session_id().to_owned(),
+                        prompt_cache_key: profile.prompt_cache_key().to_owned(),
+                        prefix: profile.prefix().to_vec(),
                         input: request.input_items().cloned().collect(),
                     });
                 ResponsesOutput::Generation(GenerationOutput {
