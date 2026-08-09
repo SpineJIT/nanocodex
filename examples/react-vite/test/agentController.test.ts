@@ -132,24 +132,6 @@ test("prompt failures are typed messages and always release accepted Turns", asy
   await controller.dispose();
 });
 
-test("terminal tool completions preserve the Worker result message contract", async () => {
-  const harness = new Harness();
-  const messages: any[] = [];
-  const controller = createExampleAgentController({
-    createAgent: async () => ({ agent: harness.createAgent("root") as any }),
-    postMessage: (message) => messages.push(message),
-  });
-
-  await controller.handle({ type: "start", transport: "openai", thinking: "high" });
-  messages.length = 0;
-  await controller.handle({ type: "prompt", id: 1, prompt: "open a branch" });
-  harness.turns[0]!.completeTerminal();
-  await settle();
-
-  assert.deepEqual(messages, [{ type: "result", id: 1, message: "", payment: undefined }]);
-  await controller.dispose();
-});
-
 test("restart releases active Turns and stale event listeners exactly once", async () => {
   const harness = new Harness();
   const messages: any[] = [];
@@ -436,11 +418,7 @@ class FakeTurn {
   }
 
   complete(value: string) {
-    this.resolve(turnResult(value, this.input, { type: "message", finalMessage: value }));
-  }
-
-  completeTerminal() {
-    this.resolve(turnResult(undefined, this.input, { type: "terminalTool" }));
+    this.resolve(turnResult(value, this.input));
   }
 
   fail(error: unknown) {
@@ -458,13 +436,8 @@ class FakeTurn {
 
 type FakeTurnResult = ReturnType<typeof turnResult>;
 
-function turnResult(
-  finalMessage: string | undefined,
-  input: string,
-  completion: { type: "message"; finalMessage: string } | { type: "terminalTool" },
-) {
+function turnResult(finalMessage: string, input: string) {
   return {
-    completion,
     finalMessage,
     snapshot: {
       version: 1,

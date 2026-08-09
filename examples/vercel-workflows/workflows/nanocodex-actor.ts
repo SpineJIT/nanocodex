@@ -181,7 +181,7 @@ export async function runNanocodexTurn(
         completed: {
           type: "turn_completed",
           id: request.id,
-          final_message: result.completion.type === "message" ? result.completion.finalMessage : "",
+          final_message: result.finalMessage,
           usage: result.usage,
         },
         snapshot: result.snapshot,
