@@ -11,7 +11,7 @@ repository.workspace = true
 description = "Experimental synchronous Spine continuation runtime for Nanocodex"
 
 [dependencies]
-codex-spine-core = { git = "https://github.com/GhabiX/SpineCodex.git", rev = "ef5e19a7eaece34fe9d752759b33f9ae90d62a91" }
+codex-spine-core = { version = "0.2.2", git = "https://github.com/GhabiX/SpineCodex.git", rev = "ef5e19a7eaece34fe9d752759b33f9ae90d62a91" }
 fs2.workspace = true
 nanocodex.workspace = true
 serde.workspace = true
