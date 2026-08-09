@@ -5,7 +5,6 @@ use nanocodex_oai_api::{ResponseError, tools::TerminalToolReceiptError};
 
 /// Error returned by the Nanocodex library boundary.
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub enum NanocodexError {
     /// Caller input or two configured policies are incompatible.
     #[error("invalid task request: {0}")]
