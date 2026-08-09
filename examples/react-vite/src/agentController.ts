@@ -107,7 +107,7 @@ export function createExampleAgentController({
           postMessage({
             type: "result",
             id: command.id,
-            message: result.finalMessage,
+            message: result.completion.type === "message" ? result.completion.finalMessage : "",
             payment: payment
               ? {
                   channelId: payment.channelId,

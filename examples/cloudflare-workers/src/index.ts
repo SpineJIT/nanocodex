@@ -548,7 +548,7 @@ export class NanocodexSession extends DurableObject<Env> {
       const terminal: TurnCompleted = {
         type: "turn_completed",
         id,
-        final_message: result.finalMessage,
+        final_message: result.completion.type === "message" ? result.completion.finalMessage : "",
         usage: result.usage,
       };
       const snapshot = JSON.stringify(result.snapshot);
