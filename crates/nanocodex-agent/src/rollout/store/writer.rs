@@ -192,18 +192,26 @@ impl RolloutWriter {
             );
             return Err(error);
         }
-        #[cfg(test)]
-        if self.injected_publish_reopen_failure {
-            self.injected_publish_reopen_failure = false;
-            let _ = tokio::fs::remove_file(path).await;
-            return Err(io::Error::other("injected rollout reopen failure"));
-        }
-        match tokio::fs::OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&path)
-            .await
-        {
+        let reopened = {
+            #[cfg(test)]
+            if self.injected_publish_reopen_failure {
+                self.injected_publish_reopen_failure = false;
+                Err(io::Error::other("injected rollout reopen failure"))
+            } else {
+                tokio::fs::OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .open(&path)
+                    .await
+            }
+            #[cfg(not(test))]
+            tokio::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&path)
+                .await
+        };
+        match reopened {
             Ok(file) => {
                 self.file = Some(file);
                 self.path = path;

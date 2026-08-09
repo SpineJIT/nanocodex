@@ -301,15 +301,23 @@ async fn rollout_persistence_failure_fail_stops_current_and_queued_turns() {
         })
         .build()
         .expect("test OpenAI client");
-    let tools = Tools::builder()
-        .without_defaults()
-        .build()
-        .expect("empty tools");
+    let tool_handle = Arc::new(Mutex::new(None));
     let (agent, mut events) = Nanocodex::builder(openai)
-        .tools(tools)
+        .tools_factory({
+            let tool_handle = Arc::clone(&tool_handle);
+            move |handle| {
+                *tool_handle.lock().expect("tool handle lock") = Some(handle);
+                Tools::builder().without_defaults().build()
+            }
+        })
         .rollout(RolloutConfig::new(home.path()))
         .build()
         .expect("agent with rollout");
+    let tool_handle = tool_handle
+        .lock()
+        .expect("tool handle lock")
+        .clone()
+        .expect("tools factory receives an agent handle");
     agent.durability.inject_write_failures(2).await;
 
     let first = agent
@@ -349,6 +357,14 @@ async fn rollout_persistence_failure_fail_stops_current_and_queued_turns() {
     ));
     assert!(matches!(
         agent.fork().await,
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+    assert!(matches!(
+        tool_handle.spawn().await,
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+    assert!(matches!(
+        tool_handle.fork().await,
         Err(NanocodexError::PersistRollout { .. })
     ));
     assert!(matches!(
@@ -521,6 +537,10 @@ async fn compaction_persistence_failure_fail_stops_current_and_queued_turns() {
         .prompt("must not run after compaction persistence failure")
         .await
         .expect("queued turn");
+    assert!(matches!(
+        agent.flush_rollout().await,
+        Err(NanocodexError::InvalidRequest(_))
+    ));
     release.send(()).expect("release compaction");
 
     assert!(matches!(
@@ -590,6 +610,16 @@ async fn fork_seeds_a_resumable_child_rollout_with_the_inherited_identity() {
         .expect("root generation starts");
     release.send(()).expect("release root generation");
     root_turn.result().await.expect("completed root turn");
+
+    let persisted_parent = RolloutConfig::new(home.path())
+        .load_session(root_session_id)
+        .expect("completed turn is resumable before any explicit flush");
+    assert!(
+        serde_json::to_value(persisted_parent.snapshot()).expect("encode durable parent snapshot")
+            ["history"]
+            .to_string()
+            .contains("durable parent boundary")
+    );
 
     let (child, child_events) = root.fork().await.expect("durable fork");
     let child_rollout = child
