@@ -7,7 +7,7 @@ mod tests;
 
 pub use load::{DurableSession, RolloutSessionInfo, RolloutTranscriptItem};
 pub use store::RolloutInfo;
-pub(crate) use store::{RolloutOrigin, RolloutRecorder, RolloutTurn};
+pub(crate) use store::{RolloutIdentity, RolloutOrigin, RolloutRecorder, RolloutTurn};
 
 use std::{
     fs::File,
@@ -41,7 +41,10 @@ const COMMAND_CAPACITY: usize = 8;
 pub struct RolloutConfig {
     codex_home: PathBuf,
     resume_path: Option<PathBuf>,
-    audit_only: bool,
+    #[cfg(test)]
+    fail_fork_seed: bool,
+    #[cfg(test)]
+    fail_fork_publish: bool,
 }
 
 impl RolloutConfig {
@@ -51,15 +54,11 @@ impl RolloutConfig {
         Self {
             codex_home: codex_home.into(),
             resume_path: None,
-            audit_only: false,
+            #[cfg(test)]
+            fail_fork_seed: false,
+            #[cfg(test)]
+            fail_fork_publish: false,
         }
-    }
-
-    /// Keeps the rollout as an audit record without permitting session resume.
-    #[must_use]
-    pub fn audit_only(mut self) -> Self {
-        self.audit_only = true;
-        self
     }
 
     /// Returns the Codex state directory used for this rollout policy.
@@ -100,7 +99,22 @@ impl RolloutConfig {
         Self {
             codex_home: self.codex_home.clone(),
             resume_path: None,
-            audit_only: self.audit_only,
+            #[cfg(test)]
+            fail_fork_seed: self.fail_fork_seed,
+            #[cfg(test)]
+            fail_fork_publish: self.fail_fork_publish,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn fail_fork_seed_for_test(mut self) -> Self {
+        self.fail_fork_seed = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn fail_fork_publish_for_test(mut self) -> Self {
+        self.fail_fork_publish = true;
+        self
     }
 }

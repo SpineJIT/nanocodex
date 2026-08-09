@@ -66,6 +66,13 @@ impl InitialResume {
             Self::History(resume) => resume.history.len(),
         }
     }
+
+    fn prompt_cache_key(&self) -> &str {
+        match self {
+            Self::Exact(checkpoint) => checkpoint.prompt_cache_key(),
+            Self::History(resume) => &resume.prompt_cache_key,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -106,10 +113,14 @@ pub use turn::{PromptRoute, Turn, TurnCompletion, TurnControl, TurnResult};
 use builder::{CodexCompatibility, PromptCacheConfig};
 pub(crate) use context_source::ContextSource;
 use context_source::ContextSourceConfig;
-use driver::{AgentDriver, AgentOrigin, BranchSpawner, DriverShutdown};
+use driver::{AgentDriver, AgentOrigin, BranchSpawner, DriverFailure, DriverShutdown};
 use durability::{Durability, DurabilityConfig};
 pub(crate) use executor::{AgentFactory, AgentSend};
 use executor::{ServiceFactory, spawn_driver};
 use handle::request_command;
 use spawn::{build_agent, spawn_agent_driver, validate};
 use turn::{Command, PromptRouteKind, QueuedTurn, TurnKey};
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

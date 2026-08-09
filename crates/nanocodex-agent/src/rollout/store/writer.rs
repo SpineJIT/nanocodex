@@ -2,7 +2,10 @@ use super::super::{load::validate_legacy_history_mode, wire::*};
 use super::*;
 
 pub(in crate::rollout) struct RolloutWriter {
-    file: tokio::fs::File,
+    file: Option<tokio::fs::File>,
+    path: PathBuf,
+    staged: bool,
+    poisoned: Option<PoisonedWriter>,
     pub(in crate::rollout) pending: Option<RolloutCommit>,
     written_revision: Option<u64>,
     written_len: usize,
@@ -13,16 +16,27 @@ pub(in crate::rollout) struct RolloutWriter {
     current_window_id: String,
     #[cfg(test)]
     injected_write_failures: usize,
+    #[cfg(test)]
+    injected_write_failure_after: Option<usize>,
+    #[cfg(test)]
+    injected_publish_reopen_failure: bool,
+    #[cfg(test)]
+    injected_rollback_failure: bool,
 }
 
 impl RolloutWriter {
     pub(in crate::rollout) fn new(
         file: tokio::fs::File,
+        path: PathBuf,
+        staged: bool,
         initial_window_id: String,
         workspace: PathBuf,
     ) -> Self {
         Self {
-            file,
+            file: Some(file),
+            path,
+            staged,
+            poisoned: None,
             pending: None,
             written_revision: None,
             written_len: 0,
@@ -33,12 +47,21 @@ impl RolloutWriter {
             current_window_id: initial_window_id,
             #[cfg(test)]
             injected_write_failures: 0,
+            #[cfg(test)]
+            injected_write_failure_after: None,
+            #[cfg(test)]
+            injected_publish_reopen_failure: false,
+            #[cfg(test)]
+            injected_rollback_failure: false,
         }
     }
 
-    pub(super) fn resumed(file: tokio::fs::File, state: ResumeWriterState) -> Self {
+    pub(super) fn resumed(file: tokio::fs::File, path: PathBuf, state: ResumeWriterState) -> Self {
         Self {
-            file,
+            file: Some(file),
+            path,
+            staged: false,
+            poisoned: None,
             pending: None,
             written_revision: Some(0),
             written_len: state.written_len,
@@ -49,6 +72,12 @@ impl RolloutWriter {
             current_window_id: state.current_window_id,
             #[cfg(test)]
             injected_write_failures: 0,
+            #[cfg(test)]
+            injected_write_failure_after: None,
+            #[cfg(test)]
+            injected_publish_reopen_failure: false,
+            #[cfg(test)]
+            injected_rollback_failure: false,
         }
     }
 
@@ -58,6 +87,9 @@ impl RolloutWriter {
     ) -> (io::Result<()>, Option<oneshot::Sender<io::Result<()>>>) {
         while let Some(command) = commands.recv().await {
             match command {
+                RolloutCommand::SeedInitialCheckpoint { seed, result } => {
+                    drop(result.send(self.seed_initial_checkpoint(*seed).await));
+                }
                 RolloutCommand::Commit { commit, result } => {
                     self.pending = Some(*commit);
                     drop(result.send(self.persist_pending().await));
@@ -65,9 +97,32 @@ impl RolloutWriter {
                 RolloutCommand::Flush { result } => {
                     drop(result.send(self.flush().await));
                 }
+                RolloutCommand::Publish { path, result } => {
+                    drop(result.send(self.publish(path).await));
+                }
                 RolloutCommand::Shutdown { result } => {
                     commands.close();
                     return (self.flush().await, Some(result));
+                }
+                #[cfg(test)]
+                RolloutCommand::InjectWriteFailures { count, result } => {
+                    self.inject_write_failures(count);
+                    let _ = result.send(());
+                }
+                #[cfg(test)]
+                RolloutCommand::InjectWriteFailureAfter { writes, result } => {
+                    self.inject_write_failure_after(writes);
+                    let _ = result.send(());
+                }
+                #[cfg(test)]
+                RolloutCommand::InjectPublishReopenFailure { result } => {
+                    self.inject_publish_reopen_failure();
+                    let _ = result.send(());
+                }
+                #[cfg(test)]
+                RolloutCommand::InjectRollbackFailure { result } => {
+                    self.inject_rollback_failure();
+                    let _ = result.send(());
                 }
             }
         }
@@ -75,53 +130,116 @@ impl RolloutWriter {
     }
 
     pub(in crate::rollout) async fn flush(&mut self) -> io::Result<()> {
+        self.ensure_healthy()?;
         if self.pending.is_some() {
             self.persist_pending().await
         } else {
-            self.file.flush().await?;
-            self.file.sync_data().await
+            self.check_injected_write_failure()?;
+            let file = self.file()?;
+            file.flush().await?;
+            file.sync_data().await
         }
     }
 
     pub(in crate::rollout) async fn persist_pending(&mut self) -> io::Result<()> {
+        self.ensure_healthy()?;
         let Some(commit) = self.pending.take() else {
             return Ok(());
         };
-        let persisted = self.append_with_retry(&commit).await;
-        match persisted {
-            Ok(()) => Ok(()),
-            Err(source) => {
-                self.pending = Some(commit);
-                Err(source)
+        self.append(&commit).await
+    }
+
+    async fn seed_initial_checkpoint(&mut self, seed: RolloutSeed) -> io::Result<()> {
+        self.ensure_healthy()?;
+        if self.pending.is_some() || self.written_revision.is_some() || self.written_len != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "initial checkpoint seed requires an empty rollout writer",
+            ));
+        }
+        if seed.history.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "initial checkpoint seed requires committed history",
+            ));
+        }
+        let original_len = self.file()?.metadata().await?.len();
+        match self.write_initial_seed(&seed).await {
+            Ok(()) => {
+                self.written_revision = Some(seed.revision);
+                self.written_len = seed.history.len();
+                self.written_context_baseline = Some(seed.context_baseline);
+                Ok(())
             }
+            Err(error) => Err(self.rollback_or_poison(error, original_len).await),
         }
     }
 
-    async fn append_with_retry(&mut self, commit: &RolloutCommit) -> io::Result<()> {
+    async fn append(&mut self, commit: &RolloutCommit) -> io::Result<()> {
+        self.ensure_healthy()?;
         let prepared = self.prepare_append(commit)?;
-        let original_len = self.file.metadata().await?.len();
-        let first_error = match self.write_prepared(&prepared).await {
-            Ok(()) => {
-                self.apply_prepared(prepared);
-                return Ok(());
-            }
-            Err(source) => source,
-        };
-
-        self.rollback(original_len).await?;
+        let original_len = self.file()?.metadata().await?.len();
         match self.write_prepared(&prepared).await {
             Ok(()) => {
                 self.apply_prepared(prepared);
                 Ok(())
             }
-            Err(second) => {
-                self.rollback(original_len).await?;
-                Err(io::Error::new(
-                    second.kind(),
-                    format!(
-                        "failed to append Codex rollout after retry; first error: {first_error}; final error: {second}"
-                    ),
-                ))
+            Err(error) => Err(self.rollback_or_poison(error, original_len).await),
+        }
+    }
+
+    async fn publish(&mut self, path: PathBuf) -> io::Result<()> {
+        self.ensure_healthy()?;
+        if !self.staged {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rollout writer has no staged file to publish",
+            ));
+        }
+        self.flush().await?;
+        let file = self.file.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "Codex rollout writer is closed")
+        })?;
+        drop(file);
+        if let Err(error) = tokio::fs::rename(&self.path, &path).await {
+            self.file = Some(
+                tokio::fs::OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .open(&self.path)
+                    .await?,
+            );
+            return Err(error);
+        }
+        let reopened = {
+            #[cfg(test)]
+            if self.injected_publish_reopen_failure {
+                self.injected_publish_reopen_failure = false;
+                Err(io::Error::other("injected rollout reopen failure"))
+            } else {
+                tokio::fs::OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .open(&path)
+                    .await
+            }
+            #[cfg(not(test))]
+            tokio::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&path)
+                .await
+        };
+        match reopened {
+            Ok(file) => {
+                self.file = Some(file);
+                self.path = path;
+                self.staged = false;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = tokio::fs::remove_file(path).await;
+                Err(error)
             }
         }
     }
@@ -219,11 +337,6 @@ impl RolloutWriter {
     }
 
     async fn write_prepared(&mut self, prepared: &PreparedAppend) -> io::Result<()> {
-        #[cfg(test)]
-        if self.injected_write_failures > 0 {
-            self.injected_write_failures -= 1;
-            return Err(io::Error::other("injected rollout write failure"));
-        }
         let turn = &prepared.turn;
         self.write_event(CodexEvent::TaskStarted {
             turn_id: &turn.turn_id,
@@ -238,44 +351,23 @@ impl RolloutWriter {
         }
         match &prepared.records {
             PreparedRecords::Items { history, start } => {
-                self.write_turn_context(turn, prepared.model).await?;
+                self.write_turn_context(turn.effort, prepared.model).await?;
                 for item in history.iter_from(*start) {
-                    write_async_line(
-                        &mut self.file,
-                        &RolloutLine {
-                            timestamp: timestamp(),
-                            item: RolloutItem::ResponseItem(item),
-                        },
-                    )
-                    .await?;
+                    self.write_response_item(item).await?;
                 }
             }
             PreparedRecords::Compacted(compacted) => {
-                write_async_line(
-                    &mut self.file,
-                    &RolloutLine {
-                        timestamp: timestamp(),
-                        item: RolloutItem::Compacted(compacted),
-                    },
-                )
-                .await?;
-                self.write_turn_context(turn, prepared.model).await?;
+                self.check_injected_write_failure()?;
+                let line = RolloutLine {
+                    timestamp: timestamp(),
+                    item: RolloutItem::Compacted(compacted),
+                };
+                write_async_line(self.file()?, &line).await?;
+                self.write_turn_context(turn.effort, prepared.model).await?;
             }
         }
         if prepared.write_state {
-            write_async_line(
-                &mut self.file,
-                &RolloutLine {
-                    timestamp: timestamp(),
-                    item: RolloutItem::WorldState(&WorldStateItem {
-                        full: true,
-                        state: PersistedContextState {
-                            nanocodex_context: &prepared.context_baseline,
-                        },
-                    }),
-                },
-            )
-            .await?;
+            self.write_context_state(&prepared.context_baseline).await?;
         }
         if let Some(message) = turn.final_message.as_deref() {
             self.write_event(CodexEvent::AgentMessage {
@@ -335,39 +427,71 @@ impl RolloutWriter {
                 ));
             }
         }
-        self.file.flush().await?;
-        self.file.sync_data().await
+        let file = self.file()?;
+        file.flush().await?;
+        file.sync_data().await
+    }
+
+    async fn write_initial_seed(&mut self, seed: &RolloutSeed) -> io::Result<()> {
+        self.write_turn_context(seed.effort, seed.model).await?;
+        for item in seed.history.iter_from(0) {
+            self.write_response_item(item).await?;
+        }
+        self.write_context_state(&seed.context_baseline).await?;
+        let file = self.file()?;
+        file.flush().await?;
+        file.sync_data().await
+    }
+
+    async fn write_context_state(&mut self, context_baseline: &ContextBaseline) -> io::Result<()> {
+        self.check_injected_write_failure()?;
+        let line = RolloutLine {
+            timestamp: timestamp(),
+            item: RolloutItem::WorldState(&WorldStateItem {
+                full: true,
+                state: PersistedContextState {
+                    nanocodex_context: context_baseline,
+                },
+            }),
+        };
+        write_async_line(self.file()?, &line).await
     }
 
     async fn write_event(&mut self, event: CodexEvent<'_>) -> io::Result<()> {
-        write_async_line(
-            &mut self.file,
-            &RolloutLine {
-                timestamp: timestamp(),
-                item: RolloutItem::Event(&event),
-            },
-        )
-        .await
+        self.check_injected_write_failure()?;
+        let line = RolloutLine {
+            timestamp: timestamp(),
+            item: RolloutItem::Event(&event),
+        };
+        write_async_line(self.file()?, &line).await
     }
 
-    async fn write_turn_context(&mut self, turn: &RolloutTurn, model: Model) -> io::Result<()> {
-        write_async_line(
-            &mut self.file,
-            &RolloutLine {
-                timestamp: timestamp(),
-                item: RolloutItem::TurnContext(&TurnContext {
-                    cwd: &self.workspace,
-                    approval_policy: "never",
-                    sandbox_policy: SandboxPolicy {
-                        kind: "danger-full-access",
-                    },
-                    model: model.as_str(),
-                    effort: turn.effort.as_str(),
-                    summary: "auto",
-                }),
-            },
-        )
-        .await
+    async fn write_turn_context(&mut self, effort: Thinking, model: Model) -> io::Result<()> {
+        self.check_injected_write_failure()?;
+        let workspace = self.workspace.clone();
+        let line = RolloutLine {
+            timestamp: timestamp(),
+            item: RolloutItem::TurnContext(&TurnContext {
+                cwd: &workspace,
+                approval_policy: "never",
+                sandbox_policy: SandboxPolicy {
+                    kind: "danger-full-access",
+                },
+                model: model.as_str(),
+                effort: effort.as_str(),
+                summary: "auto",
+            }),
+        };
+        write_async_line(self.file()?, &line).await
+    }
+
+    async fn write_response_item(&mut self, item: &ResponseItem) -> io::Result<()> {
+        self.check_injected_write_failure()?;
+        let line = RolloutLine {
+            timestamp: timestamp(),
+            item: RolloutItem::ResponseItem(item),
+        };
+        write_async_line(self.file()?, &line).await
     }
 
     fn apply_prepared(&mut self, prepared: PreparedAppend) {
@@ -383,14 +507,146 @@ impl RolloutWriter {
     }
 
     async fn rollback(&mut self, len: u64) -> io::Result<()> {
-        self.file.set_len(len).await?;
-        self.file.seek(std::io::SeekFrom::Start(len)).await?;
-        self.file.sync_data().await
+        #[cfg(test)]
+        if self.injected_rollback_failure {
+            self.injected_rollback_failure = false;
+            return Err(io::Error::other("injected rollback failure"));
+        }
+        let file = self.file()?;
+        file.set_len(len).await?;
+        file.seek(std::io::SeekFrom::Start(len)).await?;
+        file.sync_data().await
+    }
+
+    async fn rollback_or_poison(&mut self, write_error: io::Error, len: u64) -> io::Error {
+        match self.rollback(len).await {
+            Ok(()) => write_error,
+            Err(rollback_error) => self.poison(write_error, rollback_error).await,
+        }
+    }
+
+    fn ensure_healthy(&self) -> io::Result<()> {
+        match &self.poisoned {
+            Some(writer) => Err(writer.as_error()),
+            None => Ok(()),
+        }
+    }
+
+    async fn poison(&mut self, write_error: io::Error, rollback_error: io::Error) -> io::Error {
+        self.file.take();
+        self.pending = None;
+        let quarantine_error = if self.staged {
+            None
+        } else {
+            let quarantined = self.path.with_extension("jsonl.corrupt");
+            tokio::fs::rename(&self.path, quarantined).await.err()
+        };
+        let error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            RolloutCorruption {
+                write_error,
+                rollback_error,
+                quarantine_error,
+            },
+        );
+        self.poisoned = Some(PoisonedWriter::from_error(&error));
+        error
+    }
+
+    fn file(&mut self) -> io::Result<&mut tokio::fs::File> {
+        self.file.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "Codex rollout writer is closed")
+        })
     }
 
     #[cfg(test)]
     pub(in crate::rollout) const fn inject_write_failures(&mut self, count: usize) {
         self.injected_write_failures = count;
+    }
+
+    #[cfg(test)]
+    pub(in crate::rollout) const fn inject_write_failure_after(&mut self, writes: usize) {
+        self.injected_write_failure_after = Some(writes);
+    }
+
+    #[cfg(test)]
+    pub(in crate::rollout) const fn inject_publish_reopen_failure(&mut self) {
+        self.injected_publish_reopen_failure = true;
+    }
+
+    #[cfg(test)]
+    pub(in crate::rollout) const fn inject_rollback_failure(&mut self) {
+        self.injected_rollback_failure = true;
+    }
+
+    #[cfg(test)]
+    fn check_injected_write_failure(&mut self) -> io::Result<()> {
+        if self.injected_write_failures > 0 {
+            self.injected_write_failures -= 1;
+            return Err(io::Error::other("injected rollout write failure"));
+        }
+        if let Some(writes) = &mut self.injected_write_failure_after {
+            if *writes == 0 {
+                self.injected_write_failure_after = None;
+                return Err(io::Error::other("injected rollout write failure"));
+            }
+            *writes -= 1;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    const fn check_injected_write_failure(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct PoisonedWriter {
+    kind: io::ErrorKind,
+    message: String,
+}
+
+impl PoisonedWriter {
+    fn from_error(error: &io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
+    fn as_error(&self) -> io::Error {
+        io::Error::new(self.kind, self.message.clone())
+    }
+}
+
+#[derive(Debug)]
+struct RolloutCorruption {
+    write_error: io::Error,
+    rollback_error: io::Error,
+    quarantine_error: Option<io::Error>,
+}
+
+impl std::fmt::Display for RolloutCorruption {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "rollout corruption: failed to rollback after write error ({}) because rollback failed ({})",
+            self.write_error, self.rollback_error
+        )?;
+        if let Some(error) = &self.quarantine_error {
+            write!(
+                formatter,
+                "; failed to quarantine the corrupted rollout ({error})"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RolloutCorruption {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.write_error)
     }
 }
 

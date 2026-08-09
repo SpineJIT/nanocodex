@@ -145,14 +145,23 @@ where
 {
     let session_id_text = session_id.to_string();
     let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
+    let failure = DriverFailure::default();
     let tools = spawner
         .tools
         .materialize(AgentHandle {
             commands: commands.downgrade(),
+            failure: failure.clone(),
         })?
         .for_session(&session_id_text);
+    let rollout_prompt_cache_key = initial_resume
+        .as_ref()
+        .map(|resume| Arc::<str>::from(resume.prompt_cache_key()))
+        .or_else(|| spawner.prompt_cache_key.as_ref().map(Arc::clone))
+        .unwrap_or_else(|| Arc::from(session_id_text.as_str()));
     let durability = spawner.durability.start(
         &session_id_text,
+        &spawner.lineage_id,
+        &rollout_prompt_cache_key,
         workspace.as_deref(),
         spawner.config.system_prompt(),
         origin.kind,
@@ -182,6 +191,7 @@ where
     let shutdown = DriverShutdown::default();
     let agent = Nanocodex {
         commands,
+        failure: failure.clone(),
         events: events.clone(),
         next_turn: Arc::new(AtomicU64::new(1)),
         lineage_id: Arc::clone(&spawner.lineage_id),
@@ -203,11 +213,15 @@ where
         initial_model,
         origin,
         durability: durability.clone(),
+        failure,
     };
+    let driver_failure = agent.failure.clone();
     let driver_task = async move {
         let outcome = driver.run().await;
         if shutdown.requested() {
-            let outcome = outcome.and(durability.shutdown().await);
+            let outcome = outcome
+                .and(durability.shutdown().await)
+                .and(driver_failure.check());
             shutdown.complete(outcome);
         } else if let Err(error) = outcome {
             tracing::error!(

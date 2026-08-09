@@ -43,9 +43,9 @@ where
     S::Error: Into<ResponseError> + AgentSend + 'static,
     S::Future: AgentSend,
 {
-    pub(super) fn spawn_fork(
+    pub(super) async fn spawn_fork(
         &self,
-        checkpoint: &CommittedSession,
+        checkpoint: Arc<CommittedSession>,
         parent_session_id: &str,
         model: Model,
         thinking: Thinking,
@@ -62,7 +62,7 @@ where
         spawner.config = Arc::new(config);
         spawner.depth = self.depth.saturating_add(1);
         let service = (spawner.service_factory)(Arc::clone(&spawner.config));
-        spawn_agent_driver(
+        let (child, events) = spawn_agent_driver(
             spawner,
             session_id,
             workspace,
@@ -73,7 +73,13 @@ where
                 depth: self.depth.saturating_add(1),
                 parent_session_id: Some(Arc::from(parent_session_id)),
             },
-        )
+        )?;
+        if let Err(error) = child.seed_initial_checkpoint(&checkpoint, thinking).await {
+            let _ = child.shutdown().await;
+            child.discard_unpublished_rollout().await;
+            return Err(error);
+        }
+        Ok((child, events))
     }
 
     pub(super) fn spawn_clean(

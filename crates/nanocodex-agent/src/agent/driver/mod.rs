@@ -4,9 +4,9 @@ mod telemetry;
 
 use super::*;
 pub(super) use branch::{AgentOrigin, BranchSpawner};
-pub(super) use control::DriverShutdown;
+pub(super) use control::{DriverFailure, DriverShutdown};
 use control::{
-    TurnDefaults, begin_shutdown, cancel_queued_turn, handle_idle_command,
+    TurnDefaults, begin_fail_stop, begin_shutdown, cancel_queued_turn, handle_idle_command,
     mark_all_queued_turns_cancelled,
 };
 use telemetry::{ReasoningSettings, agent_compact_span, agent_turn_span};
@@ -23,6 +23,7 @@ pub(super) struct AgentDriver<S> {
     pub(super) initial_model: Option<PreparedCheckpoint>,
     pub(super) origin: AgentOrigin,
     pub(super) durability: Durability,
+    pub(super) failure: DriverFailure,
 }
 
 impl<S> AgentDriver<S>
@@ -83,6 +84,7 @@ where
         let mut queued_turns = VecDeque::new();
         let mut pending_compact = None;
         let mut pending_developer_messages = Vec::new();
+        let mut pending_rollout_flushes = Vec::new();
         let mut commands_open = true;
         loop {
             let command = loop {
@@ -243,6 +245,37 @@ where
                     )));
                     continue;
                 }
+                if let Command::FlushRollout { result } = command {
+                    match self.durability.flush().await {
+                        Ok(()) => drop(result.send(Ok(()))),
+                        Err(failure) => {
+                            self.failure.record(failure);
+                            let error = self.failure.error().expect("persistence failure recorded");
+                            drop(
+                                result.send(Err(self
+                                    .failure
+                                    .error()
+                                    .expect("persistence failure remains available"))),
+                            );
+                            finish_fail_stop(
+                                FailStopContext {
+                                    commands: &mut self.commands,
+                                    failure: &self.failure,
+                                    workspace: self.workspace.as_deref(),
+                                    session_events: &self.events,
+                                    default_thinking,
+                                    default_fast_mode,
+                                },
+                                &mut model,
+                                &mut queued_turns,
+                            )
+                            .await?;
+                            model.shutdown().await;
+                            return Err(error);
+                        }
+                    }
+                    continue;
+                }
                 if let Command::Compact { parent, result } = command {
                     logical_turn_index = logical_turn_index.saturating_add(1);
                     let span = agent_compact_span(
@@ -346,7 +379,8 @@ where
                                             },
                                             session_id.as_str(),
                                             self.workspace.clone(),
-                                        );
+                                        )
+                                        .await;
                                     }
                                     Some(Command::SetThinking { thinking, result }) => {
                                         default_thinking = thinking;
@@ -363,6 +397,9 @@ where
                                             self.workspace.as_deref(),
                                             &self.spawner.context_source,
                                         )));
+                                    }
+                                    Some(Command::FlushRollout { result }) => {
+                                        pending_rollout_flushes.push(result);
                                     }
                                     Some(Command::Shutdown) => {
                                         if let Some(cancel) = cancel_compaction.take() {
@@ -398,18 +435,23 @@ where
                                 thread_model,
                                 checkpoint,
                             ));
-                            // The installed in-memory boundary is authoritative.
-                            // Rollout writes follow the same retry-on-flush
-                            // contract as completed prompt turns and must not
-                            // roll back or hide the safe fork checkpoint.
-                            latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
-                            self.durability
+                            match self
+                                .durability
                                 .persist_compaction(
                                     &checkpoint,
                                     durability_turn.completed_without_message(),
                                 )
-                                .await;
-                            Ok(())
+                                .await
+                            {
+                                Ok(()) => {
+                                    latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                                    Ok(())
+                                }
+                                Err(failure) => {
+                                    self.failure.record(failure);
+                                    Err(self.failure.error().expect("persistence failure recorded"))
+                                }
+                            }
                         }
                         Ok(ModelCompactOutcome::Cancelled(checkpoint)) => {
                             let checkpoint = Arc::new(CommittedSession::new(
@@ -417,22 +459,31 @@ where
                                 thread_model,
                                 checkpoint,
                             ));
-                            latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
                             let durability_turn = if compact_replaced {
                                 durability_turn.replaced()
                             } else {
                                 durability_turn.interrupted()
                             };
-                            self.durability
+                            match self
+                                .durability
                                 .persist(&checkpoint, durability_turn)
                                 .instrument(span.clone())
-                                .await;
-                            model.replace_client(ResponsesClient::new((self
-                                .spawner
-                                .service_factory)(
-                                Arc::clone(&self.spawner.config),
-                            )));
-                            Err(NanocodexError::TurnCancelled)
+                                .await
+                            {
+                                Ok(()) => {
+                                    latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                                    model.replace_client(ResponsesClient::new((self
+                                        .spawner
+                                        .service_factory)(
+                                        Arc::clone(&self.spawner.config),
+                                    )));
+                                    Err(NanocodexError::TurnCancelled)
+                                }
+                                Err(failure) => {
+                                    self.failure.record(failure);
+                                    Err(self.failure.error().expect("persistence failure recorded"))
+                                }
+                            }
                         }
                         Ok(ModelCompactOutcome::Failed { error, checkpoint }) => {
                             let checkpoint = Arc::new(CommittedSession::new(
@@ -440,12 +491,21 @@ where
                                 thread_model,
                                 checkpoint,
                             ));
-                            latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
-                            self.durability
+                            match self
+                                .durability
                                 .persist(&checkpoint, durability_turn.failed())
                                 .instrument(span.clone())
-                                .await;
-                            Err(error)
+                                .await
+                            {
+                                Ok(()) => {
+                                    latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                                    Err(error)
+                                }
+                                Err(failure) => {
+                                    self.failure.record(failure);
+                                    Err(self.failure.error().expect("persistence failure recorded"))
+                                }
+                            }
                         }
                         Err(error) => Err(error),
                     };
@@ -476,7 +536,38 @@ where
                             )));
                         }
                     }
+                    let failed_persistence = self.failure.error().is_some();
+                    if failed_persistence {
+                        fail_pending_rollout_flushes(&mut pending_rollout_flushes, &self.failure);
+                    } else if let Err(failure) = resolve_pending_rollout_flushes(
+                        &self.durability,
+                        &mut pending_rollout_flushes,
+                    )
+                    .await
+                    {
+                        self.failure.record(failure);
+                    }
+                    let failed_persistence = self.failure.error().is_some();
                     drop(result.send(outcome));
+                    if failed_persistence {
+                        fail_pending_rollout_flushes(&mut pending_rollout_flushes, &self.failure);
+                        let error = self.failure.error().expect("persistence failure recorded");
+                        finish_fail_stop(
+                            FailStopContext {
+                                commands: &mut self.commands,
+                                failure: &self.failure,
+                                workspace: self.workspace.as_deref(),
+                                session_events: &self.events,
+                                default_thinking,
+                                default_fast_mode,
+                            },
+                            &mut model,
+                            &mut queued_turns,
+                        )
+                        .await?;
+                        model.shutdown().await;
+                        return Err(error);
+                    }
                     continue;
                 }
                 handle_idle_command(
@@ -490,7 +581,8 @@ where
                     },
                     session_id.as_str(),
                     self.workspace.clone(),
-                );
+                )
+                .await;
                 continue;
             };
             let thinking = thinking.unwrap_or(default_thinking);
@@ -669,7 +761,8 @@ where
                                     },
                                     session_id.as_str(),
                                     self.workspace.clone(),
-                                );
+                                )
+                                .await;
                             }
                             Some(Command::SetThinking { thinking, result }) => {
                                 default_thinking = thinking;
@@ -697,6 +790,9 @@ where
                                     self.workspace.as_deref(),
                                     &self.spawner.context_source,
                                 )));
+                            }
+                            Some(Command::FlushRollout { result }) => {
+                                pending_rollout_flushes.push(result);
                             }
                             Some(Command::Compact { parent, result }) => {
                                 pending_compact = Some((parent, result));
@@ -730,7 +826,6 @@ where
                 }
             };
             drop(execution);
-            model.set_events(self.events.clone());
             let (outcome, was_cancelled): (Result<TurnResult>, bool) = match completed {
                 Ok(ModelTurnOutcome::Completed(completed)) => {
                     let CompletedModelTurn {
@@ -751,19 +846,31 @@ where
                             durability_turn.completed_without_message()
                         }
                     };
-                    self.durability
+                    match self
+                        .durability
                         .persist(&checkpoint, durability_turn)
                         .instrument(turn_span.clone())
-                        .await;
-                    latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
-                    (
-                        Ok(TurnResult {
-                            completion,
-                            usage,
-                            checkpoint,
-                        }),
-                        false,
-                    )
+                        .await
+                    {
+                        Ok(()) => {
+                            latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                            model.emit_completed(&completion, &usage)?;
+                            (
+                                Ok(TurnResult {
+                                    completion,
+                                    usage,
+                                    checkpoint,
+                                }),
+                                false,
+                            )
+                        }
+                        Err(failure) => {
+                            self.failure.record(failure);
+                            let error = self.failure.error().expect("persistence failure recorded");
+                            model.emit_failed(&error, &usage)?;
+                            (Err(error), false)
+                        }
+                    }
                 }
                 Ok(ModelTurnOutcome::Cancelled(checkpoint)) => {
                     let checkpoint = Arc::new(CommittedSession::new(
@@ -772,15 +879,31 @@ where
                         checkpoint,
                     ));
                     let durability_turn = durability_turn.interrupted();
-                    self.durability
+                    match self
+                        .durability
                         .persist(&checkpoint, durability_turn)
                         .instrument(turn_span.clone())
-                        .await;
-                    latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
-                    model.replace_client(ResponsesClient::new((self.spawner.service_factory)(
-                        Arc::clone(&self.spawner.config),
-                    )));
-                    (Err(NanocodexError::TurnCancelled), true)
+                        .await
+                    {
+                        Ok(()) => {
+                            latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                            let usage = model.current_turn_usage();
+                            model.emit_cancelled(&usage)?;
+                            model.replace_client(ResponsesClient::new((self
+                                .spawner
+                                .service_factory)(
+                                Arc::clone(&self.spawner.config),
+                            )));
+                            (Err(NanocodexError::TurnCancelled), true)
+                        }
+                        Err(failure) => {
+                            self.failure.record(failure);
+                            let error = self.failure.error().expect("persistence failure recorded");
+                            let usage = model.current_turn_usage();
+                            model.emit_failed(&error, &usage)?;
+                            (Err(error), false)
+                        }
+                    }
                 }
                 Ok(ModelTurnOutcome::Failed { error, checkpoint }) => {
                     let checkpoint = Arc::new(CommittedSession::new(
@@ -789,15 +912,30 @@ where
                         checkpoint,
                     ));
                     let durability_turn = durability_turn.failed();
-                    self.durability
+                    match self
+                        .durability
                         .persist(&checkpoint, durability_turn)
                         .instrument(turn_span.clone())
-                        .await;
-                    latest_fork_checkpoint = Some(checkpoint);
-                    (Err(error), false)
+                        .await
+                    {
+                        Ok(()) => {
+                            latest_fork_checkpoint = Some(checkpoint);
+                            let usage = model.current_turn_usage();
+                            model.emit_failed(&error, &usage)?;
+                            (Err(error), false)
+                        }
+                        Err(failure) => {
+                            self.failure.record(failure);
+                            let error = self.failure.error().expect("persistence failure recorded");
+                            let usage = model.current_turn_usage();
+                            model.emit_failed(&error, &usage)?;
+                            (Err(error), false)
+                        }
+                    }
                 }
                 Err(error) => (Err(error), false),
             };
+            model.set_events(self.events.clone());
             turn_span.record(
                 "status",
                 if was_cancelled {
@@ -812,7 +950,41 @@ where
                 "otel.status_code",
                 if outcome.is_ok() { "OK" } else { "ERROR" },
             );
+            let failed_persistence = self.failure.error().is_some();
+            if failed_persistence {
+                fail_pending_rollout_flushes(&mut pending_rollout_flushes, &self.failure);
+            } else if let Err(failure) =
+                resolve_pending_rollout_flushes(&self.durability, &mut pending_rollout_flushes)
+                    .await
+            {
+                self.failure.record(failure);
+            }
+            let failed_persistence = self.failure.error().is_some();
             drop(result.send(outcome));
+            if failed_persistence {
+                fail_pending_rollout_flushes(&mut pending_rollout_flushes, &self.failure);
+                if let Some(cancel_result) = cancel_result {
+                    drop(cancel_result.send(Err(
+                        self.failure.error().expect("persistence failure recorded"),
+                    )));
+                }
+                let error = self.failure.error().expect("persistence failure recorded");
+                finish_fail_stop(
+                    FailStopContext {
+                        commands: &mut self.commands,
+                        failure: &self.failure,
+                        workspace: self.workspace.as_deref(),
+                        session_events: &self.events,
+                        default_thinking,
+                        default_fast_mode,
+                    },
+                    &mut model,
+                    &mut queued_turns,
+                )
+                .await?;
+                model.shutdown().await;
+                return Err(error);
+            }
             for text in pending_developer_messages.drain(..) {
                 if let Some(checkpoint) = model.append_developer_message(text) {
                     latest_fork_checkpoint = Some(Arc::new(CommittedSession::new(
@@ -832,6 +1004,105 @@ where
             }
         }
     }
+}
+
+async fn resolve_pending_rollout_flushes(
+    durability: &Durability,
+    pending_flushes: &mut Vec<oneshot::Sender<Result<()>>>,
+) -> std::result::Result<(), crate::error::PersistRolloutFailure> {
+    if pending_flushes.is_empty() {
+        return Ok(());
+    }
+    match durability.flush().await {
+        Ok(()) => {
+            for result in pending_flushes.drain(..) {
+                drop(result.send(Ok(())));
+            }
+            Ok(())
+        }
+        Err(failure) => {
+            for result in pending_flushes.drain(..) {
+                drop(result.send(Err(failure.clone().into_error())));
+            }
+            Err(failure)
+        }
+    }
+}
+
+fn fail_pending_rollout_flushes(
+    pending_flushes: &mut Vec<oneshot::Sender<Result<()>>>,
+    failure: &DriverFailure,
+) {
+    for result in pending_flushes.drain(..) {
+        drop(
+            result.send(Err(failure.error().expect(
+                "a failed agent driver always records its persistence error",
+            ))),
+        );
+    }
+}
+
+struct FailStopContext<'a> {
+    commands: &'a mut mpsc::Receiver<Command>,
+    failure: &'a DriverFailure,
+    workspace: Option<&'a str>,
+    session_events: &'a EventSink,
+    default_thinking: Thinking,
+    default_fast_mode: bool,
+}
+
+async fn finish_fail_stop<S>(
+    context: FailStopContext<'_>,
+    model: &mut ModelRun<S>,
+    queued_turns: &mut VecDeque<QueuedTurn>,
+) -> Result<()>
+where
+    S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
+    S::Error: Into<ResponseError> + AgentSend + 'static,
+    S::Future: AgentSend,
+{
+    let failed_turns = begin_fail_stop(
+        context.commands,
+        queued_turns,
+        context.failure,
+        context.default_thinking,
+        context.default_fast_mode,
+    )
+    .await;
+    let mut event_error = None;
+    for queued in failed_turns {
+        let (prompt, thinking, fast_mode, events, result) = match queued {
+            QueuedTurn::Pending {
+                prompt,
+                thinking,
+                fast_mode,
+                events,
+                result,
+                ..
+            }
+            | QueuedTurn::Cancelled {
+                prompt,
+                thinking,
+                fast_mode,
+                events,
+                result,
+                ..
+            } => (prompt, thinking, fast_mode, events, result),
+        };
+        let error = context
+            .failure
+            .error()
+            .expect("a failed agent driver always records its persistence error");
+        model.set_events(events);
+        let terminal =
+            model.emit_failed_before_start(&prompt, context.workspace, thinking, fast_mode, &error);
+        model.set_events(context.session_events.clone());
+        drop(result.send(Err(error)));
+        if event_error.is_none() {
+            event_error = terminal.err();
+        }
+    }
+    event_error.map_or(Ok(()), Err)
 }
 
 fn agent_session_context(

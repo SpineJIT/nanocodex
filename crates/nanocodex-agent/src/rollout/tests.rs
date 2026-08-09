@@ -248,6 +248,10 @@ fn recorder_with_config(config: RolloutConfig) -> RolloutRecorder {
         &Handle::current(),
         &config,
         "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+        RolloutIdentity {
+            lineage_id: "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+            prompt_cache_key: "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+        },
         Path::new("/worktree"),
         "base instructions",
         RolloutOrigin {
@@ -375,6 +379,8 @@ fn loads_codex_rollout_without_a_nanocodex_sidecar() {
     assert_eq!(session.model(), Model::Sol);
     let snapshot = serde_json::to_value(session.snapshot()).expect("encode snapshot");
     assert!(snapshot.get("request_prefix").is_none());
+    assert_eq!(snapshot["lineage_id"], thread_id);
+    assert_eq!(snapshot["prompt_cache_key"], thread_id);
     assert_eq!(snapshot["history"].as_array().map(Vec::len), Some(2));
     let history = snapshot["history"].to_string();
     assert!(history.contains("retained"));
@@ -388,6 +394,107 @@ fn loads_codex_rollout_without_a_nanocodex_sidecar() {
             RolloutTranscriptItem::Assistant("visible answer".to_owned()),
         ]
     );
+}
+
+#[test]
+fn rejects_partial_nanocodex_session_identity_metadata() {
+    let home = tempdir().expect("temporary Codex home");
+    let thread_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    let directory = home.path().join("sessions/2026/08/09");
+    std::fs::create_dir_all(&directory).expect("create rollout directory");
+    let path = directory.join(format!("rollout-2026-08-09T12-00-00-{thread_id}.jsonl"));
+    let mut file = File::create(&path).expect("create rollout");
+    for value in [
+        serde_json::json!({
+            "timestamp": "2026-08-09T12:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "cwd": home.path(),
+                "history_mode": "legacy",
+                "context_window": {"window_id": "window-1"},
+                "nanocodex_lineage_id": "019c0d31-c308-7d91-bff4-5dca82d15ac5"
+            }
+        }),
+        serde_json::json!({
+            "timestamp": "2026-08-09T12:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "resume"}]
+            }
+        }),
+    ] {
+        write_line(&mut file, &value).expect("write rollout line");
+    }
+    file.flush().expect("flush rollout");
+
+    let error = RolloutConfig::new(home.path())
+        .load_session(thread_id)
+        .expect_err("partial Nanocodex identity must not silently change cache lineage");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("must be recorded together"));
+}
+
+#[test]
+fn rejects_empty_or_non_string_nanocodex_session_identity_metadata() {
+    let thread_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    for (description, lineage_id, prompt_cache_key) in [
+        (
+            "empty lineage ID",
+            serde_json::json!(""),
+            serde_json::json!("cache-key"),
+        ),
+        (
+            "whitespace cache key",
+            serde_json::json!("lineage-id"),
+            serde_json::json!(" \t\n"),
+        ),
+        (
+            "non-string cache key",
+            serde_json::json!("lineage-id"),
+            serde_json::json!(42),
+        ),
+    ] {
+        let home = tempdir().expect("temporary Codex home");
+        let directory = home.path().join("sessions/2026/08/09");
+        std::fs::create_dir_all(&directory).expect("create rollout directory");
+        let path = directory.join(format!("rollout-2026-08-09T12-00-00-{thread_id}.jsonl"));
+        let mut file = File::create(&path).expect("create rollout");
+        for value in [
+            serde_json::json!({
+                "timestamp": "2026-08-09T12:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": thread_id,
+                    "cwd": home.path(),
+                    "history_mode": "legacy",
+                    "context_window": {"window_id": "window-1"},
+                    "nanocodex_lineage_id": lineage_id,
+                    "nanocodex_prompt_cache_key": prompt_cache_key
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-09T12:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "resume"}]
+                }
+            }),
+        ] {
+            write_line(&mut file, &value).expect("write rollout line");
+        }
+        file.flush().expect("flush rollout");
+
+        let error = RolloutConfig::new(home.path())
+            .load_session(thread_id)
+            .expect_err(description);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("must be non-empty strings"));
+    }
 }
 
 #[test]
@@ -572,6 +679,14 @@ async fn writes_codex_rollout_envelope_and_committed_items() {
         lines[0]["payload"]["id"],
         "019c0d31-c308-7d91-bff4-5dca82d15ac6"
     );
+    assert_eq!(
+        lines[0]["payload"]["nanocodex_lineage_id"],
+        "019c0d31-c308-7d91-bff4-5dca82d15ac6"
+    );
+    assert_eq!(
+        lines[0]["payload"]["nanocodex_prompt_cache_key"],
+        "019c0d31-c308-7d91-bff4-5dca82d15ac6"
+    );
     assert_eq!(lines[0]["payload"]["source"], "cli");
     assert_eq!(lines[0]["payload"]["history_mode"], "legacy");
     assert!(lines[0]["payload"]["context_window"]["window_id"].is_string());
@@ -680,6 +795,10 @@ async fn resumed_writer_repairs_a_rollout_behind_the_durable_boundary() {
         &Handle::current(),
         &config,
         "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+        RolloutIdentity {
+            lineage_id: "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+            prompt_cache_key: "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+        },
         Path::new("/worktree"),
         "base instructions",
         RolloutOrigin {
@@ -758,6 +877,10 @@ async fn fork_metadata_retains_parent_identity() {
         &Handle::current(),
         &RolloutConfig::new(home.path()),
         "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+        RolloutIdentity {
+            lineage_id: parent,
+            prompt_cache_key: parent,
+        },
         Path::new("/worktree"),
         "base instructions",
         RolloutOrigin {
@@ -768,36 +891,410 @@ async fn fork_metadata_retains_parent_identity() {
     )
     .expect("create fork rollout");
 
+    recorder
+        .seed_initial_history(
+            ResponseHistory::new(vec![message("inherited boundary")]),
+            0,
+            Thinking::High,
+        )
+        .await
+        .expect("seed and publish fork rollout");
+
     let lines = lines(&recorder);
     assert_eq!(lines[0]["payload"]["forked_from_id"], parent);
     assert_eq!(lines[0]["payload"]["parent_thread_id"], parent);
 }
 
 #[tokio::test]
-async fn failed_append_remains_pending_and_retries_without_duplicates() {
+async fn fork_seed_preserves_the_order_of_multiple_inherited_items() {
+    let home = tempdir().expect("temporary Codex home");
+    let parent = "019c0d31-c308-7d91-bff4-5dca82d15ac5";
+    let recorder = RolloutRecorder::create(
+        &Handle::current(),
+        &RolloutConfig::new(home.path()),
+        "019c0d31-c308-7d91-bff4-5dca82d15ac6",
+        RolloutIdentity {
+            lineage_id: parent,
+            prompt_cache_key: parent,
+        },
+        Path::new("/worktree"),
+        "base instructions",
+        RolloutOrigin {
+            kind: "fork",
+            parent_thread_id: Some(parent),
+        },
+        None,
+    )
+    .expect("create fork rollout");
+    let history = vec![
+        message("first inherited item"),
+        message("second inherited item"),
+    ];
+
+    recorder
+        .seed_initial_history(ResponseHistory::new(history.clone()), 0, Thinking::High)
+        .await
+        .expect("seed fork rollout");
+
+    let lines = lines(&recorder);
+    let item_types = lines
+        .iter()
+        .map(|line| line["type"].as_str().expect("rollout item type"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        item_types,
+        [
+            "session_meta",
+            "turn_context",
+            "response_item",
+            "response_item",
+            "world_state",
+        ]
+    );
+    let seeded_items = lines
+        .iter()
+        .filter(|line| line["type"] == "response_item")
+        .map(|line| line["payload"].clone())
+        .collect::<Vec<_>>();
+    let expected_items = history
+        .iter()
+        .map(|item| serde_json::to_value(item).expect("encode inherited item"))
+        .collect::<Vec<_>>();
+    assert_eq!(seeded_items, expected_items);
+}
+
+#[tokio::test]
+async fn failed_fork_seed_is_not_published_as_a_resume_target() {
+    let home = tempdir().expect("temporary Codex home");
+    let config = RolloutConfig::new(home.path());
+    let child = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    let recorder = RolloutRecorder::create(
+        &Handle::current(),
+        &config,
+        child,
+        RolloutIdentity {
+            lineage_id: "019c0d31-c308-7d91-bff4-5dca82d15ac5",
+            prompt_cache_key: "019c0d31-c308-7d91-bff4-5dca82d15ac5",
+        },
+        Path::new("/worktree"),
+        "base instructions",
+        RolloutOrigin {
+            kind: "fork",
+            parent_thread_id: Some("019c0d31-c308-7d91-bff4-5dca82d15ac5"),
+        },
+        None,
+    )
+    .expect("create unpublished fork rollout");
+    let path = recorder.info().path().to_path_buf();
+
+    assert!(
+        !path.exists(),
+        "fork rollout is unpublished before its seed"
+    );
+    recorder.inject_write_failures(1).await;
+    assert!(
+        recorder
+            .seed_initial_history(
+                ResponseHistory::new(vec![message("inherited boundary")]),
+                0,
+                Thinking::High,
+            )
+            .await
+            .is_err()
+    );
+    recorder.shutdown().await.expect("shutdown staged recorder");
+
+    assert!(
+        !path.exists(),
+        "failed seed must not publish a standard rollout"
+    );
+    assert!(config.load_session(child).is_err());
+    assert!(
+        config
+            .list_sessions()
+            .expect("list session candidates")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn empty_fork_seed_is_rejected_without_publishing_a_resume_target() {
+    let home = tempdir().expect("temporary Codex home");
+    let config = RolloutConfig::new(home.path());
+    let child = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    let recorder = RolloutRecorder::create(
+        &Handle::current(),
+        &config,
+        child,
+        RolloutIdentity {
+            lineage_id: "019c0d31-c308-7d91-bff4-5dca82d15ac5",
+            prompt_cache_key: "019c0d31-c308-7d91-bff4-5dca82d15ac5",
+        },
+        Path::new("/worktree"),
+        "base instructions",
+        RolloutOrigin {
+            kind: "fork",
+            parent_thread_id: Some("019c0d31-c308-7d91-bff4-5dca82d15ac5"),
+        },
+        None,
+    )
+    .expect("create unpublished fork rollout");
+    let path = recorder.info().path().to_path_buf();
+
+    let error = recorder
+        .seed_initial_history(ResponseHistory::new(Vec::new()), 0, Thinking::High)
+        .await
+        .expect_err("empty seed must be rejected");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    recorder.shutdown().await.expect("shutdown staged recorder");
+
+    assert!(!path.exists(), "empty seed must not publish a rollout");
+    assert!(config.load_session(child).is_err());
+    assert!(
+        config
+            .list_sessions()
+            .expect("list session candidates")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn failed_fork_publish_does_not_leave_a_resume_target() {
+    let home = tempdir().expect("temporary Codex home");
+    let config = RolloutConfig::new(home.path());
+    let child = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    let recorder = RolloutRecorder::create(
+        &Handle::current(),
+        &config,
+        child,
+        RolloutIdentity {
+            lineage_id: "019c0d31-c308-7d91-bff4-5dca82d15ac5",
+            prompt_cache_key: "019c0d31-c308-7d91-bff4-5dca82d15ac5",
+        },
+        Path::new("/worktree"),
+        "base instructions",
+        RolloutOrigin {
+            kind: "fork",
+            parent_thread_id: Some("019c0d31-c308-7d91-bff4-5dca82d15ac5"),
+        },
+        None,
+    )
+    .expect("create unpublished fork rollout");
+    let path = recorder.info().path().to_path_buf();
+    recorder.inject_publish_reopen_failure().await;
+
+    assert!(
+        recorder
+            .seed_initial_history(
+                ResponseHistory::new(vec![message("inherited boundary")]),
+                0,
+                Thinking::High,
+            )
+            .await
+            .is_err()
+    );
+    let _ = recorder.shutdown().await;
+
+    assert!(
+        !path.exists(),
+        "failed publish must not leave a standard rollout"
+    );
+    assert!(config.load_session(child).is_err());
+    assert!(
+        config
+            .list_sessions()
+            .expect("list session candidates")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn failed_append_is_discarded_and_later_flush_does_not_retry_it() {
     let home = tempdir().expect("temporary rollout directory");
     let path = home.path().join("rollout.jsonl");
     let file = File::create(&path).expect("create temporary rollout");
     let mut writer = RolloutWriter::new(
         tokio::fs::File::from_std(file),
+        path.clone(),
+        false,
         uuid::Uuid::now_v7().to_string(),
         PathBuf::from("/worktree"),
     );
+    let prefix = std::fs::read(&path).expect("read empty rollout prefix");
     writer.pending = Some(RolloutCommit::from_history(
         ResponseHistory::new(vec![message("retry me")]),
         0,
         completed_turn("retry me", "retried"),
     ));
-    writer.inject_write_failures(2);
+    writer.inject_write_failure_after(1);
 
     assert!(writer.persist_pending().await.is_err());
-    assert!(writer.pending.is_some());
-    writer.flush().await.expect("retry pending append");
+    assert!(writer.pending.is_none());
+    writer.flush().await.expect("flush after discarded append");
     drop(writer);
 
-    let lines = BufReader::new(File::open(path).expect("open retried rollout"))
+    let lines = BufReader::new(File::open(&path).expect("open discarded rollout"))
         .lines()
         .collect::<io::Result<Vec<_>>>()
-        .expect("read retried rollout");
-    assert_eq!(lines.len(), 7);
+        .expect("read discarded rollout");
+    assert!(lines.is_empty());
+    assert_eq!(
+        std::fs::read(path).expect("read rolled-back rollout"),
+        prefix
+    );
+}
+
+#[tokio::test]
+async fn failed_flush_is_reported_without_appending_a_rollout_record() {
+    let home = tempdir().expect("temporary rollout directory");
+    let path = home.path().join("rollout.jsonl");
+    let file = File::create(&path).expect("create temporary rollout");
+    let mut writer = RolloutWriter::new(
+        tokio::fs::File::from_std(file),
+        path.clone(),
+        false,
+        uuid::Uuid::now_v7().to_string(),
+        PathBuf::from("/worktree"),
+    );
+    writer.inject_write_failure_after(0);
+
+    assert!(writer.flush().await.is_err());
+    drop(writer);
+    assert!(
+        BufReader::new(File::open(path).expect("open rollout"))
+            .lines()
+            .collect::<io::Result<Vec<_>>>()
+            .expect("read rollout")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn failed_initial_seed_is_discarded_without_a_partial_checkpoint() {
+    let home = tempdir().expect("temporary rollout directory");
+    let recorder = recorder(home.path());
+    recorder.inject_write_failures(1).await;
+
+    assert!(
+        recorder
+            .seed_initial_history(
+                ResponseHistory::new(vec![message("inherited boundary")]),
+                0,
+                Thinking::High,
+            )
+            .await
+            .is_err()
+    );
+    recorder
+        .flush()
+        .await
+        .expect("flush cannot retry a failed seed");
+
+    let lines = lines(&recorder);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["type"], "session_meta");
+}
+
+#[tokio::test]
+async fn partial_initial_seed_is_rolled_back_to_session_metadata() {
+    let home = tempdir().expect("temporary rollout directory");
+    let recorder = recorder(home.path());
+    let prefix = std::fs::read(recorder.info().path()).expect("read session metadata prefix");
+    recorder.inject_write_failure_after(1).await;
+
+    assert!(
+        recorder
+            .seed_initial_history(
+                ResponseHistory::new(vec![message("inherited boundary")]),
+                0,
+                Thinking::High,
+            )
+            .await
+            .is_err()
+    );
+    recorder
+        .flush()
+        .await
+        .expect("flush cannot retry a partially written seed");
+
+    let lines = lines(&recorder);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["type"], "session_meta");
+    assert_eq!(
+        std::fs::read(recorder.info().path()).expect("read rolled-back rollout"),
+        prefix
+    );
+}
+
+#[tokio::test]
+async fn rollback_failure_marks_the_writer_corrupted_and_poisoned() {
+    let home = tempdir().expect("temporary rollout directory");
+    let path = home.path().join("rollout.jsonl");
+    let file = File::create(&path).expect("create temporary rollout");
+    let mut writer = RolloutWriter::new(
+        tokio::fs::File::from_std(file),
+        path,
+        false,
+        uuid::Uuid::now_v7().to_string(),
+        PathBuf::from("/worktree"),
+    );
+    writer.pending = Some(RolloutCommit::from_history(
+        ResponseHistory::new(vec![message("inherited boundary")]),
+        0,
+        completed_turn("persist", "final"),
+    ));
+    writer.inject_write_failure_after(1);
+    writer.inject_rollback_failure();
+
+    let error = writer
+        .persist_pending()
+        .await
+        .expect_err("failed rollback must report corruption");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("rollout corruption"));
+    assert!(error.to_string().contains("injected rollout write failure"));
+    assert!(error.to_string().contains("injected rollback failure"));
+    assert!(
+        writer.flush().await.is_err(),
+        "corrupted writer stays poisoned"
+    );
+}
+
+#[tokio::test]
+async fn rollback_corruption_quarantines_a_partially_persisted_root_rollout() {
+    let home = tempdir().expect("temporary rollout home");
+    let config = RolloutConfig::new(home.path());
+    let recorder = recorder(home.path());
+    let thread_id = recorder.info().thread_id().to_owned();
+    let path = recorder.info().path().to_path_buf();
+    recorder.inject_write_failure_after(4).await;
+    recorder.inject_rollback_failure().await;
+
+    let error = recorder
+        .persist_history(
+            ResponseHistory::new(vec![message("partially persisted root")]),
+            0,
+            completed_turn("persist root", "final"),
+        )
+        .await
+        .expect_err("failed rollback must report corruption");
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        config
+            .list_sessions()
+            .expect("list rollout candidates")
+            .is_empty(),
+        "a partially written root rollout must not be discoverable"
+    );
+    assert!(
+        config.load_session(&thread_id).is_err(),
+        "a partially written root rollout must not be resumable"
+    );
+    assert!(
+        !path.exists(),
+        "the normal rollout path must be removed from discovery"
+    );
+
+    let _ = recorder.shutdown().await;
 }
