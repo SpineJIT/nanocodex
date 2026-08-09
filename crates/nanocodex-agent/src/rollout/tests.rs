@@ -361,6 +361,66 @@ fn rejects_partial_nanocodex_session_identity_metadata() {
 }
 
 #[test]
+fn rejects_empty_or_non_string_nanocodex_session_identity_metadata() {
+    let thread_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    for (description, lineage_id, prompt_cache_key) in [
+        (
+            "empty lineage ID",
+            serde_json::json!(""),
+            serde_json::json!("cache-key"),
+        ),
+        (
+            "whitespace cache key",
+            serde_json::json!("lineage-id"),
+            serde_json::json!(" \t\n"),
+        ),
+        (
+            "non-string cache key",
+            serde_json::json!("lineage-id"),
+            serde_json::json!(42),
+        ),
+    ] {
+        let home = tempdir().expect("temporary Codex home");
+        let directory = home.path().join("sessions/2026/08/09");
+        std::fs::create_dir_all(&directory).expect("create rollout directory");
+        let path = directory.join(format!("rollout-2026-08-09T12-00-00-{thread_id}.jsonl"));
+        let mut file = File::create(&path).expect("create rollout");
+        for value in [
+            serde_json::json!({
+                "timestamp": "2026-08-09T12:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": thread_id,
+                    "cwd": home.path(),
+                    "history_mode": "legacy",
+                    "context_window": {"window_id": "window-1"},
+                    "nanocodex_lineage_id": lineage_id,
+                    "nanocodex_prompt_cache_key": prompt_cache_key
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-09T12:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "resume"}]
+                }
+            }),
+        ] {
+            write_line(&mut file, &value).expect("write rollout line");
+        }
+        file.flush().expect("flush rollout");
+
+        let error = RolloutConfig::new(home.path())
+            .load_session(thread_id)
+            .expect_err(description);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("must be non-empty strings"));
+    }
+}
+
+#[test]
 fn loads_the_latest_supported_model_from_codex_turn_context() {
     let home = tempdir().expect("temporary Codex home");
     let thread_id = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
