@@ -279,6 +279,10 @@ pub(super) enum Command {
         parent: Option<tracing::Span>,
         result: oneshot::Sender<Result<()>>,
     },
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    FlushRollout {
+        result: oneshot::Sender<Result<()>>,
+    },
     AppendDeveloperMessage {
         text: String,
         result: oneshot::Sender<Result<AgentSessionContext>>,

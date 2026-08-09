@@ -244,6 +244,37 @@ where
                     )));
                     continue;
                 }
+                if let Command::FlushRollout { result } = command {
+                    match self.durability.flush().await {
+                        Ok(()) => drop(result.send(Ok(()))),
+                        Err(failure) => {
+                            self.failure.record(failure);
+                            let error = self.failure.error().expect("persistence failure recorded");
+                            drop(
+                                result.send(Err(self
+                                    .failure
+                                    .error()
+                                    .expect("persistence failure remains available"))),
+                            );
+                            finish_fail_stop(
+                                FailStopContext {
+                                    commands: &mut self.commands,
+                                    failure: &self.failure,
+                                    workspace: self.workspace.as_deref(),
+                                    session_events: &self.events,
+                                    default_thinking,
+                                    default_fast_mode,
+                                },
+                                &mut model,
+                                &mut queued_turns,
+                            )
+                            .await?;
+                            model.shutdown().await;
+                            return Err(error);
+                        }
+                    }
+                    continue;
+                }
                 if let Command::Compact { parent, result } = command {
                     logical_turn_index = logical_turn_index.saturating_add(1);
                     let span = agent_compact_span(
@@ -365,6 +396,11 @@ where
                                             self.workspace.as_deref(),
                                             &self.spawner.context_source,
                                         )));
+                                    }
+                                    Some(Command::FlushRollout { result }) => {
+                                        drop(result.send(Err(NanocodexError::InvalidRequest(
+                                            "cannot flush a rollout while a turn is active".to_owned(),
+                                        ))));
                                     }
                                     Some(Command::Shutdown) => {
                                         if let Some(cancel) = cancel_compaction.take() {
@@ -743,6 +779,11 @@ where
                                     self.workspace.as_deref(),
                                     &self.spawner.context_source,
                                 )));
+                            }
+                            Some(Command::FlushRollout { result }) => {
+                                drop(result.send(Err(NanocodexError::InvalidRequest(
+                                    "cannot flush a rollout while a turn is active".to_owned(),
+                                ))));
                             }
                             Some(Command::Compact { parent, result }) => {
                                 pending_compact = Some((parent, result));

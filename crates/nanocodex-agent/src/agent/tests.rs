@@ -433,6 +433,53 @@ async fn explicit_rollout_flush_failure_fail_stops_the_agent() {
 }
 
 #[tokio::test]
+async fn rollout_flush_is_rejected_while_a_turn_is_active() {
+    let home = tempdir().expect("temporary rollout home");
+    let (generation_started, mut generation_started_rx) = mpsc::unbounded_channel();
+    let (release, release_rx) = oneshot::channel();
+    let generation_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let openai = OpenAi::builder("test")
+        .service({
+            let generation_started = generation_started.clone();
+            let release = Arc::new(Mutex::new(Some(release_rx)));
+            let generation_calls = Arc::clone(&generation_calls);
+            move || DelayedCompletedService {
+                generation_started: generation_started.clone(),
+                release: Arc::clone(&release),
+                generation_calls: Arc::clone(&generation_calls),
+            }
+        })
+        .build()
+        .expect("test OpenAI client");
+    let tools = Tools::builder()
+        .without_defaults()
+        .build()
+        .expect("empty tools");
+    let (agent, events) = Nanocodex::builder(openai)
+        .tools(tools)
+        .rollout(RolloutConfig::new(home.path()))
+        .build()
+        .expect("agent with rollout");
+    agent.durability.inject_write_failures(1).await;
+
+    let turn = agent.prompt("durable turn").await.expect("accepted turn");
+    generation_started_rx
+        .recv()
+        .await
+        .expect("generation starts");
+    assert!(matches!(
+        agent.flush_rollout().await,
+        Err(NanocodexError::InvalidRequest(_))
+    ));
+    release.send(()).expect("release generation");
+    assert!(matches!(
+        turn.result().await,
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+    drop(events);
+}
+
+#[tokio::test]
 async fn compaction_persistence_failure_fail_stops_current_and_queued_turns() {
     use std::sync::atomic::Ordering;
 
@@ -590,6 +637,58 @@ async fn fork_seeds_a_resumable_child_rollout_with_the_inherited_identity() {
     child.shutdown().await.expect("shutdown child");
     root.shutdown().await.expect("shutdown root");
     drop((child_events, root_events));
+}
+
+#[tokio::test]
+async fn failed_public_fork_seed_does_not_publish_a_child_rollout() {
+    let home = tempdir().expect("temporary rollout home");
+    let config = RolloutConfig::new(home.path()).fail_fork_seed_for_test();
+    let generation_inputs = Arc::new(Mutex::new(Vec::new()));
+    let openai = OpenAi::builder("test")
+        .service({
+            let generation_inputs = Arc::clone(&generation_inputs);
+            move || CheckpointLifecycleService {
+                generation_inputs: Arc::clone(&generation_inputs),
+            }
+        })
+        .build()
+        .expect("test OpenAI client");
+    let tools = Tools::builder()
+        .without_defaults()
+        .build()
+        .expect("empty tools");
+    let (root, root_events) = Nanocodex::builder(openai)
+        .tools(tools)
+        .rollout(config.clone())
+        .build()
+        .expect("root agent with rollout");
+    root.prompt("durable parent boundary")
+        .await
+        .expect("root turn")
+        .result()
+        .await
+        .expect("completed root turn");
+    let before = config
+        .list_sessions()
+        .expect("list root rollout")
+        .into_iter()
+        .map(|session| session.thread_id().to_owned())
+        .collect::<Vec<_>>();
+
+    assert!(matches!(
+        root.fork().await,
+        Err(NanocodexError::PersistRollout { .. })
+    ));
+    let after = config
+        .list_sessions()
+        .expect("list public rollouts after failed fork")
+        .into_iter()
+        .map(|session| session.thread_id().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(after, before);
+
+    root.shutdown().await.expect("shutdown root");
+    drop(root_events);
 }
 
 #[tokio::test]

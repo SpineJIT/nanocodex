@@ -76,6 +76,7 @@ where
         )?;
         if let Err(error) = child.seed_initial_checkpoint(&checkpoint, thinking).await {
             let _ = child.shutdown().await;
+            child.discard_unpublished_rollout().await;
             return Err(error);
         }
         Ok((child, events))

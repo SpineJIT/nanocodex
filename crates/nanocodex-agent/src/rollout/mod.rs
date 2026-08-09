@@ -41,6 +41,8 @@ const COMMAND_CAPACITY: usize = 8;
 pub struct RolloutConfig {
     codex_home: PathBuf,
     resume_path: Option<PathBuf>,
+    #[cfg(test)]
+    fail_fork_seed: bool,
 }
 
 impl RolloutConfig {
@@ -50,6 +52,8 @@ impl RolloutConfig {
         Self {
             codex_home: codex_home.into(),
             resume_path: None,
+            #[cfg(test)]
+            fail_fork_seed: false,
         }
     }
 
@@ -88,6 +92,17 @@ impl RolloutConfig {
     }
 
     pub(crate) fn for_new_thread(&self) -> Self {
-        Self::new(self.codex_home.clone())
+        Self {
+            codex_home: self.codex_home.clone(),
+            resume_path: None,
+            #[cfg(test)]
+            fail_fork_seed: self.fail_fork_seed,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn fail_fork_seed_for_test(mut self) -> Self {
+        self.fail_fork_seed = true;
+        self
     }
 }

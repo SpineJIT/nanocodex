@@ -74,6 +74,8 @@ enum RolloutCommand {
         writes: usize,
         result: oneshot::Sender<()>,
     },
+    #[cfg(test)]
+    InjectPublishReopenFailure { result: oneshot::Sender<()> },
 }
 
 pub(super) struct RolloutCommit {
@@ -325,6 +327,12 @@ impl RolloutRecorder {
             initial_window_id,
             cwd.to_path_buf(),
         );
+        #[cfg(test)]
+        let mut writer = writer;
+        #[cfg(test)]
+        if config.fail_fork_seed && origin.kind == "fork" {
+            writer.inject_write_failures(1);
+        }
         Ok(Self::spawn(
             runtime,
             thread_id,
@@ -509,6 +517,14 @@ impl RolloutRecorder {
         outcome
     }
 
+    pub(crate) async fn discard_unpublished_rollout(&self) {
+        let Some(path) = &self.unpublished_path else {
+            return;
+        };
+        let _ = tokio::fs::remove_file(path).await;
+        let _ = tokio::fs::remove_file(&self.info.path).await;
+    }
+
     async fn publish(&self) -> io::Result<()> {
         if self.unpublished_path.is_none() {
             return Ok(());
@@ -543,6 +559,18 @@ impl RolloutRecorder {
         let (result, receiver) = oneshot::channel();
         self.commands
             .send(RolloutCommand::InjectWriteFailureAfter { writes, result })
+            .await
+            .expect("test rollout writer remains available");
+        receiver
+            .await
+            .expect("test rollout writer accepts injection");
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn inject_publish_reopen_failure(&self) {
+        let (result, receiver) = oneshot::channel();
+        self.commands
+            .send(RolloutCommand::InjectPublishReopenFailure { result })
             .await
             .expect("test rollout writer remains available");
         receiver

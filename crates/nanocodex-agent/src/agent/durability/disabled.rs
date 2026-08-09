@@ -67,6 +67,12 @@ impl Durability {
         Ok(())
     }
 
+    pub(crate) async fn discard_unpublished_rollout(&self) {}
+
+    pub(crate) async fn flush(&self) -> std::result::Result<(), PersistRolloutFailure> {
+        Ok(())
+    }
+
     pub(crate) async fn shutdown(&self) -> Result<()> {
         Ok(())
     }

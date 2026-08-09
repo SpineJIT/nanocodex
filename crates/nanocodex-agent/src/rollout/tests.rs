@@ -819,6 +819,56 @@ async fn failed_fork_seed_is_not_published_as_a_resume_target() {
 }
 
 #[tokio::test]
+async fn failed_fork_publish_does_not_leave_a_resume_target() {
+    let home = tempdir().expect("temporary Codex home");
+    let config = RolloutConfig::new(home.path());
+    let child = "019c0d31-c308-7d91-bff4-5dca82d15ac6";
+    let recorder = RolloutRecorder::create(
+        &Handle::current(),
+        &config,
+        child,
+        RolloutIdentity {
+            lineage_id: "019c0d31-c308-7d91-bff4-5dca82d15ac5",
+            prompt_cache_key: "019c0d31-c308-7d91-bff4-5dca82d15ac5",
+        },
+        Path::new("/worktree"),
+        "base instructions",
+        RolloutOrigin {
+            kind: "fork",
+            parent_thread_id: Some("019c0d31-c308-7d91-bff4-5dca82d15ac5"),
+        },
+        None,
+    )
+    .expect("create unpublished fork rollout");
+    let path = recorder.info().path().to_path_buf();
+    recorder.inject_publish_reopen_failure().await;
+
+    assert!(
+        recorder
+            .seed_initial_history(
+                ResponseHistory::new(vec![message("inherited boundary")]),
+                0,
+                Thinking::High,
+            )
+            .await
+            .is_err()
+    );
+    let _ = recorder.shutdown().await;
+
+    assert!(
+        !path.exists(),
+        "failed publish must not leave a standard rollout"
+    );
+    assert!(config.load_session(child).is_err());
+    assert!(
+        config
+            .list_sessions()
+            .expect("list session candidates")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn failed_append_is_discarded_and_later_flush_does_not_retry_it() {
     let home = tempdir().expect("temporary rollout directory");
     let path = home.path().join("rollout.jsonl");

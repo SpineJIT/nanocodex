@@ -17,6 +17,8 @@ pub(in crate::rollout) struct RolloutWriter {
     injected_write_failures: usize,
     #[cfg(test)]
     injected_write_failure_after: Option<usize>,
+    #[cfg(test)]
+    injected_publish_reopen_failure: bool,
 }
 
 impl RolloutWriter {
@@ -43,6 +45,8 @@ impl RolloutWriter {
             injected_write_failures: 0,
             #[cfg(test)]
             injected_write_failure_after: None,
+            #[cfg(test)]
+            injected_publish_reopen_failure: false,
         }
     }
 
@@ -63,6 +67,8 @@ impl RolloutWriter {
             injected_write_failures: 0,
             #[cfg(test)]
             injected_write_failure_after: None,
+            #[cfg(test)]
+            injected_publish_reopen_failure: false,
         }
     }
 
@@ -97,6 +103,11 @@ impl RolloutWriter {
                 #[cfg(test)]
                 RolloutCommand::InjectWriteFailureAfter { writes, result } => {
                     self.inject_write_failure_after(writes);
+                    let _ = result.send(());
+                }
+                #[cfg(test)]
+                RolloutCommand::InjectPublishReopenFailure { result } => {
+                    self.inject_publish_reopen_failure();
                     let _ = result.send(());
                 }
             }
@@ -180,6 +191,12 @@ impl RolloutWriter {
                     .await?,
             );
             return Err(error);
+        }
+        #[cfg(test)]
+        if self.injected_publish_reopen_failure {
+            self.injected_publish_reopen_failure = false;
+            let _ = tokio::fs::remove_file(path).await;
+            return Err(io::Error::other("injected rollout reopen failure"));
         }
         match tokio::fs::OpenOptions::new()
             .read(true)
@@ -483,6 +500,11 @@ impl RolloutWriter {
     #[cfg(test)]
     pub(in crate::rollout) const fn inject_write_failure_after(&mut self, writes: usize) {
         self.injected_write_failure_after = Some(writes);
+    }
+
+    #[cfg(test)]
+    pub(in crate::rollout) const fn inject_publish_reopen_failure(&mut self) {
+        self.injected_publish_reopen_failure = true;
     }
 
     #[cfg(test)]

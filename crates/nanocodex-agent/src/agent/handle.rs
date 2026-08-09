@@ -112,7 +112,7 @@ impl Nanocodex {
     /// Waits for the rollout writer to flush its durable file state.
     ///
     /// This is a no-op when rollout recording is disabled. CLI consumers call
-    /// it at completed turn boundaries so persistence failures are user-visible.
+    /// it at idle completed-turn boundaries so persistence failures are user-visible.
     /// A failed commit is never retried by flushing; it fail-stops the driver.
     /// Flushing does not stop the live writer; call [`Self::shutdown`] at an
     /// explicit application or session boundary.
@@ -123,11 +123,10 @@ impl Nanocodex {
     #[cfg(not(target_family = "wasm"))]
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     pub async fn flush_rollout(&self) -> Result<()> {
-        self.failure.check()?;
-        if let Err(failure) = self.durability.flush().await {
-            self.failure.record(failure);
-        }
-        self.failure.check()
+        request_command(&self.commands, &self.failure, |result| {
+            Command::FlushRollout { result }
+        })
+        .await
     }
 
     pub(super) async fn seed_initial_checkpoint(
@@ -139,6 +138,10 @@ impl Nanocodex {
             .seed_initial_checkpoint(checkpoint, effort)
             .await
             .map_err(crate::error::PersistRolloutFailure::into_error)
+    }
+
+    pub(super) async fn discard_unpublished_rollout(&self) {
+        self.durability.discard_unpublished_rollout().await;
     }
 
     /// Gracefully stops this agent and waits for all owned resources to close.

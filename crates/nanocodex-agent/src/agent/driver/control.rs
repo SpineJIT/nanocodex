@@ -216,7 +216,8 @@ fn fail_command(command: Command, failure: &DriverFailure) {
         | Command::Cancel { result, .. }
         | Command::SetThinking { result, .. }
         | Command::SetFastMode { result, .. }
-        | Command::Compact { result, .. } => {
+        | Command::Compact { result, .. }
+        | Command::FlushRollout { result } => {
             drop(result.send(Err(failure_error(failure))));
         }
         Command::AppendDeveloperMessage { result, .. } => {
@@ -278,7 +279,8 @@ pub(super) async fn begin_shutdown(
             | Command::Cancel { result, .. }
             | Command::SetThinking { result, .. }
             | Command::SetFastMode { result, .. }
-            | Command::Compact { result, .. } => {
+            | Command::Compact { result, .. }
+            | Command::FlushRollout { result } => {
                 drop(result.send(Err(NanocodexError::AgentStopped)));
             }
             Command::Shutdown => {}
@@ -353,6 +355,9 @@ pub(super) async fn handle_idle_command<S>(
         }
         Command::Shutdown => {}
         Command::Compact { result, .. } => {
+            drop(result.send(Err(NanocodexError::AgentStopped)));
+        }
+        Command::FlushRollout { result } => {
             drop(result.send(Err(NanocodexError::AgentStopped)));
         }
         Command::AppendDeveloperMessage { result, .. } => {

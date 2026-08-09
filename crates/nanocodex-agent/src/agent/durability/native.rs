@@ -151,6 +151,12 @@ impl Durability {
             })
     }
 
+    pub(crate) async fn discard_unpublished_rollout(&self) {
+        if let Some(recorder) = &self.recorder {
+            recorder.discard_unpublished_rollout().await;
+        }
+    }
+
     pub(crate) async fn flush(&self) -> std::result::Result<(), PersistRolloutFailure> {
         let Some(recorder) = &self.recorder else {
             return Ok(());
