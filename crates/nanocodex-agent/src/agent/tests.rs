@@ -162,6 +162,23 @@ impl Service<ResponsesAttempt> for DelayedCompactionService {
                     usage: None,
                 }),
             )))),
+            ResponsesAttemptKind::Generation => Box::pin(ready(Ok(ResponsesServiceResponse::new(
+                ResponsesOutput::Generation(GenerationOutput {
+                    id: "resp-generation".to_owned(),
+                    status: "completed".to_owned(),
+                    end_turn: Some(true),
+                    final_message: Some("done".to_owned()),
+                    output_items: vec![ResponseItem::message(
+                        MessageRole::Assistant,
+                        [ContentItem::output_text("done")],
+                    )],
+                    code_calls: Vec::new(),
+                    usage: None,
+                    time_to_first_event_ns: 0,
+                    time_to_first_output_ns: None,
+                    pipeline_stats: ResponsePipelineStats::default(),
+                }),
+            )))),
             _ => panic!("compaction persistence failure test received an unsupported attempt"),
         }
     }
@@ -527,12 +544,18 @@ async fn rollout_flush_waits_for_an_active_turns_durable_boundary() {
 #[tokio::test]
 async fn rollout_flush_succeeds_after_a_durable_compaction() {
     let home = tempdir().expect("temporary rollout home");
-    let generation_inputs = Arc::new(Mutex::new(Vec::new()));
+    let (compaction_started, mut compaction_started_rx) = mpsc::unbounded_channel();
+    let (release, release_rx) = oneshot::channel();
+    let compaction_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let openai = OpenAi::builder("test")
         .service({
-            let generation_inputs = Arc::clone(&generation_inputs);
-            move || CheckpointLifecycleService {
-                generation_inputs: Arc::clone(&generation_inputs),
+            let compaction_started = compaction_started.clone();
+            let release = Arc::new(Mutex::new(Some(release_rx)));
+            let compaction_calls = Arc::clone(&compaction_calls);
+            move || DelayedCompactionService {
+                compaction_started: compaction_started.clone(),
+                release: Arc::clone(&release),
+                compaction_calls: Arc::clone(&compaction_calls),
             }
         })
         .build()
@@ -546,12 +569,51 @@ async fn rollout_flush_succeeds_after_a_durable_compaction() {
         .rollout(RolloutConfig::new(home.path()))
         .build()
         .expect("agent with rollout");
-
-    agent.compact().await.expect("durable compaction");
     agent
-        .flush_rollout()
+        .prompt("durable context before compaction")
         .await
+        .expect("pre-compaction turn")
+        .result()
+        .await
+        .expect("durable pre-compaction turn");
+
+    let compact_agent = agent.clone();
+    let compact = tokio::spawn(async move { compact_agent.compact().await });
+    compaction_started_rx
+        .recv()
+        .await
+        .expect("compaction starts");
+    let flush_agent = agent.clone();
+    let mut flush = tokio::spawn(async move { flush_agent.flush_rollout().await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), &mut flush)
+            .await
+            .is_err(),
+        "flush waits for the active compaction's durable boundary"
+    );
+    release.send(()).expect("release compaction");
+    compact
+        .await
+        .expect("compaction task joins")
+        .expect("durable compaction");
+    flush
+        .await
+        .expect("flush task joins")
         .expect("flush succeeds after durable compaction");
+
+    let durable = RolloutConfig::new(home.path())
+        .load_session(&agent.session_id().to_string())
+        .expect("successful compaction makes the rollout immediately readable");
+    assert!(
+        serde_json::to_value(durable.snapshot())
+            .expect("encode durable compaction snapshot")["history"]
+            .to_string()
+            .contains("opaque-summary")
+    );
+    assert_eq!(
+        compaction_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
 
     agent.shutdown().await.expect("shutdown agent");
     drop(events);
