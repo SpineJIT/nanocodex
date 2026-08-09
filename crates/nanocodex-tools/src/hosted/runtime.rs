@@ -269,10 +269,7 @@ impl HostedToolRuntime {
         };
         match host.execute(source, context).await {
             Ok(mut execution) => {
-                execution.apply_host_turn_behaviors(
-                    |name| host.turn_behavior(name),
-                    |name| host.emits_output_on_success(name),
-                );
+                execution.apply_host_turn_behaviors(|name| host.turn_behavior(name));
                 execution
             }
             Err(error) => failed(&error.to_string()),
@@ -400,8 +397,6 @@ mod tests {
 
     struct TerminalHost;
 
-    struct EmittingHost;
-
     impl CodeModeHost for EchoHost {
         fn tool_definitions(
             &self,
@@ -480,48 +475,6 @@ mod tests {
         }
     }
 
-    impl CodeModeHost for EmittingHost {
-        fn tool_definitions(
-            &self,
-            _session_id: &str,
-        ) -> Result<Vec<ToolDefinition>, CodeModeHostError> {
-            Ok(vec![ToolDefinition::function(
-                "handoff",
-                "Returns a handoff for the parent model.",
-                json!({"type": "object", "properties": {}}),
-            )])
-        }
-
-        fn emits_output_on_success(&self, name: &str) -> bool {
-            name == "handoff"
-        }
-
-        fn execute<'a>(
-            &'a self,
-            _source: &'a str,
-            _context: ToolContext<'a>,
-        ) -> HostFuture<'a, Result<CodeModeExecution, CodeModeHostError>> {
-            Box::pin(async {
-                Ok(CodeModeExecution::new(
-                    ToolOutputBody::Text("ordinary output ".repeat(4_000)),
-                    true,
-                    vec![NestedToolCall {
-                        call_id: "call-exec/code-1".to_owned(),
-                        name: "handoff".to_owned(),
-                        input: json!({}),
-                        output: ToolOutputBody::Text("hosted handoff".to_owned()),
-                        success: true,
-                        turn_behavior: ToolTurnBehavior::Continue,
-                        started_after_ns: 0,
-                        duration_ns: 0,
-                        metadata: None,
-                    }],
-                    Vec::new(),
-                ))
-            })
-        }
-    }
-
     #[test]
     fn model_description_orders_host_definitions() {
         let tools = HostedTools::new(EchoHost).for_session("session-1");
@@ -548,29 +501,6 @@ mod tests {
             .expect("host-declared terminal tool should complete the cell");
         assert_eq!(receipt.call_id(), "call-exec/code-1");
         assert_eq!(receipt.tool_name(), "finish");
-    }
-
-    #[tokio::test]
-    async fn hosted_code_mode_appends_static_emitting_output() {
-        let tools = HostedTools::new(EmittingHost);
-        let runtime = HostedToolRuntime::new_with_tools(".", None, None, &tools);
-        let execution = runtime
-            .execute_code(
-                "await tools.handoff({});",
-                ToolContext::new("model", "session", "call-exec", &[], 1_000),
-            )
-            .await;
-
-        let ToolOutputBody::Text(output) = execution.output else {
-            panic!("emitting output should normalize the host output to bounded text");
-        };
-        assert!(output.contains("ordinary output"));
-        assert!(output.ends_with("hosted handoff"));
-        assert!(
-            output.len() <= crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
-            "model-visible hosted output was {} bytes",
-            output.len()
-        );
     }
 
     #[tokio::test]

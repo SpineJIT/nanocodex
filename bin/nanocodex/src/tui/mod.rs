@@ -81,6 +81,12 @@ const MAX_AGENT_EVENTS_PER_BATCH: usize = 256;
 pub(crate) struct InitialPrompt {
     display: String,
     instruction: Option<String>,
+    behavior: InitialPromptBehavior,
+}
+
+enum InitialPromptBehavior {
+    SubmitImmediately,
+    PrefillOnly,
 }
 
 impl InitialPrompt {
@@ -88,6 +94,7 @@ impl InitialPrompt {
         Self {
             display,
             instruction: None,
+            behavior: InitialPromptBehavior::SubmitImmediately,
         }
     }
 
@@ -95,6 +102,15 @@ impl InitialPrompt {
         Self {
             display,
             instruction: Some(instruction),
+            behavior: InitialPromptBehavior::SubmitImmediately,
+        }
+    }
+
+    pub(crate) const fn prefill(display: String) -> Self {
+        Self {
+            display,
+            instruction: None,
+            behavior: InitialPromptBehavior::PrefillOnly,
         }
     }
 }
@@ -1052,6 +1068,9 @@ fn submit_initial_prompt(
     if let Some(prompt) = initial_prompt {
         app.input = prompt.display;
         app.cursor = app.input.len();
+        if matches!(prompt.behavior, InitialPromptBehavior::PrefillOnly) {
+            return Ok(());
+        }
         if let Some(instruction) = prompt.instruction {
             let Some(input) = app.take_submission() else {
                 return Ok(());
@@ -3225,17 +3244,38 @@ mod tests {
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
     use super::{
-        BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
-        UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, WorkerHandle, active_session_id,
-        apply_worker_event_batch, classify_submission, finish_worker, handle_key,
-        handle_worker_update, paste_clipboard_image, prepare_btw_prompt, report_cancel_outcome,
-        session_trace_url, spawn_agent_worker,
+        BTW_BOUNDARY, InitialPrompt, PaneId, RedrawPriority, Submission, TerminalAction, UiAction,
+        UiModel, UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, WorkerHandle,
+        active_session_id, apply_worker_event_batch, classify_submission, finish_worker,
+        handle_key, handle_worker_update, paste_clipboard_image, prepare_btw_prompt,
+        report_cancel_outcome, session_trace_url, spawn_agent_worker, submit_initial_prompt,
     };
+    use crate::app_core::WorkerCapabilities;
     use crate::tui::{
         app::App,
         scheduler::{RenderScheduler, STREAM_FRAME_INTERVAL},
         telemetry::StreamTelemetry,
     };
+
+    #[test]
+    fn initial_prefill_keeps_a_manual_continuation_in_the_composer() -> Result<()> {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+
+        submit_initial_prompt(
+            &mut app,
+            "root-session",
+            WorkerCapabilities::standard(),
+            &commands,
+            Some(InitialPrompt::prefill(
+                "continue the interrupted scope".to_owned(),
+            )),
+        )?;
+
+        assert_eq!(app.input, "continue the interrupted scope");
+        assert!(worker.try_recv().is_err());
+        Ok(())
+    }
 
     #[test]
     fn spine_tree_updates_replace_the_transcript_card() -> Result<()> {

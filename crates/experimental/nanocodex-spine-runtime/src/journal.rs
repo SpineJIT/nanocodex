@@ -393,9 +393,21 @@ impl JournalState {
     pub(crate) fn unclaimed_active_delivery(
         &self,
     ) -> Option<(String, String, TransitionIntent, DeliveryKind)> {
+        self.active_delivery(DeliveryStatus::Unclaimed)
+    }
+
+    pub(crate) fn claimed_active_delivery(
+        &self,
+    ) -> Option<(String, String, TransitionIntent, DeliveryKind)> {
+        self.active_delivery(DeliveryStatus::Claimed)
+    }
+
+    fn active_delivery(
+        &self,
+        status: DeliveryStatus,
+    ) -> Option<(String, String, TransitionIntent, DeliveryKind)> {
         self.deliveries.iter().find_map(|(delivery_id, delivery)| {
-            (delivery.status == DeliveryStatus::Unclaimed
-                && delivery.target_session_id == self.active_session_id)
+            (delivery.status == status && delivery.target_session_id == self.active_session_id)
                 .then(|| {
                     (
                         delivery_id.clone(),

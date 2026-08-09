@@ -32,10 +32,7 @@ use super::{
 pub use crate::hosted::{
     CodeModeExecution, CodeModeNotification, CodeModeObserver, CodeModeUpdate, NestedToolCall,
 };
-use crate::{
-    contract::DEFAULT_TOOL_OUTPUT_TOKENS,
-    runtime::{OwnedToolContext, ToolRegistry},
-};
+use crate::runtime::{OwnedToolContext, ToolRegistry};
 use embedded::EmbeddedHost;
 pub(crate) use spec::{exec_spec, wait_spec};
 
@@ -128,7 +125,6 @@ struct LiveCell {
     id: u64,
     turn_id: AtomicU64,
     output_token_budget: usize,
-    output_token_ceiling: usize,
     observation: Arc<Mutex<CellObservationState>>,
     lifecycle: Arc<CellLifecycle>,
     terminate: StdMutex<Option<oneshot::Sender<()>>>,
@@ -233,14 +229,12 @@ struct CompletedNestedCall {
     value: Value,
     call: NestedToolCall,
     shell_session_id: Option<i64>,
-    emits_output_on_success: bool,
 }
 
 struct ObservedNestedCall {
     id: u64,
     call: NestedToolCall,
     shell_session_id: Option<i64>,
-    emits_output_on_success: bool,
 }
 
 enum CellTerminal {
@@ -351,9 +345,10 @@ impl CodeModeRuntime {
             Ok(source) => source,
             Err(message) => return failed_execution(started_at, &message, Vec::new()),
         };
-        let output_token_ceiling = bounded_output_token_budget(None, context.output_token_budget);
-        let output_token_budget =
-            bounded_output_token_budget(source.max_output_tokens, output_token_ceiling);
+        let output_token_budget = source
+            .max_output_tokens
+            .unwrap_or(context.output_token_budget)
+            .max(1);
         tracing::Span::current().record("output.max_tokens", output_token_budget);
         let context = context.with_output_token_budget(output_token_budget);
         let stored = self.stored.lock().await.clone();
@@ -371,7 +366,6 @@ impl CodeModeRuntime {
                 Arc::clone(&self.stored),
                 Arc::clone(&self.host),
                 output_token_budget,
-                output_token_ceiling,
             ));
             let observation = Arc::clone(&cell.observation).lock_owned().await;
             registry.live_cells.insert(cell_id, Arc::clone(&cell));
@@ -448,7 +442,6 @@ impl CodeModeRuntime {
             }
         };
         let continued_output_token_budget = cell.output_token_budget;
-        let output_token_ceiling = cell.output_token_ceiling;
         if arguments.terminate {
             cell.request_terminate();
             let (execution, running) = observe_cell(
@@ -471,8 +464,10 @@ impl CodeModeRuntime {
                 .unwrap_or(u64::try_from(DEFAULT_WAIT_YIELD.as_millis()).unwrap_or(u64::MAX)),
         );
         let yield_time = observer_yield_timeout(yield_time);
-        let output_token_budget =
-            bounded_output_token_budget(arguments.max_tokens, output_token_ceiling);
+        let output_token_budget = arguments
+            .max_tokens
+            .unwrap_or(continued_output_token_budget)
+            .max(1);
         let (execution, running) = observe_cell(
             &cell,
             observation,
@@ -677,7 +672,6 @@ impl LiveCell {
         shared_stored: Arc<Mutex<HashMap<String, Value>>>,
         host: Arc<Mutex<SharedJsHost>>,
         output_token_budget: usize,
-        output_token_ceiling: usize,
     ) -> Self {
         let (updates_tx, updates) = mpsc::unbounded_channel();
         let (terminate, terminate_rx) = oneshot::channel();
@@ -715,7 +709,6 @@ impl LiveCell {
             id,
             turn_id: AtomicU64::new(turn_id),
             output_token_budget,
-            output_token_ceiling,
             observation: Arc::new(Mutex::new(CellObservationState {
                 updates,
                 buffered: ObservationBuffer::default(),
@@ -1019,36 +1012,16 @@ fn observed_execution(
     }: ObservationBuffer,
 ) -> CodeModeExecution {
     expose_running_shell_sessions(&mut content, &nested_calls);
-    let mut nested_calls = nested_calls;
-    nested_calls.sort_unstable_by_key(|call| call.id);
-    let emitted_output = crate::emitted_output::bounded_emitted_output(
-        nested_calls
-            .iter()
-            .filter(|call| call.emits_output_on_success && call.call.success)
-            .map(|call| &call.call.output),
-    );
-    let nested_calls = nested_calls.into_iter().map(|call| call.call).collect();
     let content = output::truncate_content(content, max_output_tokens);
-    let mut output = with_status(status, started_at.elapsed().as_secs_f64(), content);
-    if let Some(emitted_output) = emitted_output {
-        crate::emitted_output::append_bounded_output(&mut output, emitted_output);
-    }
     let mut execution = CodeModeExecution {
-        output,
+        output: with_status(status, started_at.elapsed().as_secs_f64(), content),
         success,
-        nested_calls,
+        nested_calls: ordered_calls(nested_calls),
         notifications,
         terminal_selection: Default::default(),
     };
     execution.select_terminal_tools(terminal_tools);
     execution
-}
-
-fn bounded_output_token_budget(requested: Option<usize>, context_budget: usize) -> usize {
-    requested
-        .unwrap_or(context_budget)
-        .min(context_budget)
-        .clamp(1, DEFAULT_TOOL_OUTPUT_TOKENS)
 }
 
 fn expose_running_shell_sessions(
@@ -1228,7 +1201,6 @@ impl EmbeddedHost {
             id: completed.id,
             call: completed.call,
             shell_session_id: completed.shell_session_id,
-            emits_output_on_success: completed.emits_output_on_success,
         })
     }
 }
@@ -1361,6 +1333,11 @@ impl HostFailure {
     }
 }
 
+fn ordered_calls(mut calls: Vec<ObservedNestedCall>) -> Vec<NestedToolCall> {
+    calls.sort_unstable_by_key(|call| call.id);
+    calls.into_iter().map(|call| call.call).collect()
+}
+
 async fn execute_nested_call(
     tools: &ToolRegistry,
     id: u64,
@@ -1383,7 +1360,6 @@ async fn execute_nested_call(
     );
     let execution = tools.execute_nested(&name, input.clone(), context).await;
     let turn_behavior = tools.turn_behavior(&name);
-    let emits_output_on_success = tools.emits_output_on_success(&name);
     let duration_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let value = execution.code_mode_value();
     let shell_session_id = execution
@@ -1394,7 +1370,6 @@ async fn execute_nested_call(
         id,
         value,
         shell_session_id,
-        emits_output_on_success,
         call: NestedToolCall {
             call_id,
             name,

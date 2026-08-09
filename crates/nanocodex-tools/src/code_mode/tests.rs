@@ -33,10 +33,6 @@ struct SerialConcurrencyProbe {
 
 struct FinishesTurn;
 
-struct EmitsOutput;
-
-struct EmitsLargeOutput;
-
 struct ConcurrencyProbeState {
     active: AtomicUsize,
     maximum: AtomicUsize,
@@ -120,164 +116,6 @@ impl Tool for FinishesTurn {
     async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
         Ok(ToolOutput::text("finished"))
     }
-}
-
-#[async_trait::async_trait]
-impl Tool for EmitsOutput {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function(
-            "emits_output",
-            "Returns a result that Code Mode should expose to the next model response.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-        )
-    }
-
-    fn emits_output_on_success(&self) -> bool {
-        true
-    }
-
-    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
-        Ok(ToolOutput::text("model-facing handoff"))
-    }
-}
-
-#[async_trait::async_trait]
-impl Tool for EmitsLargeOutput {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function(
-            "emits_large_output",
-            "Returns a large result that Code Mode should bound before exposing it.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-        )
-    }
-
-    fn emits_output_on_success(&self) -> bool {
-        true
-    }
-
-    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
-        Ok(ToolOutput::text("x".repeat(750)))
-    }
-}
-
-#[tokio::test]
-async fn successful_emitting_tool_surfaces_its_output_without_text() -> Result<()> {
-    let workspace = temporary_workspace("emitting-tool-output")?;
-    let tools = Tools::builder()
-        .without_defaults()
-        .tool(EmitsOutput)
-        .build()?;
-    let runtime = ToolRuntime::new_with_tools(&workspace, None, None, &tools);
-    let execution = runtime
-        .execute_code(
-            "await tools.emits_output({});",
-            ToolContext::new(
-                "test-model",
-                "test-session",
-                "test-call",
-                &[],
-                crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
-            ),
-        )
-        .await;
-
-    assert!(execution.success);
-    assert!(emitted_text(&execution)?.contains("model-facing handoff"));
-    std::fs::remove_dir_all(workspace)?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn emitted_output_survives_a_zero_normal_output_budget() -> Result<()> {
-    let workspace = temporary_workspace("emitting-tool-reserved-output")?;
-    let tools = Tools::builder()
-        .without_defaults()
-        .tool(EmitsOutput)
-        .build()?;
-    let runtime = ToolRuntime::new_with_tools(&workspace, None, None, &tools);
-    let execution = runtime
-        .execute_code(
-            "text('ordinary output'); await tools.emits_output({});",
-            ToolContext::new("test-model", "test-session", "test-call", &[], 0),
-        )
-        .await;
-
-    assert!(execution.success);
-    assert!(emitted_text(&execution)?.contains("model-facing handoff"));
-    std::fs::remove_dir_all(workspace)?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn emitted_output_has_a_non_configurable_aggregate_limit() -> Result<()> {
-    let workspace = temporary_workspace("bounded-emitting-tool-output")?;
-    let tools = Tools::builder()
-        .without_defaults()
-        .tool(EmitsLargeOutput)
-        .build()?;
-    let runtime = ToolRuntime::new_with_tools(&workspace, None, None, &tools);
-    let execution = runtime
-        .execute_code(
-            "await tools.emits_large_output({}); await tools.emits_large_output({});",
-            ToolContext::new("test-model", "test-session", "test-call", &[], 0),
-        )
-        .await;
-
-    assert!(execution.success);
-    let output = execution_output(&execution);
-    assert!(output.contains("[emitted output truncated]"));
-    assert!(output.len() <= crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS);
-    std::fs::remove_dir_all(workspace)?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn emitted_output_stays_within_the_hard_model_visible_output_budget() -> Result<()> {
-    let workspace = temporary_workspace("bounded-emitting-tool-cell-output")?;
-    let tools = Tools::builder()
-        .without_defaults()
-        .tool(EmitsLargeOutput)
-        .build()?;
-    let runtime = ToolRuntime::new_with_tools(&workspace, None, None, &tools);
-    let execution = runtime
-        .execute_code(
-            "// @exec: {\"max_output_tokens\": 100000}\ntext('界'.repeat(20_000)); await tools.emits_large_output({}); await tools.emits_large_output({});",
-            ToolContext::new(
-                "test-model",
-                "test-session",
-                "test-call",
-                &[],
-                crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
-            ),
-        )
-        .await;
-
-    assert!(execution.success);
-    assert!(emitted_text(&execution)?.contains("[emitted output truncated]"));
-    let model_visible_text_bytes = match &execution.output {
-        ToolOutputBody::Text(text) => text.len(),
-        ToolOutputBody::Content(content) => content
-            .iter()
-            .filter_map(|item| match item {
-                ToolOutputContent::InputText { text } => Some(text.len()),
-                ToolOutputContent::InputImage { .. } | ToolOutputContent::InputAudio { .. } => None,
-            })
-            .sum(),
-    };
-    assert!(
-        model_visible_text_bytes <= crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
-        "model-visible cell output was {model_visible_text_bytes} bytes"
-    );
-    std::fs::remove_dir_all(workspace)?;
-    Ok(())
 }
 
 #[tokio::test]
@@ -2055,34 +1893,37 @@ text(result);
 }
 
 #[tokio::test]
-async fn exec_pragma_and_wait_cannot_exceed_the_context_output_budget() -> Result<()> {
+async fn exec_pragma_and_wait_limit_direct_output() -> Result<()> {
     let workspace = temporary_workspace("code-output-limits")?;
     let tools = test_tools(&workspace);
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r#"// @exec: {"max_output_tokens": 100000}
-text("a".repeat(10_000));
-await yield_control();
-text("b".repeat(10_000));"#,
-            ToolContext::new("test-model", "test-session", "call-exec", &history, 2),
+            "// @exec: {\"max_output_tokens\": 2}\ntext(\"abcdefghijklmnop\")",
+            test_context(&history),
         )
         .await;
     assert!(execution.success);
-    let initial_output = execution_output(&execution);
-    assert!(initial_output.contains("Warning: truncated output"));
-    assert!(initial_output.len() < 500, "{initial_output}");
+    assert!(execution_output(&execution).contains("Warning: truncated output"));
 
+    let yielded = tools
+        .execute_code(
+            r#"
+await yield_control();
+text("abcdefghijklmnop");
+"#,
+            test_context(&history),
+        )
+        .await;
+    assert!(yielded.success);
     let completed = tools
         .wait_for_code(
-            r#"{"cell_id":"1","yield_time_ms":1000,"max_tokens":100000}"#,
-            ToolContext::new("test-model", "test-session", "call-exec", &history, 2),
+            r#"{"cell_id":"2","yield_time_ms":1000,"max_tokens":2}"#,
+            test_context(&history),
         )
         .await;
     assert!(completed.success);
-    let resumed_output = execution_output(&completed);
-    assert!(resumed_output.contains("Warning: truncated output"));
-    assert!(resumed_output.len() < 500, "{resumed_output}");
+    assert!(execution_output(&completed).contains("Warning: truncated output"));
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -2363,17 +2204,17 @@ fn model_description_uses_codex_style_declarations() {
 }
 
 fn emitted_text(execution: &CodeModeExecution) -> Result<&str> {
-    match &execution.output {
-        ToolOutputBody::Text(text) => Ok(text),
-        ToolOutputBody::Content(content) => content
-            .iter()
-            .rev()
-            .find_map(|item| match item {
-                ToolOutputContent::InputText { text } => Some(text.as_str()),
-                ToolOutputContent::InputImage { .. } | ToolOutputContent::InputAudio { .. } => None,
-            })
-            .ok_or_else(|| eyre!("code-mode execution did not emit text")),
-    }
+    let ToolOutputBody::Content(content) = &execution.output else {
+        return Err(eyre!("code-mode execution did not emit content"));
+    };
+    content
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            ToolOutputContent::InputText { text } => Some(text.as_str()),
+            ToolOutputContent::InputImage { .. } | ToolOutputContent::InputAudio { .. } => None,
+        })
+        .ok_or_else(|| eyre!("code-mode execution did not emit text"))
 }
 
 fn execution_output(execution: &CodeModeExecution) -> String {
@@ -2404,7 +2245,6 @@ fn test_live_cell(
         id,
         turn_id: AtomicU64::new(0),
         output_token_budget: crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
-        output_token_ceiling: crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS,
         observation: Arc::new(tokio::sync::Mutex::new(CellObservationState {
             updates,
             buffered: ObservationBuffer::default(),

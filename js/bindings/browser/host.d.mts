@@ -2,7 +2,6 @@ export type BrowserTool = {
   description: string;
   parameters: Record<string, unknown>;
   turnBehavior?: "continue" | "finishTurnOnSuccess" | undefined;
-  emitOutputOnSuccess?: boolean | undefined;
   handler: (
     input: unknown,
     context: { sessionId: string },

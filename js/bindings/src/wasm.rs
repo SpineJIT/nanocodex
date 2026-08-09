@@ -55,13 +55,7 @@ extern "C" {
 
 struct JavaScriptCodeModeHost {
     mode: HostedToolMode,
-    turn_behaviors: HashMap<String, JavaScriptToolBehavior>,
-}
-
-#[derive(Clone, Copy)]
-struct JavaScriptToolBehavior {
-    turn_behavior: ToolTurnBehavior,
-    emits_output_on_success: bool,
+    turn_behaviors: HashMap<String, ToolTurnBehavior>,
 }
 
 impl JavaScriptCodeModeHost {
@@ -72,18 +66,8 @@ impl JavaScriptCodeModeHost {
                 .into_iter()
                 .map(|(name, behavior)| {
                     let behavior = match behavior.as_str() {
-                        "finish_turn_on_success" => JavaScriptToolBehavior {
-                            turn_behavior: ToolTurnBehavior::FinishTurnOnSuccess,
-                            emits_output_on_success: false,
-                        },
-                        "emit_output_on_success" => JavaScriptToolBehavior {
-                            turn_behavior: ToolTurnBehavior::Continue,
-                            emits_output_on_success: true,
-                        },
-                        _ => JavaScriptToolBehavior {
-                            turn_behavior: ToolTurnBehavior::Continue,
-                            emits_output_on_success: false,
-                        },
+                        "finish_turn_on_success" => ToolTurnBehavior::FinishTurnOnSuccess,
+                        _ => ToolTurnBehavior::Continue,
                     };
                     (name, behavior)
                 })
@@ -107,15 +91,8 @@ impl CodeModeHost for JavaScriptCodeModeHost {
     fn turn_behavior(&self, name: &str) -> ToolTurnBehavior {
         self.turn_behaviors
             .get(name)
-            .map_or(ToolTurnBehavior::Continue, |behavior| {
-                behavior.turn_behavior
-            })
-    }
-
-    fn emits_output_on_success(&self, name: &str) -> bool {
-        self.turn_behaviors
-            .get(name)
-            .is_some_and(|behavior| behavior.emits_output_on_success)
+            .copied()
+            .unwrap_or(ToolTurnBehavior::Continue)
     }
 
     fn tool_definitions(&self, session_id: &str) -> Result<Vec<ToolDefinition>, CodeModeHostError> {

@@ -19,8 +19,6 @@ pub mod code_mode;
 #[cfg(feature = "native")]
 mod code_mode_order;
 #[cfg(feature = "native")]
-mod emitted_output;
-#[cfg(feature = "native")]
 pub mod hosted;
 #[cfg(all(not(target_family = "wasm"), feature = "native"))]
 #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]

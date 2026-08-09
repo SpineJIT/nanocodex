@@ -8,16 +8,10 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     if (!tool || typeof tool.handler !== "function") {
       throw new TypeError(`tool ${name} requires a handler function`);
     }
-    const turnBehavior = normalizeTurnBehavior(tool.turnBehavior);
-    const emitsOutputOnSuccess = normalizeEmitsOutputOnSuccess(tool.emitOutputOnSuccess);
-    if (emitsOutputOnSuccess && turnBehavior.host !== "continue") {
-      throw new TypeError("tool emitOutputOnSuccess requires turnBehavior continue");
-    }
     configuredTools.push(Object.freeze({
       handler: tool.handler,
       name,
-      turnBehavior: turnBehavior.nested,
-      hostTurnBehavior: emitsOutputOnSuccess ? "emit_output_on_success" : turnBehavior.host,
+      turnBehavior: normalizeTurnBehavior(tool.turnBehavior),
     }));
     definitions.push(deepFreeze({
       type: "function",
@@ -193,9 +187,9 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     executeCode,
     executeTool,
     toolDefinitions: () => encodedDefinitions,
-    toolTurnBehavior: (name) => toolByName.get(name)?.hostTurnBehavior ?? "continue",
+    toolTurnBehavior: (name) => toolByName.get(name)?.turnBehavior ?? "continue",
     toolTurnBehaviors: () => JSON.stringify(Object.fromEntries(
-      configuredTools.map((tool) => [tool.name, tool.hostTurnBehavior]),
+      configuredTools.map((tool) => [tool.name, tool.turnBehavior]),
     )),
     reset() {
       stores.clear();
@@ -240,19 +234,9 @@ async function executeHandler(
 }
 
 function normalizeTurnBehavior(value) {
-  if (value === undefined || value === "continue") {
-    return { nested: "continue", host: "continue" };
-  }
-  if (value === "finishTurnOnSuccess") {
-    return { nested: "finish_turn_on_success", host: "finish_turn_on_success" };
-  }
+  if (value === undefined || value === "continue") return "continue";
+  if (value === "finishTurnOnSuccess") return "finish_turn_on_success";
   throw new TypeError("tool turnBehavior must be continue or finishTurnOnSuccess");
-}
-
-function normalizeEmitsOutputOnSuccess(value) {
-  if (value === undefined || value === false) return false;
-  if (value === true) return true;
-  throw new TypeError("tool emitOutputOnSuccess must be boolean");
 }
 
 function encodeToolOutput(output, success, codeModeValue) {

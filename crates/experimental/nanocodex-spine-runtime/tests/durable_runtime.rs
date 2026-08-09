@@ -206,6 +206,50 @@ fn reopening_the_sidecar_selects_the_durable_active_child_and_pending_delivery()
     assert_eq!(delivery.target_session_id(), "child-session");
 }
 
+#[test]
+fn reopening_a_claimed_delivery_preserves_its_manual_continuation() {
+    let directory = tempdir().expect("temporary journal directory");
+    let runtime = fresh_runtime(directory.path());
+    let open = runtime
+        .prepare(SpineIntentRequest::new(
+            "root-session",
+            "call-open",
+            SpineTerminalControl::Open {
+                summary: "inspect the parser".to_owned(),
+            },
+        ))
+        .expect("prepare open");
+    runtime
+        .commit(&open, "child-session", None, "delivery-open")
+        .expect("commit open");
+    let delivery = runtime
+        .unclaimed_active_delivery()
+        .expect("read delivery")
+        .expect("delivery should be unclaimed");
+    runtime.claim_delivery(&delivery).expect("claim delivery");
+    drop(runtime);
+
+    let reopened = SpineRuntime::open(
+        SpineRuntimeLimits::default(),
+        directory.path(),
+        "root-session",
+    )
+    .expect("reopen runtime");
+    let claimed = reopened
+        .claimed_active_delivery()
+        .expect("read claimed delivery")
+        .expect("claimed delivery should remain available for a manual retry");
+
+    assert_eq!(claimed.id(), "delivery-open");
+    assert_eq!(claimed.target_session_id(), "child-session");
+    assert!(
+        reopened
+            .delivery_prompt(&claimed)
+            .expect("render claimed continuation")
+            .contains("Scope:\ninspect the parser")
+    );
+}
+
 fn fresh_runtime(directory: &std::path::Path) -> SpineRuntime {
     SpineRuntime::create(
         SpineRuntimeLimits::default(),

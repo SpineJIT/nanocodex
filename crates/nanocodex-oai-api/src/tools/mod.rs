@@ -610,18 +610,6 @@ pub trait Tool: Send + Sync + 'static {
         ToolTurnBehavior::Continue
     }
 
-    /// Returns whether a successful nested invocation should append its bounded
-    /// text output to the enclosing Code Mode result.
-    ///
-    /// This does not affect direct tool calls or turn completion. Use it only
-    /// for compact handoffs that the next model response must receive even when
-    /// the Code Mode cell does not explicitly call `text()`. The completed
-    /// cell is normalized to a bounded text result; images and audio are not
-    /// forwarded with the handoff.
-    fn emits_output_on_success(&self) -> bool {
-        false
-    }
-
     /// Executes one invocation.
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult;
 }

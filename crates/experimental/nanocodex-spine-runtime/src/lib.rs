@@ -536,17 +536,20 @@ impl SpineRuntime {
     /// Returns the sole undelivered prompt targeting the current active node.
     pub fn unclaimed_active_delivery(&self) -> Result<Option<SpineDelivery>, SpineRuntimeError> {
         self.with_journal(|journal| {
-            Ok(journal.state().unclaimed_active_delivery().map(
-                |(id, target_session_id, intent, kind)| SpineDelivery {
-                    id,
-                    target_session_id,
-                    kind: match kind {
-                        DeliveryKind::Continuation => SpineDeliveryKind::Continuation,
-                        DeliveryKind::Recovery => SpineDeliveryKind::Recovery,
-                    },
-                    transition: SpineTransition { intent },
-                },
-            ))
+            Ok(journal
+                .state()
+                .unclaimed_active_delivery()
+                .map(spine_delivery))
+        })
+    }
+
+    /// Returns an interrupted delivery that must be shown for manual resubmission.
+    pub fn claimed_active_delivery(&self) -> Result<Option<SpineDelivery>, SpineRuntimeError> {
+        self.with_journal(|journal| {
+            Ok(journal
+                .state()
+                .claimed_active_delivery()
+                .map(spine_delivery))
         })
     }
 
@@ -799,6 +802,20 @@ const fn delivery_status(status: DeliveryStatus) -> SpineDeliveryStatus {
         DeliveryStatus::Unclaimed => SpineDeliveryStatus::Unclaimed,
         DeliveryStatus::Claimed => SpineDeliveryStatus::Claimed,
         DeliveryStatus::Accepted => SpineDeliveryStatus::Accepted,
+    }
+}
+
+fn spine_delivery(
+    (id, target_session_id, intent, kind): (String, String, TransitionIntent, DeliveryKind),
+) -> SpineDelivery {
+    SpineDelivery {
+        id,
+        target_session_id,
+        kind: match kind {
+            DeliveryKind::Continuation => SpineDeliveryKind::Continuation,
+            DeliveryKind::Recovery => SpineDeliveryKind::Recovery,
+        },
+        transition: SpineTransition { intent },
     }
 }
 

@@ -259,7 +259,8 @@ impl AgentArgs {
     }
 
     pub(crate) async fn build(self, vm: VmArgs) -> Result<ConfiguredAgent> {
-        self.build_inner(None, vm, None).await
+        let codex_home = default_codex_home()?;
+        self.build_inner(None, vm, None, codex_home).await
     }
 
     pub(crate) async fn build_with_tool_customizer(
@@ -267,7 +268,9 @@ impl AgentArgs {
         vm: VmArgs,
         customizer: ToolCustomizer,
     ) -> Result<ConfiguredAgent> {
-        self.build_inner(None, vm, Some(customizer)).await
+        let codex_home = default_codex_home()?;
+        self.build_inner(None, vm, Some(customizer), codex_home)
+            .await
     }
 
     pub(crate) async fn build_resumed(
@@ -275,16 +278,19 @@ impl AgentArgs {
         session: DurableSession,
         vm: VmArgs,
     ) -> Result<ConfiguredAgent> {
-        self.build_inner(Some(session), vm, None).await
+        let codex_home = default_codex_home()?;
+        self.build_inner(Some(session), vm, None, codex_home).await
     }
 
-    pub(crate) async fn build_resumed_with_tool_customizer(
+    pub(crate) async fn build_resumed_with_tool_customizer_in_codex_home(
         self,
         session: DurableSession,
         vm: VmArgs,
         customizer: ToolCustomizer,
+        codex_home: PathBuf,
     ) -> Result<ConfiguredAgent> {
-        self.build_inner(Some(session), vm, Some(customizer)).await
+        self.build_inner(Some(session), vm, Some(customizer), codex_home)
+            .await
     }
 
     async fn build_inner(
@@ -292,10 +298,10 @@ impl AgentArgs {
         durable: Option<DurableSession>,
         vm: VmArgs,
         customizer: Option<ToolCustomizer>,
+        codex_home: PathBuf,
     ) -> Result<ConfiguredAgent> {
         let thinking = self.thinking();
         let web_search = self.web_search();
-        let codex_home = default_codex_home()?;
         let responses_transport = self.responses_transport();
         let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
         let configured_browser = self.browser.configure(&session.workspace)?;

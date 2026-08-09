@@ -90,7 +90,12 @@ impl SpineSessionRecipe {
     ) -> Result<ConfiguredAgent> {
         self.config
             .clone()
-            .build_resumed_with_tool_customizer(durable, self.vm.clone(), Arc::clone(&self.tools))
+            .build_resumed_with_tool_customizer_in_codex_home(
+                durable,
+                self.vm.clone(),
+                Arc::clone(&self.tools),
+                self.codex_home.clone(),
+            )
             .await
     }
 }

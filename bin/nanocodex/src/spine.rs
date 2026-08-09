@@ -88,10 +88,14 @@ async fn run(cli: Cli) -> Result<()> {
     let observability_cwd = cli.agent.cwd().to_path_buf();
     let _observability = cli.observability.install(true, &observability_cwd)?;
     let (factory, initial_prompt) = match cli.command {
-        Some(Command::Resume { root_thread_id }) => (
-            SpineWorkerFactory::resume(cli.agent, cli.vm, &root_thread_id).await?,
-            None,
-        ),
+        Some(Command::Resume { root_thread_id }) => {
+            let factory = SpineWorkerFactory::resume(cli.agent, cli.vm, &root_thread_id).await?;
+            let initial_prompt = factory
+                .manual_continuation
+                .clone()
+                .map(InitialPrompt::prefill);
+            (factory, initial_prompt)
+        }
         None => (
             SpineWorkerFactory::build(cli.agent, cli.vm).await?,
             cli.prompt.map(InitialPrompt::plain),
@@ -118,6 +122,7 @@ struct SpineWorkerFactory {
     root_session_id: String,
     active_session_id: String,
     initial_delivery: Option<SpineDelivery>,
+    manual_continuation: Option<String>,
     initial: SpineInitial,
 }
 
@@ -164,6 +169,7 @@ impl SpineWorkerFactory {
             root_session_id: root_session_id.clone(),
             active_session_id: root_session_id,
             initial_delivery: None,
+            manual_continuation: None,
             initial,
         })
     }
@@ -219,6 +225,16 @@ impl SpineWorkerFactory {
         let initial_delivery = runtime
             .unclaimed_active_delivery()
             .map_err(|error| eyre!(error))?;
+        let manual_continuation = if initial_delivery.is_some() {
+            None
+        } else {
+            runtime
+                .claimed_active_delivery()
+                .map_err(|error| eyre!(error))?
+                .map(|delivery| runtime.delivery_prompt(&delivery))
+                .transpose()
+                .map_err(|error| eyre!(error))?
+        };
         Ok(Self {
             configured,
             runtime,
@@ -227,6 +243,7 @@ impl SpineWorkerFactory {
             root_session_id,
             active_session_id,
             initial_delivery,
+            manual_continuation,
             initial,
         })
     }
@@ -285,7 +302,10 @@ mod tests {
     use super::{Cli, run};
     use crate::{
         config::ConfiguredAgent,
-        spine_worker::{SpineIntentChannel, SpineSessionRecipe, SpineWorker, capabilities},
+        spine_worker::{
+            SpineIntentChannel, SpineSessionRecipe, SpineWorker, capabilities,
+            durable_prompt_cache_key,
+        },
         tui::{PaneId, WorkerCommand, WorkerEvent},
     };
 
@@ -332,7 +352,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_open_and_close_switch_the_durable_current_node() -> eyre::Result<()> {
+    async fn terminal_open_next_and_close_switch_the_durable_current_node() -> eyre::Result<()> {
         let directory = tempdir()?;
         let root_session_id = SessionId::new();
         let calls = Arc::new(AtomicU32::new(0));
@@ -372,6 +392,7 @@ mod tests {
             Arc::clone(&intent_sink),
             directory.path().to_path_buf(),
         );
+        let resumed_recipe = session_recipe.clone();
         let configured = ConfiguredAgent {
             handle: agent,
             events,
@@ -418,14 +439,26 @@ mod tests {
         let projection = runtime.projection()?;
         assert_eq!(runtime.active_session_id()?, root_session_id);
         assert_eq!(projection.cursor.to_string(), "1");
-        assert_eq!(projection.nodes.len(), 2);
+        assert_eq!(projection.nodes.len(), 3);
         assert_eq!(
             projection.nodes[1].summary.as_deref(),
             Some("inspect the parser")
         );
-        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            projection.nodes[2].summary.as_deref(),
+            Some("write a parser fix")
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
 
         worker.shutdown().await?;
+        let durable = resumed_recipe.load(&root_session_id)?;
+        assert_eq!(durable_prompt_cache_key(&durable)?, root_session_id);
+        let restored_parent = resumed_recipe.build_resumed(durable).await?;
+        assert_eq!(
+            restored_parent.handle.session_id().to_string(),
+            root_session_id
+        );
+        restored_parent.handle.shutdown().await?;
         Ok(())
     }
 
@@ -459,13 +492,22 @@ mod tests {
                 (2, ResponsesAttemptKind::Generation) => {
                     assert_request_contains(&request, "Scope:\\ninspect the parser");
                     code_generation(
-                        "resp-child-close",
+                        "resp-child-next",
                         "call-child-exec",
-                        "await tools.spine__close({memory: 'parser accepts one token too eagerly'});",
+                        "await tools.spine__next({summary: 'write a parser fix', memory: 'parser accepts one token too eagerly'});",
                     )
                 }
                 (3, ResponsesAttemptKind::Generation) => {
+                    assert_request_contains(&request, "Scope:\\nwrite a parser fix");
                     assert_request_contains(&request, "parser accepts one token too eagerly");
+                    code_generation(
+                        "resp-sibling-close",
+                        "call-sibling-exec",
+                        "await tools.spine__close({memory: 'the parser fix needs one-token lookahead'});",
+                    )
+                }
+                (4, ResponsesAttemptKind::Generation) => {
+                    assert_request_contains(&request, "the parser fix needs one-token lookahead");
                     self.parent_finished.notify_one();
                     final_generation("resp-parent-finished", "parent resumed")
                 }
