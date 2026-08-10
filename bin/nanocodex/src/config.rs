@@ -14,6 +14,7 @@ use nanocodex::NanocodexBuilder;
 use nanocodex::{
     AgentEvents, Model, Nanocodex, OpenAi, ReasoningMode, Thinking, Tools,
     agent::{
+        AgentHandle,
         rollout::{DurableSession, RolloutConfig},
         session::{SessionId, SessionSnapshot},
     },
@@ -21,6 +22,7 @@ use nanocodex::{
         auth::{OpenAiAuth, OpenAiAuthMode},
         transport::ResponsesTransport,
     },
+    tools::ToolsBuildError,
     tools::mcp::McpHandle,
 };
 
@@ -41,6 +43,9 @@ pub(crate) struct ConfiguredAgent {
     pub(crate) vm: Option<ConfiguredVm>,
 }
 
+pub(crate) type ToolCustomizer =
+    Arc<dyn Fn(Tools, AgentHandle) -> std::result::Result<Tools, ToolsBuildError> + Send + Sync>;
+
 struct SessionBuild {
     workspace: PathBuf,
     session_id: Option<SessionId>,
@@ -49,7 +54,7 @@ struct SessionBuild {
 }
 
 /// Authentication flags shared by every direct-OpenAI CLI consumer.
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub(crate) struct AuthArgs {
     /// Explicit `OpenAI` API key override.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
@@ -61,7 +66,7 @@ pub(crate) struct AuthArgs {
 }
 
 /// Model-facing flags shared by normal agents and evaluator agents.
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub(crate) struct ModelArgs {
     /// Reasoning effort: none, low, medium, high, xhigh, or max.
     #[arg(long, env = "OPENAI_REASONING_EFFORT")]
@@ -95,7 +100,7 @@ pub(crate) struct EvalAgentArgs {
     model_policy: ModelArgs,
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent CLI feature toggles are not one state machine"
@@ -152,12 +157,11 @@ pub(crate) struct AgentArgs {
     #[arg(
         long,
         env = "NANOCODEX_SUBAGENTS",
-        default_value_t = false,
         action = ArgAction::Set
     )]
-    subagents: bool,
+    subagents: Option<bool>,
 
-    /// Write Codex-compatible resumable threads beneath `CODEX_HOME`.
+    /// Write Codex-compatible rollout records beneath `CODEX_HOME`.
     #[arg(
         long,
         env = "NANOCODEX_ROLLOUTS",
@@ -232,6 +236,20 @@ impl AgentArgs {
         self.fast_mode
     }
 
+    pub(crate) fn subagents_enabled(&self) -> bool {
+        self.subagents.unwrap_or(false)
+    }
+
+    /// Makes a specialized CLI opt into ordinary child agents unless the
+    /// caller explicitly selected a value through its flag or environment.
+    pub(crate) fn enable_subagents_by_default(&mut self) {
+        self.subagents.get_or_insert(true);
+    }
+
+    pub(crate) const fn rollouts_enabled(&self) -> bool {
+        self.rollouts
+    }
+
     pub(crate) const fn model(&self) -> Model {
         self.model
     }
@@ -246,7 +264,18 @@ impl AgentArgs {
     }
 
     pub(crate) async fn build(self, vm: VmArgs) -> Result<ConfiguredAgent> {
-        self.build_inner(None, vm).await
+        let codex_home = default_codex_home()?;
+        self.build_inner(None, vm, None, codex_home).await
+    }
+
+    pub(crate) async fn build_with_tool_customizer_in_codex_home(
+        self,
+        vm: VmArgs,
+        customizer: ToolCustomizer,
+        codex_home: PathBuf,
+    ) -> Result<ConfiguredAgent> {
+        self.build_inner(None, vm, Some(customizer), codex_home)
+            .await
     }
 
     pub(crate) async fn build_resumed(
@@ -254,17 +283,31 @@ impl AgentArgs {
         session: DurableSession,
         vm: VmArgs,
     ) -> Result<ConfiguredAgent> {
-        self.build_inner(Some(session), vm).await
+        let codex_home = default_codex_home()?;
+        self.build_inner(Some(session), vm, None, codex_home).await
+    }
+
+    pub(crate) async fn build_resumed_with_tool_customizer_in_codex_home(
+        self,
+        session: DurableSession,
+        vm: VmArgs,
+        customizer: ToolCustomizer,
+        codex_home: PathBuf,
+    ) -> Result<ConfiguredAgent> {
+        self.build_inner(Some(session), vm, Some(customizer), codex_home)
+            .await
     }
 
     async fn build_inner(
         self,
         durable: Option<DurableSession>,
         vm: VmArgs,
+        customizer: Option<ToolCustomizer>,
+        codex_home: PathBuf,
     ) -> Result<ConfiguredAgent> {
         let thinking = self.thinking();
         let web_search = self.web_search();
-        let codex_home = default_codex_home()?;
+        let subagents_enabled = self.subagents_enabled();
         let responses_transport = self.responses_transport();
         let session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
         let configured_browser = self.browser.configure(&session.workspace)?;
@@ -336,7 +379,7 @@ impl AgentArgs {
             tools = tools.provider(browser.tool());
         }
         let tools = tools.build()?;
-        let child_agents = self.subagents.then(|| Arc::new(ChildAgents::default()));
+        let child_agents = subagents_enabled.then(|| Arc::new(ChildAgents::default()));
         let mut builder = Nanocodex::builder(openai)
             .model(self.model)
             .reasoning_mode(self.reasoning_mode)
@@ -353,12 +396,32 @@ impl AgentArgs {
         if let Some(rollout) = session.rollout {
             builder = builder.rollout(rollout);
         }
-        let builder = if let Some(child_agents) = &child_agents {
-            let tools = tools;
+        let builder = if let Some(child_agents) = child_agents.as_ref() {
             let child_agents = Arc::downgrade(child_agents);
-            builder.tools_factory(move |agent| {
-                subagents::with_subagents(tools.clone(), agent, child_agents.clone())
-            })
+            let root_child_agents = child_agents.clone();
+            let root_tools = tools.clone();
+            let root_customizer = customizer.clone();
+            let builder = builder.tools_factory(move |agent| {
+                let tools = subagents::with_subagents(
+                    root_tools.clone(),
+                    agent.clone(),
+                    root_child_agents.clone(),
+                )?;
+                if let Some(customizer) = &root_customizer {
+                    customizer(tools, agent)
+                } else {
+                    Ok(tools)
+                }
+            });
+            if customizer.is_some() {
+                builder.child_tools_factory(move |agent| {
+                    subagents::with_subagents(tools.clone(), agent, child_agents.clone())
+                })
+            } else {
+                builder
+            }
+        } else if let Some(customizer) = customizer {
+            builder.tools_factory(move |agent| customizer(tools.clone(), agent))
         } else {
             builder.tools(tools)
         };
@@ -700,7 +763,7 @@ mod tests {
             .find(|argument| argument.get_id() == "subagents")
             .expect("the CLI should expose the subagents argument");
 
-        assert_eq!(subagents.get_default_values(), ["false"]);
+        assert!(subagents.get_default_values().is_empty());
     }
 
     #[test]

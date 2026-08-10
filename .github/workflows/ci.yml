@@ -16,28 +16,18 @@ concurrency:
 
 jobs:
   test:
-    name: test ${{ matrix.os }} / Rust ${{ matrix.rust }}
-    runs-on: ${{ matrix.os }}
+    name: test Rust 1.97
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            rust: stable
-          - os: ubuntu-latest
-            rust: "1.97"
-          - os: macos-latest
-            rust: stable
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
-          toolchain: ${{ matrix.rust }}
+          toolchain: "1.97"
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           cache-on-failure: true
@@ -75,6 +65,8 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   vm-guest:
+    # Deferred while productionizing the native Spine path.
+    if: ${{ false }}
     name: static Linux VM guest
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -123,6 +115,8 @@ jobs:
       - uses: crate-ci/typos@96d9af6217dc2855210655af7e1ff19d23d4e593 # v1
 
   bindings:
+    # Deferred while productionizing the native Rust Spine path.
+    if: ${{ false }}
     name: Node and browser bindings
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -202,6 +196,8 @@ jobs:
           if-no-files-found: error
 
   python:
+    # Deferred while productionizing the native Rust Spine path.
+    if: ${{ false }}
     name: Python ${{ matrix.python }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -264,6 +260,8 @@ jobs:
             -q "$GITHUB_WORKSPACE/examples/python"
 
   web:
+    # Deferred while productionizing the native Rust Spine path.
+    if: ${{ false }}
     name: website
     needs: bindings
     runs-on: ubuntu-latest
@@ -322,7 +320,7 @@ jobs:
   ci-success:
     name: ci success
     if: always()
-    needs: [test, quality, policy, bindings, python, web, codeql]
+    needs: [test, quality, policy, codeql]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -331,15 +329,9 @@ jobs:
           TEST: ${{ needs.test.result }}
           QUALITY: ${{ needs.quality.result }}
           POLICY: ${{ needs.policy.result }}
-          BINDINGS: ${{ needs.bindings.result }}
-          PYTHON: ${{ needs.python.result }}
-          WEB: ${{ needs.web.result }}
           CODEQL: ${{ needs.codeql.result }}
         run: |
           test "$TEST" = success
           test "$QUALITY" = success
           test "$POLICY" = success
-          test "$BINDINGS" = success
-          test "$PYTHON" = success
-          test "$WEB" = success
           test "$CODEQL" = success

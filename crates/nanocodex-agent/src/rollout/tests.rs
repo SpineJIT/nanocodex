@@ -180,9 +180,13 @@ fn set_modified(path: &Path, seconds: u64) {
 }
 
 fn recorder(home: &Path) -> RolloutRecorder {
+    recorder_with_config(RolloutConfig::new(home))
+}
+
+fn recorder_with_config(config: RolloutConfig) -> RolloutRecorder {
     RolloutRecorder::create(
         &Handle::current(),
-        &RolloutConfig::new(home),
+        &config,
         "019c0d31-c308-7d91-bff4-5dca82d15ac6",
         RolloutIdentity {
             lineage_id: "019c0d31-c308-7d91-bff4-5dca82d15ac6",

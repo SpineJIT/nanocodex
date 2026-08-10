@@ -31,6 +31,14 @@ mod tui {
     }
 
     #[allow(dead_code, unused_imports)]
+    mod spine_tree {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/tui/spine_tree.rs"
+        ));
+    }
+
+    #[allow(dead_code, unused_imports)]
     mod transcript {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),

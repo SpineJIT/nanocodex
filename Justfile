@@ -28,6 +28,10 @@ bootstrap:
     uv sync --frozen
     cargo fetch --locked
 
+# Install both local CLI binaries into Cargo's default bin directory.
+install:
+    cargo install --path bin/nanocodex --bin nanocodex --bin nanocodex-spine --locked --force
+
 # Install development tooling for the embedded language bindings.
 bootstrap-bindings:
     uv venv "{{python_binding_venv}}"

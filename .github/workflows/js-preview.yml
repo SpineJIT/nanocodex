@@ -2,11 +2,7 @@ name: JavaScript Package Preview
 
 permissions: {}
 
-on:
-  push:
-    branches: [master]
-  pull_request:
-  workflow_dispatch:
+on: workflow_dispatch
 
 concurrency:
   group: js-preview-${{ github.event.pull_request.number || github.ref }}

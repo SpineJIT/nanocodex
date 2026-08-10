@@ -47,6 +47,12 @@ const STEER_CAPACITY: usize = 8;
 type ToolsFactory =
     Arc<dyn Fn(AgentHandle) -> std::result::Result<Tools, ToolsBuildError> + Send + Sync>;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum ToolProfile {
+    Primary,
+    Child,
+}
+
 enum InitialResume {
     Exact(Box<ModelCheckpoint>),
     History(Box<HistoryCheckpoint>),
@@ -79,17 +85,60 @@ impl InitialResume {
 enum ToolsConfiguration {
     Shared(Tools),
     #[cfg(not(target_family = "wasm"))]
-    PerAgent(ToolsFactory),
+    PerAgent {
+        factory: ToolsFactory,
+        child_factory: Option<ToolsFactory>,
+    },
 }
 
 impl ToolsConfiguration {
-    fn materialize(&self, agent_handle: AgentHandle) -> Result<Tools> {
+    #[cfg(not(target_family = "wasm"))]
+    pub(super) const fn has_child_factory(&self) -> bool {
+        matches!(
+            self,
+            Self::PerAgent {
+                child_factory: Some(_),
+                ..
+            }
+        )
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub(super) const fn has_child_factory(&self) -> bool {
+        false
+    }
+
+    fn materialize(&self, agent_handle: AgentHandle, profile: ToolProfile) -> Result<Tools> {
         #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-        let _ = agent_handle;
+        let _ = (agent_handle, profile);
         match self {
             Self::Shared(tools) => Ok(tools.clone()),
             #[cfg(not(target_family = "wasm"))]
-            Self::PerAgent(factory) => factory(agent_handle).map_err(Into::into),
+            Self::PerAgent {
+                factory,
+                child_factory,
+            } => child_factory
+                .as_ref()
+                .filter(|_| matches!(profile, ToolProfile::Child))
+                .unwrap_or(factory)(agent_handle)
+            .map_err(Into::into),
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn with_child_factory(self, child_factory: ToolsFactory) -> Self {
+        match self {
+            Self::Shared(tools) => {
+                let factory: ToolsFactory = Arc::new(move |_agent| Ok(tools.clone()));
+                Self::PerAgent {
+                    factory,
+                    child_factory: Some(child_factory),
+                }
+            }
+            Self::PerAgent { factory, .. } => Self::PerAgent {
+                factory,
+                child_factory: Some(child_factory),
+            },
         }
     }
 }

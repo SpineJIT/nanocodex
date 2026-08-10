@@ -27,6 +27,8 @@ use super::markdown::{
     heal_streaming_markdown, render_agent_markdown, render_finalized_agent_markdown_with_math,
     render_streaming_agent_markdown_with_math, restore_markdown_links_from_sources,
 };
+use super::spine_tree;
+use nanocodex_spine_runtime::SpineTreeSnapshot;
 
 #[derive(Clone, Copy)]
 pub(super) struct InlineEdit<'a> {
@@ -37,6 +39,7 @@ pub(super) struct InlineEdit<'a> {
 
 pub(super) enum TranscriptItem {
     User(String),
+    SpineContinuation(String),
     Reasoning(String),
     Assistant(String),
     Tool {
@@ -49,6 +52,7 @@ pub(super) enum TranscriptItem {
         explanation: Option<String>,
         steps: Vec<(String, PlanStepStatus)>,
     },
+    SpineTree(SpineTreeSnapshot),
     Error(String),
 }
 
@@ -132,6 +136,30 @@ impl Transcript {
         self.invalidate_total_height();
     }
 
+    pub(super) fn upsert_spine_tree(&mut self, snapshot: SpineTreeSnapshot) {
+        let entry = Arc::new(TranscriptEntry::new(
+            TranscriptItem::SpineTree(snapshot),
+            Arc::clone(&self.tool_details_expanded),
+            self.math_renderer.clone(),
+        ));
+        if let Some(existing) = self
+            .entries
+            .last_mut()
+            .filter(|entry| matches!(entry.kind, EntryKind::SpineTree))
+        {
+            *existing = entry;
+        } else {
+            self.entries.push(entry);
+        }
+        self.invalidate_total_height();
+    }
+
+    pub(super) fn tail_is_spine_tree(&self) -> bool {
+        self.entries
+            .last()
+            .is_some_and(|entry| matches!(entry.kind, EntryKind::SpineTree))
+    }
+
     pub(super) fn set_math_renderer(&mut self, renderer: Ratatex) {
         for entry in &mut self.entries {
             Arc::make_mut(entry).set_math_renderer(renderer.clone());
@@ -200,6 +228,25 @@ impl Transcript {
         self.editable_users.push(self.entries.len());
         self.entries.push(Arc::new(entry));
         self.invalidate_total_height();
+    }
+
+    pub(super) fn remove_editable_user(&mut self, prompt_id: u64) -> Option<usize> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.prompt_id == Some(prompt_id))?;
+        let _ = self.entries.remove(index);
+        self.editable_users.retain_mut(|entry_index| {
+            if *entry_index == index {
+                return false;
+            }
+            if *entry_index > index {
+                *entry_index = entry_index.saturating_sub(1);
+            }
+            true
+        });
+        self.invalidate_total_height();
+        Some(index)
     }
 
     pub(super) fn append_assistant_delta(&mut self, delta: &str) -> bool {
@@ -818,10 +865,12 @@ fn inline_edit_layout(input: &str, width: u16) -> ComposerLayout {
 #[derive(Clone)]
 enum EntryKind {
     User,
+    SpineContinuation,
     Reasoning,
     Assistant,
     Tool { call_id: String },
     Plan,
+    SpineTree,
     Error,
 }
 
@@ -1023,6 +1072,20 @@ impl TranscriptEntry {
                 );
                 (EntryKind::User, Some(message), EntryContent::Static(text))
             }
+            TranscriptItem::SpineContinuation(message) => {
+                let text = message_text(
+                    "↳ Spine continuation",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                    &message,
+                );
+                (
+                    EntryKind::SpineContinuation,
+                    None,
+                    EntryContent::Static(text),
+                )
+            }
             TranscriptItem::Assistant(message) => (
                 EntryKind::Assistant,
                 None,
@@ -1055,6 +1118,11 @@ impl TranscriptEntry {
                 EntryKind::Plan,
                 None,
                 EntryContent::Static(plan_text(explanation.as_deref(), &steps)),
+            ),
+            TranscriptItem::SpineTree(snapshot) => (
+                EntryKind::SpineTree,
+                None,
+                EntryContent::Static(spine_tree::text(&snapshot)),
             ),
             TranscriptItem::Error(message) => (
                 EntryKind::Error,
@@ -2826,6 +2894,9 @@ mod tests {
         time::Duration,
     };
 
+    use nanocodex_spine_runtime::{
+        SpineTreeNode, SpineTreeNodeKind, SpineTreeNodeStatus, SpineTreeSnapshot,
+    };
     use ratatex::{PixelSize, Ratatex, TerminalProfile};
     use ratatui::{
         Terminal,
@@ -2853,6 +2924,112 @@ mod tests {
     #[test]
     fn cancelled_tools_have_a_distinct_neutral_terminal_style() {
         assert_eq!(tool_style(ToolStatus::Cancelled), ("■", Color::Yellow));
+    }
+
+    #[test]
+    fn spine_tree_card_replaces_the_live_snapshot() {
+        let mut transcript = Transcript::default();
+        transcript.upsert_spine_tree(SpineTreeSnapshot {
+            active_node_id: "1.1".to_owned(),
+            nodes: vec![
+                tree_node(
+                    "1",
+                    None,
+                    None,
+                    SpineTreeNodeKind::RootEpoch,
+                    SpineTreeNodeStatus::Opened,
+                ),
+                tree_node(
+                    "1.1",
+                    Some("1"),
+                    Some("inspect the parser"),
+                    SpineTreeNodeKind::Task,
+                    SpineTreeNodeStatus::Live,
+                ),
+            ],
+        });
+        transcript.upsert_spine_tree(SpineTreeSnapshot {
+            active_node_id: "1.2".to_owned(),
+            nodes: vec![
+                tree_node(
+                    "1",
+                    None,
+                    None,
+                    SpineTreeNodeKind::RootEpoch,
+                    SpineTreeNodeStatus::Opened,
+                ),
+                tree_node(
+                    "1.1",
+                    Some("1"),
+                    Some("inspect the parser"),
+                    SpineTreeNodeKind::Task,
+                    SpineTreeNodeStatus::Closed,
+                ),
+                tree_node(
+                    "1.2",
+                    Some("1"),
+                    Some("implement the fix"),
+                    SpineTreeNodeKind::Task,
+                    SpineTreeNodeStatus::Live,
+                ),
+            ],
+        });
+
+        assert_eq!(transcript.len(), 1);
+        let mut terminal = Terminal::new(TestBackend::new(48, 8)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(transcript.widget(0, None, None, "empty"), frame.area());
+            })
+            .unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Spine Tree"));
+        assert!(rendered.contains("✓ inspect the parser"));
+        assert!(rendered.contains("◉ implement the fix"));
+    }
+
+    #[test]
+    fn spine_tree_card_is_appended_after_intervening_transcript_output() {
+        let mut transcript = Transcript::default();
+        transcript.upsert_spine_tree(SpineTreeSnapshot {
+            active_node_id: "1.1".to_owned(),
+            nodes: vec![tree_node(
+                "1.1",
+                None,
+                Some("inspect the parser"),
+                SpineTreeNodeKind::Task,
+                SpineTreeNodeStatus::Live,
+            )],
+        });
+        transcript.push(TranscriptItem::Assistant("intervening output".to_owned()));
+        transcript.upsert_spine_tree(SpineTreeSnapshot {
+            active_node_id: "1.1".to_owned(),
+            nodes: vec![tree_node(
+                "1.1",
+                None,
+                Some("inspect the parser"),
+                SpineTreeNodeKind::Task,
+                SpineTreeNodeStatus::Closed,
+            )],
+        });
+
+        assert_eq!(transcript.len(), 3);
+    }
+
+    fn tree_node(
+        id: &str,
+        parent_id: Option<&str>,
+        summary: Option<&str>,
+        kind: SpineTreeNodeKind,
+        status: SpineTreeNodeStatus,
+    ) -> SpineTreeNode {
+        SpineTreeNode {
+            id: id.to_owned(),
+            parent_id: parent_id.map(str::to_owned),
+            kind,
+            status,
+            summary: summary.map(str::to_owned),
+        }
     }
 
     #[test]

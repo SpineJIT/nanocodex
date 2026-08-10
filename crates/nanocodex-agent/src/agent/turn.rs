@@ -262,9 +262,11 @@ pub(super) enum Command {
     },
     Fork {
         checkpoint: Option<Arc<CommittedSession>>,
+        tool_profile: ToolProfile,
         result: oneshot::Sender<Result<(Nanocodex, AgentEvents)>>,
     },
     Spawn {
+        tool_profile: ToolProfile,
         result: oneshot::Sender<Result<(Nanocodex, AgentEvents)>>,
     },
     SetThinking {

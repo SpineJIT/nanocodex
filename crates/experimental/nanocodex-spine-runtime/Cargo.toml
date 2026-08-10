@@ -1,0 +1,28 @@
+[package]
+name = "nanocodex-spine-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Experimental synchronous Spine continuation runtime for Nanocodex"
+
+[dependencies]
+codex-spine-core = { version = "0.2.2", git = "https://github.com/GhabiX/SpineCodex.git", rev = "ef5e19a7eaece34fe9d752759b33f9ae90d62a91" }
+fs2.workspace = true
+nanocodex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros"] }
+tower.workspace = true
+
+[lints]
+workspace = true

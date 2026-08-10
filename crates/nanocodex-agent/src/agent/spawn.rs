@@ -105,7 +105,7 @@ where
         ))
     };
     let service = service_factory(Arc::clone(&config));
-    spawn_agent_driver(
+    let (agent, events, _) = spawn_agent_driver(
         BranchSpawner {
             config,
             tools,
@@ -114,6 +114,7 @@ where
             shared_prompt_cache: shared,
             context_config: codex.context,
             context_source,
+            tool_profile: ToolProfile::Primary,
             depth: 0,
             durability: codex.durability,
             service_factory,
@@ -127,7 +128,9 @@ where
             depth: 0,
             parent_session_id: None,
         },
-    )
+        ToolProfile::Primary,
+    )?;
+    Ok((agent, events))
 }
 
 pub(super) fn spawn_agent_driver<S>(
@@ -137,7 +140,8 @@ pub(super) fn spawn_agent_driver<S>(
     service: S,
     initial_resume: Option<InitialResume>,
     origin: AgentOrigin,
-) -> Result<(Nanocodex, AgentEvents)>
+    tool_profile: ToolProfile,
+) -> Result<(Nanocodex, AgentEvents, Option<Arc<CommittedSession>>)>
 where
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
     S::Error: Into<ResponseError> + AgentSend + 'static,
@@ -148,10 +152,13 @@ where
     let failure = DriverFailure::default();
     let tools = spawner
         .tools
-        .materialize(AgentHandle {
-            commands: commands.downgrade(),
-            failure: failure.clone(),
-        })?
+        .materialize(
+            AgentHandle {
+                commands: commands.downgrade(),
+                failure: failure.clone(),
+            },
+            tool_profile,
+        )?
         .for_session(&session_id_text);
     let rollout_prompt_cache_key = initial_resume
         .as_ref()
@@ -187,6 +194,13 @@ where
             ),
         })
         .transpose()?;
+    let initial_checkpoint = initial_model.as_ref().map(|initial| {
+        Arc::new(CommittedSession::new(
+            Arc::clone(&spawner.lineage_id),
+            spawner.config.model,
+            initial.checkpoint.clone(),
+        ))
+    });
     let transport_stats = Arc::new(TransportStats::default());
     let shutdown = DriverShutdown::default();
     let agent = Nanocodex {
@@ -232,7 +246,7 @@ where
         }
     };
     spawn_driver(driver_task)?;
-    Ok((agent, event_stream))
+    Ok((agent, event_stream, initial_checkpoint))
 }
 
 pub(super) fn validate(config: &ModelConfig, prompt_cache_key: Option<&str>) -> Result<()> {

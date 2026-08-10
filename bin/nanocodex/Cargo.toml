@@ -10,6 +10,7 @@ homepage.workspace = true
 repository.workspace = true
 description = "Daily-driver TUI and headless JSONL adapter for Nanocodex"
 build = "build.rs"
+default-run = "nanocodex"
 
 [package.metadata.cargo-machete]
 # cargo-machete does not resolve imports from the package build script.
@@ -32,6 +33,7 @@ arboard.workspace = true
 async-trait.workspace = true
 alloy-primitives = { workspace = true, optional = true }
 base64.workspace = true
+chrono.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 dotenvy.workspace = true
@@ -43,6 +45,7 @@ image.workspace = true
 nanocodex.workspace = true
 nanocodex-browser.workspace = true
 nanocodex-observability.workspace = true
+nanocodex-spine-runtime.workspace = true
 nanocodex-voice.workspace = true
 nix.workspace = true
 nanousd = { workspace = true, optional = true }
@@ -69,17 +72,16 @@ tempo-alloy = { workspace = true, optional = true }
 tracing.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+uuid.workspace = true
 yansi.workspace = true
 
 [target.'cfg(any(all(target_os = "linux", not(target_env = "musl")), all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
 arcbox-ext4.workspace = true
-chrono.workspace = true
 ignore.workspace = true
 nanocodex-eval.workspace = true
 nanocodex-vm.workspace = true
 regex.workspace = true
 sysinfo.workspace = true
-uuid.workspace = true
 
 [build-dependencies]
 chrono.workspace = true
@@ -88,9 +90,11 @@ vergen = { workspace = true, features = ["build", "git", "gitcl"] }
 [dev-dependencies]
 axum.workspace = true
 criterion.workspace = true
+nanocodex-oai-api = { workspace = true, features = ["test-support"] }
 nanocodex-tools.workspace = true
 reqwest = { workspace = true, features = ["query"] }
 tokio-tungstenite.workspace = true
+tower.workspace = true
 tracing-subscriber.workspace = true
 
 [[bench]]
@@ -100,6 +104,11 @@ harness = false
 [[bin]]
 name = "nanocodex"
 path = "src/main.rs"
+doc = false
+
+[[bin]]
+name = "nanocodex-spine"
+path = "src/bin/nanocodex-spine.rs"
 doc = false
 
 [lints]

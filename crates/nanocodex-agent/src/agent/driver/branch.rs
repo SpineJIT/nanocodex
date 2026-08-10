@@ -8,6 +8,7 @@ pub(in crate::agent) struct BranchSpawner<S> {
     pub(in crate::agent) shared_prompt_cache: Option<SharedPromptCache>,
     pub(in crate::agent) context_config: ContextSourceConfig,
     pub(in crate::agent) context_source: ContextSource,
+    pub(in crate::agent) tool_profile: ToolProfile,
     pub(in crate::agent) depth: u32,
     pub(in crate::agent) durability: DurabilityConfig,
     pub(in crate::agent) service_factory: ServiceFactory<S>,
@@ -30,6 +31,7 @@ impl<S> Clone for BranchSpawner<S> {
             shared_prompt_cache: self.shared_prompt_cache.clone(),
             context_config: self.context_config.clone(),
             context_source: self.context_source.clone(),
+            tool_profile: self.tool_profile,
             depth: self.depth,
             durability: self.durability.for_new_thread(),
             service_factory: Arc::clone(&self.service_factory),
@@ -50,8 +52,10 @@ where
         model: Model,
         thinking: Thinking,
         fast_mode: bool,
+        tool_profile: ToolProfile,
     ) -> Result<(Nanocodex, AgentEvents)> {
         let session_id = SessionId::new();
+        let session_id_text = session_id.to_string();
         let workspace = Some(Arc::<str>::from(checkpoint.model().workspace()));
         let mut spawner = self.clone();
         spawner.context_source = spawner.context_config.build();
@@ -60,21 +64,50 @@ where
         config.thinking = thinking;
         config.fast_mode = fast_mode;
         spawner.config = Arc::new(config);
+        let profile_changes = self.tool_profile != tool_profile && self.tools.has_child_factory();
+        spawner.tool_profile = tool_profile;
+        if profile_changes {
+            spawner.prompt_cache_key = Some(Arc::from(session_id_text.as_str()));
+        }
         spawner.depth = self.depth.saturating_add(1);
         let service = (spawner.service_factory)(Arc::clone(&spawner.config));
-        let (child, events) = spawn_agent_driver(
+        let initial_resume = if profile_changes {
+            InitialResume::History(Box::new(HistoryCheckpoint {
+                workspace: checkpoint.model().workspace().to_owned(),
+                canonical_context: checkpoint.model().canonical_context().clone(),
+                history: checkpoint.model().snapshot_history(),
+                prompt_cache_key: spawner
+                    .prompt_cache_key
+                    .as_ref()
+                    .map_or_else(|| Arc::from(session_id_text.as_str()), Arc::clone),
+                context_baseline: None,
+            }))
+        } else {
+            InitialResume::Exact(Box::new(checkpoint.model().clone()))
+        };
+        let (child, events, initial_checkpoint) = spawn_agent_driver(
             spawner,
             session_id,
             workspace,
             service,
-            Some(InitialResume::Exact(Box::new(checkpoint.model().clone()))),
+            Some(initial_resume),
             AgentOrigin {
                 kind: "fork",
                 depth: self.depth.saturating_add(1),
                 parent_session_id: Some(Arc::from(parent_session_id)),
             },
+            tool_profile,
         )?;
-        if let Err(error) = child.seed_initial_checkpoint(&checkpoint, thinking).await {
+        let checkpoint = if profile_changes {
+            initial_checkpoint.as_ref().ok_or_else(|| {
+                NanocodexError::InvalidRequest(
+                    "profile-changing fork did not produce a child history checkpoint".to_owned(),
+                )
+            })?
+        } else {
+            &checkpoint
+        };
+        if let Err(error) = child.seed_initial_checkpoint(checkpoint, thinking).await {
             let _ = child.shutdown().await;
             child.discard_unpublished_rollout().await;
             return Err(error);
@@ -89,6 +122,7 @@ where
         model: Model,
         thinking: Thinking,
         fast_mode: bool,
+        tool_profile: ToolProfile,
     ) -> Result<(Nanocodex, AgentEvents)> {
         let session_id = SessionId::new();
         let session_id_text = session_id.to_string();
@@ -97,10 +131,14 @@ where
         config.model = model;
         config.thinking = thinking;
         config.fast_mode = fast_mode;
-        let prompt_cache_key = self
-            .prompt_cache_key
-            .as_ref()
-            .map_or_else(|| Arc::clone(&self.lineage_id), Arc::clone);
+        let profile_changes = self.tool_profile != tool_profile && self.tools.has_child_factory();
+        let prompt_cache_key = if profile_changes {
+            Arc::from(session_id_text.as_str())
+        } else {
+            self.prompt_cache_key
+                .as_ref()
+                .map_or_else(|| Arc::clone(&self.lineage_id), Arc::clone)
+        };
         let spawner = Self {
             config: Arc::new(config),
             tools: self.tools.clone(),
@@ -109,12 +147,13 @@ where
             shared_prompt_cache: self.shared_prompt_cache.clone(),
             context_config: self.context_config.clone(),
             context_source: self.context_config.build(),
+            tool_profile,
             depth,
             durability: self.durability.for_new_thread(),
             service_factory: Arc::clone(&self.service_factory),
         };
         let service = (spawner.service_factory)(Arc::clone(&spawner.config));
-        spawn_agent_driver(
+        let (agent, events, _) = spawn_agent_driver(
             spawner,
             session_id,
             workspace,
@@ -125,6 +164,8 @@ where
                 depth,
                 parent_session_id: Some(Arc::from(parent_session_id)),
             },
-        )
+            tool_profile,
+        )?;
+        Ok((agent, events))
     }
 }

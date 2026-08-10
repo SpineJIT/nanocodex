@@ -209,7 +209,7 @@ fn fail_command(command: Command, failure: &DriverFailure) {
             drop(route_result.send(Err(failure_error(failure))));
             drop(turn_result.send(Err(failure_error(failure))));
         }
-        Command::Fork { result, .. } | Command::Spawn { result } => {
+        Command::Fork { result, .. } | Command::Spawn { result, .. } => {
             drop(result.send(Err(failure_error(failure))));
         }
         Command::Steer { result, .. }
@@ -269,7 +269,7 @@ pub(super) async fn begin_shutdown(
                 drop(route_result.send(Err(NanocodexError::AgentStopped)));
                 drop(turn_result);
             }
-            Command::Fork { result, .. } | Command::Spawn { result } => {
+            Command::Fork { result, .. } | Command::Spawn { result, .. } => {
                 drop(result.send(Err(NanocodexError::AgentStopped)));
             }
             Command::AppendDeveloperMessage { result, .. } => {
@@ -309,7 +309,11 @@ pub(super) async fn handle_idle_command<S>(
     S::Future: AgentSend,
 {
     match command {
-        Command::Fork { checkpoint, result } => {
+        Command::Fork {
+            checkpoint,
+            tool_profile,
+            result,
+        } => {
             let checkpoint = checkpoint.or_else(|| latest.cloned());
             let outcome = match checkpoint {
                 Some(checkpoint) => {
@@ -320,6 +324,7 @@ pub(super) async fn handle_idle_command<S>(
                             defaults.model,
                             defaults.thinking,
                             defaults.fast_mode,
+                            tool_profile,
                         )
                         .await
                 }
@@ -327,13 +332,17 @@ pub(super) async fn handle_idle_command<S>(
             };
             drop(result.send(outcome));
         }
-        Command::Spawn { result } => {
+        Command::Spawn {
+            tool_profile,
+            result,
+        } => {
             drop(result.send(spawner.spawn_clean(
                 workspace,
                 session_id,
                 defaults.model,
                 defaults.thinking,
                 defaults.fast_mode,
+                tool_profile,
             )));
         }
         Command::Steer { result, .. } => {

@@ -8,13 +8,14 @@ mod notification;
 mod resume_picker;
 mod scheduler;
 mod selection;
+mod spine_tree;
 mod telemetry;
 mod terminal;
 mod transcript;
 mod view;
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     path::PathBuf,
     process::{Command, Stdio},
     sync::Arc,
@@ -34,6 +35,7 @@ use nanocodex::{
     },
     tools::mcp::McpHandle,
 };
+use nanocodex_spine_runtime::SpineTreeSnapshot;
 use nanocodex_voice::{
     CHATGPT_REALTIME_VOICES, PLATFORM_REALTIME_VOICES, RealtimeVoice, VoiceAgentControl,
     VoiceEvent, VoiceEvents, VoiceSession, VoiceSessionBuilder, VoiceSpeaker,
@@ -45,7 +47,7 @@ use tokio::{
 };
 use tracing::{Instrument, info_span};
 
-pub use self::app::{PaneId, SubmittedPrompt};
+pub use self::app::{PaneId, SpineInputLane, SubmittedPrompt};
 
 use self::{
     app::{App, EscapeAction, ReasoningPickerAction},
@@ -79,6 +81,38 @@ const MAX_AGENT_EVENTS_PER_BATCH: usize = 256;
 pub(crate) struct InitialPrompt {
     display: String,
     instruction: Option<String>,
+    behavior: InitialPromptBehavior,
+}
+
+pub(crate) struct RestoredTranscript {
+    items: Vec<RolloutTranscriptItem>,
+    spine_delivery_ids: BTreeSet<String>,
+}
+
+impl RestoredTranscript {
+    pub(crate) const fn spine(
+        items: Vec<RolloutTranscriptItem>,
+        spine_delivery_ids: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            items,
+            spine_delivery_ids,
+        }
+    }
+}
+
+impl From<Vec<RolloutTranscriptItem>> for RestoredTranscript {
+    fn from(items: Vec<RolloutTranscriptItem>) -> Self {
+        Self {
+            items,
+            spine_delivery_ids: BTreeSet::new(),
+        }
+    }
+}
+
+enum InitialPromptBehavior {
+    SubmitImmediately,
+    PrefillOnly,
 }
 
 impl InitialPrompt {
@@ -86,6 +120,7 @@ impl InitialPrompt {
         Self {
             display,
             instruction: None,
+            behavior: InitialPromptBehavior::SubmitImmediately,
         }
     }
 
@@ -93,6 +128,15 @@ impl InitialPrompt {
         Self {
             display,
             instruction: Some(instruction),
+            behavior: InitialPromptBehavior::SubmitImmediately,
+        }
+    }
+
+    pub(crate) const fn prefill(display: String) -> Self {
+        Self {
+            display,
+            instruction: None,
+            behavior: InitialPromptBehavior::PrefillOnly,
         }
     }
 }
@@ -102,6 +146,12 @@ pub enum WorkerCommand {
         target: PaneId,
         prompt_id: u64,
         prompt: SubmittedPrompt,
+    },
+    SpineInput {
+        target: PaneId,
+        id: u64,
+        prompt: SubmittedPrompt,
+        lane: SpineInputLane,
     },
     Steer {
         target: PaneId,
@@ -170,6 +220,45 @@ pub enum WorkerEvent {
         event: TimedAgentEvent,
     },
     RootEventStreamClosed,
+    SpineTreeUpdated {
+        snapshot: SpineTreeSnapshot,
+    },
+    SpineTreeFailed {
+        error: String,
+    },
+    SpineStatus {
+        message: String,
+    },
+    SpineContinuation {
+        delivery_id: String,
+        prompt: String,
+    },
+    SpineInputStarted {
+        target: PaneId,
+        id: u64,
+        prompt: SubmittedPrompt,
+    },
+    SpineInputSteering {
+        target: PaneId,
+        id: u64,
+        prompt: SubmittedPrompt,
+    },
+    SpineInputDelivered {
+        target: PaneId,
+        id: u64,
+        prompt: SubmittedPrompt,
+    },
+    SpineInputBuffered {
+        target: PaneId,
+        id: u64,
+        lane: SpineInputLane,
+    },
+    PromptRejected {
+        target: PaneId,
+        prompt_id: u64,
+        prompt: SubmittedPrompt,
+        error: String,
+    },
     TurnTraceStarted {
         target: PaneId,
         id: u64,
@@ -680,7 +769,7 @@ pub(crate) async fn run(
         initial_model,
         initial_thinking,
         initial_fast_mode,
-        restored_transcript,
+        restored_transcript.into(),
         initial_prompt,
     )
     .await
@@ -696,7 +785,7 @@ pub(crate) async fn run_with_worker<F>(
     initial_model: Model,
     initial_thinking: Thinking,
     initial_fast_mode: bool,
-    restored_transcript: Vec<RolloutTranscriptItem>,
+    restored_transcript: RestoredTranscript,
     initial_prompt: Option<InitialPrompt>,
 ) -> Result<()>
 where
@@ -749,7 +838,10 @@ where
         .with_thinking(initial_thinking)
         .with_fast_mode(initial_fast_mode);
     app.set_math_renderer(math_renderer.clone());
-    app.restore_transcript(restored_transcript);
+    app.restore_transcript(
+        restored_transcript.items,
+        &restored_transcript.spine_delivery_ids,
+    );
     let mut ui = UiModel::with_capabilities(app, Arc::clone(&root_session_id), capabilities);
     let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
     let mut stream_telemetry = StreamTelemetry::default();
@@ -1044,6 +1136,9 @@ fn submit_initial_prompt(
     if let Some(prompt) = initial_prompt {
         app.input = prompt.display;
         app.cursor = app.input.len();
+        if matches!(prompt.behavior, InitialPromptBehavior::PrefillOnly) {
+            return Ok(());
+        }
         if let Some(instruction) = prompt.instruction {
             let Some(input) = app.take_submission() else {
                 return Ok(());
@@ -1107,6 +1202,33 @@ fn handle_worker_update_with_capabilities(
         WorkerEvent::RootAgentEvent { .. } | WorkerEvent::RootEventStreamClosed => {
             unreachable!("root events are applied by UiModel before worker updates")
         }
+        WorkerEvent::SpineTreeUpdated { snapshot } => app.main.upsert_spine_tree(snapshot),
+        WorkerEvent::SpineTreeFailed { error } => {
+            app.push_active_error(format!("Spine tree unavailable: {error}"));
+        }
+        WorkerEvent::SpineStatus { message } => app.push_active_error(message),
+        WorkerEvent::SpineContinuation {
+            delivery_id,
+            prompt,
+        } => app.spine_continuation(delivery_id, prompt),
+        WorkerEvent::SpineInputStarted { target, id, prompt } => {
+            app.spine_input_started(target, id, prompt);
+        }
+        WorkerEvent::SpineInputSteering { target, id, prompt } => {
+            app.spine_input_steering(target, id, prompt);
+        }
+        WorkerEvent::SpineInputDelivered { target, id, prompt } => {
+            app.spine_input_delivered(target, id, prompt);
+        }
+        WorkerEvent::SpineInputBuffered { target, id, lane } => {
+            app.spine_input_buffered(target, id, lane);
+        }
+        WorkerEvent::PromptRejected {
+            target,
+            prompt_id,
+            prompt,
+            error,
+        } => app.prompt_rejected(target, prompt_id, prompt, error),
         WorkerEvent::TurnFinished {
             target,
             main_branch_id,
@@ -1325,6 +1447,9 @@ impl AgentWorker {
                 prompt_id,
                 prompt,
             } => self.prompt(target, prompt_id, prompt).await,
+            WorkerCommand::SpineInput {
+                target, id, prompt, ..
+            } => self.prompt(target, id, prompt).await,
             WorkerCommand::Steer { target, id, prompt } => self.steer(target, id, prompt).await,
             WorkerCommand::Cancel { target } => self.cancel(target).await,
             WorkerCommand::InterruptForSteers {
@@ -2870,7 +2995,23 @@ fn submit(
     match classify_submission(input) {
         Submission::Prompt(prompt) => {
             let target = app.focus;
-            if matches!(intent, SubmitIntent::Immediate) && app.is_running(target) {
+            if capabilities.supports(WorkerCapability::SpineInputHandoff) && target == PaneId::Main
+            {
+                let id = app.reserve_input_id();
+                let lane = match intent {
+                    SubmitIntent::Immediate => SpineInputLane::Immediate,
+                    SubmitIntent::Queue => SpineInputLane::Deferred,
+                };
+                send_command(
+                    commands,
+                    WorkerCommand::SpineInput {
+                        target,
+                        id,
+                        prompt,
+                        lane,
+                    },
+                )?;
+            } else if matches!(intent, SubmitIntent::Immediate) && app.is_running(target) {
                 if let Some(id) = app.queue_steer(target, prompt.clone()) {
                     send_command(commands, WorkerCommand::Steer { target, id, prompt })?;
                 }
@@ -3015,6 +3156,7 @@ const fn worker_capability_label(capability: WorkerCapability) -> &'static str {
         WorkerCapability::Thinking => "thinking selection",
         WorkerCapability::Mcp => "MCP controls",
         WorkerCapability::Voice => "voice controls",
+        WorkerCapability::SpineInputHandoff => "Spine input handoff",
     }
 }
 
@@ -3200,6 +3342,9 @@ mod tests {
         agent::events::AgentEventKind,
         oai::{__private::EventSink, PromptInput},
     };
+    use nanocodex_spine_runtime::{
+        SpineTreeNode, SpineTreeNodeKind, SpineTreeNodeStatus, SpineTreeSnapshot,
+    };
     use nanocodex_voice::RealtimeVoice;
     use serde_json::{Value, json};
     use tokio::{
@@ -3210,18 +3355,88 @@ mod tests {
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
     use super::{
-        BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
-        UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, WorkerHandle, active_session_id,
-        apply_worker_event_batch, classify_submission, finish_worker, handle_key,
-        handle_worker_update, paste_clipboard_image, prepare_btw_prompt, report_cancel_outcome,
-        session_trace_url, spawn_agent_worker,
+        BTW_BOUNDARY, InitialPrompt, PaneId, RedrawPriority, SpineInputLane, Submission,
+        TerminalAction, UiAction, UiModel, UiUpdate, VoiceControl, WorkerCommand, WorkerEvent,
+        WorkerHandle, active_session_id, apply_worker_event_batch, classify_submission,
+        finish_worker, handle_key, handle_key_with_capabilities, handle_worker_update,
+        paste_clipboard_image, prepare_btw_prompt, report_cancel_outcome, session_trace_url,
+        spawn_agent_worker, submit_initial_prompt,
     };
+    use crate::app_core::{WorkerCapabilities, WorkerCapability};
     use crate::tui::{
         app::App,
         scheduler::{RenderScheduler, STREAM_FRAME_INTERVAL},
         telemetry::StreamTelemetry,
     };
 
+    #[test]
+    fn initial_prefill_keeps_a_manual_continuation_in_the_composer() -> Result<()> {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+
+        submit_initial_prompt(
+            &mut app,
+            "root-session",
+            WorkerCapabilities::standard(),
+            &commands,
+            Some(InitialPrompt::prefill(
+                "continue the interrupted scope".to_owned(),
+            )),
+        )?;
+
+        assert_eq!(app.input, "continue the interrupted scope");
+        assert!(worker.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn spine_tree_updates_replace_the_transcript_card() -> Result<()> {
+        let (commands, _) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+
+        handle_worker_update(
+            &mut app,
+            WorkerEvent::SpineTreeUpdated {
+                snapshot: spine_tree_snapshot("1.1", SpineTreeNodeStatus::Live),
+            },
+            &commands,
+        )?;
+        handle_worker_update(
+            &mut app,
+            WorkerEvent::SpineTreeUpdated {
+                snapshot: spine_tree_snapshot("1.2", SpineTreeNodeStatus::Closed),
+            },
+            &commands,
+        )?;
+
+        assert_eq!(app.main.transcript.len(), 1);
+        Ok(())
+    }
+
+    fn spine_tree_snapshot(
+        active_node_id: &str,
+        first_task_status: SpineTreeNodeStatus,
+    ) -> SpineTreeSnapshot {
+        SpineTreeSnapshot {
+            active_node_id: active_node_id.to_owned(),
+            nodes: vec![
+                SpineTreeNode {
+                    id: "1".to_owned(),
+                    parent_id: None,
+                    kind: SpineTreeNodeKind::RootEpoch,
+                    status: SpineTreeNodeStatus::Opened,
+                    summary: None,
+                },
+                SpineTreeNode {
+                    id: "1.1".to_owned(),
+                    parent_id: Some("1".to_owned()),
+                    kind: SpineTreeNodeKind::Task,
+                    status: first_task_status,
+                    summary: Some("inspect the parser".to_owned()),
+                },
+            ],
+        }
+    }
     fn mouse_scroll(kind: MouseEventKind) -> Event {
         Event::Mouse(MouseEvent {
             kind,
@@ -4394,6 +4609,58 @@ mod tests {
         ));
         assert_eq!(app.main.status, "Cancelling");
         assert!(!app.historical_editor_active());
+    }
+
+    #[test]
+    fn spine_input_uses_explicit_enter_and_tab_lanes_without_prequeueing() {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        let capabilities = WorkerCapabilities::empty()
+            .with(WorkerCapability::Prompt)
+            .with(WorkerCapability::Steer)
+            .with(WorkerCapability::SpineInputHandoff);
+        app.main.running = true;
+
+        app.replace_input("redirect the handoff".to_owned());
+        handle_key_with_capabilities(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            "main-session",
+            capabilities,
+            &commands,
+        )
+        .expect("submit immediate Spine input");
+        assert!(matches!(
+            worker.try_recv(),
+            Ok(WorkerCommand::SpineInput {
+                target: PaneId::Main,
+                id: 1,
+                prompt,
+                lane: SpineInputLane::Immediate,
+            }) if prompt == "redirect the handoff"
+        ));
+        assert!(app.main.queued_prompts.is_empty());
+        assert!(app.main.pending_steers.is_empty());
+
+        app.replace_input("continue after the handoff".to_owned());
+        handle_key_with_capabilities(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut app,
+            "main-session",
+            capabilities,
+            &commands,
+        )
+        .expect("queue deferred Spine input");
+        assert!(matches!(
+            worker.try_recv(),
+            Ok(WorkerCommand::SpineInput {
+                target: PaneId::Main,
+                id: 2,
+                prompt,
+                lane: SpineInputLane::Deferred,
+            }) if prompt == "continue after the handoff"
+        ));
+        assert!(app.main.queued_prompts.is_empty());
     }
 
     #[test]
