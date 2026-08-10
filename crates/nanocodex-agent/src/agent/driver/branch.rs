@@ -124,10 +124,14 @@ where
         config.model = model;
         config.thinking = thinking;
         config.fast_mode = fast_mode;
-        let prompt_cache_key = self
-            .prompt_cache_key
-            .as_ref()
-            .map_or_else(|| Arc::clone(&self.lineage_id), Arc::clone);
+        let profile_changes = self.tool_profile != tool_profile && self.tools.has_child_factory();
+        let prompt_cache_key = if profile_changes {
+            Arc::from(session_id_text.as_str())
+        } else {
+            self.prompt_cache_key
+                .as_ref()
+                .map_or_else(|| Arc::clone(&self.lineage_id), Arc::clone)
+        };
         let spawner = Self {
             config: Arc::new(config),
             tools: self.tools.clone(),

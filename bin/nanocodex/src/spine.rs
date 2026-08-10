@@ -717,6 +717,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn factory_resume_aborts_a_persisted_prepared_transition() -> eyre::Result<()> {
+        let directory = tempdir()?;
+        let (endpoint, server) = completed_responses_server(1).await?;
+        let cli = spine_cli_with_websocket(&endpoint)?;
+        let factory = SpineWorkerFactory::build_in(
+            cli.agent.clone(),
+            cli.vm.clone(),
+            directory.path().to_path_buf(),
+        )
+        .await?;
+        let root_session_id = factory.root_session_id.clone();
+        let mut root = factory.start();
+        root.commands().send(WorkerCommand::Prompt {
+            target: PaneId::Main,
+            prompt_id: 1,
+            prompt: "establish a durable root boundary".into(),
+        })?;
+        wait_for_main_turn(&mut root).await?;
+        root.shutdown().await?;
+
+        let runtime = SpineRuntime::open(
+            SpineRuntimeLimits::default(),
+            directory.path().join("spine").as_path(),
+            &root_session_id,
+        )?;
+        runtime.prepare(SpineIntentRequest::new(
+            root_session_id.clone(),
+            "prepared-recovery",
+            nanocodex_spine_runtime::SpineTerminalControl::Open {
+                summary: "recover the interrupted transition".to_owned(),
+            },
+        ))?;
+        assert!(runtime.pending_transition()?.is_some());
+        drop(runtime);
+
+        let factory = SpineWorkerFactory::resume_in(
+            cli.agent,
+            cli.vm,
+            &root_session_id,
+            directory.path().to_path_buf(),
+        )
+        .await?;
+        assert_eq!(factory.active_session_id, root_session_id);
+        assert!(factory.runtime.pending_transition()?.is_none());
+        assert_eq!(
+            factory.initial_status.as_deref(),
+            Some(
+                "Recovered an uncommitted Spine transition; continuing from the last durable node."
+            )
+        );
+        factory.configured.handle.shutdown().await?;
+        drop(factory);
+
+        let runtime = SpineRuntime::open(
+            SpineRuntimeLimits::default(),
+            directory.path().join("spine").as_path(),
+            &root_session_id,
+        )?;
+        assert!(runtime.pending_transition()?.is_none());
+        assert_eq!(runtime.active_session_id()?, root_session_id);
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn factory_resume_accepts_a_claimed_manual_delivery_without_replaying_it()
     -> eyre::Result<()> {
         let directory = tempdir()?;
@@ -960,11 +1025,15 @@ mod tests {
             let profiles = profiles.lock().expect("tool profile lock");
             assert_eq!(profiles.len(), 4);
             for profile in &profiles[..2] {
-                assert_spine_coordinator_tools(profile);
+                assert_spine_coordinator_tools(&profile.names);
             }
             for profile in &profiles[2..] {
-                assert_ordinary_child_tools(profile);
+                assert_ordinary_child_tools(&profile.names);
             }
+            assert_eq!(profiles[0].prompt_cache_key, profiles[1].prompt_cache_key);
+            assert_ne!(profiles[0].prompt_cache_key, profiles[2].prompt_cache_key);
+            assert_ne!(profiles[0].prompt_cache_key, profiles[3].prompt_cache_key);
+            assert_ne!(profiles[2].prompt_cache_key, profiles[3].prompt_cache_key);
         }
 
         coordinator.shutdown().await?;
@@ -1672,7 +1741,13 @@ mod tests {
 
     #[derive(Clone)]
     struct ToolProfileService {
-        profiles: Arc<Mutex<Vec<BTreeSet<String>>>>,
+        profiles: Arc<Mutex<Vec<ToolProfileRequest>>>,
+    }
+
+    #[derive(Debug)]
+    struct ToolProfileRequest {
+        names: BTreeSet<String>,
+        prompt_cache_key: String,
     }
 
     #[derive(Clone)]
@@ -1900,7 +1975,7 @@ mod tests {
                     self.profiles
                         .lock()
                         .expect("tool profile lock")
-                        .push(request_tool_names(&request));
+                        .push(request_tool_profile(&request));
                     final_generation("resp-tool-profile", "completed")
                 }
                 _ => panic!("unexpected tool profile Responses attempt"),
@@ -1909,20 +1984,23 @@ mod tests {
         }
     }
 
-    fn request_tool_names(request: &ResponsesAttempt) -> BTreeSet<String> {
+    fn request_tool_profile(request: &ResponsesAttempt) -> ToolProfileRequest {
         let profile = nanocodex_oai_api::__private::test_support::request_profile(request);
-        profile
-            .prefix()
-            .iter()
-            .chain(request.input_items())
-            .filter_map(|item| match item {
-                ResponseItem::AdditionalTools { tools, .. } => Some(tools),
-                _ => None,
-            })
-            .flatten()
-            .map(|tool| tool.name().to_owned())
-            .chain(profile.code_mode_tool_names().map(str::to_owned))
-            .collect()
+        ToolProfileRequest {
+            names: profile
+                .prefix()
+                .iter()
+                .chain(request.input_items())
+                .filter_map(|item| match item {
+                    ResponseItem::AdditionalTools { tools, .. } => Some(tools),
+                    _ => None,
+                })
+                .flatten()
+                .map(|tool| tool.name().to_owned())
+                .chain(profile.code_mode_tool_names().map(str::to_owned))
+                .collect(),
+            prompt_cache_key: profile.prompt_cache_key().to_owned(),
+        }
     }
 
     fn assert_spine_coordinator_tools(profile: &BTreeSet<String>) {

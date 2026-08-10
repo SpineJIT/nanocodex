@@ -155,7 +155,8 @@ impl<F> NanocodexBuilder<F> {
     /// Independent root agents may share this key without sharing their
     /// session, conversation, response chain, tools, or workspace. When
     /// omitted, each independently built root uses its own session lineage.
-    /// Clean children and forks inherit their root's cache identity.
+    /// Clean children and forks inherit their root's cache identity unless an
+    /// application-selected child tool profile changes the request prefix.
     #[must_use]
     pub fn prompt_cache_key(mut self, prompt_cache_key: impl Into<String>) -> Self {
         self.prompt_cache.key = Some(prompt_cache_key.into());
