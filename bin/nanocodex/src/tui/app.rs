@@ -1344,6 +1344,12 @@ impl App {
         if target != PaneId::Main {
             return;
         }
+        if !self.input.is_empty()
+            || !self.local_images.is_empty()
+            || !self.pending_pastes.is_empty()
+        {
+            return;
+        }
         self.input = prompt.display;
         self.local_images = prompt
             .local_images
@@ -3506,6 +3512,27 @@ mod tests {
         assert!(app.main.queued_prompts.is_empty());
         assert_eq!(app.main.pending_turns, 0);
         assert!(app.main.transcript.is_empty());
+    }
+
+    #[test]
+    fn rejected_prompt_does_not_replace_a_newer_composer_draft() {
+        let mut app = App::new(std::path::PathBuf::from("/worktree"));
+        let prompt_id = app
+            .queue_prompt(PaneId::Main, "rejected submission".to_owned())
+            .expect("main prompt ID");
+        app.insert_str("new unsubmitted draft");
+
+        app.prompt_rejected(
+            PaneId::Main,
+            prompt_id,
+            SubmittedPrompt::text("rejected submission".to_owned()),
+            "an active Spine turn is already running".to_owned(),
+        );
+
+        assert_eq!(app.input, "new unsubmitted draft");
+        assert_eq!(app.cursor, app.input.len());
+        assert!(app.main.queued_prompts.is_empty());
+        assert_eq!(app.main.pending_turns, 0);
     }
 
     #[test]

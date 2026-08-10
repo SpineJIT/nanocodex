@@ -351,12 +351,13 @@ fn incomplete_final_record_is_truncated_after_replaying_the_valid_prefix() {
 }
 
 #[test]
-fn complete_final_record_without_a_newline_is_rejected_as_corruption() {
+fn unterminated_final_record_is_truncated_even_when_its_json_is_complete() {
     let directory = tempdir().expect("temporary journal directory");
     let header = JournalHeader::new("root-session", "root-cache-key", "2026-08-09T00:00:00Z");
     let path = directory.path().join("root-session.jsonl");
     let journal = Journal::create(directory.path(), header.clone()).expect("create journal");
     drop(journal);
+    let valid_prefix = fs::read(&path).expect("read valid journal prefix");
 
     let mut file = fs::OpenOptions::new()
         .append(true)
@@ -366,10 +367,13 @@ fn complete_final_record_without_a_newline_is_rejected_as_corruption() {
         .expect("append complete tail");
     drop(file);
 
-    assert!(matches!(
-        Journal::open(directory.path(), header.root_session_id()),
-        Err(JournalError::InvalidData(_))
-    ));
+    let reopened =
+        Journal::open(directory.path(), header.root_session_id()).expect("reopen journal");
+    assert_eq!(reopened.state().pending(), None);
+    assert_eq!(
+        fs::read(&path).expect("read truncated journal"),
+        valid_prefix
+    );
 }
 
 #[test]

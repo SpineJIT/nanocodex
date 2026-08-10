@@ -1144,24 +1144,7 @@ fn complete_prefix<'a>(
         )));
     };
     let complete = &bytes[..=last_newline];
-    let tail = &bytes[last_newline + 1..];
-    if tail.len() > MAX_RECORD_BYTES {
-        return Err(JournalError::InvalidData(format!(
-            "journal {} final record exceeds the {MAX_RECORD_BYTES}-byte limit",
-            path.display()
-        )));
-    }
-    match serde_json::from_slice::<RawEnvelope>(tail) {
-        Err(error) if error.is_eof() => Ok((complete, Some(complete.len() as u64))),
-        Ok(_) => Err(JournalError::InvalidData(format!(
-            "journal {} final record is complete but missing its newline terminator",
-            path.display()
-        ))),
-        Err(error) => Err(JournalError::InvalidData(format!(
-            "journal {} final record is corrupted: {error}",
-            path.display()
-        ))),
-    }
+    Ok((complete, Some(complete.len() as u64)))
 }
 
 fn decode_record(
