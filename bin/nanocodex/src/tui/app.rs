@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -40,6 +40,21 @@ const LARGE_PASTE_CHAR_THRESHOLD: usize = 1_000;
 const CANCEL_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
 const SMOOTH_SCROLL_BACKLOG_ROWS: usize = 8;
 const MAX_SMOOTH_SCROLL_CATCH_UP_ROWS: usize = 32;
+
+fn spine_continuation_body<'a>(delivery_id: &str, prompt: &'a str) -> Option<&'a str> {
+    let marker = format!("<spine_delivery id=\"{delivery_id}\">");
+    prompt
+        .strip_prefix(&marker)
+        .and_then(|body| body.strip_prefix('\n'))
+        .and_then(|body| body.strip_suffix("\n</spine_delivery>"))
+}
+
+fn spine_delivery_id(prompt: &str) -> Option<&str> {
+    prompt
+        .strip_prefix("<spine_delivery id=\"")?
+        .split_once("\">")
+        .map(|(delivery_id, _)| delivery_id)
+}
 
 pub(super) const STANDARD_THINKING_OPTIONS: [(Thinking, &str, &str); 4] = [
     (
@@ -801,6 +816,20 @@ impl Conversation {
         }
     }
 
+    fn reject_queued_prompt(&mut self, id: u64, error: String) {
+        self.remove_queued_prompt(id);
+        if let Some(removed) = self.transcript.remove_editable_user(id)
+            && let Some(selected) = self.selected_user
+        {
+            self.selected_user = if selected == removed {
+                None
+            } else {
+                Some(selected.saturating_sub(usize::from(selected > removed)))
+            };
+        }
+        self.status = error;
+    }
+
     pub(super) fn push_assistant_delta(&mut self, delta: &str) {
         let append_to_current = self.streamed_this_turn;
         self.streamed_this_turn = true;
@@ -1261,10 +1290,22 @@ impl App {
     pub(super) fn restore_transcript(
         &mut self,
         transcript: impl IntoIterator<Item = RolloutTranscriptItem>,
+        spine_delivery_ids: &BTreeSet<String>,
     ) {
         for activity in transcript {
             let item = match activity {
-                RolloutTranscriptItem::User(message) => TranscriptItem::User(message),
+                RolloutTranscriptItem::User(message) => spine_delivery_id(&message)
+                    .filter(|delivery_id| spine_delivery_ids.contains(*delivery_id))
+                    .map_or_else(
+                        || TranscriptItem::User(message.clone()),
+                        |delivery_id| {
+                            TranscriptItem::SpineContinuation(
+                                spine_continuation_body(delivery_id, &message)
+                                    .unwrap_or(message.as_str())
+                                    .to_owned(),
+                            )
+                        },
+                    ),
                 RolloutTranscriptItem::Reasoning(message) => TranscriptItem::Reasoning(message),
                 RolloutTranscriptItem::Assistant(message) => TranscriptItem::Assistant(message),
                 RolloutTranscriptItem::Tool {
@@ -1280,6 +1321,43 @@ impl App {
             };
             self.main.push_output(item);
         }
+    }
+
+    pub(super) fn spine_continuation(&mut self, delivery_id: String, prompt: String) {
+        self.main.push_output(TranscriptItem::SpineContinuation(
+            spine_continuation_body(&delivery_id, &prompt)
+                .unwrap_or(prompt.as_str())
+                .to_owned(),
+        ));
+    }
+
+    pub(super) fn prompt_rejected(
+        &mut self,
+        target: PaneId,
+        prompt_id: u64,
+        prompt: SubmittedPrompt,
+        error: String,
+    ) {
+        if let Some(conversation) = self.conversation_mut(target) {
+            conversation.reject_queued_prompt(prompt_id, error);
+        }
+        if target != PaneId::Main {
+            return;
+        }
+        self.input = prompt.display;
+        self.local_images = prompt
+            .local_images
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| AttachedImage {
+                placeholder: format!("[Image #{}]", index + 1),
+                path,
+            })
+            .collect();
+        self.pending_pastes.clear();
+        self.cursor = self.input.len();
+        self.composer_scroll = 0;
+        self.preferred_column = None;
     }
 
     pub(super) const fn with_thinking(mut self, thinking: Thinking) -> Self {
@@ -3346,22 +3424,88 @@ mod tests {
     #[test]
     fn restored_rollout_activity_seeds_the_visible_transcript() {
         let mut app = App::new(std::path::PathBuf::from("/worktree"));
-        app.restore_transcript([
-            RolloutTranscriptItem::User("visible prompt".to_owned()),
-            RolloutTranscriptItem::Reasoning("thinking".to_owned()),
-            RolloutTranscriptItem::Tool {
-                call_id: "call-1".to_owned(),
-                name: "exec".to_owned(),
-                arguments: "pwd".to_owned(),
-            },
-            RolloutTranscriptItem::Assistant("visible answer".to_owned()),
-        ]);
+        app.restore_transcript(
+            [
+                RolloutTranscriptItem::User("visible prompt".to_owned()),
+                RolloutTranscriptItem::Reasoning("thinking".to_owned()),
+                RolloutTranscriptItem::Tool {
+                    call_id: "call-1".to_owned(),
+                    name: "exec".to_owned(),
+                    arguments: "pwd".to_owned(),
+                },
+                RolloutTranscriptItem::Assistant("visible answer".to_owned()),
+            ],
+            &std::collections::BTreeSet::new(),
+        );
 
         assert_eq!(app.main.transcript.len(), 4);
         assert_eq!(
             app.main.transcript.latest_user_message(),
             Some("visible prompt")
         );
+    }
+
+    #[test]
+    fn restored_known_spine_delivery_is_not_shown_as_user_input() {
+        let mut app = App::new(std::path::PathBuf::from("/worktree"));
+        let delivery_id = "delivery-claimed".to_owned();
+        app.restore_transcript(
+            [RolloutTranscriptItem::User(format!(
+                "<spine_delivery id=\"{delivery_id}\">\ncontinue the focused scope\n</spine_delivery>"
+            ))],
+            &std::collections::BTreeSet::from([delivery_id]),
+        );
+
+        assert_eq!(app.main.transcript.latest_user_message(), None);
+        assert_eq!(app.main.transcript.len(), 1);
+    }
+
+    #[test]
+    fn unknown_spine_delivery_marker_remains_a_user_submission_on_restore() {
+        let mut app = App::new(std::path::PathBuf::from("/worktree"));
+        let prompt = "<spine_delivery id=\"delivery-claimed\">\ncontinue\n</spine_delivery>";
+        app.restore_transcript(
+            [RolloutTranscriptItem::User(prompt.to_owned())],
+            &std::collections::BTreeSet::new(),
+        );
+
+        assert_eq!(app.main.transcript.latest_user_message(), Some(prompt));
+    }
+
+    #[test]
+    fn live_spine_continuation_is_not_shown_as_user_input() {
+        let mut app = App::new(std::path::PathBuf::from("/worktree"));
+        let delivery_id = "delivery-live".to_owned();
+        app.spine_continuation(
+            delivery_id.clone(),
+            format!(
+                "<spine_delivery id=\"{delivery_id}\">\ncontinue the focused scope\n</spine_delivery>"
+            ),
+        );
+
+        assert_eq!(app.main.transcript.latest_user_message(), None);
+        assert_eq!(app.main.transcript.len(), 1);
+    }
+
+    #[test]
+    fn rejected_prompt_restores_the_composer_and_removes_the_queued_submission() {
+        let mut app = App::new(std::path::PathBuf::from("/worktree"));
+        let prompt_id = app
+            .queue_prompt(PaneId::Main, "keep this exact draft".to_owned())
+            .expect("main prompt ID");
+
+        app.prompt_rejected(
+            PaneId::Main,
+            prompt_id,
+            SubmittedPrompt::text("keep this exact draft".to_owned()),
+            "spine continuation transition is in progress".to_owned(),
+        );
+
+        assert_eq!(app.input, "keep this exact draft");
+        assert_eq!(app.cursor, app.input.len());
+        assert!(app.main.queued_prompts.is_empty());
+        assert_eq!(app.main.pending_turns, 0);
+        assert!(app.main.transcript.is_empty());
     }
 
     #[test]

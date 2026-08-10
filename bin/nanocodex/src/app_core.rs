@@ -163,7 +163,7 @@ where
         model,
         thinking,
         fast_mode,
-        Vec::new(),
+        Vec::new().into(),
         initial_prompt.map(tui::InitialPrompt::plain),
     )
     .await

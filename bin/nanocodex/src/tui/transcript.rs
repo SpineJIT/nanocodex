@@ -39,6 +39,7 @@ pub(super) struct InlineEdit<'a> {
 
 pub(super) enum TranscriptItem {
     User(String),
+    SpineContinuation(String),
     Reasoning(String),
     Assistant(String),
     Tool {
@@ -227,6 +228,25 @@ impl Transcript {
         self.editable_users.push(self.entries.len());
         self.entries.push(Arc::new(entry));
         self.invalidate_total_height();
+    }
+
+    pub(super) fn remove_editable_user(&mut self, prompt_id: u64) -> Option<usize> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.prompt_id == Some(prompt_id))?;
+        let _ = self.entries.remove(index);
+        self.editable_users.retain_mut(|entry_index| {
+            if *entry_index == index {
+                return false;
+            }
+            if *entry_index > index {
+                *entry_index = entry_index.saturating_sub(1);
+            }
+            true
+        });
+        self.invalidate_total_height();
+        Some(index)
     }
 
     pub(super) fn append_assistant_delta(&mut self, delta: &str) -> bool {
@@ -845,6 +865,7 @@ fn inline_edit_layout(input: &str, width: u16) -> ComposerLayout {
 #[derive(Clone)]
 enum EntryKind {
     User,
+    SpineContinuation,
     Reasoning,
     Assistant,
     Tool { call_id: String },
@@ -1050,6 +1071,20 @@ impl TranscriptEntry {
                     &message,
                 );
                 (EntryKind::User, Some(message), EntryContent::Static(text))
+            }
+            TranscriptItem::SpineContinuation(message) => {
+                let text = message_text(
+                    "↳ Spine continuation",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                    &message,
+                );
+                (
+                    EntryKind::SpineContinuation,
+                    None,
+                    EntryContent::Static(text),
+                )
             }
             TranscriptItem::Assistant(message) => (
                 EntryKind::Assistant,

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
@@ -12,6 +12,8 @@ use codex_spine_core::{
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+use crate::SpineAbortReason;
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
@@ -29,10 +31,21 @@ pub(crate) enum TransitionKind {
 pub(crate) struct TransitionIntent {
     source_session_id: String,
     terminal_call_id: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     parent_session_id: Option<String>,
     kind: TransitionKind,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     summary: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     memory: Option<String>,
+}
+
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 impl TransitionIntent {
@@ -378,6 +391,14 @@ impl JournalState {
             .map(|delivery| delivery.status)
     }
 
+    pub(crate) fn active_delivery_ids(&self) -> BTreeSet<String> {
+        self.deliveries
+            .iter()
+            .filter(|(_, delivery)| delivery.target_session_id == self.active_session_id)
+            .map(|(delivery_id, _)| delivery_id.clone())
+            .collect()
+    }
+
     pub(crate) fn active_parent_session_id(&self) -> Option<String> {
         let projection = self.reducer.projection();
         let parent = projection
@@ -495,11 +516,6 @@ impl JournalState {
                 if self.pending.as_ref() != Some(&aborted.intent) {
                     return Err(JournalError::InvalidData(
                         "aborted transition does not match the prepared transition".to_owned(),
-                    ));
-                }
-                if aborted.reason.trim().is_empty() {
-                    return Err(JournalError::InvalidData(
-                        "aborted transition reason must not be empty".to_owned(),
                     ));
                 }
                 self.pending = None;
@@ -801,12 +817,12 @@ impl Journal {
     pub(crate) fn abort(
         &mut self,
         intent: TransitionIntent,
-        reason: impl Into<String>,
+        reason: SpineAbortReason,
         recovery_delivery_id: Option<String>,
     ) -> Result<(), JournalError> {
         self.append(JournalRecord::Aborted(AbortedRecord {
             intent,
-            reason: reason.into(),
+            reason,
             recovery_delivery_id,
         }))
     }
@@ -878,6 +894,7 @@ enum JournalRecord {
 struct CommittedRecord {
     intent: TransitionIntent,
     active_session_id: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     closed_session_id: Option<String>,
     delivery_id: String,
 }
@@ -886,7 +903,8 @@ struct CommittedRecord {
 #[serde(deny_unknown_fields)]
 struct AbortedRecord {
     intent: TransitionIntent,
-    reason: String,
+    reason: SpineAbortReason,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     recovery_delivery_id: Option<String>,
 }
 

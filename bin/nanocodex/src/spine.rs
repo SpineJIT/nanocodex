@@ -3,7 +3,7 @@ use std::{path::PathBuf, process::ExitCode, sync::Arc};
 use clap::{Parser, Subcommand, builder::NonEmptyStringValueParser};
 use eyre::{Result, eyre};
 use nanocodex::agent::rollout::RolloutTranscriptItem;
-use nanocodex_spine_runtime::{SpineDelivery, SpineRuntime, SpineRuntimeLimits};
+use nanocodex_spine_runtime::{SpineAbortReason, SpineDelivery, SpineRuntime, SpineRuntimeLimits};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -14,7 +14,7 @@ use crate::{
         SpineIntentChannel, SpineSessionRecipe, SpineWorker, SpineWorkerInitial, capabilities,
         durable_prompt_cache_key,
     },
-    tui::{self, InitialPrompt, WorkerCommand, WorkerEvent},
+    tui::{self, InitialPrompt, RestoredTranscript, WorkerCommand, WorkerEvent},
     vm::VmArgs,
 };
 
@@ -109,7 +109,7 @@ async fn run(mut cli: Cli) -> Result<()> {
         initial.model,
         initial.thinking,
         initial.fast_mode,
-        initial.transcript,
+        RestoredTranscript::spine(initial.transcript, initial.spine_delivery_ids),
         initial_prompt,
     )
     .await
@@ -135,6 +135,7 @@ struct SpineInitial {
     thinking: nanocodex::Thinking,
     fast_mode: bool,
     transcript: Vec<RolloutTranscriptItem>,
+    spine_delivery_ids: std::collections::BTreeSet<String>,
 }
 
 impl SpineWorkerFactory {
@@ -146,6 +147,7 @@ impl SpineWorkerFactory {
             thinking: config.thinking(),
             fast_mode: config.fast_mode(),
             transcript: Vec::new(),
+            spine_delivery_ids: std::collections::BTreeSet::new(),
         };
         let codex_home = default_codex_home()?;
         let (intent_sink, intents) = SpineIntentChannel::new();
@@ -195,7 +197,7 @@ impl SpineWorkerFactory {
             runtime
                 .abort_prepared(
                     pending,
-                    "the previous process stopped before this Spine transition committed",
+                    SpineAbortReason::CoordinatorStoppedBeforeCommit,
                     Some(format!("recovery-{}", uuid::Uuid::now_v7())),
                 )
                 .map_err(|error| eyre!(error))?;
@@ -229,6 +231,9 @@ impl SpineWorkerFactory {
             thinking,
             fast_mode,
             transcript: durable.transcript().to_vec(),
+            spine_delivery_ids: runtime
+                .active_delivery_ids()
+                .map_err(|error| eyre!(error))?,
         };
         let configured = session_recipe.build_resumed(durable).await?;
         if configured.handle.session_id().to_string() != active_session_id {
@@ -333,7 +338,7 @@ mod tests {
     use crate::{
         config::ConfiguredAgent,
         spine_worker::{
-            SpineIntentChannel, SpineSessionRecipe, SpineWorker, SpineWorkerInitial,
+            DeliveryFault, SpineIntentChannel, SpineSessionRecipe, SpineWorker, SpineWorkerInitial,
             TestResumedAgentBuilder, capabilities, durable_prompt_cache_key,
         },
         tui::{PaneId, WorkerCommand, WorkerEvent},
@@ -513,6 +518,200 @@ mod tests {
         );
         restored_parent.handle.shutdown().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn delivery_failures_after_commit_stop_the_spine_coordinator() -> eyre::Result<()> {
+        for (fault, expected_claim) in [
+            (DeliveryFault::Claim, false),
+            (DeliveryFault::PromptAcceptance, true),
+            (DeliveryFault::AcceptedSync, true),
+        ] {
+            let directory = tempdir()?;
+            let (worker, runtime) =
+                scripted_spine_worker(directory.path(), Some(fault), None).await?;
+            worker.commands().send(WorkerCommand::Prompt {
+                target: PaneId::Main,
+                prompt_id: 1,
+                prompt: "open a child scope".into(),
+            })?;
+
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    if runtime.active_session_id()? != runtime.root_session_id()? {
+                        return Ok::<(), eyre::Report>(());
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await??;
+
+            let outcome = timeout(Duration::from_secs(5), worker.shutdown()).await?;
+            assert!(outcome.is_err(), "{fault:?} must stop the coordinator");
+            assert!(
+                runtime.active_session_id()? != runtime.root_session_id()?,
+                "{fault:?} must occur after the transition commit"
+            );
+            if expected_claim {
+                assert!(runtime.claimed_active_delivery()?.is_some());
+            } else {
+                assert!(runtime.unclaimed_active_delivery()?.is_some());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prompt_submitted_during_a_transition_is_rejected_with_its_contents() -> eyre::Result<()>
+    {
+        let directory = tempdir()?;
+        let (started, started_receiver) = tokio::sync::oneshot::channel();
+        let release = Arc::new(Notify::new());
+        let (mut worker, _runtime) = scripted_spine_worker(
+            directory.path(),
+            None,
+            Some((started, Arc::clone(&release))),
+        )
+        .await?;
+        worker.commands().send(WorkerCommand::Prompt {
+            target: PaneId::Main,
+            prompt_id: 1,
+            prompt: "open a child scope".into(),
+        })?;
+        timeout(Duration::from_secs(5), started_receiver).await??;
+
+        worker.commands().send(WorkerCommand::Prompt {
+            target: PaneId::Main,
+            prompt_id: 2,
+            prompt: "keep this exact draft".into(),
+        })?;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match worker.events_mut().recv().await {
+                    Some(WorkerEvent::PromptRejected {
+                        target: PaneId::Main,
+                        prompt_id: 2,
+                        prompt,
+                        error,
+                    }) => {
+                        assert_eq!(prompt.display(), "keep this exact draft");
+                        assert!(error.contains("transition is in progress"));
+                        return;
+                    }
+                    Some(_) => {}
+                    None => panic!("Spine worker stopped before rejecting the queued prompt"),
+                }
+            }
+        })
+        .await?;
+        release.notify_one();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match worker.events_mut().recv().await {
+                    Some(WorkerEvent::SpineContinuation {
+                        delivery_id,
+                        prompt,
+                    }) => {
+                        assert!(delivery_id.starts_with("delivery-"));
+                        assert!(prompt.starts_with("<spine_delivery id=\""));
+                        return;
+                    }
+                    Some(_) => {}
+                    None => panic!("Spine worker stopped before reporting its continuation"),
+                }
+            }
+        })
+        .await?;
+        worker.shutdown().await?;
+        Ok(())
+    }
+
+    async fn scripted_spine_worker(
+        directory: &std::path::Path,
+        delivery_fault: Option<DeliveryFault>,
+        transition_gate: Option<(tokio::sync::oneshot::Sender<()>, Arc<Notify>)>,
+    ) -> eyre::Result<(
+        crate::app_core::WorkerHandle<WorkerCommand, WorkerEvent>,
+        Arc<SpineRuntime>,
+    )> {
+        let root_session_id = SessionId::new();
+        let openai = OpenAi::builder("test-key")
+            .service(DeliveryFaultService::default)
+            .build()?;
+        let tools = Tools::builder().without_defaults().build()?;
+        let (intent_sink, intents) = SpineIntentChannel::new();
+        let tool_sink: Arc<dyn SpineIntentSink> = intent_sink.clone();
+        let (agent, events) = Nanocodex::builder(openai)
+            .thinking(Thinking::Low)
+            .workspace(directory)
+            .session_id(root_session_id)
+            .rollout(RolloutConfig::new(directory))
+            .tools_factory(move |_agent| with_spine_tools(tools.clone(), Arc::clone(&tool_sink)))
+            .build()?;
+        let root_session_id = agent.session_id().to_string();
+        let runtime = Arc::new(SpineRuntime::create(
+            SpineRuntimeLimits::default(),
+            directory.join("spine").as_path(),
+            &root_session_id,
+            &root_session_id,
+            "2026-08-09T00:00:00Z",
+        )?);
+        let cli = Cli::try_parse_from([
+            "nanocodex-spine",
+            "--api-key",
+            "test-key",
+            "--browser=none",
+            "--subagents",
+            "false",
+        ])?;
+        let session_recipe = SpineSessionRecipe::new(
+            cli.agent,
+            cli.vm,
+            Arc::clone(&intent_sink),
+            directory.to_path_buf(),
+        );
+        let configured = ConfiguredAgent {
+            handle: agent,
+            events,
+            realtime: None,
+            child_agents: None,
+            mpp_adapter: None,
+            mcp: None,
+            browser: None,
+            vm: None,
+        };
+        let initial = SpineWorkerInitial {
+            initial_delivery: None,
+            initial_status: None,
+            root_session_id: root_session_id.clone(),
+            active_session_id: root_session_id,
+            capabilities: capabilities(),
+        };
+        let worker = match (delivery_fault, transition_gate) {
+            (Some(delivery_fault), None) => SpineWorker::start_with_delivery_fault(
+                configured,
+                Arc::clone(&runtime),
+                intents,
+                session_recipe,
+                initial,
+                delivery_fault,
+            ),
+            (None, Some((started, release))) => SpineWorker::start_with_transition_gate(
+                configured,
+                Arc::clone(&runtime),
+                intents,
+                session_recipe,
+                initial,
+                started,
+                release,
+            ),
+            _ => {
+                return Err(eyre!(
+                    "scripted Spine worker needs exactly one test control"
+                ));
+            }
+        };
+        Ok((worker, runtime))
     }
 
     #[tokio::test]
@@ -839,6 +1038,11 @@ mod tests {
         parent_finished: Arc<Notify>,
     }
 
+    #[derive(Clone, Default)]
+    struct DeliveryFaultService {
+        generation_calls: Arc<AtomicU32>,
+    }
+
     #[derive(Clone)]
     struct ColdCloseService {
         generation_calls: Arc<AtomicU32>,
@@ -984,6 +1188,38 @@ mod tests {
                     final_generation("resp-parent-finished", "parent resumed")
                 }
                 _ => panic!("unexpected scripted Responses attempt {call}"),
+            };
+            ready(Ok(ResponsesServiceResponse::new(output)))
+        }
+    }
+
+    impl Service<ResponsesAttempt> for DeliveryFaultService {
+        type Response = ResponsesServiceResponse;
+        type Error = ResponseError;
+        type Future = Ready<Result<ResponsesServiceResponse, ResponseError>>;
+
+        fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
+            let output = match request.kind() {
+                ResponsesAttemptKind::Warmup => ResponsesOutput::Warmup(WarmupResponse {
+                    id: "resp-warmup".to_owned(),
+                    usage: None,
+                }),
+                ResponsesAttemptKind::Generation => {
+                    if self.generation_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                        code_generation(
+                            "resp-root-open",
+                            "call-root-open",
+                            "await tools.spine__open({summary: 'inspect the parser'});",
+                        )
+                    } else {
+                        final_generation("resp-unexpected-continuation", "continuation started")
+                    }
+                }
+                _ => panic!("unexpected scripted Responses attempt"),
             };
             ready(Ok(ResponsesServiceResponse::new(output)))
         }

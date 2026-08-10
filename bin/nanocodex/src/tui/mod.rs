@@ -15,7 +15,7 @@ mod transcript;
 mod view;
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     path::PathBuf,
     process::{Command, Stdio},
     sync::Arc,
@@ -82,6 +82,32 @@ pub(crate) struct InitialPrompt {
     display: String,
     instruction: Option<String>,
     behavior: InitialPromptBehavior,
+}
+
+pub(crate) struct RestoredTranscript {
+    items: Vec<RolloutTranscriptItem>,
+    spine_delivery_ids: BTreeSet<String>,
+}
+
+impl RestoredTranscript {
+    pub(crate) const fn spine(
+        items: Vec<RolloutTranscriptItem>,
+        spine_delivery_ids: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            items,
+            spine_delivery_ids,
+        }
+    }
+}
+
+impl From<Vec<RolloutTranscriptItem>> for RestoredTranscript {
+    fn from(items: Vec<RolloutTranscriptItem>) -> Self {
+        Self {
+            items,
+            spine_delivery_ids: BTreeSet::new(),
+        }
+    }
 }
 
 enum InitialPromptBehavior {
@@ -196,6 +222,16 @@ pub enum WorkerEvent {
     },
     SpineStatus {
         message: String,
+    },
+    SpineContinuation {
+        delivery_id: String,
+        prompt: String,
+    },
+    PromptRejected {
+        target: PaneId,
+        prompt_id: u64,
+        prompt: SubmittedPrompt,
+        error: String,
     },
     TurnTraceStarted {
         target: PaneId,
@@ -707,7 +743,7 @@ pub(crate) async fn run(
         initial_model,
         initial_thinking,
         initial_fast_mode,
-        restored_transcript,
+        restored_transcript.into(),
         initial_prompt,
     )
     .await
@@ -723,7 +759,7 @@ pub(crate) async fn run_with_worker<F>(
     initial_model: Model,
     initial_thinking: Thinking,
     initial_fast_mode: bool,
-    restored_transcript: Vec<RolloutTranscriptItem>,
+    restored_transcript: RestoredTranscript,
     initial_prompt: Option<InitialPrompt>,
 ) -> Result<()>
 where
@@ -776,7 +812,10 @@ where
         .with_thinking(initial_thinking)
         .with_fast_mode(initial_fast_mode);
     app.set_math_renderer(math_renderer.clone());
-    app.restore_transcript(restored_transcript);
+    app.restore_transcript(
+        restored_transcript.items,
+        &restored_transcript.spine_delivery_ids,
+    );
     let mut ui = UiModel::with_capabilities(app, Arc::clone(&root_session_id), capabilities);
     let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
     let mut stream_telemetry = StreamTelemetry::default();
@@ -1142,6 +1181,16 @@ fn handle_worker_update_with_capabilities(
             app.push_active_error(format!("Spine tree unavailable: {error}"));
         }
         WorkerEvent::SpineStatus { message } => app.push_active_error(message),
+        WorkerEvent::SpineContinuation {
+            delivery_id,
+            prompt,
+        } => app.spine_continuation(delivery_id, prompt),
+        WorkerEvent::PromptRejected {
+            target,
+            prompt_id,
+            prompt,
+            error,
+        } => app.prompt_rejected(target, prompt_id, prompt, error),
         WorkerEvent::TurnFinished {
             target,
             main_branch_id,

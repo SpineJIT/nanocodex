@@ -4,6 +4,7 @@ use tempfile::tempdir;
 
 use codex_spine_core::NodeStatus;
 
+use crate::SpineAbortReason;
 use crate::journal::{
     DeliveryKind, DeliveryStatus, Journal, JournalError, JournalHeader, TransitionIntent,
 };
@@ -128,7 +129,7 @@ fn aborted_close_restores_the_active_child_and_records_a_recovery_delivery() {
     journal
         .abort(
             close.clone(),
-            "the terminal turn was cancelled",
+            SpineAbortReason::TurnCancelled,
             Some("delivery-recover".to_owned()),
         )
         .expect("abort close");
@@ -563,6 +564,54 @@ fn strict_replay_rejects_unknown_fields_versions_types_and_sequence_gaps() {
         let directory = tempdir().expect("temporary journal directory");
         let path = directory.path().join("root-session.jsonl");
         fs::write(&path, format!("{content}\n")).expect("write malformed journal");
+        assert!(
+            matches!(
+                Journal::open(directory.path(), "root-session"),
+                Err(JournalError::InvalidData(_))
+            ),
+            "{name} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn strict_replay_requires_nullable_fields_and_known_abort_reasons() {
+    let header = concat!(
+        r#"{"seq":0,"type":"header","payload":{"schema_version":1,"root_session_id":"root-session","prompt_cache_key":"root-cache-key","created_at":"2026-08-09T00:00:00Z}}"#,
+        "\n"
+    );
+    let open_intent = r#"{"source_session_id":"root-session","terminal_call_id":"call-open","parent_session_id":null,"kind":"open","summary":"inspect the parser","memory":null}"#;
+    let cases = [
+        (
+            "missing nullable field on prepared transition",
+            format!(
+                r#"{header}{{"seq":1,"type":"prepared","payload":{{"source_session_id":"root-session","terminal_call_id":"call-open","kind":"open","summary":"inspect the parser","memory":null}}}}\n"#
+            ),
+        ),
+        (
+            "missing nullable field on committed transition",
+            format!(
+                r#"{header}{{"seq":1,"type":"prepared","payload":{open_intent}}}\n{{"seq":2,"type":"committed","payload":{{"intent":{open_intent},"active_session_id":"child-session","delivery_id":"delivery-open"}}}}\n"#
+            ),
+        ),
+        (
+            "missing nullable field on aborted transition",
+            format!(
+                r#"{header}{{"seq":1,"type":"aborted","payload":{{"intent":{open_intent},"reason":"turn_failed"}}}}\n"#
+            ),
+        ),
+        (
+            "unknown abort reason",
+            format!(
+                r#"{header}{{"seq":1,"type":"aborted","payload":{{"intent":{open_intent},"reason":"future_reason","recovery_delivery_id":null}}}}\n"#
+            ),
+        ),
+    ];
+
+    for (name, content) in cases {
+        let directory = tempdir().expect("temporary journal directory");
+        fs::write(directory.path().join("root-session.jsonl"), content)
+            .expect("write malformed journal");
         assert!(
             matches!(
                 Journal::open(directory.path(), "root-session"),

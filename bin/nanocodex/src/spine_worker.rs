@@ -7,6 +7,9 @@ use std::{
 #[cfg(test)]
 use std::{future::Future, pin::Pin};
 
+#[cfg(test)]
+use tokio::sync::Notify;
+
 use eyre::{Result, WrapErr, eyre};
 use nanocodex::tools::mcp::McpHandle;
 use nanocodex::{
@@ -14,8 +17,8 @@ use nanocodex::{
     agent::input::Prompt,
 };
 use nanocodex_spine_runtime::{
-    SpineDelivery, SpineIntentRequest, SpineIntentSink, SpinePrepareFuture, SpineRuntime,
-    SpineRuntimeError, SpineTransitionKind,
+    SpineAbortReason, SpineDelivery, SpineIntentRequest, SpineIntentSink, SpinePrepareFuture,
+    SpineRuntime, SpineRuntimeError, SpineTransitionKind,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -169,6 +172,111 @@ pub(crate) struct SpineWorker {
     next_turn_id: u64,
     transition_in_progress: bool,
     fail_stop_transition: bool,
+    delivery_faults: DeliveryFaults,
+    transition_gate: TransitionGate,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeliveryFault {
+    Claim,
+    PromptAcceptance,
+    AcceptedSync,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct DeliveryFaults {
+    next: Option<DeliveryFault>,
+}
+
+#[cfg(not(test))]
+#[derive(Default)]
+struct DeliveryFaults;
+
+impl DeliveryFaults {
+    #[cfg(test)]
+    fn normal() -> Self {
+        Self::default()
+    }
+
+    #[cfg(not(test))]
+    const fn normal() -> Self {
+        Self
+    }
+
+    #[cfg(test)]
+    const fn failing_at(next: DeliveryFault) -> Self {
+        Self { next: Some(next) }
+    }
+
+    #[cfg(test)]
+    fn check_claim(&mut self) -> Result<()> {
+        self.check(DeliveryFault::Claim)
+    }
+
+    #[cfg(not(test))]
+    const fn check_claim(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn check_prompt_acceptance(&mut self) -> Result<()> {
+        self.check(DeliveryFault::PromptAcceptance)
+    }
+
+    #[cfg(not(test))]
+    const fn check_prompt_acceptance(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn check_accepted_sync(&mut self) -> Result<()> {
+        self.check(DeliveryFault::AcceptedSync)
+    }
+
+    #[cfg(not(test))]
+    const fn check_accepted_sync(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn check(&mut self, stage: DeliveryFault) -> Result<()> {
+        if self.next == Some(stage) {
+            self.next = None;
+            return Err(eyre!("injected Spine delivery {stage:?} failure"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct TransitionGate {
+    #[cfg(test)]
+    block_before_fork: Option<BlockingTransitionGate>,
+}
+
+#[cfg(test)]
+struct BlockingTransitionGate {
+    started: oneshot::Sender<()>,
+    release: Arc<Notify>,
+}
+
+impl TransitionGate {
+    #[cfg(test)]
+    const fn block_before_fork(started: oneshot::Sender<()>, release: Arc<Notify>) -> Self {
+        Self {
+            block_before_fork: Some(BlockingTransitionGate { started, release }),
+        }
+    }
+
+    async fn wait_before_fork(&mut self) {
+        #[cfg(test)]
+        if let Some(gate) = self.block_before_fork.take() {
+            let _ = gate.started.send(());
+            gate.release.notified().await;
+        }
+    }
 }
 
 pub(crate) struct IntentCommand {
@@ -191,6 +299,67 @@ impl SpineWorker {
         intents: mpsc::UnboundedReceiver<IntentCommand>,
         session_recipe: SpineSessionRecipe,
         initial: SpineWorkerInitial,
+    ) -> WorkerHandle<WorkerCommand, WorkerEvent> {
+        Self::start_inner(
+            configured,
+            runtime,
+            intents,
+            session_recipe,
+            initial,
+            DeliveryFaults::normal(),
+            TransitionGate::default(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_with_delivery_fault(
+        configured: ConfiguredAgent,
+        runtime: Arc<SpineRuntime>,
+        intents: mpsc::UnboundedReceiver<IntentCommand>,
+        session_recipe: SpineSessionRecipe,
+        initial: SpineWorkerInitial,
+        delivery_fault: DeliveryFault,
+    ) -> WorkerHandle<WorkerCommand, WorkerEvent> {
+        Self::start_inner(
+            configured,
+            runtime,
+            intents,
+            session_recipe,
+            initial,
+            DeliveryFaults::failing_at(delivery_fault),
+            TransitionGate::default(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_with_transition_gate(
+        configured: ConfiguredAgent,
+        runtime: Arc<SpineRuntime>,
+        intents: mpsc::UnboundedReceiver<IntentCommand>,
+        session_recipe: SpineSessionRecipe,
+        initial: SpineWorkerInitial,
+        started: oneshot::Sender<()>,
+        release: Arc<Notify>,
+    ) -> WorkerHandle<WorkerCommand, WorkerEvent> {
+        Self::start_inner(
+            configured,
+            runtime,
+            intents,
+            session_recipe,
+            initial,
+            DeliveryFaults::normal(),
+            TransitionGate::block_before_fork(started, release),
+        )
+    }
+
+    fn start_inner(
+        configured: ConfiguredAgent,
+        runtime: Arc<SpineRuntime>,
+        intents: mpsc::UnboundedReceiver<IntentCommand>,
+        session_recipe: SpineSessionRecipe,
+        initial: SpineWorkerInitial,
+        delivery_faults: DeliveryFaults,
+        transition_gate: TransitionGate,
     ) -> WorkerHandle<WorkerCommand, WorkerEvent> {
         let SpineWorkerInitial {
             initial_delivery,
@@ -227,6 +396,8 @@ impl SpineWorker {
             next_turn_id: 1,
             transition_in_progress: false,
             fail_stop_transition: false,
+            delivery_faults,
+            transition_gate,
         };
         let task = tokio::spawn(worker.run());
 
@@ -247,7 +418,17 @@ impl SpineWorker {
             let _ = self.updates.send(WorkerEvent::SpineStatus { message });
         }
         if let Some(delivery) = self.initial_delivery.take() {
-            self.deliver(delivery).await?;
+            deliver(
+                &self.runtime,
+                &self.family,
+                &self.updates,
+                &self.finished_sender,
+                &mut self.next_turn_id,
+                &mut self.turns,
+                &mut self.delivery_faults,
+                delivery,
+            )
+            .await?;
         }
         let outcome: Result<()> = loop {
             tokio::select! {
@@ -485,7 +666,24 @@ impl SpineWorker {
                 if let TurnCompletion::TerminalTool { receipt } = result.completion() {
                     self.transition_in_progress = true;
                     self.fail_stop_transition = false;
-                    let outcome = self.finish_terminal(&source_session_id, receipt).await;
+                    let outcome = drive_terminal_transition(
+                        &self.runtime,
+                        &self.session_recipe,
+                        &mut self.family,
+                        &mut self.active_session_id,
+                        &mut self.fail_stop_transition,
+                        &self.updates,
+                        &self.finished_sender,
+                        &mut self.next_turn_id,
+                        &mut self.turns,
+                        &mut self.delivery_faults,
+                        &mut self.transition_gate,
+                        &mut self.commands,
+                        &mut self.intents,
+                        &source_session_id,
+                        receipt,
+                    )
+                    .await;
                     self.transition_in_progress = false;
                     if let Err(error) = outcome {
                         if self.fail_stop_transition {
@@ -493,7 +691,7 @@ impl SpineWorker {
                         }
                         self.abort_prepared_for_source(
                             &source_session_id,
-                            "the terminal Spine transition could not be completed",
+                            SpineAbortReason::TerminalTransitionFailed,
                         )?;
                         self.finish_prompt(PaneId::Main, prompt_id, error.to_string());
                         return Ok(());
@@ -501,7 +699,7 @@ impl SpineWorker {
                 } else {
                     self.abort_prepared_for_source(
                         &source_session_id,
-                        "the enclosing turn ended without a terminal Spine receipt",
+                        SpineAbortReason::MissingTerminalReceipt,
                     )?;
                 }
                 self.finish_prompt(PaneId::Main, prompt_id, String::new());
@@ -509,193 +707,23 @@ impl SpineWorker {
             Err(NanocodexError::TurnCancelled) => {
                 self.abort_prepared_for_source(
                     &source_session_id,
-                    "the enclosing turn was cancelled",
+                    SpineAbortReason::TurnCancelled,
                 )?;
                 self.finish_prompt(PaneId::Main, prompt_id, String::new());
             }
             Err(error) => {
-                self.abort_prepared_for_source(&source_session_id, "the enclosing turn failed")?;
+                self.abort_prepared_for_source(&source_session_id, SpineAbortReason::TurnFailed)?;
                 self.finish_prompt(PaneId::Main, prompt_id, error.to_string());
             }
         }
         Ok(())
     }
 
-    async fn finish_terminal(
-        &mut self,
+    fn abort_prepared_for_source(
+        &self,
         source_session_id: &str,
-        receipt: &nanocodex::TerminalToolReceipt,
+        reason: SpineAbortReason,
     ) -> Result<()> {
-        let transition = self
-            .runtime
-            .transition_for_receipt(source_session_id, receipt)?;
-        let delivery_id = format!("delivery-{}", Uuid::now_v7());
-        let delivery = match transition.kind() {
-            SpineTransitionKind::Open => {
-                let child_session_id = self.family.fork(source_session_id).await?;
-                let delivery = self.runtime.commit(
-                    &transition,
-                    child_session_id.clone(),
-                    None,
-                    delivery_id,
-                )?;
-                self.active_session_id = child_session_id;
-                delivery
-            }
-            SpineTransitionKind::Close => {
-                let parent_session_id = transition
-                    .parent_session_id()
-                    .ok_or_else(|| eyre!("Spine close has no parent session"))?
-                    .to_owned();
-                if !self.family.contains(&parent_session_id) {
-                    let parent = self.load_validated_session(&parent_session_id)?;
-                    let delivery = self.runtime.commit(
-                        &transition,
-                        parent_session_id.clone(),
-                        Some(source_session_id.to_owned()),
-                        delivery_id,
-                    )?;
-                    self.active_session_id = parent_session_id;
-                    self.fail_stop_transition = true;
-                    self.shutdown_and_drop_current_family().await;
-                    self.family = self.restore_family(parent).await?;
-                    return self.deliver(delivery).await;
-                }
-                let delivery = self.runtime.commit(
-                    &transition,
-                    parent_session_id.clone(),
-                    Some(source_session_id.to_owned()),
-                    delivery_id,
-                )?;
-                self.active_session_id = parent_session_id;
-                self.family.shutdown_closed(source_session_id).await;
-                delivery
-            }
-            SpineTransitionKind::Next => {
-                let parent_session_id = transition
-                    .parent_session_id()
-                    .ok_or_else(|| eyre!("Spine next has no parent session"))?
-                    .to_owned();
-                if !self.family.contains(&parent_session_id) {
-                    let durable_parent = self.load_validated_session(&parent_session_id)?;
-                    self.fail_stop_transition = true;
-                    self.shutdown_and_drop_current_family().await;
-                    let mut parent = self.restore_family(durable_parent).await?;
-                    let sibling_session_id = match parent.fork(&parent_session_id).await {
-                        Ok(session_id) => session_id,
-                        Err(error) => {
-                            let _ = parent.shutdown().await;
-                            return Err(error);
-                        }
-                    };
-                    let delivery = match self.runtime.commit(
-                        &transition,
-                        sibling_session_id.clone(),
-                        Some(source_session_id.to_owned()),
-                        delivery_id,
-                    ) {
-                        Ok(delivery) => delivery,
-                        Err(error) => {
-                            let _ = parent.shutdown().await;
-                            return Err(error.into());
-                        }
-                    };
-                    self.active_session_id = sibling_session_id;
-                    self.family = parent;
-                    return self.deliver(delivery).await;
-                }
-                let sibling_session_id = self.family.fork(&parent_session_id).await?;
-                let delivery = self.runtime.commit(
-                    &transition,
-                    sibling_session_id.clone(),
-                    Some(source_session_id.to_owned()),
-                    delivery_id,
-                )?;
-                self.active_session_id = sibling_session_id;
-                self.family.shutdown_closed(source_session_id).await;
-                delivery
-            }
-        };
-        self.deliver(delivery).await
-    }
-
-    fn load_validated_session(
-        &self,
-        session_id: &str,
-    ) -> Result<nanocodex::agent::rollout::DurableSession> {
-        let durable = self.session_recipe.load(session_id)?;
-        if durable.thread_id() != session_id {
-            return Err(eyre!(
-                "restored Spine session ID does not match the requested journal session"
-            ));
-        }
-        let expected_cache_key = self.runtime.prompt_cache_key()?;
-        let cache_key = durable_prompt_cache_key(&durable)?;
-        if cache_key != expected_cache_key {
-            return Err(eyre!(
-                "restored Spine session prompt cache key does not match the root journal"
-            ));
-        }
-        Ok(durable)
-    }
-
-    async fn restore_family(
-        &self,
-        durable: nanocodex::agent::rollout::DurableSession,
-    ) -> Result<SpineFamily> {
-        let session_id = durable.thread_id().to_owned();
-        let configured = self.session_recipe.build_resumed(durable).await?;
-        if configured.handle.session_id().to_string() != session_id {
-            return Err(eyre!(
-                "restored Spine session ID does not match the requested journal session"
-            ));
-        }
-        Ok(SpineFamily::new(configured, self.updates.clone()))
-    }
-
-    async fn shutdown_and_drop_current_family(&mut self) {
-        let family = std::mem::replace(&mut self.family, SpineFamily::empty(self.updates.clone()));
-        if let Err(error) = family.shutdown().await {
-            let _ = self.updates.send(WorkerEvent::SpineTreeFailed {
-                error: format!("previous Spine session cleanup failed: {error}"),
-            });
-        }
-    }
-
-    async fn deliver(&mut self, delivery: SpineDelivery) -> Result<()> {
-        self.runtime.claim_delivery(&delivery)?;
-        let prompt = self.runtime.delivery_prompt(&delivery)?;
-        let agent = self.family.agent(delivery.target_session_id())?;
-        let session_id = delivery.target_session_id().to_owned();
-        let id = self.next_turn_id;
-        self.next_turn_id = self.next_turn_id.saturating_add(1);
-        let turn = agent.prompt(prompt).await?;
-        let control = turn.control();
-        if let Err(error) = self.runtime.accept_delivery(&delivery) {
-            let _ = control.cancel().await;
-            return Err(error.into());
-        }
-        let finished = self.finished_sender.clone();
-        tokio::spawn(async move {
-            let result = match turn.result().await {
-                Ok(result) => match agent.flush_rollout().await {
-                    Ok(()) => Ok(result),
-                    Err(error) => Err(error),
-                },
-                Err(error) => Err(error),
-            };
-            let _ = finished.send(FinishedTurn {
-                id,
-                prompt_id: None,
-                source_session_id: session_id,
-                result,
-            });
-        });
-        self.turns.push_back(TrackedTurn { id, control });
-        Ok(())
-    }
-
-    fn abort_prepared_for_source(&self, source_session_id: &str, reason: &str) -> Result<()> {
         let Some(transition) = self.runtime.pending_transition()? else {
             return Ok(());
         };
@@ -720,6 +748,362 @@ impl SpineWorker {
             });
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_terminal_transition(
+    runtime: &SpineRuntime,
+    session_recipe: &SpineSessionRecipe,
+    family: &mut SpineFamily,
+    active_session_id: &mut String,
+    fail_stop_transition: &mut bool,
+    updates: &mpsc::UnboundedSender<WorkerEvent>,
+    finished_sender: &mpsc::UnboundedSender<FinishedTurn>,
+    next_turn_id: &mut u64,
+    turns: &mut VecDeque<TrackedTurn>,
+    delivery_faults: &mut DeliveryFaults,
+    transition_gate: &mut TransitionGate,
+    commands: &mut mpsc::UnboundedReceiver<WorkerCommand>,
+    intents: &mut mpsc::UnboundedReceiver<IntentCommand>,
+    source_session_id: &str,
+    receipt: &nanocodex::TerminalToolReceipt,
+) -> Result<()> {
+    let mut transition = Box::pin(finish_terminal_transition(
+        runtime,
+        session_recipe,
+        family,
+        active_session_id,
+        fail_stop_transition,
+        updates,
+        finished_sender,
+        next_turn_id,
+        turns,
+        delivery_faults,
+        transition_gate,
+        source_session_id,
+        receipt,
+    ));
+    loop {
+        tokio::select! {
+            result = &mut transition => return result,
+            Some(intent) = intents.recv() => reject_transition_intent(intent),
+            Some(command) = commands.recv() => reject_transition_command(updates, command),
+        }
+    }
+}
+
+fn reject_transition_intent(intent: IntentCommand) {
+    let _ = intent
+        .response
+        .send(Err(SpineRuntimeError::TransitionInProgress));
+}
+
+fn reject_transition_command(updates: &mpsc::UnboundedSender<WorkerEvent>, command: WorkerCommand) {
+    let error = SpineRuntimeError::TransitionInProgress.to_string();
+    match command {
+        WorkerCommand::Prompt {
+            target,
+            prompt_id,
+            prompt,
+        } => {
+            let _ = updates.send(WorkerEvent::PromptRejected {
+                target,
+                prompt_id,
+                prompt,
+                error,
+            });
+        }
+        WorkerCommand::Steer { target, id, .. } => {
+            let _ = updates.send(WorkerEvent::SteerFailed { target, id, error });
+        }
+        WorkerCommand::Cancel { target } => {
+            let _ = updates.send(WorkerEvent::CancelFailed { target, error });
+        }
+        WorkerCommand::InterruptForSteers {
+            target, prompt_id, ..
+        } => {
+            let _ = updates.send(WorkerEvent::InterruptedSteersKept { target, prompt_id });
+        }
+        WorkerCommand::SetFastMode { .. } => {
+            let _ = updates.send(WorkerEvent::FastModeChangeFailed { error });
+        }
+        WorkerCommand::SetThinking { .. } => {
+            let _ = updates.send(WorkerEvent::ThinkingChangeFailed { error });
+        }
+        WorkerCommand::OpenBtw { .. }
+        | WorkerCommand::CloseBtw { .. }
+        | WorkerCommand::EditHistorical { .. }
+        | WorkerCommand::SwitchMainBranch { .. }
+        | WorkerCommand::McpLogin { .. }
+        | WorkerCommand::McpReload { .. }
+        | WorkerCommand::VoiceAgentEvent(_)
+        | WorkerCommand::Voice(_) => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_terminal_transition(
+    runtime: &SpineRuntime,
+    session_recipe: &SpineSessionRecipe,
+    family: &mut SpineFamily,
+    active_session_id: &mut String,
+    fail_stop_transition: &mut bool,
+    updates: &mpsc::UnboundedSender<WorkerEvent>,
+    finished_sender: &mpsc::UnboundedSender<FinishedTurn>,
+    next_turn_id: &mut u64,
+    turns: &mut VecDeque<TrackedTurn>,
+    delivery_faults: &mut DeliveryFaults,
+    transition_gate: &mut TransitionGate,
+    source_session_id: &str,
+    receipt: &nanocodex::TerminalToolReceipt,
+) -> Result<()> {
+    let transition = runtime.transition_for_receipt(source_session_id, receipt)?;
+    transition_gate.wait_before_fork().await;
+    let delivery_id = format!("delivery-{}", Uuid::now_v7());
+    let delivery = match transition.kind() {
+        SpineTransitionKind::Open => {
+            let child_session_id = family.fork(source_session_id).await?;
+            let delivery = commit_transition(
+                runtime,
+                &transition,
+                child_session_id.clone(),
+                None,
+                delivery_id,
+                fail_stop_transition,
+            )?;
+            *active_session_id = child_session_id;
+            delivery
+        }
+        SpineTransitionKind::Close => {
+            let parent_session_id = transition
+                .parent_session_id()
+                .ok_or_else(|| eyre!("Spine close has no parent session"))?
+                .to_owned();
+            if !family.contains(&parent_session_id) {
+                let parent = load_validated_session(runtime, session_recipe, &parent_session_id)?;
+                let delivery = commit_transition(
+                    runtime,
+                    &transition,
+                    parent_session_id.clone(),
+                    Some(source_session_id.to_owned()),
+                    delivery_id,
+                    fail_stop_transition,
+                )?;
+                *active_session_id = parent_session_id;
+                shutdown_and_drop_current_family(family, updates).await;
+                *family = restore_family(session_recipe, updates, parent).await?;
+                return deliver(
+                    runtime,
+                    family,
+                    updates,
+                    finished_sender,
+                    next_turn_id,
+                    turns,
+                    delivery_faults,
+                    delivery,
+                )
+                .await;
+            }
+            let delivery = commit_transition(
+                runtime,
+                &transition,
+                parent_session_id.clone(),
+                Some(source_session_id.to_owned()),
+                delivery_id,
+                fail_stop_transition,
+            )?;
+            *active_session_id = parent_session_id;
+            family.shutdown_closed(source_session_id).await;
+            delivery
+        }
+        SpineTransitionKind::Next => {
+            let parent_session_id = transition
+                .parent_session_id()
+                .ok_or_else(|| eyre!("Spine next has no parent session"))?
+                .to_owned();
+            if !family.contains(&parent_session_id) {
+                let durable_parent =
+                    load_validated_session(runtime, session_recipe, &parent_session_id)?;
+                *fail_stop_transition = true;
+                shutdown_and_drop_current_family(family, updates).await;
+                let mut parent = restore_family(session_recipe, updates, durable_parent).await?;
+                let sibling_session_id = match parent.fork(&parent_session_id).await {
+                    Ok(session_id) => session_id,
+                    Err(error) => {
+                        let _ = parent.shutdown().await;
+                        return Err(error);
+                    }
+                };
+                let delivery = match commit_transition(
+                    runtime,
+                    &transition,
+                    sibling_session_id.clone(),
+                    Some(source_session_id.to_owned()),
+                    delivery_id,
+                    fail_stop_transition,
+                ) {
+                    Ok(delivery) => delivery,
+                    Err(error) => {
+                        let _ = parent.shutdown().await;
+                        return Err(error);
+                    }
+                };
+                *active_session_id = sibling_session_id;
+                *family = parent;
+                return deliver(
+                    runtime,
+                    family,
+                    updates,
+                    finished_sender,
+                    next_turn_id,
+                    turns,
+                    delivery_faults,
+                    delivery,
+                )
+                .await;
+            }
+            let sibling_session_id = family.fork(&parent_session_id).await?;
+            let delivery = commit_transition(
+                runtime,
+                &transition,
+                sibling_session_id.clone(),
+                Some(source_session_id.to_owned()),
+                delivery_id,
+                fail_stop_transition,
+            )?;
+            *active_session_id = sibling_session_id;
+            family.shutdown_closed(source_session_id).await;
+            delivery
+        }
+    };
+    deliver(
+        runtime,
+        family,
+        updates,
+        finished_sender,
+        next_turn_id,
+        turns,
+        delivery_faults,
+        delivery,
+    )
+    .await
+}
+
+fn commit_transition(
+    runtime: &SpineRuntime,
+    transition: &nanocodex_spine_runtime::SpineTransition,
+    active_session_id: String,
+    closed_session_id: Option<String>,
+    delivery_id: String,
+    fail_stop_transition: &mut bool,
+) -> Result<SpineDelivery> {
+    let delivery = runtime.commit(
+        transition,
+        active_session_id,
+        closed_session_id,
+        delivery_id,
+    )?;
+    *fail_stop_transition = true;
+    Ok(delivery)
+}
+
+fn load_validated_session(
+    runtime: &SpineRuntime,
+    session_recipe: &SpineSessionRecipe,
+    session_id: &str,
+) -> Result<nanocodex::agent::rollout::DurableSession> {
+    let durable = session_recipe.load(session_id)?;
+    if durable.thread_id() != session_id {
+        return Err(eyre!(
+            "restored Spine session ID does not match the requested journal session"
+        ));
+    }
+    let expected_cache_key = runtime.prompt_cache_key()?;
+    let cache_key = durable_prompt_cache_key(&durable)?;
+    if cache_key != expected_cache_key {
+        return Err(eyre!(
+            "restored Spine session prompt cache key does not match the root journal"
+        ));
+    }
+    Ok(durable)
+}
+
+async fn restore_family(
+    session_recipe: &SpineSessionRecipe,
+    updates: &mpsc::UnboundedSender<WorkerEvent>,
+    durable: nanocodex::agent::rollout::DurableSession,
+) -> Result<SpineFamily> {
+    let session_id = durable.thread_id().to_owned();
+    let configured = session_recipe.build_resumed(durable).await?;
+    if configured.handle.session_id().to_string() != session_id {
+        return Err(eyre!(
+            "restored Spine session ID does not match the requested journal session"
+        ));
+    }
+    Ok(SpineFamily::new(configured, updates.clone()))
+}
+
+async fn shutdown_and_drop_current_family(
+    family: &mut SpineFamily,
+    updates: &mpsc::UnboundedSender<WorkerEvent>,
+) {
+    let previous = std::mem::replace(family, SpineFamily::empty(updates.clone()));
+    if let Err(error) = previous.shutdown().await {
+        let _ = updates.send(WorkerEvent::SpineTreeFailed {
+            error: format!("previous Spine session cleanup failed: {error}"),
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deliver(
+    runtime: &SpineRuntime,
+    family: &SpineFamily,
+    updates: &mpsc::UnboundedSender<WorkerEvent>,
+    finished_sender: &mpsc::UnboundedSender<FinishedTurn>,
+    next_turn_id: &mut u64,
+    turns: &mut VecDeque<TrackedTurn>,
+    delivery_faults: &mut DeliveryFaults,
+    delivery: SpineDelivery,
+) -> Result<()> {
+    delivery_faults.check_claim()?;
+    runtime.claim_delivery(&delivery)?;
+    let prompt = runtime.delivery_prompt(&delivery)?;
+    let displayed_prompt = prompt.clone();
+    let agent = family.agent(delivery.target_session_id())?;
+    let session_id = delivery.target_session_id().to_owned();
+    let id = *next_turn_id;
+    *next_turn_id = next_turn_id.saturating_add(1);
+    delivery_faults.check_prompt_acceptance()?;
+    let turn = agent.prompt(prompt).await?;
+    let control = turn.control();
+    delivery_faults.check_accepted_sync()?;
+    if let Err(error) = runtime.accept_delivery(&delivery) {
+        let _ = control.cancel().await;
+        return Err(error.into());
+    }
+    let finished = finished_sender.clone();
+    tokio::spawn(async move {
+        let result = match turn.result().await {
+            Ok(result) => match agent.flush_rollout().await {
+                Ok(()) => Ok(result),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        let _ = finished.send(FinishedTurn {
+            id,
+            prompt_id: None,
+            source_session_id: session_id,
+            result,
+        });
+    });
+    turns.push_back(TrackedTurn { id, control });
+    let _ = updates.send(WorkerEvent::SpineContinuation {
+        delivery_id: delivery.id().to_owned(),
+        prompt: displayed_prompt,
+    });
+    Ok(())
 }
 
 struct TrackedTurn {

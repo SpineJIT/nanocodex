@@ -1,6 +1,7 @@
 //! Experimental durable Spine continuation runtime backed by `codex-spine-core`.
 
 use std::{
+    collections::BTreeSet,
     future::Future,
     path::Path,
     pin::Pin,
@@ -91,6 +92,25 @@ pub enum SpineTerminalControl {
         /// Compact state from the closed sibling.
         memory: String,
     },
+}
+
+/// The bounded cause recorded when a prepared transition cannot commit.
+///
+/// This is deliberately a closed set: journals are a durable protocol, so a
+/// free-form diagnostic must not become replayed state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpineAbortReason {
+    /// The coordinator stopped before it could commit the prepared transition.
+    CoordinatorStoppedBeforeCommit,
+    /// Creating or switching the target session failed before commit.
+    TerminalTransitionFailed,
+    /// A terminal tool receipt did not accompany the completed turn.
+    MissingTerminalReceipt,
+    /// The enclosing model turn was cancelled.
+    TurnCancelled,
+    /// The enclosing model turn failed.
+    TurnFailed,
 }
 
 /// A presentation-safe snapshot of the logical Spine tree.
@@ -460,10 +480,9 @@ impl SpineRuntime {
     pub fn abort_prepared(
         &self,
         transition: &SpineTransition,
-        reason: impl Into<String>,
+        reason: SpineAbortReason,
         recovery_delivery_id: Option<String>,
     ) -> Result<Option<SpineDelivery>, SpineRuntimeError> {
-        let reason = reason.into();
         let (delivery, tree) = self.with_journal_mut(|journal| {
             let target_session_id = journal.state().active_session_id().to_owned();
             journal
@@ -531,6 +550,15 @@ impl SpineRuntime {
                 .delivery_status(delivery_id)
                 .map(delivery_status))
         })
+    }
+
+    /// Returns known delivery IDs targeting the durable active session.
+    ///
+    /// Applications can use these IDs to distinguish application-generated
+    /// Spine continuations from ordinary user prompts when rebuilding a
+    /// transcript, including a delivery recovered after an interrupted sync.
+    pub fn active_delivery_ids(&self) -> Result<BTreeSet<String>, SpineRuntimeError> {
+        self.with_journal(|journal| Ok(journal.state().active_delivery_ids()))
     }
 
     /// Returns the sole undelivered prompt targeting the current active node.
