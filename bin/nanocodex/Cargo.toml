@@ -90,6 +90,7 @@ vergen = { workspace = true, features = ["build", "git", "gitcl"] }
 [dev-dependencies]
 axum.workspace = true
 criterion.workspace = true
+nanocodex-oai-api = { workspace = true, features = ["test-support"] }
 nanocodex-tools.workspace = true
 reqwest = { workspace = true, features = ["query"] }
 tokio-tungstenite.workspace = true

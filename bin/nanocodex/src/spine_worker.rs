@@ -101,7 +101,11 @@ impl SpineSessionRecipe {
     pub(crate) async fn build_root(&self) -> Result<ConfiguredAgent> {
         self.config
             .clone()
-            .build_with_tool_customizer(self.vm.clone(), Arc::clone(&self.tools))
+            .build_with_tool_customizer_in_codex_home(
+                self.vm.clone(),
+                Arc::clone(&self.tools),
+                self.codex_home.clone(),
+            )
             .await
     }
 
@@ -162,6 +166,7 @@ pub(crate) struct SpineWorker {
     family: SpineFamily,
     active_session_id: String,
     initial_delivery: Option<SpineDelivery>,
+    manual_delivery: Option<SpineDelivery>,
     initial_status: Option<String>,
     commands: mpsc::UnboundedReceiver<WorkerCommand>,
     intents: mpsc::UnboundedReceiver<IntentCommand>,
@@ -286,6 +291,7 @@ pub(crate) struct IntentCommand {
 
 pub(crate) struct SpineWorkerInitial {
     pub(crate) initial_delivery: Option<SpineDelivery>,
+    pub(crate) manual_delivery: Option<SpineDelivery>,
     pub(crate) initial_status: Option<String>,
     pub(crate) root_session_id: String,
     pub(crate) active_session_id: String,
@@ -363,6 +369,7 @@ impl SpineWorker {
     ) -> WorkerHandle<WorkerCommand, WorkerEvent> {
         let SpineWorkerInitial {
             initial_delivery,
+            manual_delivery,
             initial_status,
             root_session_id,
             active_session_id,
@@ -386,6 +393,7 @@ impl SpineWorker {
             family,
             active_session_id,
             initial_delivery,
+            manual_delivery,
             initial_status,
             commands: command_receiver,
             intents,
@@ -442,7 +450,7 @@ impl SpineWorker {
                     let Some(command) = command else {
                         break Ok(());
                     };
-                    self.handle_command(command).await;
+                    self.handle_command(command).await?;
                 }
                 else => break Ok(()),
             }
@@ -461,14 +469,14 @@ impl SpineWorker {
         let _ = intent.response.send(result);
     }
 
-    async fn handle_command(&mut self, command: WorkerCommand) {
+    async fn handle_command(&mut self, command: WorkerCommand) -> Result<()> {
         match command {
             WorkerCommand::Prompt {
                 target,
                 prompt_id,
                 prompt,
-            } => self.prompt(target, prompt_id, prompt).await,
-            WorkerCommand::Steer { target, id, prompt } => self.steer(target, id, prompt).await,
+            } => self.prompt(target, prompt_id, prompt).await?,
+            WorkerCommand::Steer { target, id, prompt } => self.steer(target, id, prompt).await?,
             WorkerCommand::Cancel { target } => self.cancel(target).await,
             WorkerCommand::InterruptForSteers {
                 target,
@@ -477,7 +485,7 @@ impl SpineWorker {
                 prompt,
             } => {
                 self.interrupt_for_steers(target, prompt_id, steer_ids, prompt)
-                    .await;
+                    .await?
             }
             WorkerCommand::SetFastMode { enabled } => self.set_fast_mode(enabled).await,
             WorkerCommand::SetThinking { thinking } => self.set_thinking(thinking).await,
@@ -490,16 +498,22 @@ impl SpineWorker {
             | WorkerCommand::VoiceAgentEvent(_)
             | WorkerCommand::Voice(_) => {}
         }
+        Ok(())
     }
 
-    async fn prompt(&mut self, target: PaneId, prompt_id: u64, prompt: SubmittedPrompt) {
+    async fn prompt(
+        &mut self,
+        target: PaneId,
+        prompt_id: u64,
+        prompt: SubmittedPrompt,
+    ) -> Result<()> {
         if target != PaneId::Main {
             self.finish_prompt(
                 target,
                 Some(prompt_id),
                 "Spine has no BTW branch".to_owned(),
             );
-            return;
+            return Ok(());
         }
         if self.transition_in_progress {
             self.finish_prompt(
@@ -507,7 +521,7 @@ impl SpineWorker {
                 Some(prompt_id),
                 SpineRuntimeError::TransitionInProgress.to_string(),
             );
-            return;
+            return Ok(());
         }
         if !self.turns.is_empty() {
             self.finish_prompt(
@@ -515,21 +529,31 @@ impl SpineWorker {
                 Some(prompt_id),
                 "an active Spine turn is already running; steer or cancel it first".to_owned(),
             );
-            return;
+            return Ok(());
         }
-        if let Err(error) = self.start_turn(Some(prompt_id), prompt.into_prompt()).await {
-            self.finish_prompt(target, Some(prompt_id), error.to_string());
+        match self.start_turn(Some(prompt_id), prompt.into_prompt()).await {
+            Ok(()) => {
+                if let Some(delivery) = self.manual_delivery.clone() {
+                    if let Err(error) = self.accept_manual_delivery(&delivery).await {
+                        self.cancel_latest_turn().await;
+                        return Err(error);
+                    }
+                    self.manual_delivery = None;
+                }
+            }
+            Err(error) => self.finish_prompt(target, Some(prompt_id), error.to_string()),
         }
+        Ok(())
     }
 
-    async fn steer(&mut self, target: PaneId, id: u64, prompt: SubmittedPrompt) {
+    async fn steer(&mut self, target: PaneId, id: u64, prompt: SubmittedPrompt) -> Result<()> {
         if target != PaneId::Main || self.transition_in_progress {
             let _ = self.updates.send(WorkerEvent::SteerFailed {
                 target,
                 id,
                 error: SpineRuntimeError::TransitionInProgress.to_string(),
             });
-            return;
+            return Ok(());
         }
         let Some(turn) = self.turns.back() else {
             let _ = self.updates.send(WorkerEvent::SteerQueued {
@@ -537,8 +561,7 @@ impl SpineWorker {
                 id,
                 prompt: prompt.display().to_owned(),
             });
-            self.prompt(target, id, prompt).await;
-            return;
+            return self.prompt(target, id, prompt).await;
         };
         match turn.control.steer(prompt.into_prompt()).await {
             Ok(()) => {
@@ -552,6 +575,7 @@ impl SpineWorker {
                 });
             }
         }
+        Ok(())
     }
 
     async fn cancel(&mut self, target: PaneId) {
@@ -582,7 +606,7 @@ impl SpineWorker {
         prompt_id: u64,
         steer_ids: Vec<u64>,
         prompt: SubmittedPrompt,
-    ) {
+    ) -> Result<()> {
         if self.turns.is_empty() {
             let _ = self
                 .updates
@@ -591,13 +615,13 @@ impl SpineWorker {
                     prompt_id,
                     steer_ids,
                 });
-            self.prompt(target, prompt_id, prompt).await;
-            return;
+            return self.prompt(target, prompt_id, prompt).await;
         }
         self.cancel(target).await;
         let _ = self
             .updates
             .send(WorkerEvent::InterruptedSteersKept { target, prompt_id });
+        Ok(())
     }
 
     async fn set_fast_mode(&mut self, enabled: bool) {
@@ -654,6 +678,21 @@ impl SpineWorker {
         });
         self.turns.push_back(TrackedTurn { id, control });
         Ok(())
+    }
+
+    async fn accept_manual_delivery(&mut self, delivery: &SpineDelivery) -> Result<()> {
+        self.delivery_faults.check_accepted_sync()?;
+        self.runtime
+            .accept_delivery(delivery)
+            .map_err(|error| eyre!(error))
+    }
+
+    async fn cancel_latest_turn(&self) {
+        if let Some(turn) = self.turns.back()
+            && let Err(error) = turn.control.cancel().await
+        {
+            tracing::warn!(%error, "could not cancel a manually confirmed Spine delivery turn");
+        }
     }
 
     async fn finish_turn(&mut self, finished: FinishedTurn) -> Result<()> {

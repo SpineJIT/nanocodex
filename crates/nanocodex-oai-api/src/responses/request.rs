@@ -57,6 +57,13 @@ impl RequestProfile {
         Arc::clone(&self.prefix)
     }
 
+    /// Returns the registered Code Mode tool names for test-only request inspection.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn code_mode_tool_names(&self) -> impl Iterator<Item = &str> {
+        self.code_mode_tool_names.keys().map(String::as_str)
+    }
+
     pub(crate) fn with_code_mode_tool_names(
         mut self,
         names: impl IntoIterator<Item = (String, String)>,

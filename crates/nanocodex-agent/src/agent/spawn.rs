@@ -114,6 +114,7 @@ where
             shared_prompt_cache: shared,
             context_config: codex.context,
             context_source,
+            tool_profile: ToolProfile::Primary,
             depth: 0,
             durability: codex.durability,
             service_factory,

@@ -47,7 +47,7 @@ const STEER_CAPACITY: usize = 8;
 type ToolsFactory =
     Arc<dyn Fn(AgentHandle) -> std::result::Result<Tools, ToolsBuildError> + Send + Sync>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum ToolProfile {
     Primary,
     Child,
@@ -92,6 +92,22 @@ enum ToolsConfiguration {
 }
 
 impl ToolsConfiguration {
+    #[cfg(not(target_family = "wasm"))]
+    pub(super) const fn has_child_factory(&self) -> bool {
+        matches!(
+            self,
+            Self::PerAgent {
+                child_factory: Some(_),
+                ..
+            }
+        )
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub(super) const fn has_child_factory(&self) -> bool {
+        false
+    }
+
     fn materialize(&self, agent_handle: AgentHandle, profile: ToolProfile) -> Result<Tools> {
         #[cfg(all(target_family = "wasm", target_os = "unknown"))]
         let _ = (agent_handle, profile);

@@ -5054,6 +5054,7 @@ dependencies = [
  "nanocodex-browser",
  "nanocodex-egress",
  "nanocodex-eval",
+ "nanocodex-oai-api",
  "nanocodex-observability",
  "nanocodex-spine-runtime",
  "nanocodex-tools",

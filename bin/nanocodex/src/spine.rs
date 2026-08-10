@@ -88,8 +88,10 @@ async fn run(mut cli: Cli) -> Result<()> {
         Some(Command::Resume { root_thread_id }) => {
             let factory = SpineWorkerFactory::resume(cli.agent, cli.vm, &root_thread_id).await?;
             let initial_prompt = factory
-                .manual_continuation
-                .clone()
+                .manual_delivery
+                .as_ref()
+                .map(|delivery| factory.runtime.delivery_prompt(delivery))
+                .transpose()?
                 .map(InitialPrompt::prefill);
             (factory, initial_prompt)
         }
@@ -123,7 +125,7 @@ struct SpineWorkerFactory {
     root_session_id: String,
     active_session_id: String,
     initial_delivery: Option<SpineDelivery>,
-    manual_continuation: Option<String>,
+    manual_delivery: Option<SpineDelivery>,
     initial_status: Option<String>,
     initial: SpineInitial,
 }
@@ -140,6 +142,11 @@ struct SpineInitial {
 
 impl SpineWorkerFactory {
     async fn build(config: AgentArgs, vm: VmArgs) -> Result<Self> {
+        let codex_home = default_codex_home()?;
+        Self::build_in(config, vm, codex_home).await
+    }
+
+    async fn build_in(config: AgentArgs, vm: VmArgs, codex_home: PathBuf) -> Result<Self> {
         let cwd = config.cwd().to_path_buf();
         let initial = SpineInitial {
             cwd,
@@ -149,7 +156,6 @@ impl SpineWorkerFactory {
             transcript: Vec::new(),
             spine_delivery_ids: std::collections::BTreeSet::new(),
         };
-        let codex_home = default_codex_home()?;
         let (intent_sink, intents) = SpineIntentChannel::new();
         let session_recipe = SpineSessionRecipe::new(config, vm, intent_sink, codex_home.clone());
         let configured = session_recipe.build_root().await?;
@@ -173,16 +179,25 @@ impl SpineWorkerFactory {
             root_session_id: root_session_id.clone(),
             active_session_id: root_session_id,
             initial_delivery: None,
-            manual_continuation: None,
+            manual_delivery: None,
             initial_status: None,
             initial,
         })
     }
 
     async fn resume(config: AgentArgs, vm: VmArgs, root_thread_id: &str) -> Result<Self> {
+        let codex_home = default_codex_home()?;
+        Self::resume_in(config, vm, root_thread_id, codex_home).await
+    }
+
+    async fn resume_in(
+        config: AgentArgs,
+        vm: VmArgs,
+        root_thread_id: &str,
+        codex_home: PathBuf,
+    ) -> Result<Self> {
         uuid::Uuid::parse_str(root_thread_id)
             .map_err(|error| eyre!("invalid Spine root thread ID `{root_thread_id}`: {error}"))?;
-        let codex_home = default_codex_home()?;
         let journal_directory = codex_home.join("spine");
         let runtime = Arc::new(
             SpineRuntime::open(
@@ -244,17 +259,14 @@ impl SpineWorkerFactory {
         let initial_delivery = runtime
             .unclaimed_active_delivery()
             .map_err(|error| eyre!(error))?;
-        let manual_continuation = if initial_delivery.is_some() {
+        let manual_delivery = if initial_delivery.is_some() {
             None
         } else {
             runtime
                 .claimed_active_delivery()
                 .map_err(|error| eyre!(error))?
-                .map(|delivery| runtime.delivery_prompt(&delivery))
-                .transpose()
-                .map_err(|error| eyre!(error))?
         };
-        let initial_status = manual_continuation.as_ref().map(|_| {
+        let initial_status = manual_delivery.as_ref().map(|_| {
             "Spine recovery needs confirmation: the previous continuation was claimed but not accepted. \
              Review the prefilled prompt and submit it to continue."
                 .to_owned()
@@ -272,7 +284,7 @@ impl SpineWorkerFactory {
             root_session_id,
             active_session_id,
             initial_delivery,
-            manual_continuation,
+            manual_delivery,
             initial_status,
             initial,
         })
@@ -291,6 +303,7 @@ impl WorkerFactory for SpineWorkerFactory {
             self.session_recipe,
             SpineWorkerInitial {
                 initial_delivery: self.initial_delivery,
+                manual_delivery: self.manual_delivery,
                 initial_status: self.initial_status,
                 root_session_id: self.root_session_id,
                 active_session_id: self.active_session_id,
@@ -303,10 +316,11 @@ impl WorkerFactory for SpineWorkerFactory {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeSet,
         future::{Ready, ready},
         path::PathBuf,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicU32, Ordering},
         },
         task::{Context, Poll},
@@ -315,6 +329,7 @@ mod tests {
 
     use clap::Parser;
     use eyre::eyre;
+    use futures_util::{SinkExt, StreamExt};
     use nanocodex::{
         Nanocodex, OpenAi, Thinking, Tools,
         agent::{rollout::RolloutConfig, session::SessionId},
@@ -328,19 +343,23 @@ mod tests {
         },
     };
     use nanocodex_spine_runtime::{
-        SpineIntentRequest, SpineIntentSink, SpineRuntime, SpineRuntimeLimits, with_spine_tools,
+        SpineDeliveryStatus, SpineIntentRequest, SpineIntentSink, SpineRuntime, SpineRuntimeLimits,
+        with_spine_tools,
     };
     use tempfile::tempdir;
-    use tokio::{sync::Notify, time::timeout};
+    use tokio::{net::TcpListener, sync::Notify, time::timeout};
+    use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
     use tower::Service;
 
-    use super::{Cli, run};
+    use super::{Cli, SpineWorkerFactory, run};
     use crate::{
+        app_core::WorkerFactory,
         config::ConfiguredAgent,
         spine_worker::{
             DeliveryFault, SpineIntentChannel, SpineSessionRecipe, SpineWorker, SpineWorkerInitial,
             TestResumedAgentBuilder, capabilities, durable_prompt_cache_key,
         },
+        subagents::{self, ChildAgents},
         tui::{PaneId, WorkerCommand, WorkerEvent},
     };
 
@@ -465,6 +484,7 @@ mod tests {
             session_recipe,
             SpineWorkerInitial {
                 initial_delivery: None,
+                manual_delivery: None,
                 initial_status: None,
                 root_session_id: root_session_id.clone(),
                 active_session_id: root_session_id.clone(),
@@ -558,6 +578,400 @@ mod tests {
                 assert!(runtime.unclaimed_active_delivery()?.is_some());
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_delivery_confirmation_is_accepted_once() -> eyre::Result<()> {
+        let directory = tempdir()?;
+        let (worker, runtime, delivery) = claimed_delivery_worker(directory.path(), None).await?;
+
+        worker.commands().send(WorkerCommand::Prompt {
+            target: PaneId::Main,
+            prompt_id: 1,
+            prompt: "continue with the reviewed handoff".into(),
+        })?;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if runtime.delivery_status(delivery.id())? == Some(SpineDeliveryStatus::Accepted) {
+                    return Ok::<(), eyre::Report>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        assert!(runtime.claimed_active_delivery()?.is_none());
+        assert!(runtime.unclaimed_active_delivery()?.is_none());
+
+        worker.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_delivery_accept_sync_failure_stops_the_spine_coordinator() -> eyre::Result<()> {
+        let directory = tempdir()?;
+        let (worker, runtime, delivery) =
+            claimed_delivery_worker(directory.path(), Some(DeliveryFault::AcceptedSync)).await?;
+
+        worker.commands().send(WorkerCommand::Prompt {
+            target: PaneId::Main,
+            prompt_id: 1,
+            prompt: "confirm the interrupted handoff".into(),
+        })?;
+
+        let outcome = timeout(Duration::from_secs(5), worker.shutdown()).await?;
+        assert!(
+            outcome.is_err(),
+            "manual accepted-sync failure must stop the worker"
+        );
+        assert_eq!(
+            runtime.delivery_status(delivery.id())?,
+            Some(SpineDeliveryStatus::Claimed)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn factory_resume_restores_identity_and_delivers_unclaimed_continuation()
+    -> eyre::Result<()> {
+        let directory = tempdir()?;
+        let (endpoint, server) = completed_responses_server(2).await?;
+        let cli = spine_cli_with_websocket(&endpoint)?;
+        let factory = SpineWorkerFactory::build_in(
+            cli.agent.clone(),
+            cli.vm.clone(),
+            directory.path().to_path_buf(),
+        )
+        .await?;
+        let root_session_id = factory.root_session_id.clone();
+        let mut root = factory.start();
+        root.commands().send(WorkerCommand::Prompt {
+            target: PaneId::Main,
+            prompt_id: 1,
+            prompt: "establish a durable root boundary".into(),
+        })?;
+        wait_for_main_turn(&mut root).await?;
+        root.shutdown().await?;
+        let durable_root = RolloutConfig::new(directory.path()).load_session(&root_session_id)?;
+        assert_eq!(durable_root.thread_id(), root_session_id);
+
+        let factory = SpineWorkerFactory::resume_in(
+            cli.agent.clone(),
+            cli.vm.clone(),
+            &root_session_id,
+            directory.path().to_path_buf(),
+        )
+        .await?;
+        let (child, _events) = factory.configured.handle.fork().await?;
+        let active_session_id = child.session_id().to_string();
+        child.shutdown().await?;
+        let runtime = Arc::clone(&factory.runtime);
+        drop(factory);
+        let transition = runtime.prepare(SpineIntentRequest::new(
+            root_session_id.clone(),
+            "resume-delivery",
+            nanocodex_spine_runtime::SpineTerminalControl::Open {
+                summary: "inspect the recovered scope".to_owned(),
+            },
+        ))?;
+        let delivery = runtime.commit(
+            &transition,
+            active_session_id.clone(),
+            None,
+            "delivery-resume-unclaimed",
+        )?;
+        drop(runtime);
+
+        let factory = SpineWorkerFactory::resume_in(
+            cli.agent,
+            cli.vm,
+            &root_session_id,
+            directory.path().to_path_buf(),
+        )
+        .await?;
+        assert_eq!(
+            factory.configured.handle.session_id().to_string(),
+            active_session_id
+        );
+        assert_eq!(factory.active_session_id, active_session_id);
+        assert_eq!(
+            durable_prompt_cache_key(&factory.session_recipe.load(&active_session_id)?)?,
+            factory.runtime.prompt_cache_key()?
+        );
+        assert_eq!(factory.initial_delivery.as_ref(), Some(&delivery));
+
+        let runtime = Arc::clone(&factory.runtime);
+        let resumed = factory.start();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if runtime.delivery_status(delivery.id())? == Some(SpineDeliveryStatus::Accepted) {
+                    return Ok::<(), eyre::Report>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        resumed.shutdown().await?;
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn factory_resume_accepts_a_claimed_manual_delivery_without_replaying_it()
+    -> eyre::Result<()> {
+        let directory = tempdir()?;
+        let (endpoint, server) = completed_responses_server(2).await?;
+        let cli = spine_cli_with_websocket(&endpoint)?;
+        let factory = SpineWorkerFactory::build_in(
+            cli.agent.clone(),
+            cli.vm.clone(),
+            directory.path().to_path_buf(),
+        )
+        .await?;
+        let root_session_id = factory.root_session_id.clone();
+        let mut root = factory.start();
+        root.commands().send(WorkerCommand::Prompt {
+            target: PaneId::Main,
+            prompt_id: 1,
+            prompt: "establish a durable root boundary".into(),
+        })?;
+        wait_for_main_turn(&mut root).await?;
+        root.shutdown().await?;
+
+        let factory = SpineWorkerFactory::resume_in(
+            cli.agent.clone(),
+            cli.vm.clone(),
+            &root_session_id,
+            directory.path().to_path_buf(),
+        )
+        .await?;
+        let (child, _events) = factory.configured.handle.fork().await?;
+        let active_session_id = child.session_id().to_string();
+        child.shutdown().await?;
+        let runtime = Arc::clone(&factory.runtime);
+        drop(factory);
+        let transition = runtime.prepare(SpineIntentRequest::new(
+            root_session_id.clone(),
+            "manual-resume-delivery",
+            nanocodex_spine_runtime::SpineTerminalControl::Open {
+                summary: "review the interrupted work".to_owned(),
+            },
+        ))?;
+        let delivery = runtime.commit(
+            &transition,
+            active_session_id.clone(),
+            None,
+            "delivery-resume-claimed",
+        )?;
+        runtime.claim_delivery(&delivery)?;
+        drop(runtime);
+
+        let factory = SpineWorkerFactory::resume_in(
+            cli.agent.clone(),
+            cli.vm.clone(),
+            &root_session_id,
+            directory.path().to_path_buf(),
+        )
+        .await?;
+        assert!(factory.initial_delivery.is_none());
+        assert_eq!(factory.manual_delivery.as_ref(), Some(&delivery));
+        let runtime = Arc::clone(&factory.runtime);
+        let resumed = factory.start();
+        assert_eq!(
+            runtime.delivery_status(delivery.id())?,
+            Some(SpineDeliveryStatus::Claimed)
+        );
+        resumed.commands().send(WorkerCommand::Prompt {
+            target: PaneId::Main,
+            prompt_id: 1,
+            prompt: "continue after reviewing the handoff".into(),
+        })?;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if runtime.delivery_status(delivery.id())? == Some(SpineDeliveryStatus::Accepted) {
+                    return Ok::<(), eyre::Report>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        resumed.shutdown().await?;
+        drop(runtime);
+
+        let factory = SpineWorkerFactory::resume_in(
+            cli.agent,
+            cli.vm,
+            &root_session_id,
+            directory.path().to_path_buf(),
+        )
+        .await?;
+        assert!(factory.initial_delivery.is_none());
+        assert!(factory.manual_delivery.is_none());
+        factory.configured.handle.shutdown().await?;
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn factory_resume_rejects_missing_rollouts_and_cache_mismatches() -> eyre::Result<()> {
+        let missing = tempdir()?;
+        let missing_root = SessionId::new().to_string();
+        let runtime = SpineRuntime::create(
+            SpineRuntimeLimits::default(),
+            missing.path().join("spine").as_path(),
+            &missing_root,
+            &missing_root,
+            "2026-08-10T00:00:00Z",
+        )?;
+        drop(runtime);
+        let missing_cli = spine_cli_with_websocket("ws://127.0.0.1:1")?;
+        let error = match SpineWorkerFactory::resume_in(
+            missing_cli.agent,
+            missing_cli.vm,
+            &missing_root,
+            missing.path().to_path_buf(),
+        )
+        .await
+        {
+            Ok(_) => return Err(eyre!("a Spine journal without its active rollout resumed")),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("no durable Nanocodex boundary"));
+
+        let mismatched = tempdir()?;
+        let mismatched_root = SessionId::new();
+        let openai = OpenAi::builder("test-key")
+            .service(|| CompletedSpineService)
+            .build()?;
+        let (agent, _events) = Nanocodex::builder(openai)
+            .session_id(mismatched_root)
+            .rollout(RolloutConfig::new(mismatched.path()))
+            .build()?;
+        let root_session_id = agent.session_id().to_string();
+        let turn = agent.prompt("persist a durable root boundary").await?;
+        turn.result().await?;
+        agent.flush_rollout().await?;
+        agent.shutdown().await?;
+        let runtime = SpineRuntime::create(
+            SpineRuntimeLimits::default(),
+            mismatched.path().join("spine").as_path(),
+            &root_session_id,
+            "unexpected-cache-key",
+            "2026-08-10T00:00:00Z",
+        )?;
+        drop(runtime);
+        let mismatched_cli = spine_cli_with_websocket("ws://127.0.0.1:1")?;
+        let error = match SpineWorkerFactory::resume_in(
+            mismatched_cli.agent,
+            mismatched_cli.vm,
+            &root_session_id,
+            mismatched.path().to_path_buf(),
+        )
+        .await
+        {
+            Ok(_) => return Err(eyre!("a rollout with another cache key resumed")),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("active Spine rollout prompt cache key does not match the root journal")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spine_tools_remain_visible_to_coordinator_forks_but_not_ordinary_children()
+    -> eyre::Result<()> {
+        let directory = tempdir()?;
+        let profiles = Arc::new(Mutex::new(Vec::new()));
+        let openai = OpenAi::builder("test-key")
+            .service({
+                let profiles = Arc::clone(&profiles);
+                move || ToolProfileService {
+                    profiles: Arc::clone(&profiles),
+                }
+            })
+            .build()?;
+        let base_tools = Tools::builder().without_defaults().build()?;
+        let child_registry = Arc::new(ChildAgents::default());
+        let primary_agents = Arc::downgrade(&child_registry);
+        let child_agents = Arc::downgrade(&child_registry);
+        let (intent_sink, _intents) = SpineIntentChannel::new();
+        let tool_sink: Arc<dyn SpineIntentSink> = intent_sink;
+        let root_handle = Arc::new(Mutex::new(None));
+        let (root, _events) = Nanocodex::builder(openai)
+            .rollout(RolloutConfig::new(directory.path()))
+            .tools_factory({
+                let base_tools = base_tools.clone();
+                let tool_sink = Arc::clone(&tool_sink);
+                let root_handle = Arc::clone(&root_handle);
+                move |agent| {
+                    let mut slot = root_handle.lock().expect("root tool handle lock");
+                    if slot.is_none() {
+                        *slot = Some(agent.clone());
+                    }
+                    drop(slot);
+                    let tools = subagents::with_subagents(
+                        base_tools.clone(),
+                        agent,
+                        primary_agents.clone(),
+                    )?;
+                    with_spine_tools(tools, Arc::clone(&tool_sink))
+                }
+            })
+            .child_tools_factory({
+                let base_tools = base_tools.clone();
+                move |agent| {
+                    subagents::with_subagents(base_tools.clone(), agent, child_agents.clone())
+                }
+            })
+            .build()?;
+        let root_handle = root_handle
+            .lock()
+            .expect("root tool handle lock")
+            .clone()
+            .expect("primary tools receive the root handle");
+
+        root.prompt("establish a coordinator boundary")
+            .await?
+            .result()
+            .await?;
+        let (coordinator, _events) = root.fork().await?;
+        coordinator
+            .prompt("continue as the Spine coordinator")
+            .await?
+            .result()
+            .await?;
+        let (ordinary_fork, _events) = root_handle.fork().await?;
+        ordinary_fork
+            .prompt("inspect without becoming a coordinator")
+            .await?
+            .result()
+            .await?;
+        let (ordinary_spawn, _events) = root_handle.spawn().await?;
+        ordinary_spawn
+            .prompt("start as an ordinary child")
+            .await?
+            .result()
+            .await?;
+
+        {
+            let profiles = profiles.lock().expect("tool profile lock");
+            assert_eq!(profiles.len(), 4);
+            for profile in &profiles[..2] {
+                assert_spine_coordinator_tools(profile);
+            }
+            for profile in &profiles[2..] {
+                assert_ordinary_child_tools(profile);
+            }
+        }
+
+        coordinator.shutdown().await?;
+        ordinary_fork.shutdown().await?;
+        ordinary_spawn.shutdown().await?;
+        root.shutdown().await?;
+        child_registry.shutdown().await;
         Ok(())
     }
 
@@ -682,6 +1096,7 @@ mod tests {
         };
         let initial = SpineWorkerInitial {
             initial_delivery: None,
+            manual_delivery: None,
             initial_status: None,
             root_session_id: root_session_id.clone(),
             active_session_id: root_session_id,
@@ -712,6 +1127,213 @@ mod tests {
             }
         };
         Ok((worker, runtime))
+    }
+
+    async fn claimed_delivery_worker(
+        directory: &std::path::Path,
+        delivery_fault: Option<DeliveryFault>,
+    ) -> eyre::Result<(
+        crate::app_core::WorkerHandle<WorkerCommand, WorkerEvent>,
+        Arc<SpineRuntime>,
+        nanocodex_spine_runtime::SpineDelivery,
+    )> {
+        let root_session_id = SessionId::new();
+        let openai = OpenAi::builder("test-key")
+            .service(|| CompletedSpineService)
+            .build()?;
+        let tools = Tools::builder().without_defaults().build()?;
+        let (intent_sink, intents) = SpineIntentChannel::new();
+        let tool_sink: Arc<dyn SpineIntentSink> = intent_sink.clone();
+        let (root, _root_events) = Nanocodex::builder(openai)
+            .thinking(Thinking::Low)
+            .workspace(directory)
+            .session_id(root_session_id)
+            .rollout(RolloutConfig::new(directory))
+            .tools_factory(move |_agent| with_spine_tools(tools.clone(), Arc::clone(&tool_sink)))
+            .build()?;
+        let root_session_id = root.session_id().to_string();
+        let root_turn = root.prompt("establish the durable root boundary").await?;
+        root_turn.result().await?;
+        root.flush_rollout().await?;
+        let (agent, events) = root.fork().await?;
+        let active_session_id = agent.session_id().to_string();
+        root.shutdown().await?;
+        let runtime = Arc::new(SpineRuntime::create(
+            SpineRuntimeLimits::default(),
+            directory.join("spine").as_path(),
+            &root_session_id,
+            &root_session_id,
+            "2026-08-10T00:00:00Z",
+        )?);
+        let transition = runtime.prepare(SpineIntentRequest::new(
+            root_session_id.clone(),
+            "manual-delivery",
+            nanocodex_spine_runtime::SpineTerminalControl::Open {
+                summary: "continue after recovery".to_owned(),
+            },
+        ))?;
+        let delivery = runtime.commit(
+            &transition,
+            active_session_id.clone(),
+            None,
+            "delivery-manual",
+        )?;
+        runtime.claim_delivery(&delivery)?;
+        let cli = Cli::try_parse_from([
+            "nanocodex-spine",
+            "--api-key",
+            "test-key",
+            "--browser=none",
+            "--subagents",
+            "false",
+        ])?;
+        let session_recipe = SpineSessionRecipe::new(
+            cli.agent,
+            cli.vm,
+            Arc::clone(&intent_sink),
+            directory.to_path_buf(),
+        );
+        let configured = ConfiguredAgent {
+            handle: agent,
+            events,
+            realtime: None,
+            child_agents: None,
+            mpp_adapter: None,
+            mcp: None,
+            browser: None,
+            vm: None,
+        };
+        let initial = SpineWorkerInitial {
+            initial_delivery: None,
+            manual_delivery: Some(delivery.clone()),
+            initial_status: None,
+            root_session_id: root_session_id.clone(),
+            active_session_id,
+            capabilities: capabilities(),
+        };
+        let worker = match delivery_fault {
+            Some(fault) => SpineWorker::start_with_delivery_fault(
+                configured,
+                Arc::clone(&runtime),
+                intents,
+                session_recipe,
+                initial,
+                fault,
+            ),
+            None => SpineWorker::start(
+                configured,
+                Arc::clone(&runtime),
+                intents,
+                session_recipe,
+                initial,
+            ),
+        };
+        Ok((worker, runtime, delivery))
+    }
+
+    fn spine_cli_with_websocket(endpoint: &str) -> eyre::Result<Cli> {
+        Cli::try_parse_from([
+            "nanocodex-spine",
+            "--api-key",
+            "test-key",
+            "--browser=none",
+            "--subagents",
+            "false",
+            "--websocket-url",
+            endpoint,
+        ])
+        .map_err(Into::into)
+    }
+
+    async fn completed_responses_server(
+        connections: usize,
+    ) -> eyre::Result<(String, tokio::task::JoinHandle<eyre::Result<()>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            for connection in 0..connections {
+                let (stream, _) = listener.accept().await?;
+                let mut socket = accept_async(stream).await?;
+                let warmup = next_ws_json(&mut socket).await?;
+                assert_eq!(warmup["generate"], false, "connection {connection}");
+                send_ws_json(
+                    &mut socket,
+                    serde_json::json!({
+                        "type": "response.completed",
+                        "response": { "id": format!("resp-warmup-{connection}"), "usage": null }
+                    }),
+                )
+                .await?;
+                let generation = next_ws_json(&mut socket).await?;
+                assert_ne!(generation["generate"], false, "connection {connection}");
+                send_ws_json(
+                    &mut socket,
+                    serde_json::json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": format!("resp-generation-{connection}"),
+                            "status": "completed",
+                            "output": [{
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{ "type": "output_text", "text": "completed" }]
+                            }],
+                            "usage": null
+                        }
+                    }),
+                )
+                .await?;
+            }
+            Ok(())
+        });
+        Ok((endpoint, server))
+    }
+
+    async fn wait_for_main_turn(
+        worker: &mut crate::app_core::WorkerHandle<WorkerCommand, WorkerEvent>,
+    ) -> eyre::Result<()> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    worker.events_mut().recv().await,
+                    Some(WorkerEvent::TurnFinished {
+                        target: PaneId::Main,
+                        main_branch_id: Some(0),
+                        error: None,
+                    })
+                ) {
+                    return Ok::<(), eyre::Report>(());
+                }
+            }
+        })
+        .await??;
+        Ok(())
+    }
+
+    async fn next_ws_json<S>(socket: &mut WebSocketStream<S>) -> eyre::Result<serde_json::Value>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        loop {
+            let message = socket
+                .next()
+                .await
+                .ok_or_else(|| eyre!("client closed before sending a request"))??;
+            if let Message::Text(text) = message {
+                return Ok(serde_json::from_str(text.as_str())?);
+            }
+        }
+    }
+
+    async fn send_ws_json<S>(
+        socket: &mut WebSocketStream<S>,
+        value: serde_json::Value,
+    ) -> eyre::Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        socket.send(Message::Text(value.to_string().into())).await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -830,6 +1452,7 @@ mod tests {
             session_recipe,
             SpineWorkerInitial {
                 initial_delivery: None,
+                manual_delivery: None,
                 initial_status: None,
                 root_session_id: root_session_id.clone(),
                 active_session_id: child_session_id,
@@ -994,6 +1617,7 @@ mod tests {
             session_recipe,
             SpineWorkerInitial {
                 initial_delivery: None,
+                manual_delivery: None,
                 initial_status: None,
                 root_session_id: root_session_id.clone(),
                 active_session_id: child_session_id,
@@ -1041,6 +1665,14 @@ mod tests {
     #[derive(Clone, Default)]
     struct DeliveryFaultService {
         generation_calls: Arc<AtomicU32>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct CompletedSpineService;
+
+    #[derive(Clone)]
+    struct ToolProfileService {
+        profiles: Arc<Mutex<Vec<BTreeSet<String>>>>,
     }
 
     #[derive(Clone)]
@@ -1222,6 +1854,95 @@ mod tests {
                 _ => panic!("unexpected scripted Responses attempt"),
             };
             ready(Ok(ResponsesServiceResponse::new(output)))
+        }
+    }
+
+    impl Service<ResponsesAttempt> for CompletedSpineService {
+        type Response = ResponsesServiceResponse;
+        type Error = ResponseError;
+        type Future = Ready<Result<ResponsesServiceResponse, ResponseError>>;
+
+        fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
+            let output = match request.kind() {
+                ResponsesAttemptKind::Warmup => ResponsesOutput::Warmup(WarmupResponse {
+                    id: "resp-warmup".to_owned(),
+                    usage: None,
+                }),
+                ResponsesAttemptKind::Generation => {
+                    final_generation("resp-completed", "completed manual delivery")
+                }
+                _ => panic!("unexpected scripted Responses attempt"),
+            };
+            ready(Ok(ResponsesServiceResponse::new(output)))
+        }
+    }
+
+    impl Service<ResponsesAttempt> for ToolProfileService {
+        type Response = ResponsesServiceResponse;
+        type Error = ResponseError;
+        type Future = Ready<Result<ResponsesServiceResponse, ResponseError>>;
+
+        fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
+            let output = match request.kind() {
+                ResponsesAttemptKind::Warmup => ResponsesOutput::Warmup(WarmupResponse {
+                    id: "resp-warmup".to_owned(),
+                    usage: None,
+                }),
+                ResponsesAttemptKind::Generation => {
+                    self.profiles
+                        .lock()
+                        .expect("tool profile lock")
+                        .push(request_tool_names(&request));
+                    final_generation("resp-tool-profile", "completed")
+                }
+                _ => panic!("unexpected tool profile Responses attempt"),
+            };
+            ready(Ok(ResponsesServiceResponse::new(output)))
+        }
+    }
+
+    fn request_tool_names(request: &ResponsesAttempt) -> BTreeSet<String> {
+        let profile = nanocodex_oai_api::__private::test_support::request_profile(request);
+        profile
+            .prefix()
+            .iter()
+            .chain(request.input_items())
+            .filter_map(|item| match item {
+                ResponseItem::AdditionalTools { tools, .. } => Some(tools),
+                _ => None,
+            })
+            .flatten()
+            .map(|tool| tool.name().to_owned())
+            .chain(profile.code_mode_tool_names().map(str::to_owned))
+            .collect()
+    }
+
+    fn assert_spine_coordinator_tools(profile: &BTreeSet<String>) {
+        for name in ["spine__open", "spine__close", "spine__next"] {
+            assert!(profile.contains(name), "coordinator is missing {name}");
+        }
+        assert_subagent_tools(profile);
+    }
+
+    fn assert_ordinary_child_tools(profile: &BTreeSet<String>) {
+        assert!(
+            profile.iter().all(|name| !name.starts_with("spine__")),
+            "ordinary child unexpectedly received Spine controls: {profile:?}"
+        );
+        assert_subagent_tools(profile);
+    }
+
+    fn assert_subagent_tools(profile: &BTreeSet<String>) {
+        for name in ["spawn_agent", "fork_agent", "prompt_agent"] {
+            assert!(profile.contains(name), "child is missing {name}");
         }
     }
 

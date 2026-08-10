@@ -268,12 +268,12 @@ impl AgentArgs {
         self.build_inner(None, vm, None, codex_home).await
     }
 
-    pub(crate) async fn build_with_tool_customizer(
+    pub(crate) async fn build_with_tool_customizer_in_codex_home(
         self,
         vm: VmArgs,
         customizer: ToolCustomizer,
+        codex_home: PathBuf,
     ) -> Result<ConfiguredAgent> {
-        let codex_home = default_codex_home()?;
         self.build_inner(None, vm, Some(customizer), codex_home)
             .await
     }
