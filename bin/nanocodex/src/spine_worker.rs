@@ -508,29 +508,33 @@ impl SpineWorker {
         prompt: SubmittedPrompt,
     ) -> Result<()> {
         if target != PaneId::Main {
-            self.finish_prompt(
+            self.reject_prompt(
                 target,
-                Some(prompt_id),
+                prompt_id,
+                prompt,
                 "Spine has no BTW branch".to_owned(),
             );
             return Ok(());
         }
         if self.transition_in_progress {
-            self.finish_prompt(
+            self.reject_prompt(
                 target,
-                Some(prompt_id),
+                prompt_id,
+                prompt,
                 SpineRuntimeError::TransitionInProgress.to_string(),
             );
             return Ok(());
         }
         if !self.turns.is_empty() {
-            self.finish_prompt(
+            self.reject_prompt(
                 target,
-                Some(prompt_id),
+                prompt_id,
+                prompt,
                 "an active Spine turn is already running; steer or cancel it first".to_owned(),
             );
             return Ok(());
         }
+        let rejected_prompt = prompt.clone();
         match self.start_turn(Some(prompt_id), prompt.into_prompt()).await {
             Ok(()) => {
                 if let Some(delivery) = self.manual_delivery.clone() {
@@ -541,7 +545,7 @@ impl SpineWorker {
                     self.manual_delivery = None;
                 }
             }
-            Err(error) => self.finish_prompt(target, Some(prompt_id), error.to_string()),
+            Err(error) => self.reject_prompt(target, prompt_id, rejected_prompt, error.to_string()),
         }
         Ok(())
     }
@@ -786,6 +790,21 @@ impl SpineWorker {
                 error: (!error.is_empty()).then_some(error),
             });
         }
+    }
+
+    fn reject_prompt(
+        &self,
+        target: PaneId,
+        prompt_id: u64,
+        prompt: SubmittedPrompt,
+        error: String,
+    ) {
+        let _ = self.updates.send(WorkerEvent::PromptRejected {
+            target,
+            prompt_id,
+            prompt,
+            error,
+        });
     }
 }
 

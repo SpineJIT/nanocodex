@@ -317,8 +317,9 @@ impl WorkerFactory for SpineWorkerFactory {
 mod tests {
     use std::{
         collections::BTreeSet,
-        future::{Ready, ready},
+        future::{Future, Ready, pending, ready},
         path::PathBuf,
+        pin::Pin,
         sync::{
             Arc, Mutex,
             atomic::{AtomicU32, Ordering},
@@ -717,9 +718,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn factory_resume_aborts_a_persisted_prepared_transition() -> eyre::Result<()> {
+    async fn factory_resume_aborts_and_delivers_a_persisted_prepared_transition() -> eyre::Result<()>
+    {
         let directory = tempdir()?;
-        let (endpoint, server) = completed_responses_server(1).await?;
+        let (endpoint, server) = completed_responses_server(2).await?;
         let cli = spine_cli_with_websocket(&endpoint)?;
         let factory = SpineWorkerFactory::build_in(
             cli.agent.clone(),
@@ -767,8 +769,27 @@ mod tests {
                 "Recovered an uncommitted Spine transition; continuing from the last durable node."
             )
         );
-        factory.configured.handle.shutdown().await?;
-        drop(factory);
+        let delivery = factory
+            .initial_delivery
+            .clone()
+            .ok_or_else(|| eyre!("prepared-transition recovery did not create a delivery"))?;
+        assert_eq!(
+            factory.runtime.delivery_status(delivery.id())?,
+            Some(SpineDeliveryStatus::Unclaimed)
+        );
+        let runtime = Arc::clone(&factory.runtime);
+        let resumed = factory.start();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if runtime.delivery_status(delivery.id())? == Some(SpineDeliveryStatus::Accepted) {
+                    return Ok::<(), eyre::Report>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        resumed.shutdown().await?;
+        drop(runtime);
 
         let runtime = SpineRuntime::open(
             SpineRuntimeLimits::default(),
@@ -777,6 +798,10 @@ mod tests {
         )?;
         assert!(runtime.pending_transition()?.is_none());
         assert_eq!(runtime.active_session_id()?, root_session_id);
+        assert_eq!(
+            runtime.delivery_status(delivery.id())?,
+            Some(SpineDeliveryStatus::Accepted)
+        );
         server.abort();
         Ok(())
     }
@@ -1109,6 +1134,50 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn prompt_submitted_during_an_active_turn_is_rejected_with_its_contents()
+    -> eyre::Result<()> {
+        let directory = tempdir()?;
+        let generation_started = Arc::new(Notify::new());
+        let started = generation_started.notified();
+        let mut worker =
+            active_turn_spine_worker(directory.path(), Arc::clone(&generation_started)).await?;
+
+        worker.commands().send(WorkerCommand::Prompt {
+            target: PaneId::Main,
+            prompt_id: 1,
+            prompt: "start a long-running inspection".into(),
+        })?;
+        timeout(Duration::from_secs(5), started).await?;
+
+        worker.commands().send(WorkerCommand::Prompt {
+            target: PaneId::Main,
+            prompt_id: 2,
+            prompt: "keep this exact draft".into(),
+        })?;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match worker.events_mut().recv().await {
+                    Some(WorkerEvent::PromptRejected {
+                        target: PaneId::Main,
+                        prompt_id: 2,
+                        prompt,
+                        error,
+                    }) => {
+                        assert_eq!(prompt.display(), "keep this exact draft");
+                        assert!(error.contains("active Spine turn"));
+                        return;
+                    }
+                    Some(_) => {}
+                    None => panic!("Spine worker stopped before rejecting the queued prompt"),
+                }
+            }
+        })
+        .await?;
+        worker.shutdown().await?;
+        Ok(())
+    }
+
     async fn scripted_spine_worker(
         directory: &std::path::Path,
         delivery_fault: Option<DeliveryFault>,
@@ -1196,6 +1265,77 @@ mod tests {
             }
         };
         Ok((worker, runtime))
+    }
+
+    async fn active_turn_spine_worker(
+        directory: &std::path::Path,
+        generation_started: Arc<Notify>,
+    ) -> eyre::Result<crate::app_core::WorkerHandle<WorkerCommand, WorkerEvent>> {
+        let root_session_id = SessionId::new();
+        let openai = OpenAi::builder("test-key")
+            .service({
+                let generation_started = Arc::clone(&generation_started);
+                move || BlockingSpineService {
+                    generation_started: Arc::clone(&generation_started),
+                }
+            })
+            .build()?;
+        let tools = Tools::builder().without_defaults().build()?;
+        let (intent_sink, intents) = SpineIntentChannel::new();
+        let tool_sink: Arc<dyn SpineIntentSink> = intent_sink.clone();
+        let (agent, events) = Nanocodex::builder(openai)
+            .thinking(Thinking::Low)
+            .workspace(directory)
+            .session_id(root_session_id)
+            .rollout(RolloutConfig::new(directory))
+            .tools_factory(move |_agent| with_spine_tools(tools.clone(), Arc::clone(&tool_sink)))
+            .build()?;
+        let root_session_id = agent.session_id().to_string();
+        let runtime = Arc::new(SpineRuntime::create(
+            SpineRuntimeLimits::default(),
+            directory.join("spine").as_path(),
+            &root_session_id,
+            &root_session_id,
+            "2026-08-10T00:00:00Z",
+        )?);
+        let cli = Cli::try_parse_from([
+            "nanocodex-spine",
+            "--api-key",
+            "test-key",
+            "--browser=none",
+            "--subagents",
+            "false",
+        ])?;
+        let session_recipe = SpineSessionRecipe::new(
+            cli.agent,
+            cli.vm,
+            Arc::clone(&intent_sink),
+            directory.to_path_buf(),
+        );
+        let configured = ConfiguredAgent {
+            handle: agent,
+            events,
+            realtime: None,
+            child_agents: None,
+            mpp_adapter: None,
+            mcp: None,
+            browser: None,
+            vm: None,
+        };
+        Ok(SpineWorker::start(
+            configured,
+            runtime,
+            intents,
+            session_recipe,
+            SpineWorkerInitial {
+                initial_delivery: None,
+                manual_delivery: None,
+                initial_status: None,
+                root_session_id: root_session_id.clone(),
+                active_session_id: root_session_id,
+                capabilities: capabilities(),
+            },
+        ))
     }
 
     async fn claimed_delivery_worker(
@@ -1736,6 +1876,11 @@ mod tests {
         generation_calls: Arc<AtomicU32>,
     }
 
+    #[derive(Clone)]
+    struct BlockingSpineService {
+        generation_started: Arc<Notify>,
+    }
+
     #[derive(Clone, Copy)]
     struct CompletedSpineService;
 
@@ -1929,6 +2074,33 @@ mod tests {
                 _ => panic!("unexpected scripted Responses attempt"),
             };
             ready(Ok(ResponsesServiceResponse::new(output)))
+        }
+    }
+
+    impl Service<ResponsesAttempt> for BlockingSpineService {
+        type Response = ResponsesServiceResponse;
+        type Error = ResponseError;
+        type Future =
+            Pin<Box<dyn Future<Output = Result<ResponsesServiceResponse, ResponseError>> + Send>>;
+
+        fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
+            match request.kind() {
+                ResponsesAttemptKind::Warmup => Box::pin(ready(Ok(ResponsesServiceResponse::new(
+                    ResponsesOutput::Warmup(WarmupResponse {
+                        id: "resp-warmup".to_owned(),
+                        usage: None,
+                    }),
+                )))),
+                ResponsesAttemptKind::Generation => {
+                    self.generation_started.notify_one();
+                    Box::pin(pending())
+                }
+                _ => panic!("unexpected scripted Responses attempt"),
+            }
         }
     }
 
