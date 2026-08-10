@@ -41,6 +41,14 @@ const CANCEL_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
 const SMOOTH_SCROLL_BACKLOG_ROWS: usize = 8;
 const MAX_SMOOTH_SCROLL_CATCH_UP_ROWS: usize = 32;
 
+/// Distinguishes the two user input lanes the Spine coordinator must route
+/// across a structural handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpineInputLane {
+    Immediate,
+    Deferred,
+}
+
 fn spine_continuation_body<'a>(delivery_id: &str, prompt: &'a str) -> Option<&'a str> {
     let marker = format!("<spine_delivery id=\"{delivery_id}\">");
     prompt
@@ -2303,8 +2311,7 @@ impl App {
     }
 
     pub(super) fn queue_prompt(&mut self, target: PaneId, prompt: String) -> Option<u64> {
-        let id = self.next_input_id;
-        self.next_input_id = self.next_input_id.saturating_add(1);
+        let id = self.reserve_input_id();
         let conversation = self.conversation_mut(target)?;
         conversation.queue_prompt(id, prompt);
         Some(id)
@@ -2316,11 +2323,16 @@ impl App {
         prompt: impl Into<SubmittedPrompt>,
     ) -> Option<u64> {
         self.conversation(target)?;
-        let id = self.next_input_id;
-        self.next_input_id = self.next_input_id.saturating_add(1);
+        let id = self.reserve_input_id();
         self.conversation_mut(target)?
             .queue_steer(id, prompt.into());
         Some(id)
+    }
+
+    pub(super) const fn reserve_input_id(&mut self) -> u64 {
+        let id = self.next_input_id;
+        self.next_input_id = self.next_input_id.saturating_add(1);
+        id
     }
 
     pub(super) fn interrupted_steers_resubmitted(
@@ -2357,6 +2369,47 @@ impl App {
     pub(super) fn steer_admitted(&mut self, target: PaneId, id: u64) {
         if let Some(conversation) = self.conversation_mut(target) {
             conversation.steer_admitted(id);
+        }
+    }
+
+    pub(super) fn spine_input_started(&mut self, target: PaneId, id: u64, prompt: SubmittedPrompt) {
+        if let Some(conversation) = self.conversation_mut(target) {
+            conversation.queue_prompt(id, prompt.display().to_owned());
+        }
+    }
+
+    pub(super) fn spine_input_steering(
+        &mut self,
+        target: PaneId,
+        id: u64,
+        prompt: SubmittedPrompt,
+    ) {
+        if let Some(conversation) = self.conversation_mut(target) {
+            conversation.queue_steer(id, prompt);
+        }
+    }
+
+    pub(super) fn spine_input_delivered(
+        &mut self,
+        target: PaneId,
+        _id: u64,
+        prompt: SubmittedPrompt,
+    ) {
+        if let Some(conversation) = self.conversation_mut(target) {
+            conversation.push_output(TranscriptItem::User(prompt.display));
+            if conversation.running {
+                "Steer applied".clone_into(&mut conversation.status);
+            }
+        }
+    }
+
+    pub(super) fn spine_input_buffered(&mut self, target: PaneId, _id: u64, lane: SpineInputLane) {
+        if let Some(conversation) = self.conversation_mut(target) {
+            conversation.status = match lane {
+                SpineInputLane::Immediate => "Steer queued after Spine handoff",
+                SpineInputLane::Deferred => "Prompt queued after Spine handoff",
+            }
+            .to_owned();
         }
     }
 
@@ -3411,8 +3464,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        App, EscapeAction, PaneId, SubmittedPrompt, present_tool_name, smooth_scroll_drain,
-        summarize_tool_arguments,
+        App, EscapeAction, PaneId, SpineInputLane, SubmittedPrompt, present_tool_name,
+        smooth_scroll_drain, summarize_tool_arguments,
     };
     use crate::tui::transcript::TranscriptItem;
 
@@ -3533,6 +3586,37 @@ mod tests {
         assert_eq!(app.cursor, app.input.len());
         assert!(app.main.queued_prompts.is_empty());
         assert_eq!(app.main.pending_turns, 0);
+    }
+
+    #[test]
+    fn buffered_spine_input_does_not_replace_a_later_composer_draft() {
+        let mut app = App::new(std::path::PathBuf::from("/worktree"));
+        app.replace_input("later unsent draft".to_owned());
+
+        app.spine_input_buffered(PaneId::Main, 7, SpineInputLane::Deferred);
+
+        assert_eq!(app.input, "later unsent draft");
+        assert_eq!(app.cursor, app.input.len());
+        assert_eq!(app.main.status, "Prompt queued after Spine handoff");
+    }
+
+    #[test]
+    fn delivered_spine_input_is_shown_without_entering_the_prompt_queue() {
+        let mut app = App::new(std::path::PathBuf::from("/worktree"));
+        app.main.running = true;
+
+        app.spine_input_delivered(
+            PaneId::Main,
+            7,
+            SubmittedPrompt::text("redirect the child scope".to_owned()),
+        );
+
+        assert_eq!(
+            app.main.transcript.latest_user_message(),
+            Some("redirect the child scope")
+        );
+        assert!(app.main.queued_prompts.is_empty());
+        assert!(app.main.pending_steers.is_empty());
     }
 
     #[test]

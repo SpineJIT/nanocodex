@@ -25,6 +25,7 @@ pub enum WorkerCapability {
     Thinking,
     Mcp,
     Voice,
+    SpineInputHandoff,
 }
 
 impl WorkerCapability {
@@ -41,6 +42,7 @@ impl WorkerCapability {
             Self::Thinking => 1 << 8,
             Self::Mcp => 1 << 9,
             Self::Voice => 1 << 10,
+            Self::SpineInputHandoff => 1 << 11,
         }
     }
 }

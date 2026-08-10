@@ -47,7 +47,7 @@ use tokio::{
 };
 use tracing::{Instrument, info_span};
 
-pub use self::app::{PaneId, SubmittedPrompt};
+pub use self::app::{PaneId, SpineInputLane, SubmittedPrompt};
 
 use self::{
     app::{App, EscapeAction, ReasoningPickerAction},
@@ -147,6 +147,12 @@ pub enum WorkerCommand {
         prompt_id: u64,
         prompt: SubmittedPrompt,
     },
+    SpineInput {
+        target: PaneId,
+        id: u64,
+        prompt: SubmittedPrompt,
+        lane: SpineInputLane,
+    },
     Steer {
         target: PaneId,
         id: u64,
@@ -226,6 +232,26 @@ pub enum WorkerEvent {
     SpineContinuation {
         delivery_id: String,
         prompt: String,
+    },
+    SpineInputStarted {
+        target: PaneId,
+        id: u64,
+        prompt: SubmittedPrompt,
+    },
+    SpineInputSteering {
+        target: PaneId,
+        id: u64,
+        prompt: SubmittedPrompt,
+    },
+    SpineInputDelivered {
+        target: PaneId,
+        id: u64,
+        prompt: SubmittedPrompt,
+    },
+    SpineInputBuffered {
+        target: PaneId,
+        id: u64,
+        lane: SpineInputLane,
     },
     PromptRejected {
         target: PaneId,
@@ -1185,6 +1211,18 @@ fn handle_worker_update_with_capabilities(
             delivery_id,
             prompt,
         } => app.spine_continuation(delivery_id, prompt),
+        WorkerEvent::SpineInputStarted { target, id, prompt } => {
+            app.spine_input_started(target, id, prompt);
+        }
+        WorkerEvent::SpineInputSteering { target, id, prompt } => {
+            app.spine_input_steering(target, id, prompt);
+        }
+        WorkerEvent::SpineInputDelivered { target, id, prompt } => {
+            app.spine_input_delivered(target, id, prompt);
+        }
+        WorkerEvent::SpineInputBuffered { target, id, lane } => {
+            app.spine_input_buffered(target, id, lane);
+        }
         WorkerEvent::PromptRejected {
             target,
             prompt_id,
@@ -1409,6 +1447,9 @@ impl AgentWorker {
                 prompt_id,
                 prompt,
             } => self.prompt(target, prompt_id, prompt).await,
+            WorkerCommand::SpineInput {
+                target, id, prompt, ..
+            } => self.prompt(target, id, prompt).await,
             WorkerCommand::Steer { target, id, prompt } => self.steer(target, id, prompt).await,
             WorkerCommand::Cancel { target } => self.cancel(target).await,
             WorkerCommand::InterruptForSteers {
@@ -2954,7 +2995,23 @@ fn submit(
     match classify_submission(input) {
         Submission::Prompt(prompt) => {
             let target = app.focus;
-            if matches!(intent, SubmitIntent::Immediate) && app.is_running(target) {
+            if capabilities.supports(WorkerCapability::SpineInputHandoff) && target == PaneId::Main
+            {
+                let id = app.reserve_input_id();
+                let lane = match intent {
+                    SubmitIntent::Immediate => SpineInputLane::Immediate,
+                    SubmitIntent::Queue => SpineInputLane::Deferred,
+                };
+                send_command(
+                    commands,
+                    WorkerCommand::SpineInput {
+                        target,
+                        id,
+                        prompt,
+                        lane,
+                    },
+                )?;
+            } else if matches!(intent, SubmitIntent::Immediate) && app.is_running(target) {
                 if let Some(id) = app.queue_steer(target, prompt.clone()) {
                     send_command(commands, WorkerCommand::Steer { target, id, prompt })?;
                 }
@@ -3099,6 +3156,7 @@ const fn worker_capability_label(capability: WorkerCapability) -> &'static str {
         WorkerCapability::Thinking => "thinking selection",
         WorkerCapability::Mcp => "MCP controls",
         WorkerCapability::Voice => "voice controls",
+        WorkerCapability::SpineInputHandoff => "Spine input handoff",
     }
 }
 
@@ -3297,13 +3355,14 @@ mod tests {
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
     use super::{
-        BTW_BOUNDARY, InitialPrompt, PaneId, RedrawPriority, Submission, TerminalAction, UiAction,
-        UiModel, UiUpdate, VoiceControl, WorkerCommand, WorkerEvent, WorkerHandle,
-        active_session_id, apply_worker_event_batch, classify_submission, finish_worker,
-        handle_key, handle_worker_update, paste_clipboard_image, prepare_btw_prompt,
-        report_cancel_outcome, session_trace_url, spawn_agent_worker, submit_initial_prompt,
+        BTW_BOUNDARY, InitialPrompt, PaneId, RedrawPriority, SpineInputLane, Submission,
+        TerminalAction, UiAction, UiModel, UiUpdate, VoiceControl, WorkerCommand, WorkerEvent,
+        WorkerHandle, active_session_id, apply_worker_event_batch, classify_submission,
+        finish_worker, handle_key, handle_key_with_capabilities, handle_worker_update,
+        paste_clipboard_image, prepare_btw_prompt, report_cancel_outcome, session_trace_url,
+        spawn_agent_worker, submit_initial_prompt,
     };
-    use crate::app_core::WorkerCapabilities;
+    use crate::app_core::{WorkerCapabilities, WorkerCapability};
     use crate::tui::{
         app::App,
         scheduler::{RenderScheduler, STREAM_FRAME_INTERVAL},
@@ -4550,6 +4609,58 @@ mod tests {
         ));
         assert_eq!(app.main.status, "Cancelling");
         assert!(!app.historical_editor_active());
+    }
+
+    #[test]
+    fn spine_input_uses_explicit_enter_and_tab_lanes_without_prequeueing() {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        let capabilities = WorkerCapabilities::empty()
+            .with(WorkerCapability::Prompt)
+            .with(WorkerCapability::Steer)
+            .with(WorkerCapability::SpineInputHandoff);
+        app.main.running = true;
+
+        app.replace_input("redirect the handoff".to_owned());
+        handle_key_with_capabilities(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            "main-session",
+            capabilities,
+            &commands,
+        )
+        .expect("submit immediate Spine input");
+        assert!(matches!(
+            worker.try_recv(),
+            Ok(WorkerCommand::SpineInput {
+                target: PaneId::Main,
+                id: 1,
+                prompt,
+                lane: SpineInputLane::Immediate,
+            }) if prompt == "redirect the handoff"
+        ));
+        assert!(app.main.queued_prompts.is_empty());
+        assert!(app.main.pending_steers.is_empty());
+
+        app.replace_input("continue after the handoff".to_owned());
+        handle_key_with_capabilities(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut app,
+            "main-session",
+            capabilities,
+            &commands,
+        )
+        .expect("queue deferred Spine input");
+        assert!(matches!(
+            worker.try_recv(),
+            Ok(WorkerCommand::SpineInput {
+                target: PaneId::Main,
+                id: 2,
+                prompt,
+                lane: SpineInputLane::Deferred,
+            }) if prompt == "continue after the handoff"
+        ));
+        assert!(app.main.queued_prompts.is_empty());
     }
 
     #[test]

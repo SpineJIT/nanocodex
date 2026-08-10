@@ -85,7 +85,7 @@ where
         } else {
             InitialResume::Exact(Box::new(checkpoint.model().clone()))
         };
-        let (child, events) = spawn_agent_driver(
+        let (child, events, initial_checkpoint) = spawn_agent_driver(
             spawner,
             session_id,
             workspace,
@@ -98,9 +98,16 @@ where
             },
             tool_profile,
         )?;
-        if !profile_changes
-            && let Err(error) = child.seed_initial_checkpoint(&checkpoint, thinking).await
-        {
+        let checkpoint = if profile_changes {
+            initial_checkpoint.as_ref().ok_or_else(|| {
+                NanocodexError::InvalidRequest(
+                    "profile-changing fork did not produce a child history checkpoint".to_owned(),
+                )
+            })?
+        } else {
+            &checkpoint
+        };
+        if let Err(error) = child.seed_initial_checkpoint(checkpoint, thinking).await {
             let _ = child.shutdown().await;
             child.discard_unpublished_rollout().await;
             return Err(error);
@@ -146,7 +153,7 @@ where
             service_factory: Arc::clone(&self.service_factory),
         };
         let service = (spawner.service_factory)(Arc::clone(&spawner.config));
-        spawn_agent_driver(
+        let (agent, events, _) = spawn_agent_driver(
             spawner,
             session_id,
             workspace,
@@ -158,6 +165,7 @@ where
                 parent_session_id: Some(Arc::from(parent_session_id)),
             },
             tool_profile,
-        )
+        )?;
+        Ok((agent, events))
     }
 }
