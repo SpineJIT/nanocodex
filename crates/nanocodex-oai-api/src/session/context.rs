@@ -8,6 +8,7 @@ use crate::{
 use super::compaction;
 
 const TOOL_OUTPUT_TOKEN_LIMIT: usize = 12_000;
+const SPINE_CODE_MODE_OUTPUT_NAME: &str = "spine.code_mode.output.v1";
 // Changing this value would change model-visible IDs and invalidate prompt caches.
 const SYNTHETIC_OUTPUT_ID_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
@@ -284,15 +285,11 @@ impl CallIds {
             ResponseItem::CustomToolCall { call_id, .. } => {
                 self.custom_calls.insert(call_id.clone());
             }
-            ResponseItem::CustomToolCallOutput {
-                call_id,
-                name: None,
-                ..
-            } => {
-                self.custom_outputs.insert(call_id.clone());
+            ResponseItem::CustomToolCallOutput { call_id, name, .. } => {
+                if is_terminal_custom_tool_output(name.as_deref()) {
+                    self.custom_outputs.insert(call_id.clone());
+                }
             }
-            // Named outputs are progress notifications, not terminal tool results.
-            ResponseItem::CustomToolCallOutput { .. } => {}
             ResponseItem::ToolSearchCall {
                 call_id: Some(call_id),
                 ..
@@ -366,7 +363,8 @@ pub fn has_well_formed_tool_calls(items: &[ResponseItem]) -> bool {
             ResponseItem::CustomToolCall { call_id, .. } => custom_calls.insert(call_id.as_ref()),
             ResponseItem::CustomToolCallOutput { call_id, name, .. } => {
                 custom_calls.contains(call_id.as_ref())
-                    && (name.is_some() || custom_outputs.insert(call_id.as_ref()))
+                    && (!is_terminal_custom_tool_output(name.as_deref())
+                        || custom_outputs.insert(call_id.as_ref()))
             }
             ResponseItem::ToolSearchCall {
                 call_id: Some(call_id),
@@ -391,6 +389,10 @@ pub fn has_well_formed_tool_calls(items: &[ResponseItem]) -> bool {
         && custom_calls == custom_outputs
         && search_calls.is_subset(&search_outputs)
         && non_server_search_outputs.is_subset(&search_calls)
+}
+
+fn is_terminal_custom_tool_output(name: Option<&str>) -> bool {
+    name.is_none() || name == Some(SPINE_CODE_MODE_OUTPUT_NAME)
 }
 
 const fn is_model_generated_item(item: &ResponseItem) -> bool {
